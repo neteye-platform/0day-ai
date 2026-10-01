@@ -743,7 +743,7 @@ reporter_agent:
 
     For `reproduction_steps`, the validator's PoC payload and execution logs are ground truth: rewrite and correct the original steps so a reader can reproduce the exploit from scratch, and do NOT paste the raw payload or logs verbatim into your output.
 
-    WRITING STYLE — your text is rendered into a human-read PDF report: be very concise; every sentence must carry information; no filler, hedging or restated evidence. Write plainly but technically: name exact routes, functions, parameters and values in inline `code`; prefer short paragraphs and bullets. Show an exact request, payload, or config line only in a complete, language-tagged fenced code block (e.g. ```http, ```json) — never dump the raw PoC payload or execution logs.
+    WRITING STYLE — your text is rendered into a human-read PDF report: be very concise; every sentence must carry information; no filler, hedging or restated evidence. Keep every section as terse as the evidence allows. Write plainly but technically: name exact routes, functions, parameters and values in inline `code`; prefer short paragraphs and bullets. Show an exact request, payload, config line, or the fix itself only in a complete, language-tagged fenced code block (e.g. ```http, ```json) — every remediation must carry such a minimal snippet, on its own line, instead of prose describing it; never dump the raw PoC payload or execution logs.
 
 edge_traversal:
   prompt: |
