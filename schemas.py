@@ -170,13 +170,11 @@ class VulnerabilityRecord(BaseModel):
     validation_strategy: Optional[Literal["validatable_now", "requires_chaining", "static_finding_only"]] = Field(
         default=None,
         description=(
-            "How the reviewed finding must be handled downstream (set by the Reviewer's "
-            "submit_evaluation): 'validatable_now' — an external trigger exists (e.g. XSS, "
-            "SQLi, arbitrary file read) so it goes straight to the Validator; "
-            "'requires_chaining' — real but locked behind auth, specific app state, or "
-            "another exploit, so it goes to the Integration Auditor; 'static_finding_only' — "
-            "real in source but with no network-reachable path, so it is accepted as static "
-            "evidence into the final report without Validator testing."
+            "Determines graph routing. 'direct_to_validator': The Validator can test this using "
+            "public endpoints or basic self-registration. 'requires_integration': The exploit "
+            "requires a pre-existing admin state, cross-user interaction, or chaining multiple "
+            "vulnerabilities. 'static_only': real in source but with no network-reachable path, "
+            "so it is accepted as static evidence into the final report without Validator testing."
         ),
     )
 
@@ -420,7 +418,7 @@ class ValidatorOutput(BaseModel):
 class ValidationResult(BaseModel):
     # report_id: str = Field(description="The ID/title of the vulnerability being tested.")
     is_confirmed: bool = Field(description="True if the exploit successfully triggered in the sandbox.")
-    poc_payload: Optional[str] = Field(description="The exact payload, script, or HTTP request that triggered the vulnerability.")
+    poc_payload: Optional[str] = Field(description="The exact payload or HTTP request that triggered the vulnerability. If you developed a PoC script in the attacker container using the ATTACKER SHELL TOOLS, provide the path of the script relative to /work.")
     execution_logs: str = Field(description="Relevant logs or output from the sandbox confirming the exploit.")
 
 class PackageCheck(BaseModel):
