@@ -1962,6 +1962,7 @@ class IntegrationAuditorAgent(ToolLoopAgent):
         return smart_llm.bind_tools([
             tools.get_vulnerability_details,
             tools.get_node_connections,
+            tools.get_path,
             tools.submit_integration_audit,
         ])
 
