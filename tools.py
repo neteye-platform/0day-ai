@@ -11,8 +11,9 @@ from langgraph.types import Command
 import docker
 from docker.errors import NotFound, APIError
 import re
+import networkx as nx
 
-from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationToolInput, AskForContextInput, IntegrationAuditInput, VulnerabilityDetailsInput
+from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationToolInput, AskForContextInput, IntegrationAuditInput, VulnerabilityDetailsInput, cwes
 from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer, reviewer_cache_key
 from languages import MANIFEST_NAMES
 import settings
@@ -48,6 +49,10 @@ def read_source_code(node_id: str, reason_for_reading: str, state: Annotated[dic
 
 # Maximum number of lines read_file will return in a single call.
 READ_FILE_MAX_LINES = 150
+
+# Bounding for get_path: max number of paths returned and max path length (hops).
+MAX_PATHS = 50
+MAX_PATH_CUTOFF = 12
 
 
 def _read_lines_range(file_path: str, target: Path, start_line: int,
@@ -705,22 +710,63 @@ def ask_for_context(
     )
 
 
+def _format_vulnerability_markdown(record: dict) -> str:
+    """Render a VulnerabilityRecord dict as a compact markdown report."""
+    cwe = record.get("cwe_id", "OTHER_UNCATEGORIZED")
+    cwe_desc = cwes.get(cwe, "")
+    lines = [
+        f"## {record.get('vuln_id', 'Unknown')}",
+        "",
+        f"- **CWE:** {f'{cwe}, {cwe_desc}' if cwe_desc else cwe}",
+        f"- **Status:** {record.get('status', 'hypothesis')}",
+        f"- **Type:** {record.get('vulnerability_type', 'Code Defect')}",
+    ]
+    nodes = [n for n in (record.get("affected_nodes") or []) if n]
+    if nodes:
+        lines.append(f"- **Affected Nodes:** {', '.join(nodes)}")
+    if record.get("source_cve"):
+        lines.append(f"- **Source CVE:** {record['source_cve']}")
+
+    lines += [
+        "",
+        "### Description",
+        record.get("description", "") or "_none_",
+        "",
+        "### Reviewer Reasoning",
+        record.get("reviewer_reasoning") or "_none_",
+        "",
+        "### Reproduction Steps",
+    ]
+    steps = record.get("reproduction_steps") or []
+    if steps:
+        # Strip any leading "N." / "N)" numbering the reviewer already embedded
+        # so our prefixed counter does not double-number each step.
+        lines += [
+            f"{i}. {re.sub(r'^\s*\d+[\.\)]\s+', '', str(s))}"
+            for i, s in enumerate(steps, 1)
+        ]
+    else:
+        lines.append("_none_")
+
+    return "\n".join(lines)
+
+
 @tool(args_schema=VulnerabilityDetailsInput)
 def get_vulnerability_details(
     vuln_id: str,
     state: Annotated[dict, InjectedState],
 ) -> str:
     """
-    Fetches the full record of another confirmed vulnerability by its vuln_id, so
-    you can reason over its real mechanics (full description, reviewer reasoning,
-    reproduction steps) when deciding whether it chains with your assigned
-    vulnerability. Only entries from the provided summary of other confirmed
-    vulnerabilities are available.
+    Fetches the full record of another confirmed vulnerability by its vuln_id as a
+    markdown report, so you can reason over its real mechanics (full description,
+    reviewer reasoning, reproduction steps) when deciding whether it chains with
+    your assigned vulnerability. Only entries from the provided summary of other
+    confirmed vulnerabilities are available.
     """
     confirmed = state.get("confirmed_vulns", [])
     for record in confirmed:
         if record.get("vuln_id") == vuln_id:
-            return json.dumps(record, indent=2, default=str)
+            return _format_vulnerability_markdown(record)
     available = ", ".join(r.get("vuln_id", "?") for r in confirmed) or "none"
     return (
         f"Error: no confirmed vulnerability with vuln_id '{vuln_id}' is available. "
@@ -871,6 +917,62 @@ def get_node_connections(node_id: str) -> str:
     except Exception as e:
         return f"Error traversing graph: {str(e)}"
 
+
+
+@tool
+def get_path(source_node: str, target_node: str) -> str:
+    """
+    Returns all directed paths in the application graph from `source_node` to
+    `target_node`. Each path is a chain of edges annotated with their relation
+    type (e.g. calls/imports/references), useful for verifying a concrete
+    call-graph / data-flow link between two nodes.
+
+    Args:
+        source_node (str): The starting node ID.
+        target_node (str): The destination node ID.
+    """
+    try:
+        G = build_networkx_graph(settings.graph)
+
+        missing = [n for n in (source_node, target_node) if n not in G]
+        if missing:
+            return f"Node(s) not found in the graph: {', '.join(missing)}"
+
+        if source_node == target_node:
+            return f"Source and target are the same node: {source_node}"
+
+        paths = []
+        truncated = False
+        for i, path in enumerate(nx.all_simple_paths(
+            G, source_node, target_node, cutoff=MAX_PATH_CUTOFF
+        )):
+            if i >= MAX_PATHS:
+                truncated = True
+                break
+            paths.append(path)
+
+        if not paths:
+            return (
+                f"No directed path found from '{source_node}' to '{target_node}' "
+                f"(within max path length {MAX_PATH_CUTOFF})."
+            )
+
+        paths.sort(key=len)
+        lines = [f"{len(paths)} path(s) from '{source_node}' to '{target_node}':"]
+        for i, path in enumerate(paths, 1):
+            hops = []
+            for a, b in zip(path, path[1:]):
+                rel = G.edges[a, b].get("relation", "")
+                hops.append(f"{a} -{rel}-> " if rel else f"{a} -> ")
+            hops.append(path[-1])
+            lines.append(f"{i}. {''.join(hops)}")
+
+        if truncated:
+            lines.append(f"(Only the first {MAX_PATHS} paths shown; more may exist.)")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error traversing graph: {str(e)}"
 
 
 @tool

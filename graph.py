@@ -125,6 +125,7 @@ def compile_integration_auditor():
     integration_auditor_workflow.add_node("integration_auditor_tools", ToolNode([
         tools.get_vulnerability_details,
         tools.get_node_connections,
+        tools.get_path,
         tools.submit_integration_audit
     ]))
     integration_auditor_workflow.add_edge(START, "integration_auditor_agent")
