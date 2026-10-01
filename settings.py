@@ -13,12 +13,12 @@ if _missing:
     )
 
 
-app_path = Path("../apps/open-webui")
+app_path = Path("../apps/glpi-11.0.7-clean")
 
 # LLM provider.
 # "openai" = ChatOpenAI against the internal gateway (needs OPENAI_API_KEY).
-# "ollama" = ChatOllama against a local Ollama server.
-llm_provider = "openai"
+# "ollama" = ChatOpenAI against a local Ollama server's OpenAI-compatible /v1 API.
+llm_provider = "ollama"
 openai_base_url = "http://localhost:11434/v1"
 openai_model = "deepseek-v4-flash"
 
@@ -41,17 +41,34 @@ OUTPUT_BUDGET_FRACTION = 1 / 32
 # runaway generations.
 fast_max_completion_tokens = 16384
 
-ollama_model = "gemma4:cloud"
+ollama_model = "qwen36"
 ollama_base_url = "http://localhost:11434"
 
+# Unified LLM endpoint consumed by nodes.py: both providers build the same
+# langchain_openai.ChatOpenAI instances, so the provider difference is fully
+# resolved here. "openai" uses the gateway key from the environment; "ollama"
+# ignores auth but ChatOpenAI requires a non-None api_key (dummy value).
+if llm_provider == "openai":
+    llm_base_url = openai_base_url
+    llm_model = openai_model
+    llm_api_key = os.environ.get("OPENAI_API_KEY")
+elif llm_provider == "ollama":
+    llm_base_url = ollama_base_url.rstrip("/") + "/v1"
+    llm_model = ollama_model
+    llm_api_key = "ollama"
+else:
+    raise ValueError(
+        f"Unknown llm_provider {llm_provider!r}; expected 'openai' or 'ollama'."
+    )
+
 # Concurrency
-agents_concurrency = 1
+agents_concurrency = 4
 
 # Tool-loop guards for the compiled reviewer/validator subgraphs. If the model
 # never calls submit_evaluation / mark_validation_complete within this many LLM
 # rounds, the loop terminates gracefully via the fallback node instead of
 # crashing on the LangGraph recursion limit.
-reviewer_max_iterations = 12
+reviewer_max_iterations = 25
 # First reviewer LLM turn at which the countdown note ("submit_evaluation in
 # your next turn or be terminated") is injected; turns >= this get a fresh note
 # each round. Derived so there are always COUNTDOWN_LEAD_TURNS of cushion
