@@ -180,7 +180,8 @@ def read_source_code(node_id: str, reason_for_reading: str) -> str:
 @tool
 def check_package_vulnerability(package_name: str, version: str) -> list:
     """
-    Return known vulnerabilities for the given package version
+    Use this tool immediately whenever you parse a dependency manifest (like
+    package.json or requirements.txt) to check for known vulnerabilities.
     """
     query = {
         "package": {
@@ -211,7 +212,38 @@ def check_package_vulnerability(package_name: str, version: str) -> list:
 
 
 @tool
-def submit_report(finding: VulnerabilityReport, state: Annotated[dict, InjectedState]) -> dict:
+def take_notes(
+    note: str,
+    tool_call_id: Annotated[str, InjectedToolCallId]
+) -> Command:
+    """
+    Saves crucial information (variables, logic flows, hardcoded secrets) to your persistent memory.
+
+    BEST PRACTICES FOR NOTES:
+    - Keep it concise and use markdown.
+    - Always include the context (e.g., file name, node ID, or endpoint).
+    - Example: "Node src_main_py: Found SQL injection sink, where `query` is concatenated."
+    - Example: "Login endpoint /api/auth requires CSRF token: `X-CSRF-TOKEN`."
+    """
+    return Command(
+        update={
+            "notes": [note],
+            "messages": [
+                ToolMessage(
+                    content="Note successfully saved to your persistent memory.",
+                    tool_call_id=tool_call_id
+                )
+            ]
+        }
+    )
+
+
+@tool
+def submit_report(
+    finding: VulnerabilityReport,
+    state: Annotated[dict, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId]
+) -> Command:
     """
     Call this tool whenever you find a unique, actionable vulnerability.
     You can call this tool multiple times if multiple flaws exist.
