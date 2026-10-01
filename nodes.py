@@ -796,7 +796,6 @@ def _build_cve_hypothesis(record: dict, node_imports_map: dict) -> dict | None:
     if not description:
         return None
 
-    fixed_version = record.get("fixed_version")
     full_desc = f"[{source_cve}] {description} Affected package: '{package}'."
     exposure = hypothesis.get("framework_exposure_mechanism")
     if exposure:
