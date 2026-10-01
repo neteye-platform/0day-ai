@@ -95,7 +95,7 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
     built_images = []
     if builds:
         for kind, build_file in builds:
-            tag = settings.docker_image_tag or f"vulnscan-{settings.app_path.name}:latest"
+            tag = settings.docker_image_tag or f"vulnscan-{settings.app_path.name.lower()}:latest"
             images = build_images(kind, build_file, tag)
             if images:
                 built_images.extend(images)

@@ -137,8 +137,8 @@ def build_graph(checkpointer=None, interrupt_before=None):
 
     workflow.add_conditional_edges("aggregate_demands", dispatch_verifiers, ["contract_verifier", "synchronization", END])
     workflow.add_edge("contract_verifier", "synchronization")
-    workflow.add_edge("synchronization", "reachability_filter")
-    workflow.add_conditional_edges("reachability_filter", dispatch_reviewers, ["reviewer_agent", END])
+    # workflow.add_edge("synchronization", "reachability_filter")
+    workflow.add_conditional_edges("synchronization", dispatch_reviewers, ["reviewer_agent", END])
     # workflow.add_edge("reviewer_agent", "reviewer_sync")
     workflow.add_conditional_edges("reviewer_agent", dispatch_validators, ["validator_agent", END])
     workflow.add_edge("validator_agent", END)
