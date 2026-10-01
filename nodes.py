@@ -26,7 +26,7 @@ from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, INTEGRATION_AUDITOR_AGENT, cwes
 from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, is_path_excluded, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, scan_codebase_for_keywords, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, reviewer_cache_key
 from tool_loop import CompactionConfig, ToolLoopAgent
-from dedup import Embeddings, cluster_vulnerabilities
+from dedup import Embeddings, cluster_vulnerabilities, deduplicate_demands
 
 
 _agent_progress: dict[str, dict[str, int]] = {}
@@ -1382,6 +1382,34 @@ def aggregate_demands_node(state: MasterState):
         # Process CVE Analyzer Outputs (demands + upgrade-only hypotheses)
         cve_hypotheses = _process_cve_demands(cves, node_imports_map, grouped_demands, node_map, sub_nodes_index)
         logging.info(f"Emitted {len(cve_hypotheses)} upgrade-only CVE hypothesis(es) directly into the vulnerabilities channel.")
+
+        # Merge near-duplicate demands per target before the verifier fan-out:
+        # hub callees collect the same contract restated by every caller, and
+        # the verifier pays one evaluation per demand. cve_assumption demands
+        # are never merged; upstream demands only merge on exact identity
+        # within the same (callee, parameter); downstream assumptions merge on
+        # exact identity then embedding similarity. Fails open.
+        embedder = None
+        if settings.demand_dedup_enabled and settings.semantic_dedup_enabled:
+            _demb = Embeddings(
+                settings.embeddings_base_url,
+                settings.embeddings_model,
+                settings.embeddings_timeout,
+            )
+            if _demb.available():
+                embedder = _demb
+            else:
+                logging.warning(
+                    "Demand dedup: embeddings unavailable (Ollama idle or model %r "
+                    "not pulled?); using exact-normalized dedup only.",
+                    settings.embeddings_model,
+                )
+        grouped_demands = deduplicate_demands(
+            grouped_demands,
+            embedder,
+            settings.semantic_dedup_threshold,
+            disk_cache_dir=settings.cache_dir / "demand_embeddings",
+        )
 
         # Log the accurate total by summing the lengths of the lists
         total_demands = sum(len(d) for d in grouped_demands.values())
