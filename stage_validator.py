@@ -19,7 +19,7 @@ from stage_patcher import patchable_records
 from state import MasterState, ValidatorState
 from stage_reviewer import build_reviewer_payload
 from tool_loop import CompactionConfig, ToolLoopAgent
-from utils import cache_validator, cvss_gate_blocks, get_node_code
+from utils import boundary_deferred, cache_validator, cvss_gate_blocks, get_node_code
 
 
 _BARE_IDENT_RE = re.compile(r"^[\w$]+$")
@@ -111,6 +111,19 @@ def dispatch_validators(state: MasterState):
         if cvss_gate_blocks(
             {**evaluation, "validation_strategy": strategy}, settings.validator_min_cvss
         ):
+            if boundary_deferred(evaluation, settings.validator_min_cvss):
+                # Below gate but the Reviewer flagged a server-side security
+                # boundary shift: skip direct validation anyway (the sandbox
+                # verdict on the isolated low-severity flaw is not the point),
+                # but dispatch_integration_audits will chain-audit it once the
+                # direct records are proven.
+                logging.info(
+                    f"{evaluation.get('vuln_id')} CVSS estimate {evaluation.get('cvss_vector')} "
+                    f"below gate threshold {settings.validator_min_cvss} but "
+                    f"changes_security_boundary is set — deferred to the integration "
+                    f"audit phase instead of reported unvalidated."
+                )
+                continue
             # Reviewer's CVSS estimate below settings.validator_min_cvss: the
             # sandbox is never spent on it; the record stays 'confirmed' and the
             # reporter ships it unvalidated (same predicate, state-derived row).

@@ -213,7 +213,19 @@ class VulnerabilityRecord(BaseModel):
             "Reviewer's CVSS v3.1 base-vector estimate for the adjudicated finding "
             "(set on exploitable verdicts). The pipeline recomputes the numeric score "
             "from it; a confirmed record estimated below settings.validator_min_cvss "
-            "is not dispatched to the Validator/Auditor and is reported unvalidated."
+            "is not dispatched to the Validator/Auditor and is reported unvalidated — "
+            "UNLESS changes_security_boundary is set, which defers it to the "
+            "Integration Auditor for a chain check instead."
+        ),
+    )
+    changes_security_boundary: bool = Field(
+        default=False,
+        description=(
+            "Reviewer flag: the finding shifts the attacker's execution context across a "
+            "server-side boundary (internal/loopback reach, tenant/entity switch, elevated "
+            "backend rights, server filesystem). A confirmed record below the CVSS gate "
+            "carrying this flag is routed to the Integration Auditor (its boundary shift "
+            "may only pay off chained with proven peers) instead of being skipped outright."
         ),
     )
 
@@ -725,6 +737,16 @@ class EvaluationToolInput(BaseModel):
             "- 'requires_integration': Demands privileges the Validator cannot obtain OR the output of another confirmed exploit.\n"
             "- 'static_finding_only': 100% real in source code but NO network-reachable exploit path (e.g., plaintext DB passwords)."
         )
+    )
+    changes_security_boundary: bool = Field(
+        default=False,
+        description=(
+            "True ONLY if this vulnerability shifts the attacker's execution context across a "
+            "server-side boundary (e.g., reaching internal/loopback network targets, switching tenant/entity "
+            "boundaries, gaining elevated backend execution rights, or accessing the server filesystem). "
+            "Must be fully autonomous over the wire: return False for client-side shifts requiring human "
+            "victim interaction (e.g., XSS, CSRF, phishing redirects) or localized bugs."
+        ),
     )
     reproduction_steps: Optional[list[str]] = Field(
         default_factory=list,

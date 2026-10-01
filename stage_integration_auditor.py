@@ -13,7 +13,7 @@ from run_stats import _record_stat, _start_agent_progress, affected_nodes_label,
 from schemas import INTEGRATION_AUDITOR_AGENT
 from state import IntegrationAuditorState, MasterState, ValidatorState
 from tool_loop import CompactionConfig, ToolLoopAgent
-from utils import append_note, cache_integration_auditor, cvss_gate_blocks
+from utils import append_note, boundary_deferred, cache_integration_auditor, cvss_gate_blocks
 
 
 def dispatch_integration_audits(state: MasterState):
@@ -21,18 +21,34 @@ def dispatch_integration_audits(state: MasterState):
 
     Fans each pending `requires_integration` record to the auditor with the
     other `exploitable` records as chain candidates; nothing pending →
-    `reporter_dispatch`."""
+    `reporter_dispatch`.
+
+    Pending = gate-passing `requires_integration` records PLUS below-gate
+    confirmed records the Reviewer flagged `changes_security_boundary`
+    (utils.boundary_deferred): a server-side boundary shift may only pay off
+    chained with proven peers, so the CVSS gate does not cancel its audit."""
     all_vulns = as_dicts(state.get("vulnerabilities", []))
     gated, pending = [], []
     for v in all_vulns:
-        if v.get("status") != "confirmed" or v.get("validation_strategy") != "requires_integration":
+        if v.get("status") != "confirmed":
             continue
-        # Gate-checked here (dispatch_validators defers these before its own
-        # gate fires): a below-threshold estimate buys no auditor spend either;
-        # the record stays 'confirmed' and is reported unvalidated.
-        if cvss_gate_blocks(v, settings.validator_min_cvss):
-            gated.append(v)
-        else:
+        strategy = v.get("validation_strategy") or "direct_to_validator"
+        if strategy not in ("direct_to_validator", "requires_integration"):
+            continue
+        # Gate-checked here (dispatch_validators defers both classes before its
+        # own gate fires): a below-threshold estimate buys no auditor spend —
+        # UNLESS the boundary exception below rescues the record.
+        if cvss_gate_blocks({**v, "validation_strategy": strategy}, settings.validator_min_cvss):
+            if boundary_deferred(v, settings.validator_min_cvss):
+                logging.info(
+                    f"{v.get('vuln_id')} CVSS estimate {v.get('cvss_vector')} below gate "
+                    f"threshold {settings.validator_min_cvss} but changes_security_boundary "
+                    f"is set — auditing for a boundary-crossing chain."
+                )
+                pending.append(v)
+            else:
+                gated.append(v)
+        elif strategy == "requires_integration":
             pending.append(v)
     for v in gated:
         logging.info(
@@ -43,8 +59,8 @@ def dispatch_integration_audits(state: MasterState):
     proven = [v for v in all_vulns if v.get("status") == "exploitable"]
     logging.info(
         f"dispatch_integration_audits sees {len(all_vulns)} records, "
-        f"{len(pending)} requires_integration still confirmed, "
-        f"{len(proven)} proven exploitable peer(s)."
+        f"{len(pending)} pending chain audits (requires_integration or "
+        f"boundary-deferred), {len(proven)} proven exploitable peer(s)."
     )
 
     if not pending:
@@ -151,6 +167,11 @@ class IntegrationAuditorAgent(ToolLoopAgent):
 
         report = state.get("report_to_test", {})
         affected_str = affected_nodes_label(report, report.get("node_id", "Unknown"))
+        # Below-gate estimate + Reviewer's server-side boundary-shift flag: the
+        # record was rescued from the CVSS gate for a chain check (its gate
+        # failure is the ONLY reason it is here — a genuine requires_integration
+        # finding that passed the gate is not "deferred").
+        deferred = bool(boundary_deferred(report, settings.validator_min_cvss))
         formatted_vuln = (
             f"--- CORE VULNERABILITY (requires_integration) ---\n"
             f"Vulnerability ID: {report.get('vuln_id', 'Unknown')}\n"
@@ -162,6 +183,15 @@ class IntegrationAuditorAgent(ToolLoopAgent):
         )
         if report.get("source_cve"):
             formatted_vuln += f"Source CVE: {report.get('source_cve')}\n"
+        if deferred:
+            formatted_vuln += (
+                f"CVSS VECTOR (Reviewer estimate): {report.get('cvss_vector', 'unset')} — "
+                f"BELOW the validation gate. This finding scored too low to buy its own "
+                f"sandbox validation, but the Reviewer flagged it as shifting a "
+                f"SERVER-SIDE SECURITY BOUNDARY, so it was sent here for a chain check: "
+                f"chaining is how it earns its severity back. Judge only whether a real "
+                f"chain exists — if none does, submit `unchainable`. Never force a chain.\n"
+            )
 
         peers = state.get("confirmed_vulns", [])
         if peers:
@@ -185,24 +215,39 @@ class IntegrationAuditorAgent(ToolLoopAgent):
                 + "\n".join(peer_lines)
             )
         else:
-            # 'chained' is impossible with zero peers: resolve terminal 'unchainable'
-            # in place; the empty-messages pre_router guard ends the subgraph here.
+            # 'chained' is impossible with zero peers: resolve terminal
+            # 'unchainable' in place; the empty-messages pre_router guard ends
+            # the subgraph here. A boundary-deferred record instead stays
+            # 'confirmed' — chaining was its only pass to the sandbox phases,
+            # and dropping it to terminal 'unchainable' would silently remove a
+            # finding the reporter otherwise ships unvalidated.
             logging.warning(
-                f"{report.get('vuln_id', 'Unknown')} is requires_integration but arrived "
-                f"at the auditor with an EMPTY confirmed_vulns peer list; resolving "
-                f"'unchainable' without invoking the auditor LLM. Possible cause: "
+                f"{report.get('vuln_id', 'Unknown')} was deferred to the auditor but "
+                f"arrived with an EMPTY confirmed_vulns peer list; resolving "
+                f"{'back to confirmed' if deferred else 'unchainable'} without "
+                f"invoking the auditor LLM. Possible cause: "
                 f"dispatch_integration_audits saw no 'exploitable' records in the "
                 f"parent channel (check the dispatch_integration_audits log lines "
                 f"in this run)."
             )
-            note = (
-                "[integration auditor] No other proven vulnerabilities exist to "
-                "chain with; resolved 'unchainable' without invoking the LLM (a "
-                "'chained' verdict requires at least one other exploitable "
-                "vulnerability)."
-            )
-            record = append_note(report, "integration_audit_reasoning", note)
-            record["status"] = "unchainable"
+            if deferred:
+                note = (
+                    "[integration auditor] No other proven vulnerabilities exist to "
+                    "chain with; no LLM spent (a 'chained' verdict requires at least "
+                    "one exploitable peer). This below-gate finding shifts a "
+                    "server-side security boundary, so it stays 'confirmed' and is "
+                    "reported unvalidated instead of becoming terminal 'unchainable'."
+                )
+                record = append_note(report, "integration_audit_reasoning", note)
+            else:
+                note = (
+                    "[integration auditor] No other proven vulnerabilities exist to "
+                    "chain with; resolved 'unchainable' without invoking the LLM (a "
+                    "'chained' verdict requires at least one other exploitable "
+                    "vulnerability)."
+                )
+                record = append_note(report, "integration_audit_reasoning", note)
+                record["status"] = "unchainable"
             # Cache so a repeat of the same report short-circuits in the base
             # pre_agent cache hook instead of re-running this branch. Zero LLM
             # spend (deterministic resolution), so no token usage to record.

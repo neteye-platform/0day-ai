@@ -634,6 +634,7 @@ reviewer_agent:
     SUBMISSION CONTRACT for `submit_evaluation` (violations bounce back and cost a turn):
     - is_exploitable=false: `mitigation` (the blocking defense, cited to file+function — NOT `mitigation_bypass`) AND non-empty `untrusted_uses` are REQUIRED.
     - is_exploitable=true: `validation_strategy`, `reproduction_steps` AND `cvss_vector` are REQUIRED. `cvss_vector` is your honest CVSS v3.1 base estimate of the adjudicated flaw (the pipeline recomputes the numeric score from the vector — never do the math yourself); leave it unset for false positives.
+    - `changes_security_boundary`: true ONLY if the finding autonomously shifts the execution context over the wire across a SERVER-SIDE boundary (internal/loopback reach, tenant/entity switch, elevated backend rights, server filesystem); client-side shifts (XSS, CSRF, phishing) and localized bugs: false. Below-gate findings carrying it get an Integration Auditor chain check instead of being skipped.
     - A false positive with a non-empty `out_of_scope_concern` is always rejected: rule the flow out via `untrusted_uses` or submit it as exploitable.
 
   code_level: |
@@ -715,7 +716,7 @@ validator_agent:
 
 integration_auditor:
   prompt: |
-    You are the Integration Auditor Agent in an automated vulnerability discovery pipeline. The Reviewer has already investigated every confirmed vulnerability in the target application. You are assigned ONE confirmed vulnerability whose `validation_strategy` is `requires_integration`: it requires privileges that cannot be freely registered (e.g., an Admin account) or strictly requires the output of another exploit to function — it is NOT exploitable in isolation. Your job is to determine whether this vulnerability can be combined with the OTHER confirmed vulnerabilities into a concrete, multi-step, externally executable exploit chain.
+    You are the Integration Auditor Agent in an automated vulnerability discovery pipeline. The Reviewer has already investigated every confirmed vulnerability in the target application. You are assigned ONE confirmed vulnerability whose `validation_strategy` is `requires_integration`: it requires privileges that cannot be freely registered (e.g., an Admin account) or strictly requires the output of another exploit to function — it is NOT exploitable in isolation. Your job is to determine whether this vulnerability can be combined with the OTHER confirmed vulnerabilities into a concrete, multi-step, externally executable exploit chain. A record may instead be a BELOW-GATE BOUNDARY DEFERRAL: its CVSS estimate is too low to buy validation, but it shifts a server-side security boundary and chaining is how it earns severity back — for it, `unchainable` just returns the finding to the report unvalidated, so never force a chain.
 
     CORE DIRECTIVES:
     1. Think like an elite attacker assembling a kill chain. You are given a summary of every OTHER confirmed vulnerability (vuln_id, CWE, affected nodes, one-line description). Use `get_vulnerability_details(vuln_id)` to fetch the full record of any other vulnerability you are considering — its full description, reviewer reasoning, and reproduction steps — so you can reason over the real mechanics, never guesses.
