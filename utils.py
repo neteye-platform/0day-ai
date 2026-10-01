@@ -112,6 +112,30 @@ def load_code_corpus() -> dict[str, str]:
     return corpus
 
 
+def find_unsupported_code_files(graph_data: dict) -> dict[str, list[str]]:
+    """Map unsupported-language code files to their source paths.
+
+    A graph node counts as an unsupported code file when it carries
+    ``file_type == "code"`` and a ``source_file`` whose (lowercased) extension is
+    not present in both ``LANGUAGE_MAP`` and ``SYMBOL_QUERIES`` (the same gate
+    ``index_file`` enforces). Nodes lacking a ``source_file`` or with an empty
+    extension are skipped. Returns ``{".java": ["a.java", "b.java"], ...}``.
+    """
+    unsupported: dict[str, list[str]] = defaultdict(list)
+    for node in graph_data.get("nodes", []):
+        if node.get("file_type") != "code":
+            continue
+        source_file = node.get("source_file")
+        if not source_file:
+            continue
+        ext = Path(source_file).suffix.lower()
+        if not ext or ext in LANGUAGE_MAP and ext in SYMBOL_QUERIES:
+            continue
+        if source_file not in unsupported[ext]:
+            unsupported[ext].append(source_file)
+    return dict(unsupported)
+
+
 def format_node_context(graph_data: dict, node_id: str) -> str:
     """Render 'graphify explain' style context for a node: its summary plus connections.
 
