@@ -1106,15 +1106,37 @@ def get_canonical_id(record):
 
 def deduplicate_cves(vulns: list[dict]) -> list[dict]:
     """
-    Extracts unique vulnerabilities by canonical ID and selects
-    the most detailed description available for each.
+    Extracts unique vulnerabilities by canonical ID and keeps up to 3 distinct
+    descriptions available for each.
 
-    Besides {id, details, package}, best-effort enrichment fields are carried
-    forward when present in the OSV record:
+    Descriptions differing only trivially (whitespace, casing, or one fully
+    contained in the other) are collapsed to the longest representative, so the
+    analyzer never sees near-identical copies. The `details` field remains the
+    single longest/best description (backward compatible); the new
+    `descriptions` list carries up to 3 distinct descriptions, longest-first,
+    as input for the CVE analyzer.
+
+    Besides {id, details, descriptions, package}, best-effort enrichment fields
+    are carried forward when present in the OSV record:
     - fixed_version: first `fixed` event across affected version ranges.
     - cwe_ids: database_specific.cwe_ids (list) when the OSV entry classifies them.
     """
     best_records = {}
+
+    def normalize(text: str) -> str:
+        return re.sub(r"[^0-9a-z]+", "", (text or "").lower())
+
+    def collapse_descriptions(descriptions: list[str]) -> list[str]:
+        """Dedupe near-identical texts: sorted longest-first, a description is
+        kept only if no already-kept (longer or equal) one fully contains it."""
+        kept: list[str] = []
+        for d in sorted(descriptions, key=len, reverse=True):
+            if not d:
+                continue
+            norm = normalize(d)
+            if not any(norm == normalize(k) or norm in normalize(k) for k in kept):
+                kept.append(d)
+        return kept[:3]
 
     def extract_fixed_version(record: dict) -> Optional[str]:
         for affected in record.get("affected", []):
@@ -1133,26 +1155,32 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
         affected_packages = [affected.get("package", {}) for affected in vuln.get("affected", [])]
         packages = [pkg.get("name", pkg.get("name", "unknown")) for pkg in affected_packages]
 
-        # If we haven't seen this CVE yet, or if the new record has a longer description
         if canonical_id not in best_records:
             best_records[canonical_id] = {
                 "id": canonical_id,
                 "details": current_details,
+                "descriptions": [current_details] if current_details else [],
                 "package": packages[0] if len(packages) >= 1 else "unknown",
                 "fixed_version": extract_fixed_version(vuln),
                 "cwe_ids": extract_cwe_ids(vuln),
             }
-        else:
-            # Compare the length of the details to keep the most comprehensive one
-            existing_details = best_records[canonical_id]["details"]
-            if len(current_details) > len(existing_details):
-                best_records[canonical_id]["original_osv_id"] = vuln.get("id")
-                best_records[canonical_id]["details"] = current_details
-                # Enrichment is best-effort: backfill any missing fields.
-                if not best_records[canonical_id].get("fixed_version"):
-                    best_records[canonical_id]["fixed_version"] = extract_fixed_version(vuln)
-                if not best_records[canonical_id].get("cwe_ids"):
-                    best_records[canonical_id]["cwe_ids"] = extract_cwe_ids(vuln)
+            continue
+
+        record = best_records[canonical_id]
+        if current_details:
+            record["descriptions"].append(current_details)
+            record["descriptions"] = collapse_descriptions(record["descriptions"])
+
+        # `details` always mirrors the longest kept description (backward compat).
+        best = record["descriptions"][0] if record["descriptions"] else ""
+        if best and best != record["details"] and len(best) > len(record["details"]):
+            record["details"] = best
+            record["original_osv_id"] = vuln.get("id")
+            # Enrichment is best-effort: backfill any missing fields.
+            if not record.get("fixed_version"):
+                record["fixed_version"] = extract_fixed_version(vuln)
+            if not record.get("cwe_ids"):
+                record["cwe_ids"] = extract_cwe_ids(vuln)
 
     return list(best_records.values())
 
