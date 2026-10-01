@@ -16,6 +16,7 @@ with open("agents.yaml", "r") as f:
     INTEGRATION_AUDITOR_AGENT = data.get("integration_auditor")
     EDGE_TRAVERSAL_AGENT = data.get("edge_traversal")
     REPORTER_AGENT = data.get("reporter_agent")
+    CREDENTIAL_FINDER_AGENT = data.get("credential_finder")
 
 cwes = {
     # --- MEMORY SAFETY (C / C++ / Rust-unsafe) ---
@@ -733,4 +734,43 @@ class ReporterOutput(BaseModel):
     )
     findings: list[ReporterFinding] = Field(
         description="Exactly one assessment per provided vulnerability, keyed by vuln_id."
+    )
+
+
+# ==========================================
+# Credential finder agent (preprocessing)
+# ==========================================
+
+class CredentialRecord(BaseModel):
+    service: str = Field(
+        description=(
+            "Short label identifying what this credential grants access to "
+            "(e.g. 'GLPI administrator login', 'MySQL root', 'GLPI application "
+            "database user'). Prefer the application/service name over the env "
+            "key alone."
+        )
+    )
+    kind: Literal["login", "database", "api_key", "secret", "other"] = Field(
+        description="'login' for an interactive user account, 'database' for a DB user, 'api_key' for a token/API key, 'secret' for a raw secret (signing key, root password), 'other' otherwise."
+    )
+    username: Optional[str] = Field(
+        default=None,
+        description="The username/account identifier when one is known (e.g. 'glpi', 'root'). Leave unset for bare secrets without a principal."
+    )
+    secret: str = Field(
+        description="The credential value: the plaintext password, token, API key, or secret."
+    )
+    source: Optional[str] = Field(
+        default=None,
+        description="Where this was found, e.g. '.env:3', 'docker-compose.yml' service 'db', 'install/empty_data.php:9420', 'image_metadata Env'."
+    )
+    notes: Optional[str] = Field(
+        default=None,
+        description="Optional context: which account/profile this belongs to (e.g. 'administrator'), whether it is a well-known default, and anything that helps a consumer use it."
+    )
+
+
+class CredentialList(BaseModel):
+    credentials: list[CredentialRecord] = Field(
+        description="The normalized, deduplicated set of pre-configured credentials. Empty when none are real."
     )

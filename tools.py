@@ -2,8 +2,10 @@ from typing import Annotated, Optional, Any, Union
 import json
 from langchain_core.messages import ToolMessage
 import requests
+from requests.adapters import HTTPAdapter
 from pathlib import Path
 import logging
+import threading
 from bs4 import BeautifulSoup
 from langgraph.prebuilt import InjectedState
 from langchain_core.tools import tool, InjectedToolCallId
@@ -432,6 +434,169 @@ def submit_evaluation(
     )
 
 
+# --- send_http_request: redirect cap, per-session cookies, CSRF handling -----
+
+# Sentinel form-field values that request automatic CSRF resolution: the tool
+# GETs a fresh page, extracts the token, and substitutes the real token (and,
+# when the agent guessed the wrong field name, the discovered field name) into
+# the outgoing request.
+CSRF_PLACEHOLDERS = {"__CSRF__", "__CSRF_TOKEN__", "TOKEN"}
+
+# <meta> name attributes that conventionally carry (or name) a CSRF token.
+CSRF_META_NAMES = {
+    "csrf-token", "csrf_token", "csrftoken", "csrfToken", "csrf", "_csrf",
+    "csrf-param", "authenticity_token",
+}
+
+# Hidden <input> name attributes that conventionally carry a CSRF token.
+CSRF_INPUT_NAMES = {
+    "csrf_token", "csrftoken", "csrfmiddlewaretoken", "_token", "_csrf",
+    "csrf", "csrfToken", "_csrf_token", "authenticity_token",
+    "__RequestVerificationToken",
+}
+
+
+def _extract_csrf_tokens(soup) -> dict:
+    """Return {field_name: token} found in common <meta> tags and hidden inputs.
+
+    Hidden ``<input>``s are scanned FIRST and are authoritative: their ``name``
+    is the field an agent must echo back in a form POST. Meta tags (Django/
+    Laravel ``csrf-token``, Rails ``csrf-param`` + ``csrf-token``) are added
+    afterwards only under names not already claimed by a hidden input, so a page
+    carrying both a ``csrf-token`` meta and a ``csrfmiddlewaretoken`` hidden
+    input resolves to the hidden field's name.
+    """
+    tokens = {}
+    for hidden in soup.find_all("input", {"type": "hidden"}):
+        name = (hidden.get("name") or "").strip()
+        value = (hidden.get("value") or "").strip()
+        if not name or not value:
+            continue
+        lowered = name.lower()
+        if lowered in CSRF_INPUT_NAMES or "csrf" in lowered or "token" in lowered:
+            tokens.setdefault(name, value)
+    csrf_param_name = None
+    for meta in soup.find_all("meta"):
+        key = (meta.get("name") or meta.get("property") or "").strip()
+        content = (meta.get("content") or "").strip()
+        if not key or not content:
+            continue
+        lowered = key.lower()
+        if lowered == "csrf-param":
+            csrf_param_name = content
+        elif lowered in CSRF_META_NAMES or "csrf" in lowered:
+            tokens.setdefault(key, content)
+    if csrf_param_name and "csrf-token" in tokens:
+        tokens.setdefault(csrf_param_name, tokens["csrf-token"])
+    return tokens
+
+
+class _CappedRedirectAdapter(HTTPAdapter):
+    """HTTPAdapter honouring a per-request redirect cap.
+
+    ``requests`` only exposes a fixed class-level default of 30 redirects and
+    no per-call ``max_redirects``, so mount an adapter whose ``max_redirects``
+    is set on the instance (read back by ``HTTPAdapter.send``).
+    """
+
+    def __init__(self, max_redirects: int):
+        super().__init__()
+        self.max_redirects = max_redirects
+
+
+class HttpSessionManager:
+    """Thread-safe store of per-(agent_id, session_id) HTTP cookie jars.
+
+    Holds plain ``{name: value}`` jars rather than live ``requests.Session``
+    objects, so concurrent ToolNode workers never share a mutable session:
+    every call builds a fresh ``requests.Session`` seeded from the stored jar
+    and writes the jar back afterwards. Mirrors browser_tools' agent_id
+    namespacing so two validators can pick the same session label without
+    colliding.
+    """
+
+    def __init__(self):
+        self._jars = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _key(state, session_id) -> str:
+        agent = (state.get("agent_id") if isinstance(state, dict) else None) or "no-agent"
+        return f"{agent}:{session_id}"
+
+    def load(self, state, session_id) -> Optional[dict]:
+        key = self._key(state, session_id)
+        with self._lock:
+            jar = self._jars.get(key)
+        return dict(jar) if jar else None
+
+    def save(self, state, session_id, cookies) -> None:
+        key = self._key(state, session_id)
+        with self._lock:
+            self._jars[key] = dict(cookies)
+
+    def reset(self, state, session_id) -> None:
+        key = self._key(state, session_id)
+        with self._lock:
+            self._jars.pop(key, None)
+
+
+# Shared HTTP session store for the validator tool loop.
+http_sessions = HttpSessionManager()
+
+
+def _fetch_csrf_tokens(session, target_url, sandbox_url, allow_redirects: bool) -> dict:
+    """GET ``target_url`` (falling back to the sandbox root) with ``session``
+    and parse CSRF tokens out of the HTML. Sharing the session means any cookie
+    the token page sets carries into the caller's follow-up request. Returns an
+    empty dict when no token-bearing page could be fetched."""
+    candidates = [target_url]
+    root = sandbox_url.rstrip("/") + "/"
+    if target_url != root:
+        candidates.append(root)
+    for candidate in candidates:
+        try:
+            resp = session.get(candidate, timeout=5, allow_redirects=allow_redirects)
+        except Exception:
+            continue
+        if "text/html" in resp.headers.get("Content-Type", ""):
+            tokens = _extract_csrf_tokens(BeautifulSoup(resp.text, 'html.parser'))
+            if tokens:
+                return tokens
+    return {}
+
+
+def _inject_csrf_tokens(data, session, target_url, sandbox_url,
+                        allow_redirects: bool) -> tuple:
+    """Replace CSRF sentinel values in a form ``data`` dict with real tokens.
+
+    Drops each placeholder field and writes the discovered token under its real
+    field name (e.g. ``csrfmiddlewaretoken``), so an agent that guessed ``_csrf``
+    against Django is still served correctly. Returns (data, None) on success or
+    (data, error_msg) when no token could be fetched."""
+    placeholders = [
+        k for k, v in data.items()
+        if isinstance(v, str) and v in CSRF_PLACEHOLDERS
+    ]
+    if not placeholders:
+        return data, None
+    tokens = _fetch_csrf_tokens(session, target_url, sandbox_url, allow_redirects)
+    if not tokens:
+        return data, (
+            "Error: a form field requested automatic CSRF injection (sentinel "
+            f"values in {sorted(placeholders)!r}) but no CSRF token could be "
+            "extracted from a GET of the endpoint or the sandbox root. Re-send "
+            "without the sentinel, or fetch the token manually and pass it "
+            "explicitly."
+        )
+    new_data = dict(data)
+    for name in placeholders:
+        del new_data[name]
+        token_name, token_value = next(iter(tokens.items()))
+        new_data[token_name] = token_value
+    return new_data, None
+
+
 @tool(response_format="content_and_artifact")
 def send_http_request(
     method: str,
@@ -443,6 +608,8 @@ def send_http_request(
     files: Optional[dict[str, Union[str, tuple[str, str, str]]]] = None,
     body: Optional[str] = None,
     follow_redirects: bool = True,
+    max_redirects: int = 5,
+    session_id: Optional[str] = None,
     reset_session: bool = False,
     extract_mode: str = "clean_html",
     state: Annotated[Optional[dict], InjectedState] = None,
@@ -465,7 +632,12 @@ def send_http_request(
              Or with metadata: {'field_name': ('custom_filename.png', '/path/to/file', 'image/png')}
     - body: Raw string body (used only if neither data, json_data, nor files is provided).
     - follow_redirects: Whether to follow 301/302 redirects automatically (default True).
-    - reset_session: Clears stored cookies and session state before executing.
+    - max_redirects: Maximum number of redirects to follow while follow_redirects is True (default 5).
+    - session_id: Optional session label. Cookies persist across calls that reuse the SAME
+                  session_id and are isolated per (agent, session_id); omit it to use a
+                  transient one-shot session seeded from the shared cookie state.
+    - reset_session: Clears stored cookies/session state (for the given session_id, or the
+                     shared state when session_id is omitted) before executing.
     - extract_mode:
             'clean_html' (default): Returns HTML with scripts/styles removed to save tokens.
             'forms': Returns ONLY the <form> elements on the page.
@@ -473,6 +645,14 @@ def send_http_request(
             'text': Returns only the visible text (good for reading error messages).
             'raw': Returns the untouched body (use cautiously, may truncate).
             ANY CUSTOM TAG: Enter any HTML tag (e.g., 'script', 'input', 'iframe') to extract only those elements.
+
+    CSRF AUTO-INJECTION: For a state-changing request behind a CSRF token, set the token's form
+    field to a sentinel value (__CSRF__, __CSRF_TOKEN__, or TOKEN), e.g.
+    data={'username': 'u', 'password': 'p', '_csrf': '__CSRF__'}. The tool then GETs the endpoint
+    (falling back to '/') with the SAME session cookies, extracts the CSRF token from a <meta> tag
+    or hidden <input>, and substitutes the real token (using the discovered field name, e.g.
+    'csrfmiddlewaretoken', when your guess was wrong) before sending the request. CSRF tokens found
+    in any HTML response are also listed at the end of the output for manual use.
     """
 
     # Build the full URL from the endpoint parameter
@@ -490,10 +670,29 @@ def send_http_request(
     if not url.startswith(sandbox_url):
         return f"Error: You can only make requests to the sandbox application at {sandbox_url}", {}
 
-    session = requests.Session()
+    # Resolve the starting cookie jar: a persistent per-(agent, session_id)
+    # jar when a session label is given, otherwise the shared state jar.
+    start_jar = {}
+    if session_id:
+        if reset_session:
+            http_sessions.reset(state, session_id)
+        start_jar = http_sessions.load(state, session_id)
+        if start_jar is None:
+            # First use of this session_id: seed from the shared cookie state so
+            # cookies set by the browser channel (or earlier transient calls)
+            # carry into this session.
+            if state and "cookies" in state:
+                start_jar = dict(state.get("cookies", {}))
+    elif not reset_session and state and "cookies" in state:
+        start_jar = dict(state.get("cookies", {}))
 
-    if not reset_session and state and "cookies" in state:
-        session.cookies.update(state.get("cookies", {}))
+    session = requests.Session()
+    if follow_redirects:
+        redirect_adapter = _CappedRedirectAdapter(max_redirects)
+        session.mount("http://", redirect_adapter)
+        session.mount("https://", redirect_adapter)
+    if start_jar:
+        session.cookies.update(start_jar)
 
     try:
         request_kwargs = {
@@ -530,6 +729,18 @@ def send_http_request(
             user_data = data
         elif body is not None:
             user_data = body
+
+        # Automatic CSRF resolution: replace sentinel form-field values with a
+        # freshly fetched token (same session, so the token's cookie applies).
+        if isinstance(user_data, dict) and any(
+            isinstance(v, str) and v in CSRF_PLACEHOLDERS
+            for v in user_data.values()
+        ):
+            user_data, csrf_error = _inject_csrf_tokens(
+                user_data, session, url, sandbox_url, follow_redirects
+            )
+            if csrf_error:
+                return csrf_error, {}
 
         if user_data is not None:
             request_kwargs["data"] = user_data
@@ -579,7 +790,26 @@ def send_http_request(
 
         llm_output = f"{http_response_head}{body_display}"
 
-        return llm_output, session.cookies.get_dict()
+        # Surface any CSRF tokens found on the page so the agent can include
+        # them, or leave a __CSRF__ sentinel to trigger automatic injection.
+        if "text/html" in response.headers.get("Content-Type", ""):
+            found = _extract_csrf_tokens(soup)
+            if found:
+                token_lines = "\n".join(
+                    f"{name}={value}" for name, value in found.items()
+                )
+                llm_output += (
+                    "\n\n[CSRF tokens extracted from this page — include the "
+                    "matching field in your next state-changing request, or set "
+                    "a form field's value to __CSRF__ for automatic injection:]\n"
+                    f"{token_lines}"
+                )
+
+        cookies = session.cookies.get_dict()
+        if session_id:
+            http_sessions.save(state, session_id, cookies)
+
+        return llm_output, cookies
     except Exception as e:
         return f"Error: Request failed: {str(e)}", {}
 
