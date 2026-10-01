@@ -1,6 +1,7 @@
 from pathlib import Path
 
-app_path = Path("../apps/web_reactoops")
+app_path = Path("../apps/glpi-11.0.7-clean")
+# app_path = Path("../apps/web_reactoops")
 graph = app_path / "graphify-out" / "graph.json"
 cache_dir = app_path / ".cache"
 
@@ -16,6 +17,14 @@ communities_to_analyze = None # [32, 33, 54, 61]
 # single batch. Set to False to force one dispatch per node (no batching).
 explorer_batching_enabled = True
 
+# Max expert roles assigned per community (top-K by heuristic score). Reduces
+# duplicate explorer scans of the same nodes by multiple expert roles.
+max_experts_per_community = 2
+
+# When True, the preprocessor always rebuilds the container image even if the
+# build definition (Dockerfile/compose) is unchanged since the last run.
+force_rebuild = False
+
 # Concurrency
-simple_agents_concurrency = 2
+simple_agents_concurrency = 4
 tool_agents_concurrency = 1

@@ -1,6 +1,7 @@
 import json
 import logging
 import argparse
+from pathlib import Path
 
 # Keep successful HTTP transport requests out of the application logs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -165,15 +166,28 @@ if __name__ == "__main__":
         vulnerabilities=[]
     )
 
-    try:
-        final_state = graph.invoke(initial_state)
+    from langgraph.checkpoint.sqlite import SqliteSaver
 
-        out_file = "results.json"
-        with open(out_file, "w") as f:
-            json.dump(final_state, f)
-            logging.info(f"Final state saved to {out_file}.")
+    config = {"configurable": {"thread_id": "scan-1"}}
+    done_flag = Path("states/scan-complete.flag")
 
-    except FileNotFoundError:
-        print("Waiting for actual graph.json to execute.")
-    except KeyboardInterrupt:
-        exit(1)
+    with SqliteSaver.from_conn_string("states/pipeline_checkpoints.sqlite") as checkpointer:
+        app = build_graph(checkpointer=checkpointer)
+        try:
+            if app.get_state(config).values and not done_flag.exists():
+                logging.info("Resuming previously interrupted run from checkpoint.")
+                final_state = app.invoke(None, config)
+            else:
+                final_state = app.invoke(initial_state, config)
+
+            out_file = "results.json"
+            with open(out_file, "w") as f:
+                json.dump(final_state, f)
+                logging.info(f"Final state saved to {out_file}.")
+            done_flag.touch()
+
+        except FileNotFoundError:
+            print("Waiting for actual graph.json to execute.")
+        except KeyboardInterrupt:
+            done_flag.unlink(missing_ok=True)
+            exit(1)

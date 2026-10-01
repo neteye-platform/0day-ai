@@ -25,7 +25,7 @@ from utils import build_networkx_graph, compact_tool_history, extract_imports, g
 # fast_llm = ChatOllama(model="gemma4:cloud", temperature=0.2, reasoning=False, num_ctx=32768)
 # smart_llm = ChatOllama(model="gemma4:cloud", temperature=0.6, reasoning=False, num_ctx=32768)
 # Maximum combined code size (in chars) for a batched explorer dispatch.
-EXPLORER_BATCH_CHAR_THRESHOLD = 7500
+EXPLORER_BATCH_CHAR_THRESHOLD = 10000
 
 _agent_progress: dict[str, dict[str, int]] = {}
 _agent_progress_lock = threading.Lock()
@@ -204,18 +204,21 @@ def manager_agent_node(state: MasterState) -> dict[str, Any]:
         max_score = max(scores.values())
         ASSIGNMENT_THRESHOLD = max(2, int(max_score * 0.5))
 
-        assigned = False
-        # Assign ALL agents that pass the threshold, adhering to the architecture
-        for agent, score in scores.items():
-            if score >= ASSIGNMENT_THRESHOLD:
-                heuristic_tasks.append(
-                    ExpertTask(
-                        target_community=f"Community {comm_id}",
-                        agent_role=agent,
-                        task_description=expert_descriptions[agent]
-                    ).model_dump()
-                )
-                assigned = True
+        assigned = 0
+        # Assign only the top-K best-scoring roles (settings.max_experts_per_community)
+        # that clear the threshold, instead of every role above it, so distinct
+        # expert roles do not re-scan the same nodes.
+        for agent, score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True):
+            if assigned >= settings.max_experts_per_community or score < ASSIGNMENT_THRESHOLD:
+                break
+            heuristic_tasks.append(
+                ExpertTask(
+                    target_community=f"Community {comm_id}",
+                    agent_role=agent,
+                    task_description=expert_descriptions[agent]
+                ).model_dump()
+            )
+            assigned += 1
 
         # Fallback if no agents scored anything
         if not assigned:
@@ -1163,7 +1166,7 @@ def _contract_verifier_node(state: VerifierState) -> dict:
     sys_msg = SystemMessage(content=f"{VERIFIER_AGENT['prompt']}")
     human_msg = HumanMessage(content=f"```python\n{target_code}\n```\n\nSecurity Demands:\n{demands_string}")
 
-    structured_llm = smart_llm.with_structured_output(VerifierOutput, method="json_schema", strict=True)
+    structured_llm = fast_llm.with_structured_output(VerifierOutput, method="json_schema", strict=True)
     response = structured_llm.invoke([sys_msg, human_msg])
     response = response if isinstance(response, dict) else response.model_dump()
 
@@ -1299,7 +1302,7 @@ def reviewer_agent_node(state: ReviewerState) -> dict | Command:
 
     llm_with_tools = smart_llm.bind_tools(
         reviewer_tools,
-        parallel_tool_calls=False
+        parallel_tool_calls=True
     )
 
     if not state.get("messages"):
@@ -1363,8 +1366,13 @@ def reviewer_router(state: ReviewerState):
         return "ask_reviewer_for_tool"
 
     elif last_message.type == "tool":
-        if getattr(last_message, "name", "") == "submit_evaluation":
-            return "__end__"
+        # With parallel tool calls the model may submit a final evaluation
+        # alongside other reads; end if any tool in the latest batch submitted.
+        for msg in reversed(state["messages"]):
+            if msg.type != "tool":
+                break
+            if getattr(msg, "name", "") == "submit_evaluation":
+                return "__end__"
         return "reviewer_agent"
 
     # The LLM failed to call a tool
