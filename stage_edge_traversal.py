@@ -7,7 +7,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 import settings
 from llms import fast_llm, invoke_structured_capped
-from run_stats import _record_stat, as_dict
+from run_stats import _record_stat, as_dict, raise_if_stopping
 from schemas import EDGE_TRAVERSAL_AGENT, EdgeTraversalOutput
 from state import MasterState
 from boundary_edges import (
@@ -47,6 +47,7 @@ def edge_traversal_node(state: MasterState):
     edges from the explorer notes, then run one structured LLM call per
     homogeneous batch. Emits hypotheses into `vulnerabilities` for the
     reviewer's `cross_boundary` track."""
+    raise_if_stopping()
     if not getattr(settings, "edge_traversal_enabled", True):
         logging.info("Edge Traversal disabled via settings.edge_traversal_enabled=False.")
         return {}

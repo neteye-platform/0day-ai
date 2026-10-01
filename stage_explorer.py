@@ -9,7 +9,7 @@ from llms import fast_llm
 from llms import invoke_structured_capped
 from schemas import EXPERT_AGENTS, AnalysisNote, BatchedAnalysisResult
 from state import ExplorerState, MasterState
-from run_stats import _log_agent_completion, _record_stat, _start_agent_progress
+from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping
 from utils import (
     build_networkx_graph,
     get_cached_graph_data,
@@ -184,6 +184,7 @@ def _extract_hypotheses(node_id: str, raw_hypotheses: list) -> list[dict]:
 
 def expert_explorer_node(state: ExplorerState) -> dict:
     """Explorer fan-out node: analyzes one node or one same-file batch."""
+    raise_if_stopping()
     node_ids = state.get("node_ids", [])
     role_name = state.get("role")
 

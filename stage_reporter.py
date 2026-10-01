@@ -14,7 +14,7 @@ from weasyprint import HTML
 
 import settings
 from llms import smart_llm
-from run_stats import _record_stat, _snapshot_pipeline_stats, as_dict, as_dicts, strip_step_numbering
+from run_stats import _record_stat, _snapshot_pipeline_stats, as_dict, as_dicts, raise_if_stopping, strip_step_numbering
 from schemas import REPORTER_AGENT, ReporterFinding, cwes
 from state import MasterState, ReporterState
 from utils import cache_reporter, cvss_severity_label, cvss_v3_base_score
@@ -395,6 +395,7 @@ def dispatch_reporters(state: MasterState):
 def reporter_node(state: ReporterState) -> dict:
     """Single-shot per-vulnerability Reporter: ONE structured LLM call per
     record. Fails open to the record's own evidence when the call errors."""
+    raise_if_stopping()
     report = state.get("report") or {}
     if not report:
         return {}

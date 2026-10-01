@@ -764,6 +764,8 @@ def credential_finder_node(state) -> dict:
     """Graph node: discover pre-configured credentials and persist them to
     ``<target_app>/.cache/credentials.json``. Runs after container setup.
     Returns {} (no state change)."""
+    from run_stats import raise_if_stopping
+    raise_if_stopping()
     if not getattr(settings, "credential_finder_enabled", True):
         logger.info("Credential finder disabled via settings.credential_finder_enabled=False.")
         return {}

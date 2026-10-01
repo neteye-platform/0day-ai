@@ -8,7 +8,7 @@ from tavily import TavilyClient
 
 import settings
 from llms import fast_llm, invoke_structured_capped
-from run_stats import _log_agent_completion, _record_stat, _start_agent_progress
+from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping
 from schemas import THREAT_INTEL_AGENT, CVEAnalysis
 from stage_cve import _backfill_osv_cwe_ids, _finalize_cve_analysis, cve_descriptions, osv_enrichment_lines
 from state import MasterState, ThreatIntelState
@@ -157,6 +157,7 @@ def _threat_intel_node(state: ThreatIntelState) -> dict:
 def threat_intel_node(state: ThreatIntelState) -> dict:
     """Graph node wrapper: the no-op task fires the barrier with no external
     calls; otherwise enrich and advance the progress ledger."""
+    raise_if_stopping()
     if not state.get("cve"):
         return {}
     result = _threat_intel_node(state)

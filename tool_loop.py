@@ -400,6 +400,7 @@ class ToolLoopAgent:
         if not self.progress_label:
             return
         detail = self._subject(state)
+        detail += f", turns={state.get('iterations', 0)}"
         records = state.get("vulnerabilities") or []
         if records:
             detail += f", status={as_dict(records[-1]).get('status', 'unknown')}"

@@ -174,6 +174,33 @@ class AttackerManager:
         except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
             pass
 
+    def sweep_stale_containers(self) -> None:
+        """Remove leftover per-agent attacker containers from a previous run.
+
+        A force-killed pipeline (2nd Ctrl+C / SIGTERM) exits before
+        ``close_agent_sessions`` can run, leaving ``<prefix>-<agent_id>``
+        boxes up. Every container carrying the prefix is dead weight at
+        startup: this process owns the toolset, so none can belong to a
+        live validator yet. Fail open — docker absent means nothing to sweep.
+        """
+        base = getattr(settings, "attacker_container_name", "vulnscan-kali-attacker")
+        try:
+            found = subprocess.run(
+                ["docker", "ps", "-a", "--filter", f"name={base}-", "--format", "{{.Names}}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            names = [n for n in found.stdout.split("\n") if n.strip()]
+            for name in names:
+                subprocess.run(
+                    ["docker", "rm", "-f", name], capture_output=True, text=True, timeout=60
+                )
+            if names:
+                logger.info("Swept %d stale attacker container(s): %s", len(names), ", ".join(names))
+        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+            pass
+
     def _disable(self, reason: str):
         self._disabled = True
         self._disabled_reason = reason
