@@ -278,7 +278,13 @@ class AttackerManager:
         # Bind-mount this validator's own host directory at the container's
         # workdir, so PoC files never leak between validators nor accumulate
         # across runs. Docker does not create subdirs of a bind mount, so the
-        # host directory must exist before `docker run`.
+        # host directory must exist before `docker run`. The `:z` label suffix
+        # is mandatory on SELinux-enforcing hosts (docker's selinux plugin is
+        # active): without it the bind mounts fine but every access from
+        # inside the container - even as root - fails with EACCES, because the
+        # host dir lacks a container_file_t label. `:z` (shared, not `:Z`) is
+        # safe here: the directory is this validator's private per-agent
+        # workdir, and it survives container replacement across runs.
         mount_target = getattr(settings, "attacker_workdir", "/work")
         try:
             host_dir.mkdir(parents=True, exist_ok=True)
@@ -296,7 +302,7 @@ class AttackerManager:
                     # The container stays namespaced and unprivileged - ALL
                     # applies inside its own namespaces only.
                     "--cap-add", "ALL",
-                    "-v", f"{host_dir.resolve()}:{mount_target}",
+                    "-v", f"{host_dir.resolve()}:{mount_target}:z",
                     image, "sleep", "infinity",
                 ],
                 capture_output=True,
