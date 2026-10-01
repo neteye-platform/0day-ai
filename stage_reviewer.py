@@ -95,7 +95,16 @@ def dispatch_reviewers(state: MasterState):
         "Semantic dedup",
         "exact-key dedup only",
     )
-    hypotheses = cluster_vulnerabilities(hypotheses, settings.semantic_dedup_threshold, embedder)
+    hypotheses = cluster_vulnerabilities(
+        hypotheses,
+        settings.semantic_dedup_threshold,
+        embedder,
+        cross_threshold=settings.dedup_cross_node_similarity,
+        anchor_confirmed_threshold=settings.dedup_anchor_confirmed_similarity,
+        anchor_min_jaccard=settings.dedup_anchor_min_jaccard,
+        max_merged_cluster=settings.dedup_max_merged_cluster,
+        disk_cache_dir=settings.cache_dir / "hypothesis_embeddings",
+    )
 
     commands = []
     for hypothesis in hypotheses:
