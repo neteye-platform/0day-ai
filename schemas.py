@@ -14,6 +14,7 @@ with open("agents.yaml", "r") as f:
     REVIEWER_AGENT = data.get("reviewer_agent")
     VALIDATOR_AGENT = data.get("validator_agent")
     INTEGRATION_AUDITOR_AGENT = data.get("integration_auditor")
+    EDGE_TRAVERSAL_AGENT = data.get("edge_traversal")
 
 cwes = {
     # --- MEMORY SAFETY (C / C++ / Rust-unsafe) ---
@@ -39,6 +40,7 @@ cwes = {
     # --- STATE & SESSION (Web / API) ---
     "CWE-352": "Cross-Site Request Forgery (CSRF)",
     "CWE-384": "Session Fixation",
+    "CWE-444": "Inconsistent Interpretation of HTTP Requests (HTTP Request/Response Smuggling)",
     # --- DATA & CRYPTOGRAPHY ---
     "CWE-807": "Reliance on Untrusted Inputs in a Security Decision",
     "CWE-200": "Exposure of Sensitive Information to an Unauthorized Actor",
@@ -78,7 +80,7 @@ CWE_KEYS = Literal[
     "CWE-915", "CWE-639", "CWE-306", "CWE-352", "CWE-384", "CWE-200",
     "CWE-319", "CWE-327", "CWE-502", "CWE-807", "CWE-287", "CWE-22",
     "CWE-434", "CWE-770", "CWE-284",
-    "CWE-20", "CWE-840", "OTHER_UNCATEGORIZED"
+    "CWE-20", "CWE-444", "CWE-840", "OTHER_UNCATEGORIZED"
 ]
 
 
@@ -625,4 +627,68 @@ class VulnerabilityDetailsInput(BaseModel):
         description=(
             "The exact vuln_id of another confirmed vulnerability to fetch full details for."
         )
+    )
+
+
+# ==========================================
+# Edge Traversal agent
+# ==========================================
+
+EDGE_BOUNDARY_TYPES = Literal["in_process", "async_messaging", "network_ipc", "infra"]
+
+
+class EdgeTraversalFinding(BaseModel):
+    vulnerability_type: Literal["cross_boundary_contract_mismatch", "differential_parsing", "confused_deputy"] = Field(
+        description=(
+            "The composite vulnerability class: "
+            "'cross_boundary_contract_mismatch' (an assumption at one side of the "
+            "boundary is not upheld by the other, e.g. the source strips/omits auth "
+            "context before dispatch while the target assumes an authenticated/trusted "
+            "caller); "
+            "'differential_parsing' (the two sides parse/encode the same payload "
+            "differently — header or normalization/serialization discrepancies such as "
+            "HTTP request smuggling, path normalization mismatch, unsafe deserialization "
+            "handoff); "
+            "'confused_deputy' (a privileged component acts on attacker-influenced "
+            "instructions from a less-trusted component without re-checking authority)."
+        )
+    )
+    cwe_id: CWE_KEYS = Field(
+        description="The matching CWE ID from the provided list (e.g., CWE-862 for missing authorization across queues, CWE-444 for HTTP smuggling, CWE-502 for uncoordinated serialization, CWE-22 for normalization bypasses)."
+    )
+    affected_nodes: list[str] = Field(
+        description="EXACTLY two graph node IDs: [source_node, target_node] (or [infra_config_endpoint, app_route_node]). Use the exact u/v node IDs shown in the boundary edge header."
+    )
+    gap_details: str = Field(
+        description="Explicit description of the semantic mismatch across the boundary (e.g., 'Node A strips the user auth token before enqueuing the task; Node B assumes every incoming queue task is pre-authorized')."
+    )
+    validation_strategy: Literal["direct_to_validator", "requires_integration", "static_finding_only"] = Field(
+        description="'requires_integration' for multi-step logic gaps that depend on another exploit output or unregisterable privileges; 'direct_to_validator' for infrastructure/parsing discrepancies reproducible over HTTP; 'static_finding_only' for real-in-source mismatches with no network-reachable path."
+    )
+
+    @field_validator('affected_nodes')
+    @classmethod
+    def _exactly_two_nodes(cls, v: list[str]) -> list[str]:
+        if not v or len(v) > 2:
+            raise ValueError("affected_nodes must contain exactly the [source, target] node IDs.")
+        return v
+
+
+class EdgeInvariantAssertion(BaseModel):
+    source_node: str = Field(description="The upstream/source node of the boundary edge.")
+    target_node: str = Field(description="The downstream/target node of the boundary edge.")
+    satisfied: bool = Field(
+        description="True when the upstream node's sanitization/validation demonstrably satisfies the downstream node's entry demands (the edge is SAFE and must NOT produce a finding). False otherwise."
+    )
+    reasoning: str = Field(description="Brief technical explanation referencing the visible exit/ingress code.")
+
+
+class EdgeTraversalOutput(BaseModel):
+    findings: list[EdgeTraversalFinding] = Field(
+        default_factory=list,
+        description="One entry per genuinely composition-only vulnerability found across the boundary edges in this batch. Empty when none exist."
+    )
+    assertions: list[EdgeInvariantAssertion] = Field(
+        default_factory=list,
+        description="Edge invariant assertions: flags confirming when an upstream boundary's validation satisfies a downstream node's entry demands, pruning unnecessary false-positive evaluations. Emit one per edge you explicitly verified as safe."
     )

@@ -22,8 +22,9 @@ import tools
 import browser_tools
 import attacker_tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState, IntegrationAuditorState
-from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, INTEGRATION_AUDITOR_AGENT, cwes
+from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, INTEGRATION_AUDITOR_AGENT, EDGE_TRAVERSAL_AGENT, cwes, EdgeTraversalOutput
 from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, is_path_excluded, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, scan_codebase_for_keywords, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, reviewer_cache_key
+from boundary_edges import build_boundary_edges, cluster_boundary_edges, render_batch_prompt, boundary_batch_fingerprint, summarize_boundary_edges
 from tool_loop import CompactionConfig, ToolLoopAgent
 from dedup import Embeddings, cluster_vulnerabilities, deduplicate_demands
 
@@ -1415,17 +1416,12 @@ def aggregate_demands_node(state: MasterState):
 def dispatch_verifiers(state: MasterState):
     grouped_demands = state.get("grouped_demands", {})
 
-    # No app-level demands to verify, but pending hypotheses (explorer
-    # findings, upgrade-only CVE hypotheses) may still await review. Only END
-    # when there is nothing at all; otherwise fall through to synchronization
-    # so dispatch_reviewers adjudicates them (contract_verifier is correctly
-    # skipped — there are no demands to verify).
+    # No app-level demands to verify, but the run must still advance into
+    # synchronization so the Edge Traversal agent can analyze the explorer
+    # interface notes (its composite hypotheses only exist at this point).
+    # dispatch_reviewers then ENDs safely when nothing remains.
     if not grouped_demands:
-        pending = [
-            v.get("status") if isinstance(v, dict) else v.model_dump().get("status")
-            for v in state.get("vulnerabilities", [])
-        ]
-        return "synchronization" if "hypothesis" in pending else END
+        return "synchronization"
 
     commands: list[Send] = []
     progress_id = uuid.uuid4().hex
@@ -1612,6 +1608,116 @@ def contract_verifier_node(state: VerifierState) -> dict:
     return result
 
 # ==========================================
+# Edge Traversal agent
+# ==========================================
+
+# Composite-vulnerability classes emitted by the Edge Traversal agent. Mapped
+# to the reviewer's `cross_boundary` track (see _reviewer_mode_for).
+CROSS_BOUNDARY_VULN_TYPES = {
+    "cross_boundary_contract_mismatch",
+    "differential_parsing",
+    "confused_deputy",
+}
+
+
+def edge_traversal_node(state: MasterState):
+    """Single synchronous node: deterministically synthesize trust-boundary
+    edges from the explorer interface notes, then run one structured LLM call
+    per homogeneous batch. Emits standard hypotheses into the `vulnerabilities`
+    channel for the reviewer's `cross_boundary` track."""
+    if not getattr(settings, "edge_traversal_enabled", True):
+        logging.info("Edge Traversal disabled via settings.edge_traversal_enabled=False.")
+        return {}
+
+    note_map = {}
+    for note in state.get("notes", []):
+        dict_note = note if isinstance(note, dict) else note.model_dump()
+        node_id = dict_note.get("node_id")
+        if node_id:
+            note_map[str(node_id)] = dict_note
+
+    graph_data = get_cached_graph_data(settings.graph)
+
+    edges = build_boundary_edges(graph_data, note_map)
+    if not edges:
+        logging.info("Edge Traversal: no boundary edges to analyze.")
+        return {}
+
+    batches = cluster_boundary_edges(edges)
+    logging.info(
+        "Edge Traversal: %d boundary edge(s) across %d batch(es) (%s).",
+        len(edges),
+        len(batches),
+        summarize_boundary_edges(edges),
+    )
+
+    hypotheses: list[dict] = []
+    for idx, batch in enumerate(batches, 1):
+        batch_hypotheses = _run_edge_traversal_batch(batch, idx, len(batches))
+        hypotheses.extend(batch_hypotheses)
+
+    logging.info(
+        "Edge Traversal finished: %d composite hypothesis(es) from %d batch(es).",
+        len(hypotheses),
+        len(batches),
+    )
+    return {"vulnerabilities": hypotheses}
+
+
+def _run_edge_traversal_batch(batch: list[dict], idx: int, total: int) -> list[dict]:
+    digest = boundary_batch_fingerprint(batch)
+    cache_file = settings.cache_dir / "edge_traversal" / safe_cache_filename(f"{digest}.json")
+    cached = cache(cache_file, "read")
+    if cached:
+        logging.debug("Edge Traversal cache hit for batch %d/%d.", idx, total)
+        return (cached.get("hypotheses") or []) if isinstance(cached, dict) else []
+
+    prompt = render_batch_prompt(batch)
+    sys_msg = SystemMessage(content=EDGE_TRAVERSAL_AGENT.get("prompt", ""))
+    human_msg = HumanMessage(content=prompt)
+
+    structured_llm = fast_llm.with_structured_output(EdgeTraversalOutput, method="json_schema", strict=True)
+    output = structured_llm.invoke([sys_msg, human_msg])
+    output = output if isinstance(output, dict) else output.model_dump()
+
+    for assertion in output.get("assertions") or []:
+        a = assertion if isinstance(assertion, dict) else assertion.model_dump()
+        logging.info(
+            "Edge Traversal invariant (batch %d): %s -> %s satisfied=%s — %s",
+            idx,
+            a.get("source_node", "?"),
+            a.get("target_node", "?"),
+            a.get("satisfied"),
+            str(a.get("reasoning"))[:200],
+        )
+
+    hypotheses = [_edge_traversal_finding_to_record(f) for f in (output.get("findings") or [])]
+    cache(cache_file, "write", {"hypotheses": hypotheses})
+    logging.info(
+        "Edge Traversal batch %d/%d: %d hypothesis(es).",
+        idx,
+        total,
+        len(hypotheses),
+    )
+    return hypotheses
+
+
+def _edge_traversal_finding_to_record(finding) -> dict:
+    f = finding if isinstance(finding, dict) else finding.model_dump()
+    nodes = [str(n) for n in (f.get("affected_nodes") or []) if n]
+    vuln_type = f.get("vulnerability_type", "cross_boundary_contract_mismatch")
+    return {
+        "affected_nodes": nodes,
+        "cwe_id": f.get("cwe_id", "OTHER_UNCATEGORIZED"),
+        "description": str(f.get("gap_details") or ""),
+        "status": "hypothesis",
+        "vulnerability_type": vuln_type,
+        "validation_strategy": f.get("validation_strategy"),
+        # Stable per-(pair, type) anchor: distinct boundary edges never collide.
+        "vulnerable_component": f"edge:{vuln_type}:" + "->".join(nodes) if nodes else f"edge:{vuln_type}",
+    }
+
+# ==========================================
 # Reviewer agent
 # ==========================================
 
@@ -1635,6 +1741,21 @@ FRAMEWORK_DEPENDENCY_REVIEWER_TOOLS = [
     tools.read_container_artifact,
     tools.submit_evaluation,
 ]
+# `cross_boundary` (Composite Vulnerability) track: the flaw lives in the
+# composition of two endpoints AND the transport between them, so reviewers
+# need both the source-reading toolset (both endpoint codes) and the
+# container-artifact tools (effective proxy/queue serialization configs).
+CROSS_BOUNDARY_REVIEWER_TOOLS = [
+    tools.read_source_code,
+    tools.read_file,
+    tools.get_node_connections,
+    tools.search_codebase,
+    tools.get_definition,
+    tools.list_container_artifacts,
+    tools.find_in_container,
+    tools.read_container_artifact,
+    tools.submit_evaluation,
+]
 
 
 def _reviewer_mode_for(hypothesis: dict) -> str:
@@ -1642,7 +1763,8 @@ def _reviewer_mode_for(hypothesis: dict) -> str:
 
     'framework_dependency' (Known Dependency Vulnerability), 'dependency_mitigation'
     (Dependency Mitigation Vulnerability — application-mitigable CVEs whose contract
-    verification failed), 'systemic' (Systemic Vulnerability) or 'code_level'.
+    verification failed), 'systemic' (Systemic Vulnerability), 'cross_boundary'
+    (composite boundary findings from the Edge Traversal agent) or 'code_level'.
     """
     vuln_type = hypothesis.get("vulnerability_type")
     if vuln_type == "Known Dependency Vulnerability":
@@ -1651,6 +1773,8 @@ def _reviewer_mode_for(hypothesis: dict) -> str:
         return "dependency_mitigation"
     if vuln_type == "Systemic Vulnerability":
         return "systemic"
+    if vuln_type in CROSS_BOUNDARY_VULN_TYPES:
+        return "cross_boundary"
     return "code_level"
 
 
@@ -1807,6 +1931,8 @@ class ReviewerAgent(ToolLoopAgent):
         mode = state.get("mode", "code_level")
         if mode == "framework_dependency":
             reviewer_tools = FRAMEWORK_DEPENDENCY_REVIEWER_TOOLS
+        elif mode == "cross_boundary":
+            reviewer_tools = CROSS_BOUNDARY_REVIEWER_TOOLS
         else:
             # code_level, dependency_mitigation, systemic all trace first-party
             # code and share the source-reading toolset.
@@ -1869,10 +1995,10 @@ class ReviewerAgent(ToolLoopAgent):
                 f"{qs_str}\n"
             )
 
-        # Synthetic `dependency:<package>` nodes (CVE upgrade-only / known
-        # dependency vulnerabilities) don't exist in the app graph: there is no
-        # source code to attach, so skip the lookup entirely.
-        if node_id and not node_id.startswith("dependency:"):
+        # Synthetic nodes (dependency/upgrade-only CVEs, infra pseudo-endpoints
+        # from Edge Traversal) don't exist in the app graph: there is no source
+        # code to attach, so skip the lookup entirely.
+        if node_id and not node_id.startswith(("dependency:", "infra:")):
             target_node_source = get_node_code(node_id, reviewer_mode=True)
             if target_node_source:
                 formatted_vuln += (
