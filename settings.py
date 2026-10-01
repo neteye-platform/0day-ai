@@ -40,20 +40,14 @@ llm_api_key = os.environ.get("OPENAI_API_KEY")
 # llm_api_key = "ollama"
 
 # Single context-window size shared by the reviewer, validator, and integration
-# auditor (their output budgets and compaction hard caps derive from it).
+# auditor (their compaction hard caps derive from it).
 model_context_window = 131072
 
-# Requested output budget is a fraction of the model context window (keeps input
-# headroom wide under the gateway's max-context rejection).
-OUTPUT_BUDGET_FRACTION = 1 / 32
-
-# Window-independent cap for the fast LLM (explorer, CVE analyzer, threat-intel,
-# contract verifier): their structured JSON must complete within this cap.
-fast_max_completion_tokens = 16384
-
-# smart_llm backs both the validator and the integration auditor, so they share
-# this output budget.
-smart_max_completion_tokens = int(model_context_window * OUTPUT_BUDGET_FRACTION)
+# Single fixed output budget for EVERY LLM call in the pipeline — fast
+# structured JSON (explorer, CVE analyzer, threat-intel, contract verifier),
+# compaction summaries, the reviewer, and the validator/integration-auditor
+# loops. Window-independent: stays put no matter model_context_window.
+llm_max_completion_tokens = 16384
 
 
 # =============================== Agents ==================================
@@ -76,45 +70,26 @@ validator_feedback_max_rounds = 1
 
 ## ---- Tool-loop context compaction ----
 
-# Reviewer context compaction: when estimated history tokens reach the window
-# minus context_reserved, the middle is collapsed into an LLM summary, keeping
-# the most recent verbatim tail (estimated ~2 chars/token, deliberately
+# Shared context-compaction budget for ALL tool-loop agents (reviewer,
+# validator, integration auditor): when estimated history tokens reach the
+# window minus context_reserved, the middle is collapsed into an LLM summary,
+# keeping the most recent verbatim tail (estimated ~2 chars/token, deliberately
 # conservative).
-reviewer_context_reserved = 24000
-# ~3% of the window; hard cap below keeps input + requested output within it.
-reviewer_max_completion_tokens = int(model_context_window * OUTPUT_BUDGET_FRACTION)
+context_reserved = 24000
 # Messages longer than this move out of the verbatim tail into the compressible
 # middle (a degenerate long model dump is never pinned verbatim).
-reviewer_max_response_chars = 12000
+max_response_chars = 12000
 # Most-recent AI+tool turns kept verbatim after compaction.
-reviewer_compaction_tail_turns = 1
+compaction_tail_turns = 1
 # Minimum compressible tokens before compacting (avoids thrashing).
-reviewer_compaction_min_compressible_tokens = 4000
+compaction_min_compressible_tokens = 4000
 # Force-truncate before invoking the LLM if the estimate still nears the window.
-reviewer_hard_reserved = 8192
-
-# Integration-auditor context compaction (mirrors the reviewer's).
-integration_auditor_context_reserved = 24000
-integration_auditor_max_completion_tokens = int(model_context_window * OUTPUT_BUDGET_FRACTION)
-integration_auditor_max_response_chars = 12000
-integration_auditor_compaction_tail_turns = 1
-integration_auditor_compaction_min_compressible_tokens = 4000
-integration_auditor_hard_reserved = 8192
-
-# Validator context compaction: same mechanism as the reviewer, applied to the
-# HTTP-proving loop whose responses can grow without bound.
-validator_context_reserved = 24000
-# ~3% of the window; see the reviewer note.
-validator_max_completion_tokens = int(model_context_window * OUTPUT_BUDGET_FRACTION)
-validator_max_response_chars = 12000
-validator_compaction_tail_turns = 1
-validator_compaction_min_compressible_tokens = 4000
-validator_hard_reserved = 8192
+hard_reserved = 8192
 
 ## ---- Contract verifier ----
 
 # Max demands per structured contract-verifier call: output scales with demand
-# count, so batches stay well under fast_max_completion_tokens.
+# count, so batches stay well under llm_max_completion_tokens.
 verifier_max_demands_per_call = 40
 
 ## ---- Deduplication ----
