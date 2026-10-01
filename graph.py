@@ -19,6 +19,7 @@ def compile_reviewer():
         tools.read_source_code,
         tools.get_node_connections,
         tools.search_codebase,
+        tools.get_definition,
         tools.submit_evaluation
     ]))
     reviewer_workflow.add_edge(START, "reviewer_agent")
@@ -27,7 +28,8 @@ def compile_reviewer():
         reviewer_router,
         {
             "reviewer_tools": "reviewer_tools",
-            "ask_reviewer_for_tool": "ask_reviewer_for_tool"
+            "ask_reviewer_for_tool": "ask_reviewer_for_tool",
+            "__end__": END
         }
     )
     reviewer_workflow.add_conditional_edges(
@@ -45,7 +47,7 @@ def compile_reviewer():
 
 
 def compile_validator():
-    validator_workflow = StateGraph(ValidatorState, output_schema=ValidatorOutput)
+    validator_workflow = StateGraph(ValidatorState)
     validator_workflow.add_node("validator_agent", validator_agent_node)
     validator_workflow.add_node("ask_validator_for_tool", ask_validator_for_tool)
     validator_workflow.add_node("validator_tools", ToolNode([
@@ -88,6 +90,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("reviewer_agent", compiled_reviewer_agent)
     workflow.add_node("validator_agent", compiled_validator_agent)
     workflow.add_node("synchronization", synchronization_node)
+    # workflow.add_node("reviewer_sync", synchronization_node)
 
     workflow.add_edge(START, "preprocessor")
     workflow.add_edge("preprocessor", "manager")
@@ -99,6 +102,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_conditional_edges("aggregate_demands", dispatch_verifiers, ["contract_verifier", "synchronization", END])
     workflow.add_edge("contract_verifier", "synchronization")
     workflow.add_conditional_edges("synchronization", dispatch_reviewers, ["reviewer_agent", END])
+    # workflow.add_edge("reviewer_agent", "reviewer_sync")
     workflow.add_conditional_edges("reviewer_agent", dispatch_validators, ["validator_agent", END])
     workflow.add_edge("validator_agent", END)
 

@@ -7,8 +7,6 @@ from utils import merge_vulnerabilities
 
 
 class MasterState(TypedDict):
-    graph: dict[str, Any]
-    app_summary: str
     known_vulns: list[dict]
     expert_tasks: list[ExpertTask]
 
@@ -34,11 +32,12 @@ class VerifierState(TypedDict):
 class ReviewerState(TypedDict):
     node_id: str
     expert_report: dict
+    vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
     messages: Annotated[list, add_messages]
 
 class ValidatorState(TypedDict):
     report_to_test: dict # The specific vulnerability to validate
     sandbox_url: str     # The endpoint/IP of the sandbox
-    messages: Annotated[list, add_messages]
     cookies: dict
-
+    vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
+    messages: Annotated[list, add_messages]

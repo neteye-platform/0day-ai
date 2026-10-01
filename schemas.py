@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import List, Literal, Optional
+from typing import Literal, Optional
 import json
 import yaml
 
@@ -62,7 +62,7 @@ cwes = {
 
 
 class VulnerabilityRecord(BaseModel):
-    vuln_id: str
+    vuln_id: Optional[str] = None
 
     # Lifecycle tracking
     status: Literal["hypothesis", "confirmed", "exploitable", "false_positive"] = "hypothesis"
@@ -76,8 +76,13 @@ class VulnerabilityRecord(BaseModel):
         ),
         json_schema_extra={"enum": list(cwes.keys())}
     )
-    vulnerability_type: str
+    vulnerability_type: str = "Code Defect"
     description: str
+    demand_id: Optional[str] = None
+    vulnerable_component: Optional[str] = Field(
+        default=None,
+        description="The structural anchor from the Explorer hypothesis."
+    )
 
     # Reviewer additions
     reviewer_reasoning: Optional[str] = None
@@ -99,7 +104,18 @@ class VulnerabilityRecord(BaseModel):
     @model_validator(mode='after')
     def set_vuln_id(self) -> 'VulnerabilityRecord':
         if not self.vuln_id:
-            self.vuln_id = f"{self.node_id}:{self.cwe_id}"
+            # If it came from the Contract Verifier, use the demand_id anchor
+            if self.demand_id and self.demand_id != "unknown_anchor":
+                anchor = self.demand_id
+            # If it came from the Explorer, use the vulnerable_component anchor
+            elif self.vulnerable_component:
+                # Normalize the string (lowercase, strip spaces) to prevent trivial mismatches
+                anchor = self.vulnerable_component.strip().lower()
+            # Fallback if neither exists
+            else:
+                anchor = "general"
+
+            self.vuln_id = f"{self.node_id}:{self.cwe_id}:{anchor}"
         return self
 
 
@@ -123,6 +139,10 @@ class CVEDemand(BaseModel):
     security_assumption: str = Field(
         description="The specific demand or configuration requirement that must be verified in the code to prevent the vulnerability."
     )
+    trigger_condition: Optional[str] = Field(
+        default=None,
+        description="The explicit data flow, function call, or execution sink required for the vulnerability to trigger. If the CVE description does not explicitly state how the payload is executed, leave empty."
+    )
     import_namespace: str = Field(
         description="The actual module name used in the source code to import this package (e.g., if the package is 'beautifulsoup4', the import is 'bs4')."
     )
@@ -136,15 +156,15 @@ class VulnerabilityEvaluation(BaseModel):
     reasoning: str = Field(description="Brief technical explanation for the decision.")
     entry_point_url: Optional[str] = Field(description="The specific HTTP route or URI path required to reach the source node (e.g., '/dashboard').")
     http_method: Optional[str] = Field(description="The HTTP method required (e.g., 'POST', 'GET').")
-    required_parameters: Optional[List[str]] = Field(description="List of expected input names, headers, or form fields.")
+    required_parameters: Optional[list[str]] = Field(description="List of expected input names, headers, or form fields.")
     auth_required: bool = Field(description="True if the route is protected by an authentication middleware.")
     original_report: list[dict]
 
 class ReviewerOutput(BaseModel):
-    filtered_reports: List[VulnerabilityEvaluation]
+    vulnerabilities: list[VulnerabilityEvaluation]
 
 class ValidatorOutput(BaseModel):
-    reports: List[ValidationResult]
+    reports: list[ValidationResult]
 
 class ValidationResult(BaseModel):
     # report_id: str = Field(description="The ID/title of the vulnerability being tested.")
@@ -156,10 +176,29 @@ class PackageCheck(BaseModel):
     name: str = Field(description="The name of the package")
     version: str = Field(description="The exact version string")
 
-class SecurityAssumption(BaseModel):
-    description: str = Field(..., description="The exact security contract this node expects the target to fulfill (e.g., 'Must verify that the caller owns job_id before returning data').")
-    module: str = Field(..., description="The module the symbol is imported from (e.g., 'utils', 'app.auth').")
-    symbol: str = Field(..., description="The specific function, decorator, or class relied upon (e.g., 'login_required', 'get_jobs').")
+class DownstreamSecurityAssumption(BaseModel):
+    description: str = Field(
+        ...,
+        description="The exact security contract this node expects the target to fulfill."
+    )
+    module: str = Field(
+        ...,
+        description="The module the downstream symbol is imported from (e.g., 'utils', 'app.auth'). Use 'self' if the symbol is defined in the same file."
+    )
+    symbol:str = Field(
+        ...,
+        description="The specific function called (e.g., 'get_jobs'). NEVER put the current node's own name here."
+    )
+
+class UpstreamSecurityAssumption(BaseModel):
+    description: str = Field(
+        ...,
+        description="The exact security contract this node expects its caller to fulfill (e.g., 'Caller must pass a parameterized SQL query')."
+    )
+    parameter_name: str = Field(
+        ...,
+        description="The specific function argument or input parameter this assumption applies to (e.g., 'query' or 'file_path'). Use 'context' if it applies to global state (e.g., 'g.user')."
+    )
 
 class VulnerabilityHypothesis(BaseModel):
     cwe_id: str = Field(
@@ -170,40 +209,54 @@ class VulnerabilityHypothesis(BaseModel):
         ),
         json_schema_extra={"enum": list(cwes.keys())}
     )
-    description: str = Field(..., description="The suspected flaw.")
-    # vulnerable_component: str = Field(..., description="The specific parameter, function call, or state transition that is flawed (e.g., 'req.query.id').")
+    description: str = Field(..., description="A strictly factual, summary of the vulnerability.", max_length=250)
+    vulnerable_component: str = Field(..., description="The specific parameter, function call, or state transition that is flawed (e.g., 'req.query.id').")
+
+    @field_validator('description', mode='before')
+    @classmethod
+    def truncate_description(cls, v: str) -> str:
+        # If the LLM generates a string longer than 150 chars, truncate it safely
+        if isinstance(v, str) and len(v) > 150:
+            return v[:247] + "..."
+        return v
 
 class BusinessInterface(BaseModel):
     interface_type: Literal["source", "sink"] = Field(..., description="Strictly 'source' (untrusted data enters) or 'sink' (sensitive state changes).")
     description: str = Field(..., description="What the interface does (e.g., 'Kafka consumer for order events', 'Upgrades user role'). Ignore standard HTTP/DB flows; focus on business logic boundaries.")
 
 class AnalysisNote(BaseModel):
-    # node_id: str = Field(..., description="The exact ID of the node analyzed (e.g. 'src_main_login').")
-    role_in_system: str = Field(..., description="One sentence summarizing what this node does and its security context.")
-    business_interfaces: List[BusinessInterface] = Field(
-        default_factory=list,
-        description="High-level architectural entry and exit points."
+    role_in_system: str = Field(
+        ..., 
+        description="One sentence summarizing what this node does and its security context."
     )
-    assumptions_to_verify: List[SecurityAssumption] = Field(
+    business_interfaces: list[BusinessInterface] = Field(
         default_factory=list,
-        description="Security demands this node makes of its dependencies."
+        description="High-level architectural entry and exit points (sources and sinks)."
     )
-    vulnerability_hypothesis: List[VulnerabilityHypothesis] = Field(
+    upstream_assumptions: list[UpstreamSecurityAssumption] = Field(
         default_factory=list,
-        description="Suspected localized vulnerabilities. Leave empty if no anomalies are found."
+        description="Security requirements that the UPSTREAM CALLER of this node must fulfill before invoking it (e.g., 'Caller must sanitize the file path' or 'Caller must verify authorization')."
     )
-    imports: list[str] = Field(
+    downstream_assumptions: list[DownstreamSecurityAssumption] = Field(
         default_factory=list,
-        description=(
-            "A list of external modules or namespaces explicitly imported in this node's source code.\n"
-            "CRITICAL: Extract ONLY the base root module name. Never include keywords like 'import', 'from', or aliases. "
-            "(e.g. 'from bs4 import BeautifulSoup' -> 'bs4', 'import django.conf' -> 'django')"
-        )
+        description="Security requirements that this node expects its DOWNSTREAM CALLEES to fulfill (e.g., 'The called database function must use parameterized queries')."
+    )
+    vulnerability_hypotheses: list[VulnerabilityHypothesis] = Field(
+        default_factory=list,
+        description="Suspected localized vulnerabilities visible in this exact code snippet. Flag anything that looks objectively dangerous (e.g., raw SQL string formatting, plaintext secrets)."
     )
 
 class DemandEvaluation(BaseModel):
-    demand_description: str = Field(description="The exact demand being evaluated")
-    status: Literal["MET", "FAILED", "OUT_OF_SCOPE"] = Field(description="MET if the code fulfills the demand, FAILED if it does not, OUT_OF_SCOPE if the demand describes a responsibility that belongs to a different architectural layer.")
+    demand_id: str = Field(description="The exact ID extracted from the [ID: ...] tag provided in the demand description.")
+    # demand_description: str = Field(description="The exact demand being evaluated")
+    status: Literal["MET", "FAILED", "DELEGATED", "OUT_OF_SCOPE"] = Field(
+        description=(
+            "MET: If the visible code explicitly implements standard, robust security controls (e.g., parameterized queries) that neutralize the threat.\n"
+            "FAILED: the code explicitly manipulates data insecurely IN PLAIN SIGHT, or implements a visibly weak/fragile mitigation (e.g., custom regex for path traversal).\n"
+            "DELEGATED: the code passes the untrusted data to a helper function, validator, or sanitizer whose implementation is NOT visible in the snippet.\n"
+            "OUT_OF_SCOPE: the demand targets a different layer (e.g., expecting a database helper to handle HTTP cookies) or a different context (e.g., HTML configuration on a Markdown exporter)."
+        )
+    )
     reasoning: str = Field(description="Brief explanation referencing specific lines of code.")
     cwe_id: Optional[str] = Field(
         default=None, 
@@ -215,7 +268,7 @@ class DemandEvaluation(BaseModel):
     )
 
 class VerifierOutput(BaseModel):
-    evaluations: List[DemandEvaluation]
+    evaluations: list[DemandEvaluation]
 
 # ==========================================
 # Tools
