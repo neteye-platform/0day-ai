@@ -449,7 +449,6 @@ class CVEAnalysis(BaseModel):
         return strip_version_numbers(v) if v else None
 
 class VulnerabilityEvaluation(BaseModel):
-    # report_id: str = Field(description="The unique identifier or title of the vulnerability report.")
     is_exploitable: bool = Field(
         description="True if the vulnerability has a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by standard mitigations."
     )
@@ -798,8 +797,11 @@ class EdgeTraversalOutput(BaseModel):
 # ==========================================
 
 class ReporterFinding(BaseModel):
+    title: str = Field(
+        description="Short, clean, human-readable title for this finding (a few words). You may reuse the meaningful parts of the raw vulnerability ID or CWE description (e.g. 'Unauthenticated SQL Injection in Export Endpoint'). Keep it brief and readable: no file paths, no full node IDs, no boilerplate."
+    )
     summary: str = Field(
-        description="A short, right-to-the-point description of the vulnerability (1-3 sentences) distilling the record's description and reviewer reasoning. Do not restate the whole evidence."
+        description="As short as possible: the finding in one or two direct sentences, distilled from the record's description and reviewer reasoning. Nothing beyond what a reader needs to grasp it."
     )
     cvss_vector: str = Field(
         description=(
@@ -825,11 +827,11 @@ class ReporterFinding(BaseModel):
         description="Chronological, self-sufficient reproduction steps for this vulnerability, rewritten/updated from the validator's PoC payload and execution logs so a reader can reproduce it from scratch. State the exact HTTP method, path, parameters/headers/body, carried session state, and the observable evidence of success. Do NOT paste the raw PoC payload or raw execution logs."
     )
     worst_case_scenario: str = Field(
-        description="The decisive answer to 'what is the worst thing that could happen if a malicious actor exploits this vulnerability?', grounded in this vulnerability's real mechanics and the application's actual function."
+        description="Decisive and terse answer to 'what is the worst thing that could happen if a malicious actor exploits this vulnerability?', grounded in this vulnerability's real mechanics and the application's actual function."
     )
     remediation: Optional[str] = Field(
         default=None,
-        description="The concrete fix (code change, configuration, or library upgrade) that closes this vulnerability. Leave null when no concrete remediation is known."
+        description="A one-line statement of the concrete fix (code change, configuration, or library upgrade) followed by a MINIMAL, correctly fenced and language-tagged code snippet showing the change (e.g. ```php / ```yaml / ```sql). Prefer the snippet over prose; put the fenced block at the start of its own line. Leave null when no concrete remediation is known."
     )
 
     @field_validator('cvss_vector')

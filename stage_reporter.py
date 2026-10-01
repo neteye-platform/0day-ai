@@ -243,14 +243,16 @@ def _render_report_markdown(
     lines += [
         "## Findings at a Glance",
         "",
-        "| # | Vulnerability ID | CWE | CVSS v3.1 | Severity |",
-        "|---|------------------|-----|-----------|----------|",
+        "| # | Title | Vulnerability ID | CWE | CVSS v3.1 | Severity |",
+        "|---|-------|------------------|-----|-----------|----------|",
     ]
     for i, (record, finding, vector, score, label) in enumerate(rows, 1):
         cwe = record.get("cwe_id", "OTHER_UNCATEGORIZED")
         score_str = f"{score:.1f}" if score is not None else "N/A"
+        title = str(finding.get("title") or "").strip() or record.get("vuln_id", "Unknown")
         lines.append(
-            f"| {i} | `{record.get('vuln_id', 'Unknown')}` | {cwe} | {score_str} | {label} |"
+            f"| {i} | {title.replace('|', chr(92) + '|')} | `{record.get('vuln_id', 'Unknown')}` "
+            f"| {cwe} | {score_str} | {label} |"
         )
 
     lines += ["", "## Findings", ""]
@@ -258,9 +260,11 @@ def _render_report_markdown(
         cwe = record.get("cwe_id", "OTHER_UNCATEGORIZED")
         cwe_desc = cwes.get(cwe, "")
         score_str = f"{score:.1f}" if score is not None else "N/A"
+        title = str(finding.get("title") or "").strip() or record.get("vuln_id", "Unknown")
         lines += [
-            f"### {i}. {record.get('vuln_id', 'Unknown')}",
+            f"### {i}. {title}",
             "",
+            f"**ID:** `{record.get('vuln_id', 'Unknown')}`  ",
             f"**Severity:** {label}  \n",
             f"**CVSS v3.1 base score:** {score_str}  ",
             f"**CVSS vector:** `{vector}`  ",
@@ -413,6 +417,7 @@ def reporter_node(state: ReporterState) -> dict:
             # Fail open: keep the record's own evidence, losing no finding.
             logging.error(f"Reporter: LLM call failed for {vuln_id} ({exc}); using record evidence.")
             finding = {
+                "title": "",
                 "summary": report.get("description") or "",
                 "cvss_vector": "",
                 "severity": None,
