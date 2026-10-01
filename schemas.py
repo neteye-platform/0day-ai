@@ -263,6 +263,14 @@ class VulnerabilityRecord(BaseModel):
             return self
 
         if not self.vuln_id:
+            # Known Dependency Vulnerability records (from CVE analyzer,
+            # upgrade_only path) route to the framework/dependency reviewer
+            # track; their identity is node:CWE without a per-occurrence anchor.
+            if self.vulnerability_type == "Known Dependency Vulnerability":
+                primary = self.affected_nodes[0] if self.affected_nodes else "general"
+                self.vuln_id = f"{primary}:{self.cwe_id}"
+                return self
+
             # If it came from the Contract Verifier, use the demand_id anchor
             if self.demand_id and self.demand_id != "unknown_anchor":
                 anchor = self.demand_id
