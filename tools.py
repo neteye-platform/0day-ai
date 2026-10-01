@@ -436,6 +436,7 @@ def submit_evaluation(
     updated_vuln["confidence_score"] = kwargs.get("confidence_score")
     updated_vuln["reviewer_reasoning"] = kwargs.get("reasoning")
     updated_vuln["reproduction_steps"] = kwargs.get("reproduction_steps", [])
+    updated_vuln["validation_strategy"] = kwargs.get("validation_strategy")
 
     tool_msg = ToolMessage(
         content="Evaluation submitted successfully. Ending review.",
