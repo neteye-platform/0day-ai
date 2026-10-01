@@ -945,8 +945,9 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False) 
 
         if is_file_node:
             target_ast_node = tree.root_node
+            target_body_node = None
         else:
-            target_ast_node, _ = find_ast_node_with_body(target_line_idx)
+            target_ast_node, target_body_node = find_ast_node_with_body(target_line_idx)
             if not target_ast_node:
                 return source_content
 
@@ -981,11 +982,17 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False) 
             # Rule logic: If querying a specific node, DO NOT prune the target itself
             # or any ancestor/container enclosing the target (e.g. keep the parent class open).
             if not is_file_node:
-                is_target = (sub_start == target_ast_node.start_byte and sub_end == target_ast_node.end_byte)
+                # Another graph node aliasing the same start line resolves to the
+                # target's own AST body; compare body-to-body so it is never pruned.
+                is_target = (
+                    target_body_node is not None
+                    and sub_start == target_body_node.start_byte
+                    and sub_end == target_body_node.end_byte
+                )
                 is_ancestor = (sub_start <= target_ast_node.start_byte and sub_end >= target_ast_node.end_byte)
 
                 # Check for exact target match
-                if sub_start == target_ast_node.start_byte and sub_end == target_ast_node.end_byte:
+                if is_target:
                     continue
                 # Check if it's an ancestor (like the enclosing Class)
                 if is_ancestor:
