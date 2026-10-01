@@ -1,5 +1,7 @@
+from typing import Annotated
 from langchain_core.tools import tool
 import json
+from langgraph.prebuilt import InjectedState
 import settings
 import requests
 from pathlib import Path
@@ -7,6 +9,8 @@ import tree_sitter
 import tree_sitter_python
 import tree_sitter_javascript
 import logging
+
+from schemas import VulnerabilityReport
 
 LANGUAGE_MAP = {
     ".py": tree_sitter.Language(tree_sitter_python.language()),
@@ -134,3 +138,20 @@ def check_package_vulnerability(package_name: str, version: str) -> list:
         })
 
     return output
+
+
+@tool
+def submit_report(finding: VulnerabilityReport, state: Annotated[dict, InjectedState]) -> dict:
+    """
+    Call this tool whenever you find a unique, actionable vulnerability. 
+    You can call this tool multiple times if multiple flaws exist.
+    """
+    report_dict = finding.model_dump()
+    report_dict["role"] = state["task"].agent_role
+    return {"vulnerability_reports": [report_dict]}
+
+
+@tool
+def mark_task_complete(summary: str) -> dict:
+    """Call this tool ONLY when you have analyzed EVERY single node assigned to you and are ready to finish."""
+    return {"audit_status": "completed", "summary": summary}

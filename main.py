@@ -1,93 +1,23 @@
-import json
 import os
 import settings
-import operator
 import logging
 import argparse
-from typing import TypedDict, List, Dict, Any, Annotated, Literal
-from pydantic import BaseModel, Field
+from typing import List, Dict, Any
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Send
-from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode
-import tools
-from utils import *
+from langgraph.prebuilt import ToolNode, tools_condition
 
-import warnings
-warnings.filterwarnings("ignore", message=".*allowed_objects.*")
-from langchain_core.globals import set_llm_cache
-from langchain_community.cache import SQLiteCache
-set_llm_cache(SQLiteCache(database_path=".langchain_cache.db"))
+import tools
+from utils import build_networkx_graph, run_stream
+from state import MasterState, ExpertState
+from schemas import ExpertTask, VulnerabilityReport, ManagerOutput, ReviewerOutput, EXPERT_AGENTS, TOOLS
 
 logger = logging.getLogger(__name__)
-
-# ==========================================
-# State
-# ==========================================
-
-class MasterState(TypedDict):
-    graph_path: str
-    app_summary: str
-    communities_map: Dict[str, List[str]] # Maps community ID to list of node IDs
-    expert_tasks: List[ExpertTask]
-    vulnerability_reports: Annotated[List[Dict[str, Any]], operator.add] # Aggregated findings
-    filtered_reports: list[dict]
-
-class ExpertState(TypedDict):
-    task: ExpertTask
-    subgraph_nodes: List[str]
-    messages: Annotated[list, add_messages] # Tracks the conversation and tool calls
-    vulnerability_reports: List[Dict[str, Any]]
-
-# ==========================================
-# Output Schemas
-# ==========================================
-
-with open("agents.json", "r") as f:
-    data = json.load(f)
-    EXPERT_AGENTS = data.get("agents")
-    TOOLS = data.get("tools")
-
-class ExpertTask(BaseModel):
-    agent_role: str = Field(
-        description="The PREDEFINED role best suited for this specific architectural area.",
-        json_schema_extra={"enum": list(EXPERT_AGENTS.keys())}
-    )
-    target_communities: List[str] = Field(
-        description="List of EXACT community IDs this agent must focus on (e.g., ['1', '3', '4']). Extract these exact IDs from the summary. It MUST NOT be empty."
-    )
-    task_description: str = Field(
-        description="Detailed instructions on what specific vulnerability classes, architectural risks, or cross-component interactions to investigate within this subgraph."
-    )
-
-class ManagerOutput(BaseModel):
-    strategic_overview: str = Field(description="The manager's brief (max 200 words) reasoning on the app's attack surface.")
-    tasks: List[ExpertTask] = Field(description="List of tasks matching predefined roles.")
-
-class VulnerabilityReport(BaseModel):
-    vulnerability_type: str = Field(description="Type of logic bug or misconfiguration found.")
-    description: str = Field(description="Detailed explanation of the flaw.")
-    affected_nodes: List[str] = Field(description="List of node IDs involved in the vulnerability.")
-
-class SubmitReport(BaseModel):
-    findings: List[VulnerabilityReport]
-    audit_summary: str = Field(description="Brief summary of what was checked.")
-
-class VulnerabilityEvaluation(BaseModel):
-    report_id: str = Field(description="The unique identifier or title of the vulnerability report.")
-    is_exploitable: bool = Field(
-        description="True if the vulnerability has a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by standard mitigations."
-    )
-    confidence_score: int = Field(description="Confidence in this assessment from 1 to 10.")
-    reasoning: str = Field(description="Brief technical explanation for the decision.")
-
-class ReviewerOutput(BaseModel):
-    evaluations: List[VulnerabilityEvaluation]
 
 # ==========================================
 # Nodes
@@ -159,7 +89,7 @@ def manager_agent_node(state: MasterState) -> Dict[str, Any]:
 
     llm = ChatOpenAI(
         base_url="http://localhost:11434/v1",
-        model="mistral-3.5-128b",
+        model="glm-5-2-3-bit",
         temperature=0
     )
     parser = PydanticOutputParser(pydantic_object=ManagerOutput)
@@ -184,7 +114,7 @@ def manager_agent_node(state: MasterState) -> Dict[str, Any]:
     response = parser.invoke(response_msg)
 
     logger.debug(f"Manager created {len(response.tasks)} expert tasks.")
-    return {"expert_tasks": response.tasks}
+    return {"expert_tasks": response.tasks, "messages": response_msg}
 
 
 def expert_agent_node(state: ExpertState) -> dict:
@@ -197,11 +127,11 @@ def expert_agent_node(state: ExpertState) -> dict:
 
     llm = ChatOpenAI(
         base_url="http://localhost:11434/v1",
-        model="mistral-3.5-128b",
+        model="glm-5-2-3-bit",
         temperature=0
     )
 
-    agent_tools = [SubmitReport]
+    agent_tools = [tools.submit_report]
     tool_names = EXPERT_AGENTS[role_name].get("tools", [])
     for name in tool_names:
         if hasattr(tools, name):
@@ -218,8 +148,7 @@ def expert_agent_node(state: ExpertState) -> dict:
 
         sys_msg_content = (
             f"{EXPERT_AGENTS[role_name]['prompt']}\n\n"
-            f"Operational Rules:\n{tool_rules}\n"
-            "When you have found vulnerabilities OR finished your audit, you MUST call the 'SubmitReport' tool to output your findings."
+            f"### Operational Rules\n\n{tool_rules}\n"
         )
         sys_msg = SystemMessage(content=sys_msg_content)
 
@@ -235,10 +164,6 @@ def expert_agent_node(state: ExpertState) -> dict:
         logger.debug(f"Continuing existing conversation for {role_name}. Message count: {len(state['messages'])}")
         messages = state["messages"]
 
-        # Strip dynamically generated IDs for cache
-        for msg in messages:
-            msg.id = None
-
         response = llm_with_tools.invoke(messages)
         messages = [response]
 
@@ -246,45 +171,29 @@ def expert_agent_node(state: ExpertState) -> dict:
     return {"messages": messages}
 
 
-def expert_router(state: ExpertState) -> Literal["execute_tools", "save_report", "__end__"]:
-    """Routes the sub-graph based on which tool the LLM decided to call."""
+def expert_agent_router(state: ExpertState) -> str:
     last_message = state["messages"][-1]
 
-    if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
-        logger.debug(f"Router ending execution: No tool calls found in the last message.")
-        return "__end__"
+    if last_message.tool_calls:
+        # Check if it called the termination tool
+        for tc in last_message.tool_calls:
+            if tc["name"] == "mark_task_complete":
+                return "__end__" 
 
-    for tool_call in last_message.tool_calls:
-        if tool_call["name"] == "SubmitReport":
-            logger.debug("Router directing to 'save_report_node'.")
-            return "save_report"
+        # Go to tools node
+        return "tools"
 
-    logger.debug(f"Router directing to 'execute_tools' for tools: {[tc['name'] for tc in last_message.tool_calls]}")
-    return "execute_tools"
+    # The LLM output plain text but DID NOT call a tool!
+    # Instead of ending, we route to a "nagging" node.
+    return "nag_agent"
 
 
-def save_report_node(state: ExpertState) -> dict:
-    """Intercepts the SubmitReport tool call, formats it, and prepares it for the Master Graph."""
-    role_name = state["task"].agent_role
-    logger.debug(f"Entering save_report_node for role: {role_name}")
-
-    last_message = state["messages"][-1]
-    reports = []
-
-    for tool_call in last_message.tool_calls:
-        if tool_call["name"] == "SubmitReport":
-            args = tool_call["args"]
-
-            for finding in args.get("findings", []):
-                reports.append({
-                    "role": role_name,
-                    "vulnerability": finding.get("vulnerability_type"),
-                    "details": finding.get("description"),
-                    "nodes": finding.get("affected_nodes")
-                })
-                logger.debug(f"Saved finding: {finding.get('vulnerability_type')} by {role_name}")
-
-    return {"vulnerability_reports": reports}
+def nag_agent_node(state: ExpertState):
+    """If the agent tries to chat instead of working, hit it with a system prompt."""
+    nag_message = SystemMessage(
+        content="You did not invoke any tools. You must either use `read_source_code`, `submit_single_finding`, or `mark_task_complete` to proceed."
+    )
+    return {"messages": [nag_message]}
 
 
 def dispatch_experts(state: MasterState):
@@ -317,11 +226,11 @@ def reviewer_node(state: MasterState):
     if not reports:
         logger.debug("No reports to review. Skipping.")
         return {"filtered_reports": []}
-    reports = reports[:1] # Analyze only the first one for testing the node
+    reports = reports[:10] # Analyze only the first one for testing the node
 
     llm = ChatOpenAI(
         base_url="http://localhost:11434/v1",
-        model="mistral-3.5-128b",
+        model="glm-5-2-3-bit",
         temperature=0
     )
     parser = PydanticOutputParser(pydantic_object=ReviewerOutput)
@@ -380,42 +289,34 @@ def reviewer_node(state: MasterState):
 # Build and Compile the Graph
 # ==========================================
 
-# Force sequential execution
-import threading
-expert_lock = threading.Lock()
-def expert_agent_wrapper(state, config: RunnableConfig):
-    with expert_lock:
-        # Create a fresh copy of the config so we don't mutate the master graph's config
-        child_config = config.copy()
-        # Remove the concurrency limit so the sub-graph has room to execute
-        child_config.pop("max_concurrency", None)
-        # Invoke the compiled sub-graph manually
-        return compiled_expert_agent.invoke(state, child_config)
+def build_graph(checkpointer=None):
 
-# Expert Sub-Graph
-expert_workflow = StateGraph(ExpertState)
-expert_workflow.add_node("expert", expert_agent_node)
-expert_workflow.add_node("execute_tools", ToolNode([tools.read_source_code]))
-expert_workflow.add_node("save_report", save_report_node)
-expert_workflow.add_edge(START, "expert")
-expert_workflow.add_conditional_edges("expert", expert_router)
-expert_workflow.add_edge("execute_tools", "expert")
-expert_workflow.add_edge("save_report", END)
-compiled_expert_agent = expert_workflow.compile()
+    # Expert Sub-Graph
+    expert_workflow = StateGraph(ExpertState)
+    expert_workflow.add_node("expert", expert_agent_node)
+    expert_workflow.add_node("tools", ToolNode([tools.submit_report, tools.read_source_code, tools.check_package_vulnerability]))
+    expert_workflow.add_node("nag_agent", nag_agent_node)
+    expert_workflow.add_edge(START, "expert")
+    expert_workflow.add_conditional_edges("expert", expert_agent_router)
+    expert_workflow.add_edge("tools", "expert")
+    expert_workflow.add_edge("nag_agent", "expert")
+    compiled_expert_agent = expert_workflow.compile()
 
-# Master Graph
-workflow = StateGraph(MasterState)
-workflow.add_node("preprocessor", preprocessor_node)
-workflow.add_node("manager", manager_agent_node)
-# workflow.add_node("expert_agent", compiled_expert_agent)
-workflow.add_node("expert_agent", expert_agent_wrapper)
-workflow.add_node("reviewer", reviewer_node)
-workflow.add_edge(START, "preprocessor")
-workflow.add_edge("preprocessor", "manager")
-workflow.add_conditional_edges("manager", dispatch_experts, ["expert_agent"])
-workflow.add_edge("expert_agent", "reviewer")
-workflow.add_edge("reviewer", END)
-app = workflow.compile()
+    # Master Graph
+    workflow = StateGraph(MasterState)
+    workflow.add_node("preprocessor", preprocessor_node)
+    workflow.add_node("manager", manager_agent_node)
+    workflow.add_node("expert_agent", compiled_expert_agent)
+    # workflow.add_node("expert_agent", expert_agent_wrapper)
+    workflow.add_node("reviewer", reviewer_node)
+    workflow.add_edge(START, "preprocessor")
+    workflow.add_edge("preprocessor", "manager")
+    workflow.add_conditional_edges("manager", dispatch_experts, ["expert_agent"])
+    workflow.add_edge("expert_agent", "reviewer")
+    workflow.add_edge("reviewer", END)
+    app = workflow.compile(checkpointer=checkpointer)
+
+    return app
 
 # ==========================================
 # Execution
@@ -432,11 +333,15 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S"
     )
 
+    app = build_graph()
     initial_state = MasterState(
         graph_path=os.path.join(settings.app_path, "graphify-out/graph.json"),
         app_summary="",
         communities_map={},
-        expert_tasks=[]
+        expert_tasks=[],
+        vulnerability_reports=[],
+        filtered_reports=[],
+        messages=[]
     )
 
     try:
