@@ -14,7 +14,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from langgraph.types import RetryPolicy
-from openai import LengthFinishReasonError
+from openai import BadRequestError, LengthFinishReasonError
 
 import settings
 import tools
@@ -245,6 +245,8 @@ def compile_integration_auditor():
 
 
 # Retry only transient errors: LengthFinishReasonError and other deterministic failures fail fast.
+# Context-length 400s belong in the same bucket: the prompt size is recomputed
+# identically on every attempt, so retrying just burns the attempt budget.
 try:  # lives in a private langgraph module; fall back to "retry others" if moved
     from langgraph._internal._retry import default_retry_on as default_retry_on
 except ImportError:  # pragma: no cover
@@ -255,6 +257,10 @@ except ImportError:  # pragma: no cover
 def _retry_on(exc):
     # RunStopped is the cooperative Ctrl+C unwind: retrying it would defeat the stop.
     if isinstance(exc, RunStopped):
+        return False
+    # A context-window 400 is deterministic: every retry resends the identical
+    # oversized prompt. Any other BadRequestError keeps the default behavior.
+    if isinstance(exc, BadRequestError) and "maximum context length" in str(exc):
         return False
     return default_retry_on(exc) and not isinstance(exc, LengthFinishReasonError)
 

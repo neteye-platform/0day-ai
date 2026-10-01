@@ -37,7 +37,10 @@ communities_to_analyze = None
 
 # Path patterns (relative to app root) skipped before analysis and blocked from
 # reviewer file reads; globs and bare dir names supported.
-scan_exclude_paths = []          # e.g. ["tests/", "docs/api/*", "**/migrations/*"]
+scan_exclude_paths = ["install/mysql/", "*.sql"]   # e.g. ["tests/", "docs/api/*", "**/migrations/*"]
+# SQL dumps/seeds (GLPI's install/mysql/*-empty.sql is ~400 KB) are unanalyzable
+# (no tree-sitter grammar) and were blowing the explorer's unmanaged prompt past
+# the model window; excluded by default.
 # Auto-exclude well-known dependency/test/doc paths even when the list is empty.
 scan_exclude_defaults = True
 
@@ -175,6 +178,14 @@ validator_variant_max_group = 6
 # Batch small nodes sharing a file into one explorer dispatch.
 explorer_batching_enabled = True
 explorer_batch_char_threshold = 15000
+# Hard cap on ONE explorer prompt (code + context + overhead). Explorer prompts
+# have NO compaction and _pack_node_batches lets an oversized node solo: a
+# DB-dump-sized file tokenizes past the model window -> deterministic HTTP 400.
+# 0.75 chars/token is a deliberately pessimistic worst case that keeps even
+# pathological tokenizers inside window - output budget - context_reserved.
+explorer_max_prompt_chars = int(
+    (model_context_window - llm_max_completion_tokens - context_reserved) * 0.75
+)
 
 # Max expert roles assigned per community (top-K by heuristic score).
 max_experts_per_community = 1
