@@ -142,11 +142,7 @@ class VulnerabilityRecord(BaseModel):
         ),
     )
     cwe_id: str = Field(
-        description=(
-            "The exact CWE ID. Mapping:\n"
-            "\n".join([f"{k}: {v}" for k, v in cwes.items()])
-        ),
-        json_schema_extra={"enum": list(cwes.keys())}
+        description="CWE ID of the vulnerability."
     )
     vulnerability_type: str = "Code Defect"
     description: str
@@ -490,14 +486,7 @@ class DemandEvaluation(BaseModel):
         )
     )
     reasoning: str = Field(description="Brief explanation referencing specific lines of code.")
-    cwe_id: Optional[str] = Field(
-        default=None, 
-        description=(
-            "If status is FAILED, provide the exact CWE ID that best represents this broken assumption. Mapping:\n"
-            "\n".join([f"{k}: {v}" for k, v in cwes.items()])
-        ),
-        json_schema_extra={"enum": list(cwes.keys())}
-    )
+    cwe: Optional[CWE_KEYS] = Field(description="The matching CWE ID from the provided list.")
 
 class VerifierOutput(BaseModel):
     evaluations: list[DemandEvaluation]
