@@ -27,43 +27,33 @@ from utils import estimate_message_tokens
 
 
 class CompactionConfig:
-    """Settings-backed compaction budget for one tool-loop agent.
+    """Settings-backed compaction budget shared by every tool-loop agent.
 
-    Reads ``settings.model_context_window`` (one general setting) and
-    ``settings.<prefix>_*`` friends live (on every call) so runtime overrides
-    stay effective, exactly as the original nodes read their
-    ``settings.reviewer_*`` / ``settings.validator_*`` values.
+    Reads the single shared compaction budget (``settings.context_reserved``,
+    ``settings.hard_reserved``, etc.) plus ``settings.model_context_window``
+    and ``settings.llm_max_completion_tokens`` live (on every call) so runtime
+    overrides stay effective.
     """
 
-    __slots__ = ("prefix",)
-
-    def __init__(self, prefix: str):
-        self.prefix = prefix
-
-    def _get(self, name: str) -> int:
-        # model_context_window is a single general setting shared by all agents;
-        # everything else is read per-prefix (e.g. settings.reviewer_context_reserved).
-        if name == "model_context_window":
-            return getattr(settings, "model_context_window")
-        return getattr(settings, f"{self.prefix}_{name}")
+    __slots__ = ()
 
     def threshold(self) -> int:
         """Estimated-token threshold at which soft-threshold compaction triggers."""
-        return self._get("model_context_window") - self._get("context_reserved")
+        return settings.model_context_window - settings.context_reserved
 
     def hard_cap(self) -> int:
         """Estimated-token ceiling below which the LLM must never be invoked.
 
         Reserves both the configured hard margin AND the per-request output
-        budget (``<prefix>_max_completion_tokens``): the OpenAI-compat gateway
+        budget (``llm_max_completion_tokens``): the OpenAI-compat gateway
         rejects any request whose input + requested output exceeds the model
         window, so the estimated input alone must stay under
         ``window - output_budget - hard_reserved``.
         """
         return (
-            self._get("model_context_window")
-            - self._get("max_completion_tokens")
-            - self._get("hard_reserved")
+            settings.model_context_window
+            - settings.llm_max_completion_tokens
+            - settings.hard_reserved
         )
 
     @property
@@ -71,23 +61,23 @@ class CompactionConfig:
         """Char size above which a single AI/tool message is considered
         oversized and demoted out of the verbatim tail into the compressible
         middle (see ``_split_agent_history``). No truncation is applied."""
-        return self._get("max_response_chars")
+        return settings.max_response_chars
 
     @property
     def tail_turns(self) -> int:
-        return self._get("compaction_tail_turns")
+        return settings.compaction_tail_turns
 
     @property
     def min_compressible(self) -> int:
-        return self._get("compaction_min_compressible_tokens")
+        return settings.compaction_min_compressible_tokens
 
     @property
     def model_context_window(self) -> int:
-        return self._get("model_context_window")
+        return settings.model_context_window
 
     @property
     def hard_reserved(self) -> int:
-        return self._get("hard_reserved")
+        return settings.hard_reserved
 
 
 def _split_agent_history(
@@ -326,7 +316,7 @@ class ToolLoopAgent:
 
     def summarize(self, middle: list[AnyMessage]) -> SystemMessage | None:
         # The cheap summarizer is a fast_llm call with its own output budget
-        # (settings.fast_max_completion_tokens); its transcript (rendered inside
+        # (settings.llm_max_completion_tokens); its transcript (rendered inside
         # the summary prompt) must fit window - output budget - hard reserved.
         # The token estimate is deliberately ~2.9x over real prose, so an
         # over-budget estimate usually means ONE degenerate single message (a
@@ -338,7 +328,7 @@ class ToolLoopAgent:
         # None and callers fail open as usual.
         summarizer_budget = (
             self.compaction.model_context_window
-            - settings.fast_max_completion_tokens
+            - settings.llm_max_completion_tokens
             - self.compaction.hard_reserved
         )
         working = list(middle)

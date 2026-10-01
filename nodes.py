@@ -37,7 +37,7 @@ fast_llm = ChatOpenAI(
     api_key=settings.llm_api_key,
     stream_usage=True,
     temperature=0.2,
-    max_completion_tokens=settings.fast_max_completion_tokens,
+    max_completion_tokens=settings.llm_max_completion_tokens,
     reasoning_effort="none",
     http_client=build_debug_http_client(),
 )
@@ -47,7 +47,7 @@ smart_llm = ChatOpenAI(
     api_key=settings.llm_api_key,
     stream_usage=True,
     temperature=0.8,
-    max_completion_tokens=settings.smart_max_completion_tokens,
+    max_completion_tokens=settings.llm_max_completion_tokens,
     reasoning_effort="medium",
     http_client=build_debug_http_client(),
 )
@@ -57,7 +57,7 @@ reviewer_llm = ChatOpenAI(
     api_key=settings.llm_api_key,
     stream_usage=True,
     temperature=0.8,
-    max_completion_tokens=settings.reviewer_max_completion_tokens,
+    max_completion_tokens=settings.llm_max_completion_tokens,
     reasoning_effort="low",
     http_client=build_debug_http_client(),
 )
@@ -1520,7 +1520,7 @@ def _contract_verifier_node(state: VerifierState) -> dict:
 
     # Chunked LLM invocation: the verifier emits one evaluation per demand, so
     # output size scales with the demand count and a hub node (200+ demands)
-    # truncates a single call at fast_max_completion_tokens (finish_reason:
+    # truncates a single call at llm_max_completion_tokens (finish_reason:
     # length). Split the formatted demands into batches, evaluate each in its
     # own structured call against the same target code, and merge the
     # evaluations in order — every demand still gets exactly one evaluation.
@@ -1919,7 +1919,7 @@ class ReviewerAgent(ToolLoopAgent):
 reviewer_agent = ReviewerAgent(
     name="reviewer",
     settings_prefix="reviewer",
-    compaction=CompactionConfig(prefix="reviewer"),
+    compaction=CompactionConfig(),
     summary_ledger=REVIEWER_SUMMARY_LEDGER,
     summary_llm=fast_llm,
 )
@@ -2257,7 +2257,7 @@ class IntegrationAuditorAgent(ToolLoopAgent):
 integration_auditor_agent = IntegrationAuditorAgent(
     name="integration_auditor",
     settings_prefix="integration_auditor",
-    compaction=CompactionConfig(prefix="integration_auditor"),
+    compaction=CompactionConfig(),
     summary_ledger=INTEGRATION_AUDITOR_SUMMARY_LEDGER,
     summary_llm=fast_llm,
 )
@@ -2568,7 +2568,7 @@ class ValidatorAgent(ToolLoopAgent):
 validator_agent = ValidatorAgent(
     name="validator",
     settings_prefix="validator",
-    compaction=CompactionConfig(prefix="validator"),
+    compaction=CompactionConfig(),
     summary_ledger=VALIDATOR_SUMMARY_LEDGER,
     summary_llm=fast_llm,
 )
