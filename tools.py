@@ -797,6 +797,31 @@ def submit_integration_audit(
     )
 
 
+def _compile_pattern(keyword: str, is_regex: bool) -> re.Pattern:
+    if not is_regex:
+        return re.compile(re.escape(keyword))
+
+    try:
+        return re.compile(keyword)
+    except re.error:
+        # Split only on pipes NOT preceded by an odd number of backslashes
+        branches = re.split(r'(?<!\\)\|', keyword)
+        if len(branches) > 1:
+            safe_branches = []
+            for branch in branches:
+                branch = branch.strip()
+                if not branch:
+                    continue
+                try:
+                    re.compile(branch)
+                    safe_branches.append(branch)
+                except re.error:
+                    safe_branches.append(re.escape(branch))
+            return re.compile("|".join(safe_branches))
+
+        return re.compile(re.escape(keyword))
+
+
 @tool
 def search_codebase(keyword: str, state: Annotated[dict, InjectedState], regex: bool = True) -> str:
     """
@@ -824,14 +849,7 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState], regex: 
     results = []
     match_count = 0
     MAX_MATCHES = 20 # prevent context window overflow
-    regex_fallbacks = []
-    try:
-        query = re.compile(keyword) if regex else re.escape(keyword)
-    except re.error as e:
-        regex_fallbacks.append(
-            f"NOTE: {keyword!r} was an invalid regular expression ({e}); searched as a literal string instead."
-        )
-        query = re.escape(keyword)
+    query = _compile_pattern(keyword, regex)
 
     # Recursively search all files
     for file_path in app_dir.rglob("*"):
@@ -877,12 +895,10 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState], regex: 
             # Safely skip binary files (images, compiled files, etc.)
             continue
 
-    prefix = "\n".join(regex_fallbacks) + "\n" if regex_fallbacks else ""
-
     if not results:
-        return f"{prefix}No matches found for '{keyword}'."
+        return f"No matches found for '{keyword}'."
 
-    return prefix + "\n".join(results)
+    return "\n".join(results)
 
 
 @tool
