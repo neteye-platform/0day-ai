@@ -77,14 +77,11 @@ SYSTEMIC_CWES = {
     "CWE-915",  # Improperly Controlled Modification of Dynamically-Determined Object Attributes (Mass Assignment)
 }
 
-CWE_KEYS = Literal[
-    "CWE-119", "CWE-416", "CWE-476", "CWE-190", "CWE-362", "CWE-89",
-    "CWE-78", "CWE-79", "CWE-94", "CWE-918", "CWE-862", "CWE-863",
-    "CWE-915", "CWE-639", "CWE-306", "CWE-352", "CWE-384", "CWE-200",
-    "CWE-319", "CWE-327", "CWE-502", "CWE-807", "CWE-287", "CWE-307",
-    "CWE-22", "CWE-434", "CWE-770", "CWE-284",
-    "CWE-20", "CWE-444", "CWE-840", "OTHER_UNCATEGORIZED"
-]
+# Deterministic (numerically sorted) rendering used in LLM-facing field
+# descriptions, so the wording never drifts from the allowlist above.
+_SYSTEMIC_CWE_LABEL = ", ".join(sorted(SYSTEMIC_CWES, key=lambda c: int(c.split("-")[1])))
+
+CWE_KEYS = Literal[tuple(cwes.keys())]
 
 
 # A canonical systemic signature must be a short pattern label. Verbose
@@ -465,8 +462,8 @@ class Hypothesis(BaseModel):
     pattern_label: Optional[str] = Field(
         default=None,
         description=(
-            "Short canonical name (≤6 lowercase words) REQUIRED for architectural flaws: "
-            "CWE-306, CWE-307, CWE-319, CWE-327, CWE-352, CWE-384, CWE-840, CWE-915. "
+            f"Short canonical name (≤6 lowercase words) REQUIRED for architectural flaws: "
+            f"{_SYSTEMIC_CWE_LABEL}. "
             "Leave null for localized injection defects."
         ),
     )
