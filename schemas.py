@@ -1,12 +1,14 @@
 from pydantic import BaseModel, Field
 from typing import List, Literal
 import json
+import yaml
 
 
-with open("agents.json", "r") as f:
-    data = json.load(f)
-    EXPERT_AGENTS = data.get("agents")
+with open("agents.yaml", "r") as f:
+    data = yaml.safe_load(f)
+    EXPERT_AGENTS = data.get("expert_agents")
     TOOLS = data.get("tools")
+    REVIEWER_AGENT = data.get("reviewer_agent")
 
 CWEs = Literal[
     # --- MEMORY SAFETY (C / C++ / Rust-unsafe) ---
@@ -84,5 +86,5 @@ class VulnerabilityEvaluation(BaseModel):
     reasoning: str = Field(description="Brief technical explanation for the decision.")
 
 class ReviewerOutput(BaseModel):
-    evaluations: List[VulnerabilityEvaluation]
+    reports: List[VulnerabilityEvaluation]
 
