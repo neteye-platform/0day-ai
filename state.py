@@ -17,9 +17,10 @@ class MasterState(TypedDict):
 class ExpertState(TypedDict):
     task: ExpertTask
     subgraph_nodes: list[str]
+    unprocessed_nodes: list[str]
     messages: Annotated[list, add_messages] # Tracks the conversation and tool calls
     vulnerability_reports: Annotated[list[dict[str, Any]], operator.add]
-    notes: Annotated[list[str], operator.add]
+    notes: Annotated[list[dict], operator.add]
 
 class ReviewerState(TypedDict):
     report_id: str

@@ -1,21 +1,23 @@
+import json
 import os
 import settings
 import logging
 import argparse
+import hashlib
 from typing import Any
 from collections import defaultdict
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from langgraph.types import Send
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 
 import tools
-from utils import build_networkx_graph, run_stream, compact_tool_history
+from utils import build_networkx_graph, run_stream, compact_tool_history, format_notes, get_node_source_code
 from state import MasterState, ExpertState, ReviewerState, ValidatorState
-from schemas import ManagerOutput, MANAGER_AGENT, EXPERT_AGENTS, REVIEWER_AGENT, VALIDATOR_AGENT, TOOLS
+from schemas import ExpertTask, ManagerOutput, MANAGER_AGENT, EXPERT_AGENTS, REVIEWER_AGENT, VALIDATOR_AGENT, TOOLS, TakeNoteInput
 
 # ==========================================
 # Preprocessor
@@ -42,7 +44,20 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
         f"Community Breakdown:\n"
     )
 
-    for comm_id, nodes_data in communities_map.items():
+    counter = 0
+    max_comm = 50
+
+    sorted_communities = sorted(
+        communities_map.items(),
+        key=lambda x: int(x[0]) if x[0].isdigit() else x[0]
+    )
+
+    for comm_id, nodes_data in sorted_communities:
+        counter += 1
+        if counter > max_comm:
+            logging.warning("Truncated the number of communities of this application")
+            break
+
         node_ids = [n[0] for n in nodes_data]
 
         # Node Types
@@ -63,7 +78,7 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
         subgraph = G.subgraph(node_ids)
         if len(subgraph.nodes) > 0:
             degrees = dict(subgraph.degree())
-            god_node = max(degrees, key=degrees.__getitem__)
+            god_node = max(degrees, key=lambda x: (degrees[x], x))
         else:
             god_node = "None"
 
@@ -84,18 +99,30 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
 
 def manager_agent_node(state: MasterState) -> dict[str, Any]:
     """The Manager LLM reads the programmatic summary and dispatches tasks."""
+    # ----------------------
+    # Check cache
+    # ----------------------
+    # Create a hash of the app_summary so the cache auto-invalidates if the graph changes
+    summary_hash = hashlib.md5(state.get("app_summary", "").encode()).hexdigest()
+    cache_file = settings.manager_cache_dir / f"manager_tasks_{summary_hash}.json"
 
-    # from schemas import ExpertTask
-    # return {"expert_tasks": [ExpertTask(
-    #         agent_role="InfraConfigAuditor",
-    #         target_communities=[
-    #             "8",
-    #             "2"
-    #         ],
-    #         task_description="Audit the Docker Compose configuration in Community 8 for security best practices (e.g., non-root users, exposed ports). Review Community 2's requirements to ensure no vulnerable or outdated dependencies are present that could compromise the container environment."
-    #     )
-    # ]}
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r") as f:
+                cached_data = json.load(f)
 
+            # Reconstruct the Pydantic objects and the AIMessage
+            expert_tasks = [ExpertTask(**task) for task in cached_data.get("expert_tasks", [])]
+            manager_message = AIMessage(content=cached_data.get("manager_message", ""))
+
+            logging.debug("Loaded Manager tasks from cache.")
+            return {"expert_tasks": expert_tasks, "manager_message": manager_message}
+        except Exception as e:
+            logging.warning(f"Manager cache corrupted or schema changed. Re-generating... ({e})")
+
+    # ----------------------
+    # LLM invocation
+    # ----------------------
     llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
     # llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="glm-5-2", temperature=0)
 
@@ -110,22 +137,174 @@ def manager_agent_node(state: MasterState) -> dict[str, Any]:
     response_msg = llm.invoke([sys_msg, human_msg])
     response = parser.invoke(response_msg)
 
+    # ----------------------
+    # Save to cache
+    # ----------------------
+    try:
+        cache_data = {
+            # Convert Pydantic objects to dicts
+            "expert_tasks": [task.model_dump() for task in response.tasks],
+            # Extract the raw text from the AIMessage
+            "manager_message": response_msg.content
+        }
+        with open(cache_file, "w") as f:
+            json.dump(cache_data, f, indent=2)
+        logging.debug("Saved Manager tasks to cache.")
+    except Exception as e:
+        logging.warning(f"Failed to write Manager cache: {e}")
+
     return {"expert_tasks": response.tasks, "manager_message": response_msg}
 
 # ==========================================
 # Expert agents
 # ==========================================
 
-def expert_agent_node(state: ExpertState) -> dict:
-    role_name = state["task"].agent_role
+def expert_explorer_node(state: ExpertState) -> dict:
+    if isinstance(state["task"], dict):
+        task = ExpertTask(**state["task"])
+    else:
+        task = state["task"]
 
-    if not state.get("subgraph_nodes"):
-        return {"vulnerability_reports": []}
+    unprocessed = state.get("unprocessed_nodes")
+    if unprocessed is None:
+        unprocessed = list(state.get("subgraph_nodes", []))
+
+    if not unprocessed:
+        return {}
+
+    current_node = unprocessed.pop(0)
+    role_name = task.agent_role
+
+    # ----------------------
+    # Check cache
+    # ----------------------
+    cache_file = settings.expert_explorer_cache_dir / f"{current_node}-{role_name}.json"
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r") as f:
+                cached_note = json.load(f)
+            logging.debug(f"Loaded note for {current_node} from cache.")
+            return {
+                "unprocessed_nodes": unprocessed,
+                "notes": [cached_note]
+            }
+        except json.JSONDecodeError:
+            logging.warning(f"Cache file {cache_file} corrupted. Re-generating...")
+
+    # ----------------------
+    # LLM invocation
+    # ----------------------
+    source_code = get_node_source_code(settings.graph, current_node)
 
     llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
     # llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="glm-5-2", temperature=0)
 
-    agent_tools = [tools.submit_report]
+    parser = PydanticOutputParser(pydantic_object=TakeNoteInput)
+    sys_msg = SystemMessage(content=(
+        f"{EXPERT_AGENTS[role_name]['prompt']}\n\n"
+        "Your ONLY job is to read the code and take a structured note. "
+        "You must extract sources, sinks, and assumptions."
+    ))
+    human_msg = HumanMessage(content=(
+        f"Analyze this node: {current_node}\n\n```python\n{source_code}\n```\n\n"
+        f"{parser.get_format_instructions()}"
+    ))
+
+    # structured_llm = llm.with_structured_output(TakeNoteInput)
+    response = llm.invoke([sys_msg, human_msg])
+    note = parser.invoke(response)
+    dict_note = note if isinstance(note, dict) else note.model_dump()
+
+    # ----------------------
+    # Node ID resolution
+    # ----------------------
+    with open(settings.graph, "r") as f:
+        graph_data = json.load(f)
+        nodes_list = graph_data.get("nodes", [])
+
+    items_to_resolve = dict_note.get("assumptions_to_verify", []) + dict_note.get("potential_issues", [])
+    for item in items_to_resolve:
+        depends_on = item.get("depends_on")
+        if not depends_on:
+            continue
+
+        module = depends_on.get("module")
+        symbol = depends_on.get("symbol")
+        if not module or not symbol:
+            continue
+
+        node = next(
+            (n for n in nodes_list 
+             if n.get("source_file", "").endswith(module.replace(".", "/") + ".py")
+             and n.get("label") in [symbol, f"{symbol}()"]),
+            None
+        )
+
+        if not node:
+            logging.warning(f"Failed to find graph node for local symbol '{module}.{symbol}'.")
+            continue
+
+        depends_on["resolved_node_id"] = node.get("id")
+
+    # ----------------------
+    # Save to cache
+    # ----------------------
+    try:
+        with open(cache_file, "w") as f:
+            json.dump(dict_note, f, indent=2)
+        logging.debug(f"Saved note for {current_node} to cache.")
+    except Exception as e:
+        logging.warning(f"Failed to write cache file for {current_node}: {e}")
+
+    return {
+        "unprocessed_nodes": unprocessed,
+        "notes": [dict_note]
+    }
+
+
+def expert_researcher_node(state: ExpertState) -> dict:
+    if isinstance(state["task"], dict):
+        task = ExpertTask(**state["task"])
+    else:
+        task = state["task"]
+
+    role_name = task.agent_role
+    community_id = task.target_community
+
+    # ----------------------
+    # Check cache
+    # ----------------------
+    cache_file = settings.expert_researcher_cache_dir / f"{community_id}-{role_name}.json"
+
+    # Only check the cache if this is the very first time we enter this node 
+    if not state.get("messages") and cache_file.exists():
+        try:
+            with open(cache_file, "r") as f:
+                cached_reports = json.load(f)
+            logging.debug(f"Loaded cached reports for Community {community_id} ({role_name}).")
+
+            # Create a mock AIMessage that forces the router to end the subgraph
+            mock_completion = AIMessage(
+                content="Loaded from cache.",
+                tool_calls=[{"name": "mark_task_complete", "args": {}, "id": "cache_hit_id"}]
+            )
+            return {
+                "vulnerability_reports": cached_reports,
+                "messages": [mock_completion]
+            }
+        except json.JSONDecodeError:
+            logging.warning(f"Cache file {cache_file} corrupted. Re-generating...")
+
+    # ----------------------
+    # LLM invocation
+    # ----------------------
+    llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
+    # llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="glm-5-2", temperature=0)
+
+    agent_tools = [
+        tools.submit_report,
+        tools.mark_task_complete
+    ]
     tool_names = EXPERT_AGENTS[role_name].get("tools", [])
     for name in tool_names:
         if hasattr(tools, name):
@@ -134,13 +313,14 @@ def expert_agent_node(state: ExpertState) -> dict:
     llm_with_tools = llm.bind_tools(agent_tools)
 
     if not state.get("messages"):
+        notes_str = format_notes(state.get("notes", []))
         sys_msg = SystemMessage(content=(
             f"{EXPERT_AGENTS[role_name]['prompt']}\n\n"
             f"{EXPERT_AGENTS['prompt']}"
         ))
         human_msg = HumanMessage(content=(
-            f"Your Task: {state['task'].task_description}\n\n"
-            f"Your Assigned Nodes: {state['subgraph_nodes']}"
+            f"Your Task: {task.task_description}\n\n"
+            f"## Audit Notes for Assigned Community\n\n{notes_str}"
         ))
 
         messages = [sys_msg, human_msg]
@@ -148,19 +328,21 @@ def expert_agent_node(state: ExpertState) -> dict:
         messages = [sys_msg, human_msg, response]
     else:
         compacted_messages = compact_tool_history(state["messages"], safe_window=8)
+        response = llm_with_tools.invoke(compacted_messages)
+        messages = [response]
 
-        dynamic_msgs = []
-        if state.get("notes"):
-            notes_str = "\n".join([f"- {n}" for n in state["notes"]])
-            saved_notes = f"\n\n### Persistent Scratchpad\n{notes_str}\n"
-            dynamic_msgs.append(HumanMessage(content=saved_notes))
-
-        sys_msg = compacted_messages[0]
-        human_msg = compacted_messages[1]
-        messages = [sys_msg, human_msg] + dynamic_msgs + compacted_messages[2:]
-
-        response = llm_with_tools.invoke(messages)
-        return {"messages": [response]}
+    # ----------------------
+    # Save to cache
+    # ----------------------
+    # If the LLM decides to finish the task, save the accumulated reports to disk
+    is_complete = any(tc["name"] == "mark_task_complete" for tc in response.tool_calls)
+    if is_complete:
+        try:
+            with open(cache_file, "w") as f:
+                json.dump(state.get("vulnerability_reports", []), f, indent=2)
+            logging.debug(f"Saved reports to cache for Community {community_id} ({role_name}).")
+        except Exception as e:
+            logging.warning(f"Failed to write cache for Community {community_id}: {e}")
 
     return {"messages": messages}
 
@@ -169,16 +351,30 @@ def expert_agent_router(state: ExpertState):
     last_message = state["messages"][-1]
 
     if last_message.tool_calls:
-        # Check if it called the termination tool
-        for tc in last_message.tool_calls:
-            if tc["name"] == "mark_task_complete":
-                return "__end__"
+        tool_names = [tc["name"] for tc in last_message.tool_calls]
+
+        # If it has other tools to run (like submit_report), force it to the ToolNode first
+        if "mark_task_complete" in tool_names and len(tool_names) == 1:
+            return "__end__"
 
         # Go to tools node
         return "tools"
 
     # The LLM failed to call a tool
     return "ask_expert_for_tool"
+
+
+def route_expert_phases(state: ExpertState) -> str:
+    unprocessed = state.get("unprocessed_nodes")
+
+    # Initialize check on first run
+    if unprocessed is None:
+        unprocessed = state.get("subgraph_nodes", [])
+
+    if len(unprocessed) == 0:
+        return "expert_researcher_node"
+    return "expert_explorer_node"
+
 
 def ask_expert_for_tool(state: ExpertState):
     """Fallback node to force the LLM to use a tool."""
@@ -191,17 +387,28 @@ def ask_expert_for_tool(state: ExpertState):
 def dispatch_experts(state: MasterState):
     """Reads the Manager's instructions and creates a list of 'Send' objects."""
 
+    # G = build_networkx_graph(state["graph_path"])
     commands: list[Send] = []
-    for task in state["expert_tasks"]:
-        nodes_for_task = []
-        for comm_id in task.target_communities:
-            clean_id = comm_id.lower().replace("community ", "").strip()
-            nodes_for_task.extend(state["communities_map"].get(clean_id, []))
 
+    for task in state["expert_tasks"]:
+        clean_id = task.target_community.lower().replace("community ", "").strip()
+        nodes_for_task = state["communities_map"].get(clean_id, [])
+
+        # # Filter out skeleton nodes, but keep functions, classes, and non-code files
+        # for node in community_nodes:
+        #     for node_id, data in G.nodes(data=True):
+        #         if node_id == node:
+        #             if not data.get("source_file", "").endswith(data.get("label")):
+        #                 nodes_for_task.append(node)
+        #                 break
 
         payload = ExpertState(
             task=task,
-            subgraph_nodes=nodes_for_task
+            subgraph_nodes=nodes_for_task,
+            unprocessed_nodes=nodes_for_task.copy(),
+            messages=[],
+            vulnerability_reports=[],
+            notes=[]
         )
         commands.append(Send("expert_agent", payload))
 
@@ -263,8 +470,7 @@ def reviewer_agent_node(state: ReviewerState) -> dict:
         tools.read_source_code,
         tools.search_codebase,
         tools.get_node_connections,
-        tools.submit_evaluation,
-        tools.take_notes
+        tools.submit_evaluation
     ])
 
     # Use a slightly larger safe_window for the reviewer
@@ -391,25 +597,42 @@ def ask_validator_for_tool(state: ValidatorState):
 # Build and Compile the Graph
 # ==========================================
 
-def build_graph(checkpointer=None, interrupt_before=None):
-
-    # Expert Sub-Graph
+def compile_expert():
     expert_workflow = StateGraph(ExpertState)
-    expert_workflow.add_node("expert", expert_agent_node)
+    expert_workflow.add_node("expert_explorer", expert_explorer_node)
+    expert_workflow.add_node("expert_researcher", expert_researcher_node)
     expert_workflow.add_node("ask_expert_for_tool", ask_expert_for_tool)
     expert_workflow.add_node("tools", ToolNode([
         tools.submit_report,
-        tools.read_source_code,
-        tools.check_package_vulnerability,
-        tools.take_notes
+        tools.mark_task_complete,
+        tools.check_package_vulnerability
     ]))
-    expert_workflow.add_edge(START, "expert")
-    expert_workflow.add_conditional_edges("expert", expert_agent_router)
-    expert_workflow.add_edge("tools", "expert")
-    expert_workflow.add_edge("ask_expert_for_tool", "expert")
+    expert_workflow.add_edge(START, "expert_explorer")
+    expert_workflow.add_conditional_edges(
+        "expert_explorer",
+        route_expert_phases,
+        {
+            "expert_explorer_node": "expert_explorer",
+            "expert_researcher_node": "expert_researcher"
+        }
+    )
+    expert_workflow.add_conditional_edges(
+        "expert_researcher",
+        expert_agent_router,
+        {
+            "tools": "tools",
+            "ask_expert_for_tool": "ask_expert_for_tool",
+            "__end__": END
+        }
+    )
+    expert_workflow.add_edge("tools", "expert_researcher")
+    expert_workflow.add_edge("ask_expert_for_tool", "expert_researcher")
     compiled_expert_agent = expert_workflow.compile()
 
-    # Reviewer Sub-Graph
+    return compiled_expert_agent
+
+
+def compile_reviewer():
     reviewer_workflow = StateGraph(ReviewerState)
     reviewer_workflow.add_node("reviewer_agent", reviewer_agent_node)
     reviewer_workflow.add_node("ask_reviewer_for_tool", ask_reviewer_for_tool)
@@ -426,7 +649,10 @@ def build_graph(checkpointer=None, interrupt_before=None):
     reviewer_workflow.add_edge("ask_reviewer_for_tool", "reviewer_agent")
     compiled_reviewer_agent = reviewer_workflow.compile()
 
-    # Validator Sub-Graph
+    return compiled_reviewer_agent
+
+
+def compile_validator():
     validator_workflow = StateGraph(ValidatorState)
     validator_workflow.add_node("validator_agent", validator_agent_node)
     validator_workflow.add_node("ask_validator_for_tool", ask_validator_for_tool)
@@ -440,6 +666,13 @@ def build_graph(checkpointer=None, interrupt_before=None):
     validator_workflow.add_edge("validator_tools", "validator_agent")
     validator_workflow.add_edge("ask_validator_for_tool", "validator_agent")
     compiled_validator_agent = validator_workflow.compile()
+
+    return compiled_validator_agent 
+
+def build_graph(checkpointer=None, interrupt_before=None):
+    compiled_expert_agent = compile_expert()
+    compiled_reviewer_agent = compile_reviewer()
+    compiled_validator_agent = compile_validator()
 
     # Master Graph
     workflow = StateGraph(MasterState)
