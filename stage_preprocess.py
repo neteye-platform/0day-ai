@@ -84,7 +84,13 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
             raw_vulns = run_osv_scanner(settings.app_path)
 
         sandbox_future = (
-            pool.submit(start_sandbox, *sandbox_target, settings.app_path.name)
+            pool.submit(
+                start_sandbox, *sandbox_target, settings.app_path.name,
+                # A prior scan whose Patcher docker-cp'd fixes into the live
+                # container left them in its layer: recreate so this scan
+                # starts from the pristine image.
+                settings.patcher_enabled,
+            )
             if sandbox_target else None
         )
         # Artifact snapshot depends on the images only, not on sandbox success.
@@ -118,4 +124,5 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
     return {
         "known_vulns": clean_vulns,
         "sandbox_url": sandbox_data["sandbox_url"] if sandbox_data else None,
+        "sandbox_container": sandbox_data["container_name"] if sandbox_data else None,
     }

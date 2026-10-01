@@ -15,7 +15,7 @@ if _missing:
 
 # ============================ Target settings ============================
 
-app_path = Path("../apps/glpi-11.0.7-clean")
+app_path = Path("../apps/glpi")
 
 graph = app_path / "graphify-out" / "graph.json"
 cache_dir = app_path / ".cache"
@@ -32,8 +32,8 @@ repair_call_edges = True
 container_demands_scope_to_members = True
 
 # None = all
-# communities_to_analyze = None
-communities_to_analyze = [0, 1, 2, 3, 5, 9, 12, 54, 77, 115, 150, 158, 205, 403]
+communities_to_analyze = None
+# communities_to_analyze = [0, 1, 2, 3, 5, 9, 12, 54, 77, 115, 150, 158, 205, 403]
 
 # Path patterns (relative to app root) skipped before analysis and blocked from
 # reviewer file reads; globs and bare dir names supported.
@@ -79,6 +79,28 @@ integration_auditor_countdown_start = max(1, integration_auditor_max_iterations 
 # Max times the Validator may request more context from the Reviewer per record;
 # past this it must conclude on the evidence it has.
 validator_feedback_max_rounds = 1
+
+## ---- Patcher agent ----
+
+# Post-validator fixer: patches the SOURCE CODE of the target application to
+# block the exact flow of every validator-proven exploitable record (minimal,
+# surgical edits only — no refactoring, no best-practice extras). After the
+# edits, the sandbox is resynced to the patched code and each patched record is
+# re-reviewed against the patched source; a re-confirmed record is validated
+# again in the resynced sandbox. When False the whole stage is inert and the
+# pipeline behaves exactly as before the feature existed.
+patcher_enabled = False
+# Tool-loop cap for one patcher run (read + edit + submit_patch turns).
+patcher_max_iterations = 30
+patcher_countdown_start = max(1, patcher_max_iterations - COUNTDOWN_LEAD_TURNS)
+# Patch attempts allowed per record. The patcher -> reviewer -> validator fix
+# loop re-runs while a re-validated patch was REJECTED and this budget is left;
+# a record still rejected at budget exhaustion ships flagged as not fixed.
+patcher_max_attempts = 2
+# Cap on file edits a single patch may apply (minimalism enforced mechanically).
+patcher_max_edits = 6
+# Replacement chunks above this line count bounce as "refactoring, not patching".
+patcher_max_edit_lines = 40
 
 ## ---- Tool-loop context compaction ----
 
@@ -245,8 +267,9 @@ force_rebuild = False
 
 # Tracing itself stays purely env-driven (LANGSMITH_TRACING / LANGSMITH_API_KEY
 # in .env); these settings only control HOW traces are split. When enabled, the
-# three tool-loop subagents (reviewer, validator, integration auditor) run with
-# their own LangSmith project, so their runs navigate as separate traces instead
+# four tool-loop subagents (reviewer, validator, integration auditor, patcher)
+# run with their own LangSmith project, so their runs navigate as separate
+# traces instead
 # of bloating the single giant pipeline trace (25k-run-per-trace cap). Every
 # run is tagged `agent:<name>` and carries `pipeline_run_id` metadata for
 # cross-project correlation with the main trace. No effect unless tracing is
@@ -260,6 +283,7 @@ langsmith_split_projects = {
     "reviewer": f"{langsmith_project}-reviewer",
     "validator": f"{langsmith_project}-validator",
     "integration_auditor": f"{langsmith_project}-integration-auditor",
+    "patcher": f"{langsmith_project}-patcher",
 }
 
 # osv-scanner results are cached under <cache_dir>/osv keyed by target identity

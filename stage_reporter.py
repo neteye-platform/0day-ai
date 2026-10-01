@@ -21,9 +21,17 @@ from utils import cache_reporter, cvss_severity_label, cvss_v3_base_score
 
 
 # Reportable = proven exploitable, or confirmed with a static-only proof.
-# false_positive / unchainable / review_error / unproven are excluded.
+# false_positive / unchainable / review_error / unproven are excluded — except
+# a false positive reached THROUGH the patch lifecycle: the auto-verified fix is
+# itself the deliverable, and its section documents the applied patch.
 def _is_reportable(record: dict) -> bool:
     if record.get("status") == "exploitable":
+        return True
+    if (
+        record.get("status") == "false_positive"
+        and record.get("patch_diff")
+        and record.get("patch_state") in ("reviewed", "verified")
+    ):
         return True
     return (
         record.get("status") == "confirmed"
@@ -147,6 +155,23 @@ def _build_pipeline_statistics(state: MasterState) -> str:
         f"| Vulnerability findings reported | {len(state.get('reporter_findings', []))} |",
     ]
 
+    if stats.get("patcher_records"):
+        patched_verified = sum(
+            1
+            for v in as_dicts(state.get("vulnerabilities", []))
+            if v.get("patch_state") == "verified"
+        )
+        patched_attempts = sum(
+            (v.get("patch_round") or 0)
+            for v in as_dicts(state.get("vulnerabilities", []))
+        )
+        lines += [
+            f"| Records dispatched to the Patcher | {stats['patcher_records']} |",
+            f"| Patch attempts banked (edits applied to source) | {patched_attempts} |",
+            f"| Reviewer patch re-checks | {stats.get('reviewer_patch_rechecks', 0)} |",
+            f"| Patches verified in the sandbox (exploit dead, app healthy) | {patched_verified} |",
+        ]
+
     for label, key in (
         ("Demands skipped at output cap (verifier)", "verifier_demands_skipped_output_cap"),
         ("Explorer nodes skipped at output cap", "explorer_nodes_skipped_output_cap"),
@@ -205,11 +230,63 @@ def _step_block(index: int, step: str) -> list[str]:
     return out
 
 
+def _patch_section_lines(record: dict, patch_file: str | None) -> list[str]:
+    """Deterministic `#### Proposed fix` block for the patch lifecycle: the
+    banked summary/diff plus a verification line derived ONLY from the record's
+    final status (never reinterpreted by any LLM)."""
+    diff = record.get("patch_diff")
+    if not diff:
+        if record.get("patch_state") == "failed":
+            return [
+                "", "#### Proposed fix", "",
+                "_An automatic fix was attempted and abandoned: no safe minimal "
+                "first-party patch could be authored — remediate manually._",
+            ]
+        return []
+    status = record.get("status")
+    state = record.get("patch_state")
+    rounds = record.get("patch_round") or 1
+    if state == "verified":
+        verdict = (
+            "**Verified** — dynamic re-validation against the resynced sandbox: the "
+            "exploit no longer reproduces and the legitimate flow still works."
+        )
+    elif state == "rejected":
+        verdict = (
+            f"**REJECTED and not fixed** — the exploit still reproduced after "
+            f"{rounds} patch attempt(s) on the resynced sandbox: treat the diff as "
+            "an unproven proposal and remediate manually."
+        )
+    elif status == "exploitable":
+        verdict = (
+            "**NOT verified** — the exploit still reproduced after the patch (or the "
+            "sandbox could not adopt it): treat this fix as a proposal only."
+        )
+    else:
+        verdict = (
+            "**Statically adjudicated** — the re-review accepted the patch; no "
+            "dynamic re-proof was executed."
+        )
+    lines = [
+        "", "#### Proposed fix", "",
+        str(record.get("patch_summary") or "_no summary_").rstrip(), "",
+        verdict, "",
+    ]
+    if record.get("patched_files"):
+        lines.append(f"**Files changed:** {', '.join(record['patched_files'])}  ")
+    if patch_file:
+        lines.append(f"**Patch file:** `patches/{patch_file}`  ")
+    files = ", ".join(record.get("patched_files") or []) or "n/a"
+    lines += ["", f"```diff\n# {files}\n{str(diff).rstrip()}\n```"]
+    return lines
+
+
 def _render_report_markdown(
     records: list[dict],
     findings_by_id: dict[str, dict],
     statistics: str | None = None,
     poc_files: dict[str, str] | None = None,
+    patch_files: dict[str, str] | None = None,
 ) -> str:
     """Assemble the report markdown (summary + rewritten steps) that
     _write_report renders to PDF. poc_files maps vuln_id -> the PoC script
@@ -227,7 +304,17 @@ def _render_report_markdown(
     )
 
     exploitable = sum(1 for r in records if r.get("status") == "exploitable")
-    static = len(records) - exploitable
+    patched_verified = sum(
+        1 for r in records
+        if r.get("status") == "false_positive"
+        and r.get("patch_diff") and r.get("patch_state") == "verified"
+    )
+    patched_static = sum(
+        1 for r in records
+        if r.get("status") == "false_positive"
+        and r.get("patch_diff") and r.get("patch_state") != "verified"
+    )
+    static = len(records) - exploitable - patched_verified - patched_static
 
     lines = [
         f"# Vulnerability Report — {settings.app_path.name}",
@@ -235,6 +322,14 @@ def _render_report_markdown(
         f"- **Target application:** `{settings.app_path}`",
         f"- **Generated:** {datetime.now().astimezone().isoformat(timespec='seconds')}",
         f"- **Exploitable findings:** {exploitable}",
+        *(
+            [f"- **Auto-patched & verified (fix applied, exploit dead, feature intact):** {patched_verified}"]
+            if patched_verified else []
+        ),
+        *(
+            [f"- **Auto-patched, statically adjudicated (no dynamic re-proof):** {patched_static}"]
+            if patched_static else []
+        ),
         f"- **Static findings (no network-reachable path):** {static}",
         "",
     ]
@@ -303,6 +398,7 @@ def _render_report_markdown(
             lines.append(str(finding["remediation"]).rstrip())
         else:
             lines.append("_No remediation was provided._")
+        lines += _patch_section_lines(record, (patch_files or {}).get(record.get("vuln_id")))
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
@@ -476,6 +572,32 @@ def _copy_poc_scripts(records: list[dict], report_dir: Path) -> dict[str, str]:
     return files
 
 
+def _copy_patch_files(records: list[dict], report_dir: Path) -> dict[str, str]:
+    """Bundle every patched record's diff into <report_dir>/patches/<vuln_id>.patch
+    so the reader can `git apply`/`patch -p1` it. Mirrors _copy_poc_scripts'
+    fail-open and slug/collision conventions. Returns vuln_id -> filename."""
+    files: dict[str, str] = {}
+    patches_dir = report_dir / "patches"
+    for record in records:
+        diff = record.get("patch_diff")
+        if not diff:
+            continue
+        vuln_id = str(record.get("vuln_id") or "unknown")
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", vuln_id).strip("_")
+        name, counter = f"{slug}.patch", 2
+        while name in files.values():
+            name = f"{slug}_{counter}.patch"
+            counter += 1
+        try:
+            patches_dir.mkdir(parents=True, exist_ok=True)
+            (patches_dir / name).write_text(str(diff).rstrip() + "\n", encoding="utf-8")
+        except OSError as exc:
+            logging.warning(f"Reporter: could not bundle patch for {vuln_id}: {exc}")
+            continue
+        files[vuln_id] = name
+    return files
+
+
 def report_assembler_node(state: MasterState) -> dict:
     """Terminal barrier node: writes a FRESH timestamped report directory
     (<target_app>/report_<YYYY-MM-DD_HHMMSS>/report.pdf + poc/ scripts),
@@ -500,6 +622,7 @@ def report_assembler_node(state: MasterState) -> dict:
         return {}
 
     poc_files = _copy_poc_scripts(records, report_dir)
-    markdown = _render_report_markdown(records, findings_by_id, statistics, poc_files)
+    patch_files = _copy_patch_files(records, report_dir)
+    markdown = _render_report_markdown(records, findings_by_id, statistics, poc_files, patch_files)
     _write_report(report_dir / "report.pdf", markdown)
     return {}

@@ -54,7 +54,7 @@ def read_source_code(node_id: str, include_context: bool = False, state: Annotat
 
 
 # Maximum number of lines read_file will return in a single call.
-READ_FILE_MAX_LINES = 150
+READ_FILE_MAX_LINES = 500
 
 # Bounding for get_path: max number of paths returned and max path length (hops).
 MAX_PATHS = 50
@@ -484,6 +484,12 @@ def submit_evaluation(
     updated_vuln["reproduction_steps"] = kwargs.get("reproduction_steps", [])
     updated_vuln["validation_strategy"] = kwargs.get("validation_strategy")
 
+    # Patch lifecycle: this verdict adjudicates the PATCHED code, so the re-check
+    # is consumed — route_patch_reviews only re-dispatches "applied" records, and
+    # the report labels this verdict as evidence about the fix.
+    if report.get("patch_state") == "applied":
+        updated_vuln["patch_state"] = "reviewed"
+
     tool_msg = ToolMessage(
         content="Evaluation submitted successfully. Ending review.",
         name="submit_evaluation",
@@ -680,9 +686,9 @@ def send_http_request(
     body: Optional[str] = None,
     follow_redirects: bool = True,
     max_redirects: int = 5,
-    session_id: Optional[str] = None,
+    session_id: Optional[str] = "default",
     reset_session: bool = False,
-    extract_mode: str = "clean_html",
+    extract_mode: str = "text",
     state: Annotated[Optional[dict], InjectedState] = None,
 ) -> tuple[str, dict]:
     """
@@ -702,18 +708,18 @@ def send_http_request(
              Format: {'field_name': '/path/to/file'}
              Or with metadata: {'field_name': ('custom_filename.png', '/path/to/file', 'image/png')}
     - body: Raw string body (used only if neither data, json_data, nor files is provided).
-    - follow_redirects: Whether to follow 301/302 redirects automatically (default True).
-    - max_redirects: Maximum number of redirects to follow while follow_redirects is True (default 5).
-    - session_id: Optional session label. Cookies persist across calls that reuse the SAME
+    - follow_redirects: Whether to follow 301/302 redirects automatically (default: True).
+    - max_redirects: Maximum number of redirects to follow while follow_redirects is True (default: 5).
+    - session_id: Optional session label (default: "default"). Cookies persist across calls that reuse the SAME
                   session_id and are isolated per (agent, session_id); omit it to use a
                   transient one-shot session seeded from the shared cookie state.
     - reset_session: Clears stored cookies/session state (for the given session_id, or the
                      shared state when session_id is omitted) before executing.
     - extract_mode:
-            'clean_html' (default): Returns HTML with scripts/styles removed to save tokens.
+            'text' (default): Returns only the visible text (good for reading error messages).
+            'clean_html': Returns HTML with scripts/styles removed to save tokens.
             'forms': Returns ONLY the <form> elements on the page.
             'links': Returns ONLY the <a> tags.
-            'text': Returns only the visible text (good for reading error messages).
             'raw': Returns the untouched body (use cautiously, may truncate).
             ANY CUSTOM TAG: Enter any HTML tag (e.g., 'script', 'input', 'iframe') to extract only those elements.
 
@@ -956,6 +962,16 @@ def mark_validation_complete(
         updated_vuln["status"] = "exploitable"
     else:
         updated_vuln["status"] = "false_positive"
+
+    # Patch lifecycle: a verdict on a re-reviewed (patched) record IS the fix
+    # adjudication — exploit still firing after the sandbox adopted the patch is
+    # a REJECTED fix (retry-eligible while patch_round budget remains), exploit
+    # dead + smoke pass is a VERIFIED fix. Both states carry above the ladder's
+    # FP>exploitable precedence via explicit merge_vulnerabilities rules.
+    if report.get("patch_state") == "reviewed":
+        updated_vuln["patch_state"] = (
+            "rejected" if kwargs.get("is_confirmed") else "verified"
+        )
 
     # Inject the Validator's findings
     updated_vuln["poc_payload"] = kwargs.get("poc_payload")
@@ -1308,6 +1324,8 @@ def search_codebase(
     results = []
     match_count = 0
     MAX_MATCHES = 20 # prevent context window overflow
+    hit_limit = False
+    omitted_dirs = set()
     pos_globs, neg_globs = _split_file_patterns(file_pattern) if file_pattern else ([], [])
     pattern = _compile_pattern(query, is_regex)
     # Whole-word boundaries only make sense when both ends of the raw query are
@@ -1348,6 +1366,12 @@ def search_codebase(
                     match = pattern.search(line)
                     if match:
                         relative_path = str(file_path.relative_to(app_dir))
+
+                        # If we already hit the limit, just record the directory and skip the rest of this file
+                        if hit_limit:
+                            omitted_dirs.add(str(Path(relative_path).parent))
+                            break
+
                         # Match the file back to its Node ID so the agent can read it
                         node_id = file_to_node.get(relative_path, "Unknown (Not in Graph)")
 
@@ -1357,14 +1381,26 @@ def search_codebase(
                         )
                         match_count += 1
 
-                        # Stop if we hit the limit
+                        # Flag the limit but do NOT return yet
                         if match_count >= MAX_MATCHES:
-                            results.append(
-                                f"... [Truncated: found more than {MAX_MATCHES} matches. "
-                                f"This query is too broad — narrow it or restrict files "
-                                f"with file_pattern instead of re-issuing the same search.] ..."
-                            )
-                            return "\n".join(results)
+                            hit_limit = True
+
+                if hit_limit:
+                    # Sort and cap the directories to keep the prompt clean
+                    dirs_list = sorted(list(omitted_dirs))[:10]
+                    dirs_str = ", ".join(dirs_list)
+                    example_dir = dirs_list[0] if dirs_list else "src"
+
+                    results.append(
+                        f"... [Truncated: found more than {MAX_MATCHES} matches. "
+                        f"Additional matches exist in these directories: {dirs_str}. "
+                        f"Narrow your query or use file_pattern (e.g., file_pattern='{example_dir}/*') to explore them.] ..."
+                    )
+
+                if not results:
+                    return f"No matches found for '{query}'."
+
+                return "\n".join(results)
 
         except UnicodeDecodeError:
             # Safely skip binary files (images, compiled files, etc.)
