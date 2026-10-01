@@ -26,6 +26,39 @@ def get_cached_graph_data(graph_path: Path):
         return {}
 
 
+def load_code_corpus() -> dict[str, str]:
+    """Read the contents of every unique source file whose graph nodes carry
+    ``file_type == "code"``.
+
+    Returns ``{source_file: content}`` so callers can search the whole
+    codebase in a single pass (the deterministic pre-filter uses this instead
+    of re-reading files per CVE). Unreadable, missing, or binary files are
+    skipped with a debug log.
+    """
+    graph_data = get_cached_graph_data(settings.graph)
+    code_files = sorted({
+        node.get("source_file")
+        for node in graph_data.get("nodes", [])
+        if node.get("file_type") == "code" and node.get("source_file")
+    })
+
+    corpus: dict[str, str] = {}
+    for source_file in code_files:
+        path = settings.app_path / Path(source_file)
+        if not path.exists():
+            logging.debug(f"Code corpus: skipping missing file '{source_file}'.")
+            continue
+        try:
+            corpus[source_file] = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            logging.debug(f"Code corpus: skipping binary file '{source_file}'.")
+        except OSError as e:
+            logging.debug(f"Code corpus: skipping unreadable file '{source_file}': {e}")
+
+    logging.debug(f"Code corpus: indexed {len(corpus)}/{len(code_files)} code files.")
+    return corpus
+
+
 def format_node_context(graph_data: dict, node_id: str) -> str:
     """Render 'graphify explain' style context for a node: its summary plus connections.
 
@@ -489,8 +522,24 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
     """
     Extracts unique vulnerabilities by canonical ID and selects
     the most detailed description available for each.
+
+    Besides {id, details, package}, best-effort enrichment fields are carried
+    forward when present in the OSV record:
+    - fixed_version: first `fixed` event across affected version ranges.
+    - cwe_ids: database_specific.cwe_ids (list) when the OSV entry classifies them.
     """
     best_records = {}
+
+    def extract_fixed_version(record: dict) -> Optional[str]:
+        for affected in record.get("affected", []):
+            for rng in affected.get("ranges", []):
+                for event in rng.get("events", []):
+                    if event.get("fixed"):
+                        return event["fixed"]
+        return None
+
+    def extract_cwe_ids(record: dict) -> list[str]:
+        return record.get("database_specific", {}).get("cwe_ids", []) or []
 
     for vuln in vulns:
         canonical_id = get_canonical_id(vuln)
@@ -503,7 +552,9 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
             best_records[canonical_id] = {
                 "id": canonical_id,
                 "details": current_details,
-                "package": packages[0] if len(packages) >= 1 else "unknown"
+                "package": packages[0] if len(packages) >= 1 else "unknown",
+                "fixed_version": extract_fixed_version(vuln),
+                "cwe_ids": extract_cwe_ids(vuln),
             }
         else:
             # Compare the length of the details to keep the most comprehensive one
@@ -511,6 +562,11 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
             if len(current_details) > len(existing_details):
                 best_records[canonical_id]["original_osv_id"] = vuln.get("id")
                 best_records[canonical_id]["details"] = current_details
+                # Enrichment is best-effort: backfill any missing fields.
+                if not best_records[canonical_id].get("fixed_version"):
+                    best_records[canonical_id]["fixed_version"] = extract_fixed_version(vuln)
+                if not best_records[canonical_id].get("cwe_ids"):
+                    best_records[canonical_id]["cwe_ids"] = extract_cwe_ids(vuln)
 
     return list(best_records.values())
 

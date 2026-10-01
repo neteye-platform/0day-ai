@@ -17,8 +17,8 @@ from languages import SYMBOL_QUERIES
 import settings
 import tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, VerifierState, ReviewerState, ValidatorState
-from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEDemand, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images
+from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
+from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, load_code_corpus
 
 # fast_llm = ChatOllama(model="gemma4:cloud", temperature=0.2, reasoning=False, num_ctx=32768)
 # smart_llm = ChatOllama(model="gemma4:cloud", temperature=0.6, reasoning=False, num_ctx=32768)
@@ -507,7 +507,9 @@ def dispatch_cve_analyzers(state: MasterState):
 
 
 def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
-    """LLM node that extracts security assumptions from a single CVE description."""
+    """LLM node that classifies a single CVE description and either extracts a
+    security demand (application_mitigation) or emits a vulnerability hypothesis
+    (upgrade_only, e.g. RCE in the HTTP server where only a package upgrade fixes it)."""
     cve = state.get("cve", {})
     package_name = cve.get("package") or "unknown"
     cve_id = cve.get("id", "UNKNOWN-CVE")
@@ -526,29 +528,62 @@ def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     # LLM invocation
     sys_msg = SystemMessage(content=(
         f"{CVE_ANALYZER_AGENT['prompt']}\n\n"
-        # f"{parser.get_format_instructions()}"
     ))
+
+    enrichment = ""
+    fixed_version = cve.get("fixed_version")
+    if fixed_version:
+        enrichment += f"\nFixed version: {fixed_version}\n"
+    cwe_ids = cve.get("cwe_ids") or []
+    if cwe_ids:
+        enrichment += f"OSV CWE classifications: {', '.join(cwe_ids)}\n"
+    if enrichment:
+        enrichment = f"\n--- OSV ENRICHMENT ---\n{enrichment}"
+
     human_msg = HumanMessage(content=(
         f"Analyze this CVE affecting the package '{package_name}':\n\n"
         f"CVE ID: {cve_id}\n"
-        f"Description: {details}\n\n"
+        f"Description: {details}\n"
+        f"{enrichment}"
     ))
 
-    cve_analyzer_llm = fast_llm.with_structured_output(CVEDemand, method="json_schema", strict=True)
-    explorer_llm = with_robust_retry(cve_analyzer_llm)
-    demand = cve_analyzer_llm.invoke([sys_msg, human_msg])
+    cve_analyzer_llm = fast_llm.with_structured_output(CVEAnalysis, method="json_schema", strict=True)
+    cve_analyzer_llm = with_robust_retry(cve_analyzer_llm)
+    analysis = cve_analyzer_llm.invoke([sys_msg, human_msg])
 
-    dict_demand = demand if isinstance(demand, dict) else demand.model_dump()
-    # Tag the resulting demand with the CVE ID for traceability during the Verification Phase
-    dict_demand["source_cve"] = cve_id
-    dict_demand["package"] = package_name
+    dict_analysis = analysis if isinstance(analysis, dict) else analysis.model_dump()
+
+    # Deterministic guards: reject malformed/contradictory outputs before caching.
+    fix_category = dict_analysis.get("fix_category")
+    if fix_category == "application_mitigation" and not dict_analysis.get("security_assumption"):
+        logging.warning(f"{cve_id}: classified as application_mitigation but no security_assumption. Dropping.")
+        return {"cve_demands": []}
+    if fix_category == "upgrade_only" and not dict_analysis.get("hypothesis"):
+        logging.warning(f"{cve_id}: classified as upgrade_only but no hypothesis. Dropping.")
+        return {"cve_demands": []}
+    if fix_category not in ("application_mitigation", "upgrade_only"):
+        logging.warning(f"{cve_id}: invalid fix_category '{fix_category}'. Dropping.")
+        return {"cve_demands": []}
+
+    # Normalize required_keywords deterministically before caching: strip
+    # whitespace, drop empties, dedupe while preserving order.
+    dict_analysis["required_keywords"] = list(dict.fromkeys(
+        kw.strip()
+        for kw in (dict_analysis.get("required_keywords") or [])
+        if kw and kw.strip()
+    ))
+
+    # Tag the resulting analysis with the CVE ID for traceability during the Verification Phase
+    dict_analysis["source_cve"] = cve_id
+    dict_analysis["package"] = package_name
+    dict_analysis["fixed_version"] = fixed_version
 
     # Save to cache
-    cache(cache_file, "write", dict_demand)
+    cache(cache_file, "write", dict_analysis)
 
-    # Return the extracted demand to be appended to the global state
+    # Return the extracted analysis to be appended to the global state
     return {
-        "cve_demands": [dict_demand]
+        "cve_demands": [dict_analysis]
     }
 
 # ==========================================
@@ -670,15 +705,37 @@ def _route_explorer_notes(notes: list, graph_data: dict, callers_map: dict, grou
     return updated_notes
 
 
-def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: defaultdict) -> None:
-    """Route CVE demands to every node that imports and actually uses the affected namespace."""
-    for demand in cves:
-        target_import = demand.get("import_namespace", "")
-        source_cve = demand.get("source_cve", "unknown")
+def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: defaultdict) -> list[dict]:
+    """Route CVE analyzer outputs.
 
+    Two output kinds are handled (mirroring the `fix_category` classifier):
+    - `application_mitigation` records become `cve_assumption` demands routed to
+      every node that imports AND uses the affected namespace.
+    - `upgrade_only` records bypass the contract verifier and become direct
+      vulnerability hypotheses (like explorer `vulns`), anchored to a synthetic
+      `dependency:<package>` node. Exactly ONE hypothesis is emitted per CVE.
+      Returns the list of hypothesis dicts for the `vulnerabilities` channel.
+    """
+    hypotheses: list[dict] = []
+
+    for record in cves:
+        target_import = record.get("import_namespace", "")
+        source_cve = record.get("source_cve", "unknown")
+        package = record.get("package", "unknown")
+        fix_category = record.get("fix_category", "application_mitigation")
+
+        if fix_category == "upgrade_only":
+            hypothesis = _build_cve_hypothesis(record, node_imports_map)
+            if hypothesis:
+                hypotheses.append(hypothesis)
+            else:
+                logging.warning(f"[CVE HYPOTHESIS DROP] {source_cve} for '{target_import}' produced no usable hypothesis.")
+            continue
+
+        # --- application_mitigation: route as a verifiable demand ---
         combined_desc = (
-            f"Security Context: {demand.get('security_assumption')} | "
-            f"Trigger: {demand.get('trigger_condition')}"
+            f"Security Context: {record.get('security_assumption')} | "
+            f"Trigger: {record.get('trigger_condition')}"
         )
 
         matched_any = False
@@ -698,6 +755,122 @@ def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: de
         if not matched_any:
             logging.warning(f"[CVE DROP] {source_cve} for '{target_import}' matched 0 nodes in the graph.")
 
+    return hypotheses
+
+
+def _build_cve_hypothesis(record: dict, node_imports_map: dict) -> dict | None:
+    """Build a single vulnerability hypothesis for an upgrade-only CVE.
+
+    Anchored to a synthetic `dependency:<package>` node (a library-internal flaw
+    has no application node of its own). Usage-site hints are appended to the
+    description so the Reviewer (which has no library source) knows where to look,
+    including the transitive-dependency case where nothing imports the package.
+    """
+    source_cve = record.get("source_cve", "unknown")
+    package = record.get("package", "unknown")
+    target_import = record.get("import_namespace", "")
+    hypothesis = record.get("hypothesis") or {}
+    cwe_id = hypothesis.get("cwe", "OTHER_UNCATEGORIZED")
+    description = hypothesis.get("description", "")
+    affected_component = hypothesis.get("affected_component", "")
+
+    if not description:
+        return None
+
+    fixed_version = record.get("fixed_version")
+    full_desc = f"[{source_cve}] {description}"
+    if fixed_version:
+        full_desc += f" Affected package: '{package}' (fixed in {fixed_version})."
+    else:
+        full_desc += f" Affected package: '{package}'."
+
+    # Usage hints: nodes that import AND use the namespace, capped to bound prompt size.
+    if target_import:
+        matching_nodes = sorted(
+            node_id for node_id, imports in node_imports_map.items()
+            if target_import in imports and uses_namespace_in_ast(node_id, target_import)
+        )
+        if matching_nodes:
+            shown = matching_nodes[:5]
+            hint = f" Nodes importing/using '{target_import}': {', '.join(shown)}"
+            if len(matching_nodes) > 5:
+                hint += f" (+{len(matching_nodes) - 5} more)"
+            full_desc += hint
+        else:
+            full_desc += (
+                f" No application node imports '{target_import}' directly — the package is likely a "
+                f"transitive dependency pulled in by a framework. Look for usage of the parent-framework "
+                f"feature instead (see 'Component')."
+            )
+
+    return {
+        "node_id": f"dependency:{package}",
+        "cwe_id": cwe_id,
+        "description": full_desc,
+        "status": "hypothesis",
+        "demand_id": source_cve,
+        "source_cve": source_cve,
+        "vulnerable_component": affected_component,
+        "vulnerability_type": "Known Dependency Vulnerability",
+    }
+
+
+def filter_cve_demands_by_keywords(cves: list[dict]) -> list[dict]:
+    """Deterministic pre-filter: drop CVE records whose ``required_keywords``
+    are all absent from the application's code files (graph nodes with
+    ``file_type == "code"``).
+
+    A record is kept if ANY of its keywords appears as an exact, case-sensitive
+    substring in ANY code file. Records with an empty or missing keyword list
+    are kept unchanged (fail-open — protects stale caches generated before the
+    ``required_keywords`` field existed). Applies to BOTH fix categories, so a
+    dropped record never produces a contract-verifier demand nor an
+    upgrade-only reviewer hypothesis.
+    """
+    if not cves:
+        return cves
+
+    corpus = load_code_corpus()
+    if not corpus:
+        logging.warning(
+            "CVE keyword filter: no code files indexed — skipping filter "
+            "(all CVE records forwarded)."
+        )
+        return cves
+
+    kept: list[dict] = []
+    dropped: list[dict] = []
+
+    for record in cves:
+        source_cve = record.get("source_cve", record.get("id", "unknown"))
+        keywords = record.get("required_keywords") or []
+
+        if not keywords:
+            logging.debug(f"{source_cve}: no required_keywords — keeping (cannot filter).")
+            kept.append(record)
+            continue
+
+        match = next(
+            ((kw, source_file) for kw in keywords for source_file, content in corpus.items()
+             if kw in content),
+            None
+        )
+        if match:
+            keyword, source_file = match
+            logging.debug(f"{source_cve}: keyword '{keyword}' found in '{source_file}' — keeping.")
+            kept.append(record)
+        else:
+            logging.info(
+                f"[CVE KEYWORD DROP] {source_cve}: none of {keywords} found in code files — dropped."
+            )
+            dropped.append(record)
+
+    logging.info(
+        f"CVE keyword filter: kept {len(kept)}/{len(cves)} record(s), "
+        f"dropped {len(dropped)} before downstream LLM stages."
+    )
+    return kept
+
 
 def aggregate_demands_node(state: MasterState):
     grouped_demands = defaultdict(list)
@@ -708,22 +881,24 @@ def aggregate_demands_node(state: MasterState):
 
     logging.info(f"Loaded graph data: {len(callers_map)} caller entries, {len(node_imports_map)} import entries.")
     notes = state.get("notes", [])
-    cves = state.get("cve_demands", [])
+    cves = filter_cve_demands_by_keywords(state.get("cve_demands", []))
     logging.info(f"Processing {len(notes)} notes and {len(cves)} CVE demands.")
 
     # Process Explorer Notes
     updated_notes = _route_explorer_notes(notes, graph_data, callers_map, grouped_demands)
 
-    # Process CVE Demands
-    _process_cve_demands(cves, node_imports_map, grouped_demands)
+    # Process CVE Analyzer Outputs (demands + upgrade-only hypotheses)
+    cve_hypotheses = _process_cve_demands(cves, node_imports_map, grouped_demands)
+    logging.info(f"Emitted {len(cve_hypotheses)} upgrade-only CVE hypothesis(es) directly into the vulnerabilities channel.")
 
     # Log the accurate total by summing the lengths of the lists
     total_demands = sum(len(d) for d in grouped_demands.values())
     logging.info(f"Summary: Grouped {total_demands} total demands across {len(grouped_demands)} target nodes.")
 
     return {
-        "grouped_demands": dict(grouped_demands), 
-        "notes": updated_notes 
+        "grouped_demands": dict(grouped_demands),
+        "notes": updated_notes,
+        "vulnerabilities": cve_hypotheses,
     }
 
 # ==========================================
@@ -913,19 +1088,23 @@ def reviewer_agent_node(state: ReviewerState) -> dict | Command:
         formatted_vuln = (
             f"Target: {state['node_id']}\n\n"
             f"Potential Issue to Investigate:\n"
+            f"- Type: {report.get('vulnerability_type', 'Code Defect')}\n"
             f"- CWE ID: {report.get('cwe_id', 'Unknown')}\n"
             f"- Component: {report.get('vulnerable_component', 'Unknown')}\n"
             f"- Description: {report.get('description', '')}\n"
         )
+        if report.get("source_cve"):
+            formatted_vuln += f"- Source CVE: {report.get('source_cve')}\n"
 
         if node_id:
             target_node_source = get_node_code(node_id, reviewer_mode=True)
-            formatted_vuln += (
-                f"--- TARGET NODE SOURCE CODE ---\n"
-                f"```\n"
-                f"{target_node_source}\n"
-                f"```\n"
-            )
+            if target_node_source:
+                formatted_vuln += (
+                    f"--- TARGET NODE SOURCE CODE ---\n"
+                    f"```\n"
+                    f"{target_node_source}\n"
+                    f"```\n"
+                )
 
         human_msg = HumanMessage(content=(
             f"Review the following potential issues found in the target node.\n\n"
