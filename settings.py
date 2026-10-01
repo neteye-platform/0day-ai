@@ -67,7 +67,7 @@ llm_max_completion_tokens = 16384
 
 # =============================== Agents ==================================
 
-agents_concurrency = 4
+agents_concurrency = 3
 
 # Reviewer/validator loop caps: if the terminal tool isn't called within this many
 # LLM rounds, the loop ends via the fallback node instead of hitting the recursion
@@ -75,7 +75,7 @@ agents_concurrency = 4
 reviewer_max_iterations = 25
 validator_max_iterations = 150
 integration_auditor_max_iterations = 20
-COUNTDOWN_LEAD_TURNS = 4
+COUNTDOWN_LEAD_TURNS = 8
 reviewer_countdown_start = max(1, reviewer_max_iterations - COUNTDOWN_LEAD_TURNS)
 validator_countdown_start = max(1, validator_max_iterations - COUNTDOWN_LEAD_TURNS)
 integration_auditor_countdown_start = max(1, integration_auditor_max_iterations - COUNTDOWN_LEAD_TURNS)
@@ -138,6 +138,15 @@ verifier_max_demands_per_call = 15
 # records; fails open to no dedup if Ollama is unreachable.
 semantic_dedup_enabled = True
 semantic_dedup_threshold = 0.80
+# Plain official model (ollama pull). N.B. the local embeddinggemma2 alias
+# (OLLAMA create: FROM embeddinggemma + num_thread 16, byte-identical GGUF
+# blob, identical vectors) is ~2.5x SLOWER here, not faster: clean interleaved
+# benches on 150 demand-length texts measured 5.4s (plain) vs 13s (alias) —
+# pinning 16 threads on this 4P+8E+4LPE hybrid makes every batch barrier wait
+# on the E/LPE cores. Throughput on this box ~28 texts/s warm => a 13k pass
+# is minutes. The historical embedding outages were code bugs (parallel
+# chunk pile-ups + a fixed 300s budget burned before the fallback), fixed in
+# dedup.py, not a model-size problem.
 embeddings_model = "embeddinggemma"
 embeddings_base_url = "http://localhost:11434"
 
@@ -153,6 +162,23 @@ dedup_anchor_confirmed_similarity = 0.85  # mid tier: needs a strong descriptive
 dedup_anchor_min_jaccard = 0.6          # component token overlap for the mid tier
 dedup_max_merged_cluster = 25           # cap on cross-node cluster growth
 
+# LLM dedup agent (stage_dedup node, between edge_traversal and the reviewer
+# fan-out): groups hypotheses by cwe_id and spends ONE structured smart_llm
+# call per group to decide true-duplicate equivalence classes (the embedding
+# pass above only catches surface paraphrases — reworded duplicates and the
+# same sink re-anchored under different node ids survive it). Groups larger
+# than group_max subdivide by the source root directory of the affected
+# component to keep each call's context focused. Fails open: a group whose
+# call errors/caps passes through un-deduplicated.
+dedup_agent_enabled = True
+dedup_agent_group_max = 50     # CWE groups larger than this split by root dir
+dedup_agent_max_group = 80     # hard cap of records per LLM call (further splits)
+dedup_agent_parallel = 4       # concurrent group calls
+dedup_agent_desc_chars = 900   # per-record description budget in the prompt
+                               # (verifier "Fails to satisfy demand… Evidence:"
+                               # texts run p90 ~1 KB; cutting mid-Evidence would
+                               # hide the discriminating sink call)
+
 # Demand dedup (contract-verifier input): collapse paraphrases of one requirement
 # per target node (exact identity, then embedding similarity). cve_assumption
 # demands never merge; fails open to exact-only merging.
@@ -163,9 +189,27 @@ demand_dedup_enabled = True
 # contract checks, while true paraphrases cluster above 0.90.
 demand_dedup_threshold = 0.86
 embeddings_timeout = 180
-# On expiry the embedding pass raises and dedup fails open to exact-identity
-# merging; partial work is already on disk, so repeated runs resume.
-embeddings_fallback_budget_sec = 300
+# Texts per /api/embed request. Failed chunks subdivide (halved down to 1)
+# instead of aborting the pass, so an oversized batch is a slowdown, not a
+# fail-open.
+embeddings_batch_size = 200
+# Serial by design: one llama.cpp server queues concurrent requests anyway,
+# and >1 concurrent cold loads/contexts on the same box caused the pile-up
+# timeouts (4 parallel chunks each holding a model copy).
+embeddings_parallel_chunks = 1
+# One-shot cold-load allowance: the model load normally happens INSIDE the
+# first request, so a healthy-but-cold server can burn the whole
+# embeddings_timeout before serving a byte. Prewarm absorbs that with a
+# dedicated long timeout, only when uncached texts actually exist.
+embeddings_prewarm_timeout = 600
+# Pinned across the dedup passes (hours apart: demands then hypotheses);
+# the model is small, and without this every pass re-pays the cold load.
+embeddings_keep_alive = "6h"
+# Progress watchdog: the pass aborts only after this many seconds with ZERO
+# newly embedded texts (a healthy pass can never stall longer than one
+# request timeout), replacing the old fixed total budget that was incompatible
+# with 13k-text lists. 0 disables the watchdog entirely.
+embeddings_stall_budget_sec = 540
 
 # Confirmed records sharing (cwe, vulnerable_component) exactly are validated by
 # ONE validator that tests every finding's reproduction steps and records its

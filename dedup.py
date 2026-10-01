@@ -18,12 +18,17 @@ embeddings; see settings.py):
   * Fixed-representative (non-chaining) clustering prevents A~B~C over-merges.
   * Merged records keep the seed's vuln_id, union affected_nodes, and fold in
     child descriptions, so no information is lost.
-  * Embeddings (local Ollama) are batched and disk-cached per (model, text)
-    incrementally, so re-runs — and interrupted or budget-truncated ones —
-    only pay for unseen texts.
-  * Fails open: any embedding error (including the bounded single-text
-    fallback exceeding its wall-clock budget) leaves only the exact-identity
-    pre-merge.
+  * Embeddings (local Ollama) are requested in configurable chunks; a failed
+    chunk is halved and retried (down to one text) instead of aborting the
+    pass, requests are serialized against the single llama.cpp server, the
+    model is pre-warmed with a dedicated cold-load timeout only when uncached
+    texts actually exist, and keep_alive pins it resident across the dedup
+    passes. Every success is disk-cached per (model, text) incrementally, so
+    re-runs — and interrupted ones — only pay for unseen texts.
+  * Fails open: a hung server trips the stall watchdog (abort after N seconds
+    with zero progress, no total-size cap; 0 disables it) and leaves only the
+    exact-identity pre-merge; individual permanently failing texts stay
+    unembedded and degrade only their own cluster/group.
 """
 from __future__ import annotations
 
@@ -32,6 +37,7 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -55,16 +61,41 @@ _DEFAULT_CWE = "OTHER_UNCATEGORIZED"
 # Embeddings client
 # ---------------------------------------------------------------------------
 class Embeddings:
-    """Thin wrapper around a local Ollama embeddings endpoint with per-text caching."""
+    """Local Ollama embeddings client with per-text caching.
 
-    def __init__(self, base_url: str, model: str, timeout: int = 60,
-                 budget_sec: float = 300.0):
+    Request policy tuned for a single (possibly cold) llama.cpp server and
+    10k+-text passes: one pre-warm call with its own long timeout absorbs the
+    model load that would otherwise silently eat the first chunk's request
+    timeout; the rest proceeds in ``batch_size`` chunks against ``/api/embed``
+    (serial by default — concurrent chunks only multiply the queue and the
+    resident-model copies on the one server), pinned in memory via
+    ``keep_alive``. A failing chunk (timeout / HTTP error / batch-count
+    mismatch, e.g. a too-large batch hitting context pressure) is HALVED and
+    retried down to a single text instead of aborting the whole pass; only a
+    single text failing after one retry is dropped (returned as None), which
+    degrades its own cluster/group, never the stage. Progress (not total
+    time) is what the pass is bounded by: ``stall_budget_sec`` is the maximum
+    tolerated period WITHOUT a single embedding landing (0 = unbounded), so a
+    hung server trips after ~3 request timeouts while a slow-but-progressing
+    pass of any size runs to completion.
+    """
+
+    PROGRESS_EVERY = 200
+
+    def __init__(self, base_url: str, model: str, timeout: int = 60, *,
+                 batch_size: int = 200, parallel_chunks: int = 1,
+                 prewarm_timeout: int = 600, keep_alive: str = "6h",
+                 stall_budget_sec: float = 540.0):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
-        # Wall-clock ceiling for embed_batch incl. the single-text fallback.
-        self.budget_sec = budget_sec
+        self.batch_size = max(1, batch_size)
+        self.parallel_chunks = max(1, parallel_chunks)
+        self.prewarm_timeout = prewarm_timeout
+        self.keep_alive = keep_alive
+        self.stall_budget_sec = stall_budget_sec
         self._cache: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
 
     @staticmethod
     def _key(text: str) -> str:
@@ -72,7 +103,9 @@ class Embeddings:
 
     def available(self, timeout: int = 5) -> bool:
         """Cheap liveness check: does the local Ollama serve our embed model?
-        Used to fail open before any per-group embedding call if it does not."""
+        Used to fail open before any per-group embedding call if it does not.
+        N.B. this only hits /api/tags — it does NOT load the model, so a
+        passing check does NOT mean the first embed is cold-load free."""
         try:
             resp = requests.get(f"{self.base_url}/api/tags", timeout=timeout)
             if not resp.ok:
@@ -82,47 +115,47 @@ class Embeddings:
         except Exception:
             return False
 
-    def embed(self, text: str) -> list[float]:
-        key = self._key(text)
-        cached = self._cache.get(key)
-        if cached is not None:
-            return cached
-        resp = requests.post(
-            f"{self.base_url}/api/embeddings",
-            json={"model": self.model, "prompt": text},
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
-        vec = resp.json().get("embedding")
-        if not vec:
-            raise ValueError(f"Ollama returned no embedding for model {self.model!r}: {resp.text[:200]}")
-        self._cache[key] = vec
-        return vec
-
-    # Chunks stay small: a local Ollama serves one ~2048-token slot, so a
-    # 128-text batch can never fit the context and only burns the request
-    # timeout (empirically: every chunk 400'd after exactly 60s on GLPI).
-    BATCH_CHUNK = 16
-    PARALLEL_CHUNKS = 4
-    FALLBACK_PROGRESS_EVERY = 50
+    def prewarm(self) -> bool:
+        """Force the embedding model into Ollama's memory with ONE trivial
+        /api/embed call carrying its own long timeout, so the cold load never
+        counts against a chunk request's ``timeout`` (that's what made every
+        request of a healthy-but-cold server read-time out). Also sets
+        ``keep_alive`` so the model stays resident for the whole pass (and
+        the later dedup stages). Returns False (warns) on any error; callers
+        continue either way — the stall watchdog still guards the pass."""
+        started = time.monotonic()
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/embed",
+                json={"model": self.model, "input": ["warm up"],
+                      "keep_alive": self.keep_alive, "truncate": True},
+                timeout=self.prewarm_timeout,
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            log.warning("Embeddings: pre-warm failed (%s); continuing anyway.",
+                        str(e)[:200])
+            return False
+        log.info("Embeddings: pre-warmed model %r in %.1fs (keep_alive=%s).",
+                 self.model, time.monotonic() - started, self.keep_alive)
+        return True
 
     def embed_batch(
         self,
         texts: list[str],
         on_result=None,
-    ) -> list[list[float]]:
-        """Embed many texts, using Ollama's batch endpoint when available.
+    ) -> list[list[float] | None]:
+        """Embed many texts through Ollama's ``/api/embed`` endpoint.
 
-        Tries ``/api/embed`` in concurrent chunks and on the FIRST failure
-        cancels every queued chunk and falls back to sequential single-text
-        ``embed()`` calls. The fallback is bounded by ``self.budget_sec`` for
-        the whole call and raises on expiry so callers fail open (their
-        exact-identity pre-merge) instead of grinding silently for hours.
-        Every text that succeeds is cached and reported through ``on_result``
-        immediately, so an interrupted run resumes from disk instead of
-        re-paying the whole embedding pass. The per-text cache is consulted
-        and filled either way. Results are written back at the original index,
-        so the returned order is identical to sequential fetching.
+        Cache hits short-circuit; if ANYTHING is uncached the model is
+        pre-warmed first, then the remainder is fetched in chunks (see the
+        class docstring for the chunk/halving/watchdog policy). Every text
+        that succeeds is cached and reported through ``on_result`` the moment
+        it lands, so an interrupted run resumes from disk instead of
+        re-paying the whole pass. Results are written back at the original
+        index, so the returned order matches the input. Raises only when the
+        stall watchdog declares the server hung (or the pool surfaced such
+        an error); texts that merely failed individually stay None.
         """
         results: list[list[float] | None] = [None] * len(texts)
         missing: list[tuple[int, str]] = []
@@ -135,75 +168,130 @@ class Embeddings:
         if not missing:
             return results
 
-        deadline = time.monotonic() + self.budget_sec
+        self.prewarm()
+
+        watchdog = self.stall_budget_sec
+        state = {"last_progress": time.monotonic(), "done": 0, "failed": 0}
+
+        def _check_stall() -> None:
+            if watchdog and time.monotonic() - state["last_progress"] > watchdog:
+                raise RuntimeError(
+                    f"embeddings stalled: no text embedded for {watchdog:.0f}s "
+                    f"({state['done']}/{len(missing)} done, "
+                    f"{state['failed']} failed)"
+                )
 
         def _publish(i: int, t: str, vec: list[float]) -> None:
-            results[i] = vec
-            self._cache[self._key(t)] = vec
+            with self._lock:
+                results[i] = vec
+                self._cache[self._key(t)] = vec
+                state["last_progress"] = time.monotonic()
+                state["done"] += 1
+                done = state["done"]
+            if done % self.PROGRESS_EVERY == 0:
+                log.info("Embeddings: %d/%d uncached text(s) embedded.",
+                         done, len(missing))
             if on_result is not None:
                 try:
                     on_result(t, vec)
                 except Exception:  # disk-cache write errors are mere misses
                     pass
 
-        def _fetch(chunk: list[tuple[int, str]]) -> list[list[float]]:
+        def _note_failure() -> None:
+            with self._lock:
+                state["failed"] += 1
+                failed, done = state["failed"], state["done"]
+            # Cascade guard: the stall watchdog covers HUNG servers, but a
+            # dead one fast-fails every halved chunk and single retry in
+            # milliseconds, so no stall would ever trip. A dead server must
+            # not burn ~4 attempts x 13k texts — abort once enough texts
+            # failed while NOTHING ever succeeded. Sporadic per-text failures
+            # (done > 0) are always tolerated.
+            if failed >= 25 and done == 0:
+                raise RuntimeError(
+                    f"embeddings aborted: {failed} texts failed with zero "
+                    f"successes — server unreachable/down?"
+                )
+
+        def _post(inputs: list[str]) -> list[list[float]]:
             resp = requests.post(
                 f"{self.base_url}/api/embed",
-                json={"model": self.model, "input": [t for _, t in chunk]},
+                json={"model": self.model, "input": inputs,
+                      "keep_alive": self.keep_alive, "truncate": True},
                 timeout=self.timeout,
             )
             resp.raise_for_status()
             vecs = resp.json().get("embeddings") or []
-            if len(vecs) != len(chunk):
+            if len(vecs) != len(inputs):
                 raise ValueError(
-                    f"batch size mismatch: {len(vecs)} embeddings for {len(chunk)} texts"
+                    f"batch size mismatch: {len(vecs)} embeddings for {len(inputs)} texts"
                 )
             return vecs
 
-        chunks = [
-            missing[s:s + self.BATCH_CHUNK]
-            for s in range(0, len(missing), self.BATCH_CHUNK)
-        ]
-        pool = ThreadPoolExecutor(
-            max_workers=min(len(chunks), self.PARALLEL_CHUNKS) or 1,
-            thread_name_prefix="embed",
-        )
-        try:
-            futures = {pool.submit(_fetch, chunk): chunk for chunk in chunks}
+        def _fetch(chunk: list[tuple[int, str]]) -> None:
+            """Embed one chunk into results, halving on failure. Only the
+            stall watchdog may raise (killing a doomed pass early)."""
+            _check_stall()
             try:
-                for fut in as_completed(futures):
-                    # Raises on failure -> cancel + one-by-one fallback below.
-                    vecs = fut.result()
-                    for (i, t), vec in zip(futures[fut], vecs):
-                        _publish(i, t, vec)
-                return results
-            except Exception as batch_err:
-                # Cancel every QUEUED chunk instead of letting the pool join
-                # dozens of doomed per-chunk timeouts (a running one still
-                # costs <= timeout), then fall back one-by-one.
-                log.warning(
-                    "Embeddings: /api/embed batch failed (%s); falling back to "
-                    "single-text embedding of %d remaining text(s).",
-                    batch_err, sum(1 for r in results if r is None),
-                )
-        finally:
-            pool.shutdown(wait=True, cancel_futures=True)
+                vecs = _post([t for _, t in chunk])
+            except Exception as err:
+                if len(chunk) > 1:
+                    log.warning(
+                        "Embeddings: %d-text chunk failed (%s); halving.",
+                        len(chunk), str(err)[:200],
+                    )
+                    mid = len(chunk) // 2
+                    _fetch(chunk[:mid])
+                    _fetch(chunk[mid:])
+                    return
+                # Single text: one retry for a transient blip, then drop
+                # ONLY this text (fail-open is per-text, not per-pass).
+                _check_stall()
+                i, t = chunk[0]
+                try:
+                    vecs = _post([t])
+                except Exception as err2:
+                    log.warning("Embeddings: dropping text idx %d after retry (%s).",
+                                i, str(err2)[:200])
+                    _note_failure()
+                    return
+            for (i, t), vec in zip(chunk, vecs):
+                _publish(i, t, vec)
 
-        # Bounded, audible fallback; already-embedded texts are cached, so a
-        # budget raise is cheap for the next attempt.
-        todo = [(i, t) for i, t in missing if results[i] is None]
-        for done, (i, t) in enumerate(todo):
-            if time.monotonic() > deadline:
-                raise RuntimeError(
-                    f"embeddings fallback exceeded its {self.budget_sec:.0f}s "
-                    f"budget after {done}/{len(todo)} single-text embeds"
-                )
-            if done and done % self.FALLBACK_PROGRESS_EVERY == 0:
-                log.info(
-                    "Embeddings: single-text fallback at %d/%d texts.",
-                    done, len(todo),
-                )
-            _publish(i, t, self.embed(t))
+        chunks = [
+            missing[s:s + self.batch_size]
+            for s in range(0, len(missing), self.batch_size)
+        ]
+        log.info("Embeddings: %d uncached text(s) in %d chunk(s) of <=%d.",
+                 len(missing), len(chunks), self.batch_size)
+
+        if self.parallel_chunks > 1 and len(chunks) > 1:
+            pool = ThreadPoolExecutor(
+                max_workers=min(len(chunks), self.parallel_chunks),
+                thread_name_prefix="embed",
+            )
+            errors: list[Exception] = []
+            futures = [pool.submit(_fetch, chunk) for chunk in chunks]
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as e:
+                    errors.append(e)
+            # Queue nothing else on a stall; in-flight requests die on their
+            # own request timeout (already-embedded texts are disk-cached).
+            pool.shutdown(wait=False, cancel_futures=True)
+            if errors:
+                raise errors[0]
+        else:
+            for chunk in chunks:
+                _fetch(chunk)
+
+        if state["failed"]:
+            log.warning(
+                "Embeddings: embedded %d/%d uncached text(s); %d dropped — "
+                "clusters/groups touching a dropped text fall back to exact "
+                "-only merging.", state["done"], len(missing), state["failed"],
+            )
         return results
 
 
@@ -456,7 +544,9 @@ def cluster_vulnerabilities(
     duplicates (the same defect reported from different caller nodes) go
     through the two-tier gate in ``_pair_mergeable_fast``. Embeddings are batched
     and served from the per-(model, text) ``disk_cache_dir`` when given.
-    Fails open: on any embedding error only the exact-identity pre-merge runs.
+    Fails open: on a wholesale embedding error only the exact-identity
+    pre-merge runs; individually dropped texts (post-halving failures)
+    dispatch unmerged instead of aborting the pass.
     """
     if not hypotheses:
         return hypotheses
@@ -490,7 +580,7 @@ def cluster_vulnerabilities(
                 for h in pool
             ]
             vectors = _embed_with_disk_cache(embedder, texts, disk_cache_dir)
-            if len(vectors) != len(pool) or any(v is None for v in vectors):
+            if len(vectors) != len(pool):
                 raise ValueError("embedding count mismatch in hypothesis dedup")
         except Exception as e:
             log.warning(
@@ -499,23 +589,43 @@ def cluster_vulnerabilities(
             )
             outcome.extend(pool)
         else:
-            groups: dict[tuple, list[int]] = {}
-            for i, h in enumerate(pool):
-                key = (
-                    h.get("vulnerability_type") or _DEFAULT_VTYPE,
-                    h.get("cwe_id") or _DEFAULT_CWE,
+            # Per-text failures (embed_batch halving exhausted → None hole)
+            # must not forfeit the whole pass: those records simply never
+            # enter a similarity group and dispatch unmerged.
+            if all(v is None for v in vectors):
+                log.warning(
+                    "Semantic dedup: every text failed to embed; dispatching "
+                    "%d hypotheses with exact-identity merging only.", len(pool),
                 )
-                groups.setdefault(key, []).append(i)
-            for idxs in groups.values():
-                sub = [pool[i] for i in idxs]
-                sub_vecs = [vectors[i] for i in idxs]
-                clusters = _cluster_by_similarity(
-                    sub, sub_vecs, threshold, cross_threshold,
-                    anchor_confirmed_threshold, anchor_min_jaccard,
-                    max_merged_cluster,
-                )
-                for cl in clusters:
-                    outcome.append(_merge_cluster([sub[i] for i in cl]) if len(cl) > 1 else sub[cl[0]])
+                outcome.extend(pool)
+            else:
+                dropped = {i for i, v in enumerate(vectors) if v is None}
+                if dropped:
+                    log.warning(
+                        "Semantic dedup: %d/%d hypothesis texts failed to embed; "
+                        "those records dispatch unmerged.", len(dropped), len(pool),
+                    )
+                groups: dict[tuple, list[int]] = {}
+                for i, v in enumerate(vectors):
+                    if i in dropped:
+                        continue
+                    h = pool[i]
+                    key = (
+                        h.get("vulnerability_type") or _DEFAULT_VTYPE,
+                        h.get("cwe_id") or _DEFAULT_CWE,
+                    )
+                    groups.setdefault(key, []).append(i)
+                for idxs in groups.values():
+                    sub = [pool[i] for i in idxs]
+                    sub_vecs = [vectors[i] for i in idxs]
+                    clusters = _cluster_by_similarity(
+                        sub, sub_vecs, threshold, cross_threshold,
+                        anchor_confirmed_threshold, anchor_min_jaccard,
+                        max_merged_cluster,
+                    )
+                    for cl in clusters:
+                        outcome.append(_merge_cluster([sub[i] for i in cl]) if len(cl) > 1 else sub[cl[0]])
+                outcome.extend(pool[i] for i in sorted(dropped))
 
     log.info(
         "Semantic dedup: %d hypotheses -> %d unique dispatch records (%d merged).",

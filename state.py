@@ -35,6 +35,12 @@ class MasterState(TypedDict):
 
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
 
+    # LLM dedup agent's equivalence classes over the review hypotheses (one
+    # {"cwe_id", "bucket", "members", "reason"} dict per cluster). Written by
+    # the dedup_agent node; applied by dispatch_reviewers, which never Sends a
+    # duplicate member. Single writer: plain overwrite field (re-runs replace).
+    hypothesis_clusters: Optional[list[dict]]
+
     # Per-vulnerability reporter outputs (one dict per reportable record,
     # assembled into the report dir by report_assembler_node). Append-reduced since
     # the reporter fan-out writes them concurrently.

@@ -299,7 +299,11 @@ def get_embedder(gate: bool, warn_prefix: str, exact_mode_note: str):
         settings.embeddings_base_url,
         settings.embeddings_model,
         settings.embeddings_timeout,
-        budget_sec=settings.embeddings_fallback_budget_sec,
+        batch_size=settings.embeddings_batch_size,
+        parallel_chunks=settings.embeddings_parallel_chunks,
+        prewarm_timeout=settings.embeddings_prewarm_timeout,
+        keep_alive=settings.embeddings_keep_alive,
+        stall_budget_sec=settings.embeddings_stall_budget_sec,
     )
     if embedder.available():
         return embedder
