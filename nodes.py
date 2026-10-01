@@ -22,8 +22,8 @@ import tools
 import browser_tools
 import attacker_tools
 import credential_finder
-from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState, IntegrationAuditorState
-from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, INTEGRATION_AUDITOR_AGENT, EDGE_TRAVERSAL_AGENT, REPORTER_AGENT, ReporterOutput, cwes, EdgeTraversalOutput
+from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState, IntegrationAuditorState, ReporterState
+from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, INTEGRATION_AUDITOR_AGENT, EDGE_TRAVERSAL_AGENT, REPORTER_AGENT, ReporterFinding, cwes, EdgeTraversalOutput
 from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, is_path_excluded, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, scan_codebase_for_keywords, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, cache_validator, cache_integration_auditor, cache_reporter, reviewer_cache_key, is_feedback_review, cvss_v3_base_score, cvss_severity_label
 from boundary_edges import build_boundary_edges, cluster_boundary_edges, render_batch_prompt, boundary_batch_fingerprint, summarize_boundary_edges
 from tool_loop import CompactionConfig, ToolLoopAgent
@@ -1837,9 +1837,9 @@ def dispatch_reviewers(state: MasterState):
 
     if not hypotheses:
         logging.warning(f"No vulnerabilities hypotheses to dispatch.")
-        # Advance straight to the Reporter: it writes an empty report rather
-        # than silently ENDing (the reviewer/validator phases are skipped).
-        return "reporter"
+        # Advance straight to the reporter-dispatch barrier: it writes an empty
+        # report rather than silently ENDing (reviewer/validator phases skipped).
+        return "reporter_dispatch"
 
     # Semantic dedup before fan-out. Duplicate hypotheses (same real
     # flaw described differently by different agents) are merged so one reviewer
@@ -2215,8 +2215,8 @@ def dispatch_integration_audits(state: MasterState):
 
     if not pending:
         # Everything was proven (or is terminal): the validator/auditor phases
-        # have fully drained, so the pipeline advances to the Reporter node.
-        return "reporter"
+        # have fully drained, so the pipeline advances to reporter dispatch.
+        return "reporter_dispatch"
 
     commands = []
     for evaluation in pending:
@@ -2485,8 +2485,8 @@ def route_integration_audit(state: MasterState):
 
     if not chained:
         # No record needs a final validator pass: the audit phase is done and
-        # the pipeline advances to the Reporter node.
-        return "reporter"
+        # the pipeline advances to the reporter-dispatch barrier.
+        return "reporter_dispatch"
 
     by_id = {v.get("vuln_id"): v for v in all_vulns}
     commands = []
@@ -2826,52 +2826,62 @@ def _is_reportable(record: dict) -> bool:
     )
 
 
-def _render_vulnerability_block(record: dict) -> str:
-    """Render a reportable record as compact evidence prose for the reporter."""
+def _render_reporter_prompt(record: dict) -> str:
+    """Build the single-shot human prompt for ONE vulnerability record.
+
+    The validator's ``poc_payload`` and ``execution_logs`` are included as
+    ground truth so the reporter can rewrite the reproduction steps, but the
+    prompt explicitly forbids quoting them verbatim in the output."""
     cwe = record.get("cwe_id", "OTHER_UNCATEGORIZED")
     cwe_desc = cwes.get(cwe, "")
     lines = [
-        f"**CWE:** {f'{cwe} — {cwe_desc}' if cwe_desc else cwe}",
-        f"**Type:** {record.get('vulnerability_type', 'Code Defect')}",
+        f"Target application: {settings.app_path.name} ({settings.app_path})",
+        "",
+        f"Vulnerability ID: {record.get('vuln_id', 'Unknown')}",
+        f"Type: {record.get('vulnerability_type', 'Code Defect')}",
+        f"CWE: {f'{cwe} — {cwe_desc}' if cwe_desc else cwe}",
     ]
-    nodes = [n for n in (record.get("affected_nodes") or []) if n]
-    if nodes:
-        lines.append(f"**Affected nodes:** {', '.join(nodes)}")
+    affected = [n for n in (record.get("affected_nodes") or []) if n]
+    if affected:
+        lines.append(f"Affected nodes: {', '.join(affected)}")
     if record.get("source_cve"):
-        lines.append(f"**Source CVE:** {record['source_cve']}")
+        lines.append(f"Source CVE: {record['source_cve']}")
     if record.get("confidence_score") is not None:
-        lines.append(f"**Reviewer confidence:** {record['confidence_score']}/10")
-    lines += ["", "**Description**", "", str(record.get("description") or "_none_")]
+        lines.append(f"Reviewer confidence: {record['confidence_score']}/10")
+    lines += ["", "Description:", str(record.get("description") or "_none_")]
     if record.get("reviewer_reasoning"):
-        lines += ["", "**Reviewer reasoning**", "", str(record["reviewer_reasoning"]).rstrip()]
+        lines += ["", "Reviewer reasoning:", str(record["reviewer_reasoning"]).rstrip()]
     steps = record.get("reproduction_steps") or []
     if steps:
-        lines += ["", "**Reproduction steps**", ""]
+        lines += ["", "Original reproduction steps (reviewer):"]
         lines += [
             f"{i}. {re.sub(r'^\s*\d+[\.\)]\s+', '', str(s))}"
             for i, s in enumerate(steps, 1)
         ]
     if record.get("poc_payload"):
-        lines += ["", "**Validated PoC payload**", "", "```", str(record["poc_payload"]).rstrip(), "```"]
+        lines += [
+            "",
+            "Validator PoC payload (ground truth — use it to correct the steps; "
+            "do NOT quote it verbatim in your output):",
+            "```",
+            str(record["poc_payload"]).rstrip(),
+            "```",
+        ]
     if record.get("execution_logs"):
-        lines += ["", "**Validation evidence / execution logs**", "", str(record["execution_logs"]).rstrip()]
+        lines += [
+            "",
+            "Validation evidence / execution logs (ground truth — use it to prove "
+            "success; do NOT quote it verbatim in your output):",
+            str(record["execution_logs"]).rstrip(),
+        ]
+    lines += [
+        "",
+        "Produce ONE ReporterFinding for this vulnerability: a short summary, "
+        "rewritten self-sufficient reproduction steps based on the PoC payload and "
+        "execution logs, a CVSS v3.1 base vector, a worst-case scenario, and a "
+        "remediation.",
+    ]
     return "\n".join(lines)
-
-
-def _render_reporter_prompt(records: list[dict]) -> str:
-    """Build the single-shot human prompt: every reportable record in full."""
-    blocks = []
-    for i, record in enumerate(records, 1):
-        blocks.append(
-            f"### Finding {i}: {record.get('vuln_id', 'Unknown')}\n"
-            + _render_vulnerability_block(record)
-        )
-    return (
-        f"Target application: {settings.app_path.name} ({settings.app_path})\n\n"
-        f"Produce ONE ReporterOutput assessment for EACH of the {len(records)} "
-        f"vulnerabilities below, keyed by its exact vuln_id.\n\n"
-        + "\n\n".join(blocks)
-    )
 
 
 def _assessment_for(finding: dict, record: dict) -> tuple[float | None, str, str]:
@@ -2940,6 +2950,7 @@ def _build_pipeline_statistics(state: MasterState) -> str:
         f"| Chained records re-dispatched to the Validator | {stats.get('validator_chained_records', 0)} |",
         f"| Integration audits (requires_integration) | {stats.get('integration_audits', 0)} |",
         f"| Contract-verifier evaluations (total) | {verified_total} |",
+        f"| Vulnerability findings reported | {len(state.get('reporter_findings', []))} |",
     ]
 
     if verified_total:
@@ -2975,18 +2986,20 @@ def _build_pipeline_statistics(state: MasterState) -> str:
 
 def _render_report_markdown(
     records: list[dict],
-    assessments: dict[str, dict],
-    executive_summary: str,
+    findings_by_id: dict[str, dict],
     statistics: str | None = None,
 ) -> str:
-    """Assemble the final report.md (severity-ranked findings + per-vuln
-    sections, each closing with the mandatory worst-case answer)."""
+    """Assemble the final report.md.
+
+    Each finding section is rendered from the per-vulnerability reporter's
+    `summary` and rewritten `reproduction_steps` (plus deterministic CVSS,
+    worst-case and remediation). The raw `description`, `reviewer_reasoning`,
+    `poc_payload`, and `execution_logs` are deliberately NOT written to the
+    report — the reporter already distilled the first two into `summary` and the
+    last two into `reproduction_steps`."""
     rows = []
     for record in records:
-        finding = assessments.get(record.get("vuln_id"))
-        if finding is None:
-            rows.append((record, None, "N/A", None, "Not assessed"))
-            continue
+        finding = findings_by_id.get(record.get("vuln_id")) or {}
         score, vector, label = _assessment_for(finding, record)
         rows.append((record, finding, vector, score, label))
     # Severity rank: highest CVSS score first, then vuln_id for stability.
@@ -3004,11 +3017,6 @@ def _render_report_markdown(
         f"- **Generated:** {datetime.now().astimezone().isoformat(timespec='seconds')}",
         f"- **Exploitable findings:** {exploitable}",
         f"- **Static findings (no network-reachable path):** {static}",
-        "",
-        "## Executive Summary",
-        "",
-        (executive_summary.strip() if executive_summary and executive_summary.strip()
-         else "_No executive summary produced._"),
         "",
     ]
     if statistics:
@@ -3038,20 +3046,36 @@ def _render_report_markdown(
             f"**CVSS v3.1 base score:** {score_str}  ",
             f"**CVSS vector:** `{vector}`  ",
             f"**CWE:** {cwe}{f' — {cwe_desc}' if cwe_desc else ''}",
-            "",
-            "#### Evidence",
-            "",
+            f"**Type:** {record.get('vulnerability_type', 'Code Defect')}",
         ]
-        lines.append(_render_vulnerability_block(record))
+        affected = [n for n in (record.get("affected_nodes") or []) if n]
+        if affected:
+            lines.append(f"**Affected nodes:** {', '.join(affected)}")
+        if record.get("source_cve"):
+            lines.append(f"**Source CVE:** {record['source_cve']}")
+        if record.get("confidence_score") is not None:
+            lines.append(f"**Reviewer confidence:** {record['confidence_score']}/10")
+
+        summary = finding.get("summary") or record.get("description") or "_none_"
+        steps = finding.get("reproduction_steps") or record.get("reproduction_steps") or []
+        lines += ["", "#### Summary", "", str(summary).rstrip()]
+        lines += ["", "#### Reproduction steps", ""]
+        if steps:
+            lines += [
+                f"{j}. {re.sub(r'^\s*\d+[\.\)]\s+', '', str(s))}"
+                for j, s in enumerate(steps, 1)
+            ]
+        else:
+            lines.append("_No reproduction steps available._")
         lines += ["", "#### Worst-case impact", ""]
-        if finding is not None and finding.get("worst_case_scenario"):
+        if finding.get("worst_case_scenario"):
             lines.append(str(finding["worst_case_scenario"]).rstrip())
         else:
             lines.append(
                 "_The reporter produced no worst-case assessment for this finding._"
             )
         lines += ["", "#### Remediation", ""]
-        if finding is not None and finding.get("remediation"):
+        if finding.get("remediation"):
             lines.append(str(finding["remediation"]).rstrip())
         else:
             lines.append("_No remediation was provided._")
@@ -3086,58 +3110,97 @@ def _write_report(path: Path, text: str) -> None:
         logging.error(f"Reporter: failed to write {path}: {exc}")
 
 
-def reporter_node(state: MasterState) -> dict:
-    """Single-shot terminal Reporter node.
-
-    Runs once after the validator/audit phases have fully drained. Collects
-    every proven-exploitable record plus accepted static findings, spends ONE
-    structured LLM call deriving a CVSS v3.1 vector and the worst-case
-    narrative per finding, then computes the base scores deterministically and
-    writes the full markdown report to ``<target_app>/report.md``. Returns {}
-    (no state change)."""
+def dispatch_reporters(state: MasterState):
+    """Select every reportable record and fan out ONE reporter task per
+    vulnerability. Routes straight to the assembler when nothing is reportable
+    (so report.md — with statistics — is still written)."""
     records = []
     for v in state.get("vulnerabilities", []):
         record = v if isinstance(v, dict) else v.model_dump()
         if _is_reportable(record):
             records.append(record)
-    report_path = settings.app_path / "report.md"
-    statistics = _build_pipeline_statistics(state)
 
     if not records:
         logging.warning("Reporter: no exploitable/static findings to report.")
+        return "report_assembler"
+
+    _record_stat("reporters_dispatched", len(records))
+    logging.info(f"Dispatching {len(records)} per-vulnerability reporter task(s).")
+    return [Send("reporter", ReporterState(report=record)) for record in records]
+
+
+def reporter_node(state: ReporterState) -> dict:
+    """Single-shot per-vulnerability Reporter node.
+
+    Receives ONE reportable record and spends ONE structured LLM call on it:
+    a short `summary` of the description + reviewer reasoning, reproduction
+    steps rewritten from the validator's PoC payload / execution logs, a CVSS
+    v3.1 base vector, the worst-case scenario, and a remediation. The finding is
+    keyed by the record's `vuln_id` (attached deterministically) and appended to
+    the `reporter_findings` channel for the assembler. Fails open to the
+    record's own description/steps when the LLM call errors."""
+    report = state.get("report") or {}
+    if not report:
+        return {}
+    vuln_id = report.get("vuln_id", "Unknown")
+
+    finding = cache_reporter(report)
+    if finding is not None:
+        logging.info(f"Reporter cache hit for {vuln_id}.")
+        finding = dict(finding)
+    else:
+        sys_msg = SystemMessage(content=REPORTER_AGENT.get("prompt", ""))
+        human_msg = HumanMessage(content=_render_reporter_prompt(report))
+        reporter_llm = smart_llm.with_structured_output(
+            ReporterFinding, method="json_schema", strict=True
+        )
+        try:
+            result = reporter_llm.invoke([sys_msg, human_msg])
+            finding = result if isinstance(result, dict) else result.model_dump()
+        except Exception as exc:
+            # Fail open: keep the record's own evidence rather than losing the
+            # finding entirely (the assembler still renders a section).
+            logging.error(f"Reporter: LLM call failed for {vuln_id} ({exc}); using record evidence.")
+            finding = {
+                "summary": report.get("description") or "",
+                "cvss_vector": "",
+                "severity": None,
+                "reproduction_steps": list(report.get("reproduction_steps") or []),
+                "worst_case_scenario": "",
+                "remediation": "",
+            }
+        cache_reporter(report, finding)
+
+    finding["vuln_id"] = vuln_id
+    return {"reporter_findings": [finding]}
+
+
+def report_assembler_node(state: MasterState) -> dict:
+    """Terminal node: assemble every per-vulnerability reporter finding into the
+    single markdown report at ``<target_app>/report.md``.
+
+    Runs once after the reporter fan-out barrier (or directly when there is
+    nothing to report). Computes each finding's CVSS base score deterministically
+    from its vector, severity-ranks the sections, and writes the statistics +
+    findings-at-a-glance table + per-vulnerability sections. Returns {}."""
+    report_path = settings.app_path / "report.md"
+    statistics = _build_pipeline_statistics(state)
+
+    findings_by_id = {}
+    for finding in state.get("reporter_findings", []) or []:
+        if isinstance(finding, dict) and finding.get("vuln_id"):
+            findings_by_id[finding["vuln_id"]] = finding
+
+    records = []
+    for v in state.get("vulnerabilities", []):
+        record = v if isinstance(v, dict) else v.model_dump()
+        if _is_reportable(record) and record.get("vuln_id") in findings_by_id:
+            records.append(record)
+
+    if not records:
         _write_report(report_path, _render_empty_report(statistics))
         return {}
 
-    output = cache_reporter(records)
-    if output is None:
-        sys_msg = SystemMessage(content=REPORTER_AGENT.get("prompt", ""))
-        human_msg = HumanMessage(content=_render_reporter_prompt(records))
-        reporter_llm = smart_llm.with_structured_output(
-            ReporterOutput, method="json_schema", strict=True
-        )
-        try:
-            output = reporter_llm.invoke([sys_msg, human_msg])
-            output = output if isinstance(output, dict) else output.model_dump()
-        except Exception as exc:
-            # Fail open: never leave the pipeline without a report.md. The
-            # evidence block per record is retained; only the LLM-derived
-            # assessments drop.
-            logging.error(f"Reporter: LLM assessment failed ({exc}); writing evidence-only report.")
-            output = {"executive_summary": "", "findings": []}
-        cache_reporter(records, output)
-    else:
-        logging.info("Reporter cache hit; reusing previous LLM assessments.")
-
-    assessments = {
-        f.get("vuln_id"): f
-        for f in (output.get("findings") or [])
-        if isinstance(f, dict) and f.get("vuln_id")
-    }
-    markdown = _render_report_markdown(
-        records,
-        assessments,
-        output.get("executive_summary") or "",
-        statistics,
-    )
+    markdown = _render_report_markdown(records, findings_by_id, statistics)
     _write_report(report_path, markdown)
     return {}
