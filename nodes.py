@@ -1845,7 +1845,10 @@ def dispatch_validators(state: MasterState):
       another exploit; sent to the Integration Auditor so the finding can be
       combined with other confirmed vulnerabilities into a multi-step exploit
       chain; the auditor's `chained` verdicts are forwarded to the Validator by
-      `route_integration_audit`.
+      `route_integration_audit`. A record with no confirmed peers is resolved
+      `unchainable` by the auditor itself: `first_turn` detects the empty peer list
+      and marks it so deterministically, without invoking the LLM (a 'chained'
+      verdict is impossible by construction).
     - `static_finding_only`: no network-reachable path exists; the Reviewer's static
       proof is accepted into the final report and the record is not dispatched.
     """
@@ -1967,6 +1970,22 @@ class IntegrationAuditorAgent(ToolLoopAgent):
             tools.submit_integration_audit,
         ])
 
+    def pre_router(self, state) -> bool:
+        """End the auditor loop immediately when `first_turn` already resolved the
+        record as `unchainable` (no other confirmed vulnerability exists to chain
+        with; a 'chained' verdict is impossible by construction). The router is
+        then never allowed to index the still-empty `messages` list. Invariant:
+        the subgraph's `vulnerabilities` channel only ever holds this one record
+        (init `[]`, `first_turn` writes exactly one), so the match-by-id scan is
+        safe and can never end a live with-peers loop."""
+        report_vid = state.get("report_to_test", {}).get("vuln_id")
+        if not report_vid:
+            return False
+        return any(
+            v.get("vuln_id") == report_vid and v.get("status") == "unchainable"
+            for v in state.get("vulnerabilities", [])
+        )
+
     def first_turn(self, state, llm_with_tools) -> dict:
         sys_msg = SystemMessage(content=INTEGRATION_AUDITOR_AGENT.get("prompt", ""))
 
@@ -2003,15 +2022,39 @@ class IntegrationAuditorAgent(ToolLoopAgent):
                 + "\n".join(peer_lines)
             )
         else:
-            formatted_vuln += (
-                f"\n--- OTHER CONFIRMED VULNERABILITIES ---\n"
-                f"None. There is nothing to chain this record with; you cannot emit a "
-                f"'chained' verdict without at least one other confirmed vulnerability."
+            # No peers to chain with, so a 'chained' verdict is impossible by
+            # construction. Resolve deterministically here -- inside the auditor,
+            # not as a separate graph node -- without launching an LLM loop on a
+            # dead end: mark the record 'unchainable' (terminal, stays in the
+            # report) and let `pre_router` end the subgraph before any message
+            # indexing. `agent()` returns this `Command` verbatim.
+            logging.info(
+                f"{report.get('vuln_id', 'Unknown')} is requires_integration but "
+                f"has no other confirmed vulnerabilities to chain with; resolving "
+                f"'unchainable' without invoking the auditor LLM."
             )
+            record = dict(report)
+            existing = record.get("integration_audit_reasoning") or ""
+            note = (
+                "[integration auditor] No other confirmed vulnerabilities exist to "
+                "chain with; resolved 'unchainable' without invoking the LLM (a "
+                "'chained' verdict requires at least one other confirmed "
+                "vulnerability)."
+            )
+            record["integration_audit_reasoning"] = (
+                f"{existing}\n{note}" if existing else note
+            )
+            record["status"] = "unchainable"
+            return Command(update={"vulnerabilities": [record]})
 
         steps = report.get("reproduction_steps") or []
+        # Strip any leading "N." / "N)" numbering the reviewer already embedded
+        # so our prefixed counter does not double-number each step.
         steps_str = (
-            "\n".join(f"  {i}. {s}" for i, s in enumerate(steps, 1))
+            "\n".join(
+                f"  {i}. {re.sub(r'^\s*\d+[\.\)]\s+', '', str(s))}"
+                for i, s in enumerate(steps, 1)
+            )
             if steps else "  None provided by reviewer"
         )
         formatted_vuln += (
