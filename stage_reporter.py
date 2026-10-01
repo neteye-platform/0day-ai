@@ -16,7 +16,7 @@ from markdown_it import MarkdownIt
 from weasyprint import HTML
 
 import settings
-from llms import invoke_tracked, smart_llm
+from llms import get_llm, invoke_tracked
 from run_stats import _record_stat, _snapshot_pipeline_stats, as_dict, as_dicts, raise_if_stopping, snapshot_token_totals, strip_step_numbering
 from schemas import REPORTER_AGENT, ReporterFinding, cwes
 from state import MasterState, ReporterState
@@ -770,7 +770,7 @@ def reporter_node(state: ReporterState) -> dict:
     else:
         sys_msg = SystemMessage(content=REPORTER_AGENT.get("prompt", ""))
         human_msg = HumanMessage(content=_render_reporter_prompt(report))
-        reporter_llm = smart_llm.with_structured_output(
+        reporter_llm = get_llm("reporter").with_structured_output(
             ReporterFinding, method="json_schema", strict=True
         )
         usage = None

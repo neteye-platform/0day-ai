@@ -20,7 +20,7 @@ from langgraph.types import Command, Send
 import patch_tools
 import settings
 import tools
-from llms import fast_llm, smart_llm
+from llms import get_llm
 from run_stats import (
     _record_stat,
     _start_agent_progress,
@@ -209,7 +209,7 @@ class PatcherAgent(ToolLoopAgent):
         return affected_nodes_label(report, report.get("node_id", "Unknown"))
 
     def bind_tools(self, state):
-        return smart_llm.bind_tools(
+        return get_llm("patcher").bind_tools(
             [
                 tools.read_source_code,   # graph-attached code + its numbering
                 tools.read_file,          # paged host reads relative to app root
@@ -346,9 +346,10 @@ class PatcherAgent(ToolLoopAgent):
 patcher_agent = PatcherAgent(
     name="patcher",
     settings_prefix="patcher",
-    compaction=CompactionConfig(),
+    compaction=CompactionConfig("patcher"),
     summary_ledger=PATCHER_SUMMARY_LEDGER,
-    summary_llm=fast_llm,
+    summary_llm=get_llm("compaction"),
+    summarizer_compaction=CompactionConfig("compaction"),
 )
 
 # Module-level graph node callables (mirrors the other stage modules).

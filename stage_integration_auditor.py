@@ -8,7 +8,7 @@ from langgraph.types import Command, Send
 
 import settings
 import tools
-from llms import fast_llm, smart_llm
+from llms import get_llm
 from run_stats import _record_stat, _start_agent_progress, affected_nodes_label, as_dicts, record_llm_usage, steps_block
 from schemas import INTEGRATION_AUDITOR_AGENT
 from state import IntegrationAuditorState, MasterState, ValidatorState
@@ -163,7 +163,7 @@ class IntegrationAuditorAgent(ToolLoopAgent):
         return state.get("report_to_test", {}).get("vuln_id", "Unknown")
 
     def bind_tools(self, state):
-        return smart_llm.bind_tools([
+        return get_llm("integration_auditor").bind_tools([
             tools.get_vulnerability_details,
             tools.get_node_connections,
             tools.get_path,
@@ -309,9 +309,10 @@ class IntegrationAuditorAgent(ToolLoopAgent):
 integration_auditor_agent = IntegrationAuditorAgent(
     name="integration_auditor",
     settings_prefix="integration_auditor",
-    compaction=CompactionConfig(),
+    compaction=CompactionConfig("integration_auditor"),
     summary_ledger=INTEGRATION_AUDITOR_SUMMARY_LEDGER,
-    summary_llm=fast_llm,
+    summary_llm=get_llm("compaction"),
+    summarizer_compaction=CompactionConfig("compaction"),
 )
 
 # Module-level graph node callables (kept so graph.py's imports stay untouched).

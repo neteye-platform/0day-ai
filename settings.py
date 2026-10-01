@@ -54,11 +54,11 @@ llm_api_key = os.environ.get("OPENAI_API_KEY")
 # llm_model = "deepseek/deepseek-v4.1-flash"
 # llm_api_key = os.environ.get("OPENROUTER_API_KEY")
 # llm_base_url = "http://localhost:11434/v1"
-# llm_model = "qwen36"
+# llm_model = "qwen3.6:35b"
 # llm_api_key = "ollama"
 
-# Single context-window size shared by the reviewer, validator, and integration
-# auditor (their compaction hard caps derive from it).
+# Default model context window (registry key `context_window`); each agent's
+# tool-loop compaction caps derive from ITS effective window.
 model_context_window = 250112
 
 # Single fixed output budget for EVERY LLM call in the pipeline — fast
@@ -66,6 +66,56 @@ model_context_window = 250112
 # compaction summaries, the reviewer, and the validator/integration-auditor
 # loops. Window-independent: stays put no matter model_context_window.
 llm_max_completion_tokens = 16384
+
+# Per-agent LLM assignment (consumed by llms.get_llm / llms.get_config).
+# `llm_defaults` is the base for every agent; each `llm_overrides` entry may
+# override any of: model, base_url, api_key, temperature, reasoning_effort,
+# max_completion_tokens, context_window — e.g. to route one agent to a
+# different endpoint, give it more thinking, or switch to a model with a
+# smaller window (the tool-loop compaction caps and the explorer prompt cap
+# then follow the agent's own window). Unset keys inherit the default.
+# Agent keys:
+# explorer, cve_analyzer, threat_intel, contract_verifier, edge_traversal,
+# credential_finder, compaction (tool-loop context summaries), dedup_agent,
+# reviewer, validator, integration_auditor, patcher, reporter.
+llm_defaults = {
+    "model": llm_model,
+    "base_url": llm_base_url,
+    "api_key": llm_api_key,
+    "temperature": 0.2,
+    "reasoning_effort": "none",
+    "max_completion_tokens": llm_max_completion_tokens,
+    "context_window": model_context_window,
+}
+llm_overrides = {
+    # Full-override example (every key is optional; unset ones inherit
+    # llm_defaults):
+    # "reviewer": {
+    #     "model": "openai/gpt-6.1-sol",
+    #     "base_url": "https://openrouter.ai/api/v1",
+    #     "api_key": os.environ.get("OPENROUTER_API_KEY"),
+    #     "temperature": 0.6,
+    #     "reasoning_effort": "high",
+    #     "max_completion_tokens": 32768,
+    #     "context_window": 1073741824,
+    # },
+    # cheap fast structured-JSON agents + compaction summaries: inherit defaults
+    "explorer": {},
+    "cve_analyzer": {},
+    "threat_intel": {},
+    "contract_verifier": {},
+    "edge_traversal": {},
+    "credential_finder": {},
+    "compaction": {},
+    # deliberate-reasoning agents
+    "dedup_agent": {"temperature": 0.8, "reasoning_effort": "medium"},
+    "integration_auditor": {"temperature": 0.8, "reasoning_effort": "medium"},
+    "patcher": {"temperature": 0.8, "reasoning_effort": "medium"},
+    "reporter": {"temperature": 0.8, "reasoning_effort": "medium"},
+    # tool-loop agents
+    "reviewer": {"temperature": 0.8, "reasoning_effort": "low"},
+    "validator": {"temperature": 0.8, "reasoning_effort": "low"},
+}
 
 
 # =============================== Agents ==================================
@@ -173,7 +223,8 @@ dedup_anchor_min_jaccard = 0.6          # component token overlap for the mid ti
 dedup_max_merged_cluster = 25           # cap on cross-node cluster growth
 
 # LLM dedup agent (stage_dedup node, between edge_traversal and the reviewer
-# fan-out): groups hypotheses by cwe_id and spends ONE structured smart_llm
+# fan-out): groups hypotheses by cwe_id and spends ONE structured
+# get_llm("dedup_agent")
 # call per group to decide true-duplicate equivalence classes (the embedding
 # pass above only catches surface paraphrases — reworded duplicates and the
 # same sink re-anchored under different node ids survive it). Groups larger
@@ -240,8 +291,9 @@ explorer_batch_char_threshold = 15000
 # DB-dump-sized file tokenizes past the model window -> deterministic HTTP 400.
 # 0.75 chars/token is a deliberately pessimistic worst case that keeps even
 # pathological tokenizers inside window - output budget - context_reserved.
+_explorer_llm_cfg = {**llm_defaults, **llm_overrides.get("explorer", {})}
 explorer_max_prompt_chars = int(
-    (model_context_window - llm_max_completion_tokens - context_reserved) * 0.75
+    (_explorer_llm_cfg["context_window"] - _explorer_llm_cfg["max_completion_tokens"] - context_reserved) * 0.75
 )
 
 # Max expert roles assigned per community (top-K by heuristic score).

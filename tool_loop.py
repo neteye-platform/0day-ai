@@ -26,6 +26,7 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt.tool_node import ToolInvocationError, ToolNode, ToolRuntime
 from langgraph.types import Command
 
+import llms
 import settings
 from run_stats import (
     _log_agent_completion,
@@ -38,32 +39,51 @@ from utils import estimate_message_tokens
 
 
 class CompactionConfig:
-    """Settings-backed compaction budget shared by every tool-loop agent.
+    """Settings-backed compaction budget, resolved per LLM-registry agent.
 
-    Reads the single shared compaction budget (``settings.context_reserved``,
-    ``settings.hard_reserved``, etc.) plus ``settings.model_context_window``
-    and ``settings.llm_max_completion_tokens`` live (on every call) so runtime
-    overrides stay effective.
+    Constructed with the loop's llms registry key (e.g.
+    ``CompactionConfig("reviewer")``): the model window and output budget then
+    follow that agent's effective config (``context_window`` /
+    ``max_completion_tokens``), so routing an agent to a differently-sized
+    model keeps every cap honest. Without an agent key the window and output
+    budget fall back to the global ``settings.model_context_window`` /
+    ``settings.llm_max_completion_tokens``. The shared knobs
+    (``context_reserved``, ``hard_reserved``, …) are always global. All values
+    are re-read live (on every call) so runtime overrides stay effective.
     """
 
-    __slots__ = ()
+    __slots__ = ("agent",)
+
+    def __init__(self, agent: str = ""):
+        self.agent = agent
+
+    @property
+    def model_context_window(self) -> int:
+        if self.agent:
+            return llms.get_config(self.agent)["context_window"]
+        return settings.model_context_window
+
+    @property
+    def max_output_tokens(self) -> int:
+        if self.agent:
+            return llms.get_config(self.agent)["max_completion_tokens"]
+        return settings.llm_max_completion_tokens
 
     def threshold(self) -> int:
         """Estimated-token threshold at which soft-threshold compaction triggers."""
-        return settings.model_context_window - settings.context_reserved
+        return self.model_context_window - settings.context_reserved
 
     def hard_cap(self) -> int:
         """Estimated-token ceiling below which the LLM must never be invoked.
 
         Reserves both the configured hard margin AND the per-request output
-        budget (``llm_max_completion_tokens``): the OpenAI-compat gateway
-        rejects any request whose input + requested output exceeds the model
-        window, so the estimated input alone must stay under
-        ``window - output_budget - hard_reserved``.
+        budget: the OpenAI-compat gateway rejects any request whose input +
+        requested output exceeds the model window, so the estimated input alone
+        must stay under ``window - output_budget - hard_reserved``.
         """
         return (
-            settings.model_context_window
-            - settings.llm_max_completion_tokens
+            self.model_context_window
+            - self.max_output_tokens
             - settings.hard_reserved
         )
 
@@ -81,10 +101,6 @@ class CompactionConfig:
     @property
     def min_compressible(self) -> int:
         return settings.compaction_min_compressible_tokens
-
-    @property
-    def model_context_window(self) -> int:
-        return settings.model_context_window
 
     @property
     def hard_reserved(self) -> int:
@@ -369,12 +385,16 @@ class ToolLoopAgent:
         compaction: CompactionConfig,
         summary_ledger: str,
         summary_llm,
+        summarizer_compaction: CompactionConfig | None = None,
     ):
         self.name = name
         self.settings_prefix = settings_prefix
         self.compaction = compaction
         self.summary_ledger = summary_ledger
         self.summary_llm = summary_llm
+        # Budget backing the summarizer call itself; must follow the SUMMARY
+        # model's window/output budget (defaults to the loop agent's own).
+        self.summarizer_compaction = summarizer_compaction or compaction
         # Stable graph node identifiers (must match graph.py's wiring).
         self.agent_node_name = f"{name}_agent"
         self.tools_node_name = f"{name}_tools"
@@ -489,9 +509,10 @@ class ToolLoopAgent:
     # -- memory management ----------------------------------------------------
 
     def summarize(self, middle: list[AnyMessage]) -> tuple[SystemMessage | None, Optional[dict]]:
-        # The cheap summarizer is a fast_llm call with its own output budget
-        # (settings.llm_max_completion_tokens); its transcript (rendered inside
-        # the summary prompt) must fit window - output budget - hard reserved.
+        # The cheap summarizer is the per-loop summary_llm (get_llm("compaction"))
+        # call with its OWN window and output budget (summarizer_compaction);
+        # its transcript (rendered inside the summary prompt) must fit
+        # summarizer window - summarizer output budget - hard reserved.
         # The token estimate is deliberately ~2.9x over real prose, so an
         # over-budget estimate usually means ONE degenerate single message (a
         # ~100k-token 'finish_reason: length' dump) dominates the middle. Never
@@ -501,9 +522,9 @@ class ToolLoopAgent:
         # ENTIRE middle. No truncation is applied; if nothing survives we return
         # None and callers fail open as usual.
         summarizer_budget = (
-            self.compaction.model_context_window
-            - settings.llm_max_completion_tokens
-            - self.compaction.hard_reserved
+            self.summarizer_compaction.model_context_window
+            - self.summarizer_compaction.max_output_tokens
+            - self.summarizer_compaction.hard_reserved
         )
         working = list(middle)
         if estimate_message_tokens(working) >= summarizer_budget:

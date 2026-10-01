@@ -1,4 +1,4 @@
-"""Shared ChatOpenAI instances. `import settings` loads .env before any key read."""
+"""Per-agent ChatOpenAI factory (get_llm). `import settings` loads .env before any key read."""
 
 import logging
 
@@ -14,18 +14,38 @@ from run_stats import new_usage, record_usage
 # every retry resends the identical oversized prompt.
 _CONTEXT_LENGTH_MARKER = "maximum context length"
 
-_KEYS = dict(
-    base_url=settings.llm_base_url,
-    model=settings.llm_model,
-    api_key=settings.llm_api_key,
-    stream_usage=True,
-    max_completion_tokens=settings.llm_max_completion_tokens,
-)
+_INSTANCES: dict[str, ChatOpenAI] = {}
 
-fast_llm = ChatOpenAI(temperature=0.2, reasoning_effort="none", **_KEYS)
-smart_llm = ChatOpenAI(temperature=0.8, reasoning_effort="medium", **_KEYS)
-reviewer_llm = ChatOpenAI(temperature=0.8, reasoning_effort="low", **_KEYS)
-validator_llm = ChatOpenAI(temperature=0.8, reasoning_effort="low", **_KEYS)
+# Registry keys consumed by the pipeline itself, not ChatOpenAI kwargs.
+_CONFIG_ONLY_KEYS = ("context_window",)
+
+
+def get_config(agent: str) -> dict:
+    """Effective per-agent LLM config: settings.llm_defaults merged with
+    settings.llm_overrides[agent] (model/base_url/api_key/temperature/
+    reasoning_effort/max_completion_tokens/context_window all overridable per
+    agent). Re-read per call, so edits are seen live by config consumers
+    (compaction caps, cache fingerprints) — but get_llm builds its client once
+    per key, so registry edits must happen before that agent's first get_llm
+    (a long-lived `langgraph dev` server needs a restart)."""
+    cfg = dict(settings.llm_defaults)
+    cfg.update(settings.llm_overrides.get(agent, {}))
+    return cfg
+
+
+def get_llm(agent: str) -> ChatOpenAI:
+    """ChatOpenAI for one pipeline agent, built once per key and reused from
+    the get_config merge (config-only keys like context_window excluded)."""
+    llm = _INSTANCES.get(agent)
+    if llm is None:
+        cfg = {
+            k: v
+            for k, v in get_config(agent).items()
+            if k not in _CONFIG_ONLY_KEYS
+        }
+        llm = ChatOpenAI(stream_usage=True, **cfg)
+        _INSTANCES[agent] = llm
+    return llm
 
 
 class UsageCapture(BaseCallbackHandler):
@@ -64,7 +84,7 @@ def invoke_structured_capped(llm, messages, description: str, agent: str = ""):
     """Structured-output invoke that survives the completion-token cap.
 
     Hub-sized prompts can push the model into a degeneration that burns the
-    whole `llm_max_completion_tokens` budget and dies mid-JSON
+    whole `max_completion_tokens` budget and dies mid-JSON
     (LengthFinishReasonError). Re-roll once; on a second cap hit log an ERROR
     and return (None, usage) so the caller skips its unit of work instead of
     exhausting LangGraph's task retries and crashing the whole run. A
@@ -95,8 +115,8 @@ def invoke_structured_capped(llm, messages, description: str, agent: str = ""):
             except LengthFinishReasonError:
                 if attempt == 2:
                     logging.error(
-                        f"{description}: LLM hit the {settings.llm_max_completion_tokens}-token "
-                        "output cap twice; skipping this call to keep the run alive."
+                        f"{description}: LLM hit its completion-token output cap twice; "
+                        "skipping this call to keep the run alive."
                     )
                     return None, capture.usage
                 logging.warning(
