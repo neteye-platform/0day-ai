@@ -275,7 +275,6 @@ def build_networkx_graph(graph_path: Path, allowed_communities: Optional[list[in
             attributes = {k: v for k, v in edge.items() if k not in ['source', 'target']}
             G.add_edge(source, target, **attributes)
 
-    print(f"Loaded Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges.")
     return G
 
 
