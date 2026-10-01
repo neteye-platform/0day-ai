@@ -1,4 +1,5 @@
 from collections import defaultdict
+import hashlib
 import logging
 import re
 from pathlib import Path
@@ -1262,6 +1263,18 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
     return list(best_records.values())
 
 
+def safe_cache_filename(filename: str, max_bytes: int = 240) -> str:
+    """Keep a cache filename within filesystem component length limits."""
+    if len(filename.encode("utf-8")) <= max_bytes:
+        return filename
+
+    suffix = Path(filename).suffix
+    digest = hashlib.md5(filename.encode("utf-8")).hexdigest()
+    prefix_bytes = max_bytes - len(suffix.encode("utf-8")) - len(digest) - 1
+    prefix = filename.encode("utf-8")[:max(0, prefix_bytes)].decode("utf-8", "ignore")
+    return f"{prefix}-{digest}{suffix}"
+
+
 def cache(file: Path, action: str, content: dict = {}) -> Optional[dict]:
     if action == "read":
         if not file.exists():
@@ -2151,4 +2164,3 @@ def index_file(filepath: str | Path) -> list[dict]:
                 }
 
     return list(symbol_index.values())
-
