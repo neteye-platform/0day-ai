@@ -13,6 +13,42 @@ LANGUAGE_MAP = {
     ".tsx": tree_sitter.Language(tree_sitter_typescript.language_tsx()),
 }
 
+# Dependency manifest and lockfile names across all supported ecosystems.
+# These files are already handled by the SCA layer (osv-scanner), so the
+# LLM explorers should never spend budget re-analyzing them.
+MANIFEST_NAMES = {
+    # Python / Conda
+    "requirements.txt", "requirements.in", "Pipfile", "Pipfile.lock",
+    "poetry.lock", "pyproject.toml", "setup.py", "setup.cfg",
+    "environment.yml", "conda.yaml", "conda-lock.yml",
+    # Node / JavaScript
+    "package.json", "packages.json", "package-lock.json", "npm-shrinkwrap.json",
+    "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb",
+    "deno.lock", "deno.json", "deno.jsonc",
+    # JVM
+    "pom.xml", "build.gradle", "build.gradle.kts",
+    "settings.gradle", "settings.gradle.kts", "gradle.lockfile",
+    "gradle/libs.versions.toml", "ivy.xml",
+    # Go
+    "go.mod", "go.sum",
+    # Ruby
+    "Gemfile", "Gemfile.lock", "gems.rb", "gems.locked",
+    # PHP
+    "composer.json", "composer.lock",
+    # Rust
+    "Cargo.toml", "Cargo.lock",
+    # Dart
+    "pubspec.yaml", "pubspec.lock",
+    # Elixir
+    "mix.exs", "mix.lock",
+    # Swift / Objective-C
+    "Package.swift", "Package.resolved", "Podfile", "Podfile.lock",
+    # .NET
+    "packages.config", "packages.lock.json", "project.json", "project.lock.json", "global.json",
+    # C / C++
+    "vcpkg.json", "conanfile.txt", "conanfile.py", "conan.lock", "CMakeLists.txt",
+}
+
 # Define the AST mappings for the languages your agents will scan
 AST_GRAMMAR_MAP = {
     ".py": {

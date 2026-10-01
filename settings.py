@@ -1,7 +1,6 @@
-import os
 from pathlib import Path
 
-app_path = Path("../apps/htb")
+app_path = Path("../apps/web_reactoops")
 graph = app_path / "graphify-out" / "graph.json"
 sandbox_url = "http://127.0.0.1:8000"
 # sandbox_url = "http://127.0.0.1:9000"
@@ -10,11 +9,12 @@ container_name = "notebookconverter"
 
 
 # None = all
-communities_to_analyze = None
-# Glpi
-#communities_to_analyze = [32, 33, 54, 61]
+communities_to_analyze = None # [32, 33, 54, 61]
 
 # When True, the explorer dispatches multiple small nodes sharing a file in a
 # single batch. Set to False to force one dispatch per node (no batching).
 explorer_batching_enabled = True
 
+# Concurrency
+simple_agents_concurrency = 4
+tool_agents_concurrency = 1

@@ -5,6 +5,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from langgraph.types import RetryPolicy
 
+import settings
 import tools
 from nodes import preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, reviewer_agent_node, ask_reviewer_for_tool, dispatch_all_tasks, dispatch_reviewers, dispatch_validators, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
 from reachability import reachability_filter_node
@@ -88,8 +89,8 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("cve_analyzer", cve_analyzer_node)
     workflow.add_node("aggregate_demands", aggregate_demands_node)
     workflow.add_node("contract_verifier", contract_verifier_node)
-    workflow.add_node("reviewer_agent", compiled_reviewer_agent)
-    workflow.add_node("validator_agent", compiled_validator_agent)
+    workflow.add_node("reviewer_agent", compiled_reviewer_agent.with_config({"max_concurrency": settings.tool_agents_concurrency}))
+    workflow.add_node("validator_agent", compiled_validator_agent.with_config({"max_concurrency": settings.tool_agents_concurrency}))
     workflow.add_node("synchronization", synchronization_node)
     workflow.add_node("reachability_filter", reachability_filter_node)
     # workflow.add_node("reviewer_sync", synchronization_node)
@@ -110,7 +111,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_edge("validator_agent", END)
 
     app = workflow.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)
-    app = app.with_config({"max_concurrency": 1})
+    app = app.with_config({"max_concurrency": settings.simple_agents_concurrency})
 
     return app
 

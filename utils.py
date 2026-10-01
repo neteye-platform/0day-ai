@@ -12,7 +12,7 @@ from schemas import VulnerabilityRecord
 import settings
 from functools import lru_cache
 
-from languages import LANGUAGE_MAP, AST_GRAMMAR_MAP, SYMBOL_QUERIES
+from languages import LANGUAGE_MAP, AST_GRAMMAR_MAP, SYMBOL_QUERIES, MANIFEST_NAMES
 
 
 @lru_cache(maxsize=1)
@@ -319,9 +319,12 @@ def resolve_node_id(module, symbol):
     return None
 
 
-def run_osv_scanner(repo_path: str) -> list[dict]:
+def run_osv_scanner(repo_path: Path) -> list[dict]:
     """Runs osv-scanner on a directory and extracts raw vulnerability records."""
     raw_vulnerabilities = []
+
+    if not repo_path.exists():
+        logging.error(f"Input report does not exist.")
 
     try:
         # Run the scanner recursively (-r) and output as JSON
@@ -335,7 +338,7 @@ def run_osv_scanner(repo_path: str) -> list[dict]:
         if not result.stdout.strip():
             error = result.stderr
             if error:
-                logging.warning(f"Error running osv-scanner: {error}")
+                logging.error(f"Error running osv-scanner: {error}")
             return []
 
         data = json.loads(result.stdout)
@@ -1079,14 +1082,20 @@ def is_node_worth_scanning(node_id: str, min_signals: int = 1) -> bool:
       (function calls, imports, string interpolation, control flow).
 
     Unparseable nodes (unsupported extension, parse failure) are kept.
+    Dependency manifest/lockfile nodes are always dropped: they are already
+    handled by the SCA layer (osv-scanner).
     """
-    source_code = get_node_code(node_id, raw=True)
-    if not source_code:
-        return False
-
     graph_data = get_cached_graph_data(settings.graph)
     target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), None)
     if not target_node or not target_node.get("source_file"):
+        return False
+
+    if Path(target_node["source_file"]).name in MANIFEST_NAMES:
+        logging.debug(f"Skipping dependency manifest node {node_id} ({target_node['source_file']}).")
+        return False
+
+    source_code = get_node_code(node_id, raw=True)
+    if not source_code:
         return False
 
     ext = Path(target_node["source_file"]).suffix.lower()
