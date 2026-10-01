@@ -66,6 +66,9 @@ class ReviewerState(TypedDict):
     # Ledger id from dispatch_reviewers; the base router advances it on every
     # terminal route so the run log tracks reviewer fan-out.
     progress_id: str
+    # 'HIT' written by pre_agent on a cached-verdict short-circuit; rendered
+    # as the HIT/MISS tag on the progress completion line (absent => MISS).
+    cache_tag: str
     # Number of LLM invocations in the tool loop. Bounds the loop so a model
     # that never submits a verdict ends gracefully via the fallback node.
     iterations: Annotated[int, operator.add]
@@ -96,6 +99,9 @@ class ValidatorState(TypedDict):
     # Ledger id from dispatch_validators; the base router advances it on every
     # terminal route so the run log tracks validator fan-out (turns included).
     progress_id: str
+    # 'HIT' written by pre_agent on a cached-verdict short-circuit; rendered
+    # as the HIT/MISS tag on the progress completion line (absent => MISS).
+    cache_tag: str
     # Number of LLM invocations in the tool loop (same role as ReviewerState.iterations).
     iterations: Annotated[int, operator.add]
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
