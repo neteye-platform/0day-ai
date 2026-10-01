@@ -1,7 +1,10 @@
-from collections import defaultdict
+from collections import defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from datetime import datetime, timezone
 import fnmatch
 import hashlib
 import logging
+import os
 import re
 import shutil
 from pathlib import Path
@@ -769,13 +772,13 @@ def resolve_node_id(module, symbol):
     return None
 
 
-def _run_osv(cmd: list, label: str, skip_os: bool = False) -> list[dict]:
+def _run_osv(cmd: list, label: str, skip_os: bool = False) -> list | None:
     """Run an osv-scanner command and collect raw vulnerability records.
 
-    Exit code 1 simply means "vulnerabilities found" - the JSON on stdout is
-    still valid; only an empty stdout indicates no results. ``skip_os`` drops
-    OS-package scan results (image scans).
-    """
+    Exit code 1 = "vulnerabilities found": stdout is still valid. Returns None
+    when the scan FAILED (missing binary, unparseable output, stderr-only
+    error) — never cache a failed result; an empty successful scan is a plain
+    []. ``skip_os`` drops OS-package results (image scans)."""
     raw_vulnerabilities = []
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -783,6 +786,7 @@ def _run_osv(cmd: list, label: str, skip_os: bool = False) -> list[dict]:
         if not result.stdout.strip():
             if result.stderr:
                 logging.error(f"Error running osv-scanner on {label}: {result.stderr}")
+                return None
             return []
 
         data = json.loads(result.stdout)
@@ -797,10 +801,51 @@ def _run_osv(cmd: list, label: str, skip_os: bool = False) -> list[dict]:
 
     except FileNotFoundError:
         logging.error("osv-scanner is not installed or not in PATH.")
+        return None
     except json.JSONDecodeError:
         logging.error("Could not parse osv-scanner output.")
+        return None
 
     return raw_vulnerabilities
+
+
+# SCA result cache: keyed on target identity (image content id / repo path),
+# TTL-bounded via settings.osv_cache_max_age_hours (the OSV DB grows
+# continuously, so freshness is TTL-based, never invalidated). Failed scans
+# are never cached.
+
+
+def _osv_cached_scan(label: str, key: str, run_scan) -> list[dict]:
+    """run_scan() -> list on success, None on failure (never cached)."""
+    max_age_sec = settings.osv_cache_max_age_hours * 3600
+    path = settings.cache_dir / "osv" / f"{_slugify_image(key)}.json"
+    if max_age_sec > 0 and path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            age_sec = time.time() - float(data.get("scanned_at", 0))
+            if 0 <= age_sec < max_age_sec:
+                vulns = data.get("vulns", [])
+                logging.info(
+                    f"Reusing cached SCA results for {label}: {len(vulns)} vuln(s), "
+                    f"{age_sec / 3600:.1f} h old."
+                )
+                return vulns
+        except (OSError, ValueError, TypeError):
+            logging.warning(f"Unusable osv-scanner cache file {path}; re-scanning.")
+
+    vulns = run_scan()
+    if vulns is None:
+        return []  # scan failure: fail open, cache nothing
+    if max_age_sec > 0:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"scanned_at": time.time(), "label": label, "vulns": vulns}),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            logging.warning(f"Failed to write osv-scanner cache {path}: {e}")
+    return vulns
 
 
 def run_osv_scanner(repo_path: Path) -> list[dict]:
@@ -808,7 +853,11 @@ def run_osv_scanner(repo_path: Path) -> list[dict]:
     if not repo_path.exists():
         logging.error(f"Input report does not exist: {repo_path}")
         return []
-    return _run_osv(["osv-scanner", "-r", "--format", "json", repo_path], str(repo_path))
+    return _osv_cached_scan(
+        f"repo '{repo_path}'",
+        f"repo::{repo_path.resolve()}",
+        lambda: _run_osv(["osv-scanner", "-r", "--format", "json", repo_path], str(repo_path)),
+    )
 
 
 COMPOSE_FILENAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
@@ -842,13 +891,33 @@ def find_container_builds(app_path: Path) -> list[tuple[str, Path]]:
     return [("dockerfile", d) for d in dockerfiles]
 
 
-def _docker(*args: str, timeout: int | None = None) -> subprocess.CompletedProcess | None:
+def _docker(*args: str, timeout: int | None = None,
+            stream: bool = False) -> subprocess.CompletedProcess | None:
     """Run a docker CLI command; returns the CompletedProcess, or None (with a
-    logged error) when the docker binary is missing."""
+    logged error) when the docker binary is missing.
+
+    ``stream=True`` mirrors stdout+stderr into the pipeline log line by line
+    (for long silent phases like image builds) and returns the last lines in
+    ``stderr`` so callers can still log a failure reason."""
+    cmd = ["docker", *args]
     try:
-        return subprocess.run(
-            ["docker", *args], capture_output=True, text=True, timeout=timeout
-        )
+        if stream:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            tail: deque[str] = deque(maxlen=80)
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    tail.append(line)
+                    logging.info("[docker %s] %s", args[0], line[:200])
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                raise
+            return subprocess.CompletedProcess(cmd, rc, "", "\n".join(tail))
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
         logging.error("docker is not installed or not in PATH.")
         return None
@@ -860,15 +929,74 @@ def _image_exists(image: str) -> bool:
     return result is not None and result.returncode == 0
 
 
-def _build_definition_hash(kind: str, path: Path) -> str:
-    digest = hashlib.md5()
-    digest.update(path.read_bytes())
+def _image_inspect(image: str, fmt: str) -> str | None:
+    """`docker image inspect --format <fmt>` stdout, or None on failure."""
+    result = _docker("image", "inspect", "--format", fmt, image, timeout=60)
+    if result is None or result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _image_content_id(image: str) -> str | None:
+    """The immutable image config ID (sha256:...) — identical iff the image
+    content is identical, even when the tag is reused across rebuilds."""
+    return _image_inspect(image, "{{.Id}}")
+
+
+def _parse_docker_time(value: str) -> float | None:
+    """Parse a docker RFC3339 timestamp (Go prints nanosecond fractions and a
+    trailing Z) into an epoch float; None when unparseable."""
+    value = value.strip()
+    if not value:
+        return None
+    utc = value.endswith("Z")
+    base = value[:-1] if utc else value
+    if "." in base:
+        head, frac = base.split(".", 1)
+        base = f"{head}.{frac[:6]}"  # datetime only accepts microsecond precision
+    try:
+        dt = datetime.fromisoformat(base)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _images_newer_than_definitions(images: list[str], definition_files: list[Path]) -> bool:
+    """True when every image was created after ALL build-definition files were
+    last modified (so the images provably reflect the current definitions)."""
+    try:
+        newest_def = max(f.stat().st_mtime for f in definition_files)
+    except OSError:
+        return False
+    for image in images:
+        created = _image_inspect(image, "{{.Created}}")
+        epoch = _parse_docker_time(created or "")
+        if epoch is None or epoch < newest_def:
+            return False
+    return True
+
+
+def _build_definition_files(kind: str, path: Path) -> list[Path]:
+    """Every file whose content defines the build: the compose file (plus any
+    Dockerfiles in its directory) or the single Dockerfile."""
+    files = [path]
     if kind == "compose":
         # Fold in any Dockerfiles under the compose directory so edits to the
         # build context bust the reuse check too.
-        for candidate in sorted(p for p in path.parent.rglob("Dockerfile*") if p.is_file()):
-            if not _is_build_ignored(candidate):
-                digest.update(candidate.read_bytes())
+        files.extend(
+            candidate
+            for candidate in sorted(p for p in path.parent.rglob("Dockerfile*") if p.is_file())
+            if not _is_build_ignored(candidate)
+        )
+    return files
+
+
+def _build_definition_hash(kind: str, path: Path) -> str:
+    digest = hashlib.md5()
+    for definition in _build_definition_files(kind, path):
+        digest.update(definition.read_bytes())
     return digest.hexdigest()
 
 
@@ -899,43 +1027,114 @@ def _record_build_hash(kind: str, path: Path) -> None:
         pass
 
 
-def _compose_images(path: Path) -> list[str]:
-    """Derive the image names a compose file builds without building."""
-    result = _docker("compose", "-f", str(path), "config", "--images")
+def _compose_config(path: Path) -> dict | None:
+    """Parsed `docker compose config --format json` output, or None on failure."""
+    result = _docker("compose", "-f", str(path), "config", "--format", "json", timeout=120)
     if result is None:
-        return []
+        return None
     if result.returncode != 0:
         logging.error(f"docker compose config failed: {result.stderr}")
-        return []
-    images = [img.strip() for img in result.stdout.splitlines() if img.strip()]
-    if not images:
-        logging.error("docker compose config returned no images.")
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        logging.error("docker compose config returned unparseable JSON.")
+        return None
+
+
+def _normalize_image_ref(ref: str) -> str:
     # Compose emits build-only services (and unqualified `image:` refs)
     # without a tag (e.g. "<project>-<service>"); osv-scanner rejects
     # untagged references, so normalize them to :latest.
-    return [img if ":" in img else f"{img}:latest" for img in images]
+    return ref if ":" in ref else f"{ref}:latest"
+
+
+def _compose_images(path: Path) -> list[str]:
+    """Derive the image names a compose file builds/uses without building."""
+    data = _compose_config(path)
+    if data is None:
+        return []
+    images = [
+        _normalize_image_ref(svc["image"])
+        for svc in (data.get("services") or {}).values()
+        if svc.get("image")
+    ]
+    if not images:
+        logging.error("docker compose config returned no images.")
+    return sorted(images)
+
+
+def _compose_built_refs(path: Path) -> set[str] | None:
+    """Normalized image refs of services compose BUILDS from context (those
+    with a `build:` section). Pull-only services are excluded: their images are
+    upstream-built, so local definition-file mtimes say nothing about them.
+    Returns None when the config cannot be parsed (caller stays conservative)."""
+    data = _compose_config(path)
+    if data is None:
+        return None
+    project = re.sub(r"[^a-z0-9-]+", "-", (data.get("name") or path.parent.name).lower())
+    refs = set()
+    for svc_name, svc in (data.get("services") or {}).items():
+        if not svc.get("build"):
+            continue
+        ref = svc.get("image") or f"{project}-{svc_name}"
+        refs.add(_normalize_image_ref(ref))
+    return refs
+
+
+def _built_images_match_definitions(kind: str, images: list[str], path: Path) -> bool:
+    """Stamp-less reuse test: the image(s) compose actually BUILDS must postdate
+    every definition file. Pull-only services are exempt (no local definition;
+    their upstream build date says nothing about this repo). An unparseable
+    config or a built ref missing from ``images`` stays conservative (rebuild)."""
+    if kind != "compose":
+        return _images_newer_than_definitions(images, _build_definition_files(kind, path))
+    built = _compose_built_refs(path)
+    if built is None:
+        return False
+    to_check = [img for img in images if img in built]
+    # A built ref missing from `images` (config drift) or unreadable definition
+    # files keeps it conservative (rebuild); an empty pull-only set passes, as
+    # there is nothing local to compare against.
+    return len(to_check) == len(built) and _images_newer_than_definitions(to_check, _build_definition_files(kind, path))
 
 
 def build_images(kind: str, path: Path, tag: str) -> list[str]:
-    """Build the container image(s) described by a compose file or Dockerfile.
+    """Build the container image(s) described by a compose file or Dockerfile;
+    returns the image refs, [] on failure.
 
-    Returns the built image tag(s). On failure logs the error and returns [].
-    Unless ``settings.force_rebuild`` is set, images whose build definition
-    content is unchanged since the last recorded build are reused as-is (the
-    caller still scans/extracts artifacts from them).
-    """
-    if kind == "compose":
-        images = _compose_images(path)
-        if (
-            not settings.force_rebuild
-            and images
-            and all(_image_exists(img) for img in images)
-            and _build_definition_unchanged(kind, path)
-        ):
-            logging.info(f"Reusing existing compose image(s) {images} (build definition unchanged).")
+    Reuse unless settings.force_rebuild: images are reused when their recorded
+    build-definition hash is unchanged; with no stamp (fresh cache), built
+    images predating every definition file are reused and the stamp back-filled
+    (pull-only services are exempt — no local definition governs them)."""
+    images = _compose_images(path) if kind == "compose" else [tag]
+
+    if settings.force_rebuild:
+        reason = "force_rebuild is set"
+    elif kind == "compose" and not images:
+        reason = "compose image references could not be resolved"
+    else:
+        missing = [img for img in images if not _image_exists(img)]
+        if missing:
+            reason = f"missing locally: {', '.join(missing)}"
+        elif _build_definition_unchanged(kind, path):
+            logging.info(f"Reusing existing image(s) {images} (build definition unchanged).")
             return images
+        elif _build_hash_file(path).exists():
+            reason = "build definition changed since the last recorded build"
+        elif _built_images_match_definitions(kind, images, path):
+            logging.info(
+                f"Reusing existing image(s) {images}: no build stamp in this cache, but the "
+                "image(s) are newer than every build-definition file."
+            )
+            _record_build_hash(kind, path)
+            return images
+        else:
+            reason = ("no build stamp and image(s) predate the build-definition files")
 
-        build = _docker("compose", "-f", str(path), "build")
+    logging.info(f"Rebuilding container image(s): {reason}.")
+    if kind == "compose":
+        build = _docker("compose", "-f", str(path), "build", stream=True)
         if build is None:
             return []
         if build.returncode != 0:
@@ -945,15 +1144,7 @@ def build_images(kind: str, path: Path, tag: str) -> list[str]:
         return _compose_images(path)
 
     # Single Dockerfile build
-    if (
-        not settings.force_rebuild
-        and _image_exists(tag)
-        and _build_definition_unchanged(kind, path)
-    ):
-        logging.info(f"Reusing existing image {tag} (build definition unchanged).")
-        return [tag]
-
-    build = _docker("build", "-t", tag, "-f", str(path), str(path.parent))
+    build = _docker("build", "-t", tag, "-f", str(path), str(path.parent), stream=True)
     if build is None:
         return []
     if build.returncode != 0:
@@ -1146,11 +1337,17 @@ def start_sandbox(kind: str, path: Path, tag: str, app_name: str) -> dict | None
 
 def run_osv_scanner_image(image: str) -> list[dict]:
     """Runs `osv-scanner scan image` against a built container image and
-    extracts raw vulnerability records (same JSON shape as a source scan)."""
-    return _run_osv(
-        ["osv-scanner", "scan", "image", "--format", "json", image],
+    extracts raw vulnerability records (same JSON shape as a source scan).
+    Cached per image CONTENT id, so a rebuilt image busts it automatically."""
+    content_id = _image_content_id(image) or image
+    return _osv_cached_scan(
         f"image '{image}'",
-        skip_os=True,
+        f"image::{content_id}",
+        lambda: _run_osv(
+            ["osv-scanner", "scan", "image", "--format", "json", image],
+            f"image '{image}'",
+            skip_os=True,
+        ),
     )
 
 
@@ -1319,61 +1516,34 @@ def extract_container_artifacts(images: list[str]) -> dict:
     For every image a throwaway container is created (never started), its
     filesystem is exported and streamed: matching files are extracted to
     ``<target>/.cache/container_artifacts/<image-slug>/rootfs/``, non-dependency
-    members are recorded (sorted, bounded) in ``filesystem_index.txt``, and
-    image metadata
-    (ENV / WORKDIR / ENTRYPOINT / CMD / EXPOSE / USER / LABELS) is written to
-    ``image_metadata.json`` alongside an ``extraction_summary.json``.
+    members are recorded (sorted, bounded) in ``filesystem_index.txt``, and image
+    metadata (ENV / WORKDIR / ENTRYPOINT / CMD / EXPOSE / USER / LABELS) is
+    written to ``image_metadata.json`` alongside an ``extraction_summary.json``
+    that records the image content id — a re-run whose images carry the same id
+    reuses the existing snapshot instead of re-exporting (same id ⇒ byte-identical
+    filesystem). Images are snapshotted concurrently.
 
     Deliberately never raises: failures are logged and the image is skipped.
-    Returns a summary dict ``{image: {"extracted": n, "files": [...]}}``.
+    Returns a summary dict ``{image: {"slug": ..., "dir": ...}}``.
     """
     artifacts_root = settings.cache_dir / "container_artifacts"
     artifacts_root.mkdir(parents=True, exist_ok=True)
 
-    summary: dict[str, dict] = {}
+    infos: list[dict | None] = []
+    try:
+        if images:
+            with ThreadPoolExecutor(
+                max_workers=min(len(images), 4), thread_name_prefix="artifacts"
+            ) as pool:
+                infos = list(pool.map(_extract_image_artifacts, images))
+    except FileNotFoundError:
+        # docker missing: skip the whole snapshot stage, and pruning must not
+        # wipe past snapshots.
+        return {}
 
-    for image in images:
-        slug = _slugify_image(image)
-        image_dir = artifacts_root / slug
-        rootfs_dir = image_dir / "rootfs"
-
-        try:
-            # Remove any stale snapshot from a previous run so it always
-            # reflects the current build.
-            subprocess.run(["docker", "rm", "-f", slug], capture_output=True, text=True)
-        except FileNotFoundError:
-            logging.warning("docker is not installed or not in PATH. Skipping container artifact extraction.")
-            return summary
-        except Exception as e:
-            logging.warning(f"Failed to remove stale container '{slug}': {e}")
-
-        create = subprocess.run(
-            ["docker", "create", "--name", slug, image],
-            capture_output=True,
-            text=True,
-        )
-        if create.returncode != 0:
-            logging.warning(f"docker create failed for image '{image}': {create.stderr.strip()}")
-            continue
-
-        try:
-            metadata = _docker_image_metadata(image)
-            workdir = (metadata or {}).get("WorkingDir")
-            _extract_container_export(slug, image_dir, rootfs_dir, workdir)
-            image_dir.mkdir(parents=True, exist_ok=True)
-            if metadata:
-                with open(image_dir / "image_metadata.json", "w", encoding="utf-8") as f:
-                    json.dump(metadata, f, indent=2)
-            summary[image] = {"slug": slug, "dir": str(image_dir)}
-            logging.info(
-                f"Container artifacts for '{image}' written to {image_dir} "
-                f"(metadata keys: {sorted(metadata.keys())})."
-            )
-        finally:
-            try:
-                subprocess.run(["docker", "rm", "-f", slug], capture_output=True, text=True)
-            except Exception:
-                pass
+    summary: dict[str, dict] = {
+        image: info for image, info in zip(images, infos) if info
+    }
 
     # Remove snapshots for images that are no longer built (e.g. after a
     # compose service is removed) so the tool never serves stale configs.
@@ -1386,12 +1556,71 @@ def extract_container_artifacts(images: list[str]) -> dict:
     return summary
 
 
+def _extract_image_artifacts(image: str) -> dict | None:
+    """Snapshot one image (image_id-stamped snapshot reused when the content id
+    is unchanged); returns ``{"slug":..., "dir":...}`` or None on failure."""
+    slug = _slugify_image(image)
+    image_dir = get_container_artifacts_root() / slug
+    rootfs_dir = image_dir / "rootfs"
+    image_id = _image_content_id(image)
+
+    if image_id and (image_dir / "filesystem_index.txt").exists():
+        try:
+            previous = json.loads((image_dir / "extraction_summary.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+        if previous.get("image_id") == image_id:
+            logging.info(f"Container artifacts for '{image}' unchanged (image id {image_id[:19]}...); reusing snapshot.")
+            return {"slug": slug, "dir": str(image_dir)}
+
+    try:
+        # Remove any stale snapshot from a previous run so it always
+        # reflects the current build.
+        subprocess.run(["docker", "rm", "-f", slug], capture_output=True, text=True)
+    except FileNotFoundError:
+        logging.warning("docker is not installed or not in PATH. Skipping container artifact extraction.")
+        raise  # propagates through pool.map: the caller aborts the whole snapshot stage
+    except Exception as e:
+        logging.warning(f"Failed to remove stale container '{slug}': {e}")
+
+    create = subprocess.run(
+        ["docker", "create", "--name", slug, image],
+        capture_output=True,
+        text=True,
+    )
+    if create.returncode != 0:
+        logging.warning(f"docker create failed for image '{image}': {create.stderr.strip()}")
+        return None
+
+    try:
+        metadata = _docker_image_metadata(image)
+        workdir = (metadata or {}).get("WorkingDir")
+        _extract_container_export(slug, image_dir, rootfs_dir, workdir, image_id)
+        image_dir.mkdir(parents=True, exist_ok=True)
+        if metadata:
+            with open(image_dir / "image_metadata.json", "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+        logging.info(
+            f"Container artifacts for '{image}' written to {image_dir} "
+            f"(metadata keys: {sorted(metadata.keys())})."
+        )
+    finally:
+        try:
+            subprocess.run(["docker", "rm", "-f", slug], capture_output=True, text=True)
+        except Exception:
+            pass
+
+    return {"slug": slug, "dir": str(image_dir)}
+
+
 def _extract_container_export(cid: str, image_dir: Path, rootfs_dir: Path,
-                             workdir: str | None = None) -> dict:
+                             workdir: str | None = None,
+                             image_id: str | None = None) -> dict:
     """Stream `docker export <cid>` and write extracted files + fs index.
 
     ``workdir`` enables the catch-all pass for small text config files under the
-    app's working directory that the curated patterns miss.
+    app's working directory that the curated patterns miss. ``image_id`` is
+    stamped into the summary so an unchanged image is recognized next run.
     Returns ``{"extracted": n, "skipped": [paths...]}``. Never raises; on
     failure returns empty stats with a logged warning.
     """
@@ -1508,13 +1737,15 @@ def _extract_container_export(cid: str, image_dir: Path, rootfs_dir: Path,
         logging.warning(f"Failed to write filesystem index: {e}")
 
     try:
+        summary_data = {
+            "extracted": extracted, "catchall": catchall, "skipped": skipped,
+            "total_extracted_bytes": total_bytes,
+            "index_entries": len(index_sorted), "index_truncated": index_truncated,
+        }
+        if image_id:
+            summary_data["image_id"] = image_id
         with open(image_dir / "extraction_summary.json", "w", encoding="utf-8") as f:
-            json.dump(
-                {"extracted": extracted, "catchall": catchall, "skipped": skipped,
-                 "total_extracted_bytes": total_bytes,
-                 "index_entries": len(index_sorted), "index_truncated": index_truncated},
-                f, indent=2,
-            )
+            json.dump(summary_data, f, indent=2)
     except OSError as e:
         logging.warning(f"Failed to write extraction summary: {e}")
 
@@ -2770,3 +3001,47 @@ def index_file(filepath: str | Path) -> list[dict]:
                 }
 
     return list(symbol_index.values())
+
+
+def _index_file_safe(filepath: Path) -> list[dict]:
+    """Worker entry: index one file, swallowing per-file errors (a broken file
+    must not kill the whole index or the process pool chunk)."""
+    try:
+        return index_file(filepath)
+    except Exception as e:
+        logging.warning(f"Failed to index {filepath}: {e}")
+        return []
+
+
+def _iter_indexable_source_files(app_path: Path) -> list[Path]:
+    """Application source files we have tree-sitter symbol queries for
+    (dependency trees / excluded paths dropped)."""
+    return [
+        f for f in app_path.rglob("*")
+        if f.is_file() and not is_path_excluded(str(f)) and f.suffix.lower() in SYMBOL_QUERIES
+    ]
+
+
+def build_symbol_index(app_path: Path) -> list[dict]:
+    """Index every application code file with tree-sitter.
+
+    tree-sitter parsing is pure CPU work on independent files, so the files are
+    chunked across a process pool (the GIL would serialize threads). Any pool
+    failure falls back to the sequential loop — the index is never lost."""
+    files = _iter_indexable_source_files(app_path)
+    if not files:
+        return []
+
+    try:
+        workers = min(32, os.cpu_count() or 1)
+        with ProcessPoolExecutor(max_workers=max(1, workers)) as pool:
+            symbols: list[dict] = []
+            for file_symbols in pool.map(_index_file_safe, files, chunksize=64):
+                symbols.extend(file_symbols)
+        return symbols
+    except Exception as e:
+        logging.warning(f"Parallel symbol indexing failed ({e}); falling back to sequential.")
+        symbols = []
+        for filepath in files:
+            symbols.extend(_index_file_safe(filepath))
+        return symbols

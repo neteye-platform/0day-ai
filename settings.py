@@ -235,3 +235,9 @@ threat_intel_enabled = False
 
 # Always rebuild the container image even if Dockerfile/compose is unchanged.
 force_rebuild = False
+
+# osv-scanner results are cached under <cache_dir>/osv keyed by target identity
+# (container image content id / repo path) and reused while younger than this
+# many hours; the upstream OSV database grows continuously, so freshness is
+# TTL-based. 0 disables the cache (scan every run).
+osv_cache_max_age_hours = 168
