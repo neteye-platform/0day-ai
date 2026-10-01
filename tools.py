@@ -12,7 +12,7 @@ import docker
 from docker.errors import NotFound, APIError
 import re
 
-from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationToolInput, AskForContextInput
+from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationToolInput, AskForContextInput, IntegrationAuditInput, VulnerabilityDetailsInput
 from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer, reviewer_cache_key
 from languages import MANIFEST_NAMES
 import settings
@@ -643,6 +643,65 @@ def ask_for_context(
             "you will not continue validating unless this record is re-dispatched."
         ),
         name="ask_for_context",
+        tool_call_id=tool_call_id
+    )
+
+    return Command(
+        update={
+            "vulnerabilities": [updated_vuln],
+            "messages": [tool_msg]
+        }
+    )
+
+
+@tool(args_schema=VulnerabilityDetailsInput)
+def get_vulnerability_details(
+    vuln_id: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Fetches the full record of another confirmed vulnerability by its vuln_id, so
+    you can reason over its real mechanics (full description, reviewer reasoning,
+    reproduction steps) when deciding whether it chains with your assigned
+    vulnerability. Only entries from the provided summary of other confirmed
+    vulnerabilities are available.
+    """
+    confirmed = state.get("confirmed_vulns", [])
+    for record in confirmed:
+        if record.get("vuln_id") == vuln_id:
+            return json.dumps(record, indent=2, default=str)
+    available = ", ".join(r.get("vuln_id", "?") for r in confirmed) or "none"
+    return (
+        f"Error: no confirmed vulnerability with vuln_id '{vuln_id}' is available. "
+        f"Available vuln_ids: {available}"
+    )
+
+
+@tool(args_schema=IntegrationAuditInput)
+def submit_integration_audit(
+    state: Annotated[dict, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    **kwargs
+) -> Command:
+    """Call this tool when you have decided whether the assigned `requires_chaining`
+    vulnerability combines with other confirmed vulnerabilities into a concrete
+    multi-step exploit chain (chained) or cannot be chained (unchainable)."""
+    report = state.get("report_to_test", {})
+
+    # Mutate a copy of the single report (same vuln_id, upgrade in place).
+    updated_vuln = dict(report)
+    updated_vuln["status"] = "chained" if kwargs.get("is_chained") else "unchainable"
+    updated_vuln["confidence_score"] = kwargs.get("confidence_score")
+    updated_vuln["integration_audit_reasoning"] = kwargs.get("reasoning")
+    updated_vuln["chained_with"] = kwargs.get("chained_with")
+    if kwargs.get("is_chained"):
+        # The auditor's reproduction_steps are the FULL combined chain plan the
+        # downstream Validator executes to build the PoC.
+        updated_vuln["reproduction_steps"] = kwargs.get("reproduction_steps", [])
+
+    tool_msg = ToolMessage(
+        content="Integration audit submitted. Ending chaining review.",
+        name="submit_integration_audit",
         tool_call_id=tool_call_id
     )
 

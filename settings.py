@@ -67,6 +67,20 @@ reviewer_compaction_min_compressible_tokens = 4000
 # model's maximum context length.
 reviewer_hard_reserved = 8192
 
+# Tool-loop guards for the compiled integration-auditor subgraph. The auditor
+# decides whether a `requires_chaining` vulnerability combines with other
+# confirmed findings; if it never calls submit_integration_audit within this
+# many LLM rounds, the loop terminates via the fallback node.
+integration_auditor_max_iterations = 20
+# Same countdown derivation as the reviewer/validator tracks.
+integration_auditor_countdown_start = max(1, integration_auditor_max_iterations - COUNTDOWN_LEAD_TURNS)
+# Integration-auditor context compaction settings (mirror the reviewer's).
+integration_auditor_model_context_window = 131072
+integration_auditor_context_reserved = 24000
+integration_auditor_compaction_tail_turns = 1
+integration_auditor_compaction_min_compressible_tokens = 4000
+integration_auditor_hard_reserved = 8192
+
 # Headless-browser toolset (browser_tools.py) for the validator. One shared
 # Firefox process serves all concurrent validators; each session_id gets an
 # isolated BrowserContext. browser_executable = None uses Playwright's own

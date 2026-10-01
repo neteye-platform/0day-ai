@@ -364,9 +364,15 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
         "review_error": 1,
         "unreachable": 1,
         "confirmed": 2,
+        # "chained" ranks above "confirmed" (auditor proved the record joins a
+        # multi-step exploit) but below "exploitable" (a validator PoC outranks
+        # the auditor's static chain proof). "unchainable" is a terminal auditor
+        # verdict that stays in the report, like "false_positive".
+        "chained": 3,
         "insufficient_context": 3,
         "exploitable": 4,
         "false_positive": 5,
+        "unchainable": 5,
         "proven": 5
     }
 

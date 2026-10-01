@@ -15,6 +15,7 @@ with open("agents.yaml", "r") as f:
     VERIFIER_AGENT = data.get("contract_verifier_agent")
     REVIEWER_AGENT = data.get("reviewer_agent")
     VALIDATOR_AGENT = data.get("validator_agent")
+    INTEGRATION_AUDITOR_AGENT = data.get("integration_auditor")
 
 cwes = {
     # --- MEMORY SAFETY (C / C++ / Rust-unsafe) ---
@@ -129,7 +130,7 @@ class VulnerabilityRecord(BaseModel):
     vuln_id: Optional[str] = None
 
     # Lifecycle tracking
-    status: Literal["hypothesis", "unreachable", "confirmed", "exploitable", "false_positive", "review_error", "insufficient_context"] = "hypothesis"
+    status: Literal["hypothesis", "unreachable", "confirmed", "exploitable", "false_positive", "review_error", "insufficient_context", "chained", "unchainable"] = "hypothesis"
 
     # Core details (from Explorer/Verifier). Systemic records accumulate every
     # affected graph node here; localized records carry exactly one.
@@ -181,6 +182,22 @@ class VulnerabilityRecord(BaseModel):
     # Validator additions
     poc_payload: Optional[str] = None
     execution_logs: Optional[str] = None
+
+    # Integration Auditor additions
+    integration_audit_reasoning: Optional[str] = Field(
+        default=None,
+        description=(
+            "The Integration Auditor's reasoning for the `chained`/`unchainable` "
+            "verdict on a `requires_chaining` record."
+        ),
+    )
+    chained_with: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "vuln_ids of the other confirmed vulnerabilities this record chains "
+            "with into a single multi-step exploit (set when status is 'chained')."
+        ),
+    )
 
     # Validator -> Reviewer feedback loop
     open_questions: Optional[list[str]] = Field(
@@ -559,5 +576,50 @@ class AskForContextInput(BaseModel):
             "testable (e.g. 'What is the exact HTTP method and path to reach the export "
             "endpoint?', 'What credentials/session state are needed to reach it?', 'Is the "
             "route exposed publicly or behind an unauthenticated login?')."
+        )
+    )
+
+
+class IntegrationAuditInput(BaseModel):
+    is_chained: bool = Field(
+        description=(
+            "True if this vulnerability can be combined with the other confirmed "
+            "vulnerabilities into a concrete multi-step external exploit chain. False "
+            "if no usable chain exists in isolation."
+        )
+    )
+    confidence_score: int = Field(description="Confidence in this assessment from 1 to 10.")
+    reasoning: str = Field(description="Brief technical explanation for the decision.")
+    chained_with: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "The vuln_ids of the other confirmed vulnerabilities this record chains "
+            "with, in step order. REQUIRED when is_chained is true."
+        ),
+    )
+    reproduction_steps: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "REQUIRED when is_chained is true. The complete chronological, numbered "
+            "external actions of the combined multi-step exploit, self-sufficient over "
+            "the wire (HTTP method, path, required parameters/headers/body, and any "
+            "session state carried from earlier steps). The downstream Validator CANNOT "
+            "read source code, so every step must be executable over HTTP alone."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def chained_requires_steps(self):
+        if self.is_chained and not self.chained_with:
+            raise ValueError("chained_with is required when is_chained is true.")
+        if self.is_chained and not self.reproduction_steps:
+            raise ValueError("reproduction_steps is required when is_chained is true.")
+        return self
+
+
+class VulnerabilityDetailsInput(BaseModel):
+    vuln_id: str = Field(
+        description=(
+            "The exact vuln_id of another confirmed vulnerability to fetch full details for."
         )
     )

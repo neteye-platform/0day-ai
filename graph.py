@@ -18,9 +18,9 @@ import settings
 import tools
 import browser_tools
 import attacker_tools
-from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, integration_auditor_node, route_validator_feedback, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
+from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, integration_auditor_node, integration_auditor_router, integration_auditor_fallback_node, ask_integration_auditor_for_tool, route_integration_audit, route_validator_feedback, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
 from reachability import reachability_filter_node
-from state import MasterState, ReviewerState, ValidatorState
+from state import MasterState, ReviewerState, ValidatorState, IntegrationAuditorState
 from schemas import ReviewerOutput, ValidatorOutput
 
 
@@ -116,6 +116,44 @@ def compile_validator():
     return compiled_validator_agent 
 
 
+def compile_integration_auditor():
+    integration_auditor_workflow = StateGraph(IntegrationAuditorState)
+    # Same scoped-retry rationale as the reviewer/validator agent nodes.
+    integration_auditor_workflow.add_node("integration_auditor_agent", integration_auditor_node, retry_policy=RETRY)
+    integration_auditor_workflow.add_node("ask_integration_auditor_for_tool", ask_integration_auditor_for_tool)
+    integration_auditor_workflow.add_node("integration_auditor_fallback", integration_auditor_fallback_node)
+    integration_auditor_workflow.add_node("integration_auditor_tools", ToolNode([
+        tools.get_vulnerability_details,
+        tools.get_node_connections,
+        tools.submit_integration_audit
+    ]))
+    integration_auditor_workflow.add_edge(START, "integration_auditor_agent")
+    integration_auditor_workflow.add_conditional_edges(
+        "integration_auditor_agent",
+        integration_auditor_router,
+        {
+            "integration_auditor_tools": "integration_auditor_tools",
+            "ask_integration_auditor_for_tool": "ask_integration_auditor_for_tool",
+            "integration_auditor_fallback": "integration_auditor_fallback",
+            "__end__": END
+        }
+    )
+    integration_auditor_workflow.add_conditional_edges(
+        "integration_auditor_tools",
+        integration_auditor_router,
+        {
+            "integration_auditor_agent": "integration_auditor_agent",
+            "integration_auditor_fallback": "integration_auditor_fallback",
+            "__end__": END
+        }
+    )
+    integration_auditor_workflow.add_edge("ask_integration_auditor_for_tool", "integration_auditor_agent")
+    integration_auditor_workflow.add_edge("integration_auditor_fallback", END)
+    compiled_integration_auditor = integration_auditor_workflow.compile()
+
+    return compiled_integration_auditor
+
+
 RETRY = RetryPolicy(
     initial_interval=1.0,
     backoff_factor=2.0,
@@ -141,7 +179,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     # retries here (set_node_defaults would otherwise apply RETRY to them).
     workflow.add_node("reviewer_agent", compiled_reviewer_agent, retry_policy=RetryPolicy(max_attempts=1))
     workflow.add_node("validator_agent", compiled_validator_agent, retry_policy=RetryPolicy(max_attempts=1))
-    workflow.add_node("integration_auditor", integration_auditor_node, retry_policy=RetryPolicy(max_attempts=1))
+    workflow.add_node("integration_auditor", compiled_integration_auditor, retry_policy=RetryPolicy(max_attempts=1))
     workflow.add_node("synchronization", synchronization_node)
     workflow.add_node("reachability_filter", reachability_filter_node)
     # workflow.add_node("reviewer_sync", synchronization_node)
@@ -171,7 +209,9 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_conditional_edges("synchronization", dispatch_reviewers, ["reviewer_agent", END])
     # workflow.add_edge("reviewer_agent", "reviewer_sync")
     workflow.add_conditional_edges("reviewer_agent", dispatch_validators, ["validator_agent", "integration_auditor", END])
-    workflow.add_edge("integration_auditor", END)
+    # Chained records from the integration auditor go to the Validator for PoC
+    # construction; unchainable (and non-chained) records are terminal.
+    workflow.add_conditional_edges("integration_auditor", route_integration_audit, ["validator_agent", END])
     workflow.add_conditional_edges("validator_agent", route_validator_feedback, ["reviewer_agent", END])
 
     app = workflow.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)
@@ -182,6 +222,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
 
 compiled_reviewer_agent = compile_reviewer()
 compiled_validator_agent = compile_validator()
+compiled_integration_auditor = compile_integration_auditor()
 graph = build_graph()
 
 

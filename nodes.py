@@ -23,7 +23,7 @@ import tools
 import browser_tools
 import attacker_tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState, IntegrationAuditorState
-from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, cwes
+from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, INTEGRATION_AUDITOR_AGENT, cwes
 from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, reviewer_cache_key
 from tool_loop import CompactionConfig, ToolLoopAgent
 
@@ -1838,8 +1838,10 @@ def dispatch_validators(state: MasterState):
 
     Confirmed records are routed by their `validation_strategy`:
     - `validatable_now` (or missing): sent to the Validator to be proven externally.
-    - `requires_chaining`: sent to the Integration Auditor (placeholder) so the
-      finding can later be combined into a multi-step exploit chain.
+    - `requires_chaining`: sent to the Integration Auditor so the finding can be
+      combined with other confirmed vulnerabilities into a multi-step exploit
+      chain; the auditor's `chained` verdicts are forwarded to the Validator by
+      `route_integration_audit`.
     - `static_finding_only`: no network-reachable path exists; the Reviewer's static
       proof is accepted into the final report and the record is not dispatched.
     """
@@ -1864,13 +1866,18 @@ def dispatch_validators(state: MasterState):
             )
             continue
         if strategy == "requires_chaining":
-            # Real but locked behind auth/state/another exploit. Route to the
-            # Integration Auditor (placeholder) for future exploit chaining.
+            # The auditor chains this record against every OTHER confirmed
+            # vulnerability (itself excluded); it never needs the sandbox.
+            others = [
+                v for v in confirmed_vulns
+                if v.get("vuln_id") != evaluation.get("vuln_id")
+            ]
             payload = IntegrationAuditorState(
                 report_to_test=evaluation,
+                confirmed_vulns=others,
                 iterations=0,
                 vulnerabilities=[],
-                messages=[],
+                messages=[]
             )
             commands.append(Send("integration_auditor", payload))
             continue
@@ -1893,23 +1900,198 @@ def dispatch_validators(state: MasterState):
     return commands
 
 
-def integration_auditor_node(state: IntegrationAuditorState) -> dict:
-    """Placeholder for the Integration Auditor.
+INTEGRATION_AUDITOR_SUMMARY_LEDGER = (
+    "You are an expert summarizer. The following is the message history of a "
+    "security integration auditor agent deciding whether a `requires_chaining` "
+    "vulnerability (real but not exploitable in isolation) can be combined with "
+    "other confirmed vulnerabilities into a concrete multi-step external exploit "
+    "chain. Your summary will REPLACE these messages in the model context, so the "
+    "auditor must be able to continue the decision from it WITHOUT re-reading the "
+    "original tool outputs.\n\n"
+    "Produce an information-dense summary as a security chaining ledger with "
+    "exactly these sections:\n"
+    "## Objective\n"
+    "One or two sentences restating the exact `requires_chaining` vulnerability "
+    "under audit (vuln_id, CWE, affected nodes) and the chain decision pending.\n"
+    "## Candidate Peers Examined\n"
+    "Bulleted, deduplicated list of every other confirmed vulnerability whose "
+    "details were fetched, with the single most important fact each revealed "
+    "about how it could provide a precondition (privilege, session, state, file) "
+    "to the chained path. Do NOT include full records — distill them.\n"
+    "## Confirmed Chain Facts\n"
+    "Bulleted list of verified facts established for the chain (e.g. 'IDOR "
+    "leaks any user id so it can obtain the admin cookie', 'XSS fires only after "
+    "authentication') stated in final form.\n"
+    "## Ruled-Out Candidates\n"
+    "Bulleted list of other vulnerabilities or chaining paths already rejected, "
+    "with a one-line reason for each.\n"
+    "## Active Leads & Next Steps\n"
+    "Bulleted list of the most promising remaining chain checks not yet completed.\n\n"
+    "RULES:\n"
+    "- If the history contains a prior SUMMARY (a system message containing "
+    "'CONTEXT COMPACTION SUMMARY'), treat it as the anchoring summary: extend "
+    "and refine it with only the new facts gathered since, rather than "
+    "regenerating from scratch.\n"
+    "- Write in final form ('the IDOR returns any profile', 'auth is required "
+    "before the sink'), never 'the model checked X'.\n"
+    "- Keep it concise, under 1024 words. Preserve exact vuln_ids, node ids, "
+    "and reproduction-step content.\n"
+)
 
-    Receives `requires_chaining` records the Reviewer confirmed to be real but not
-    exploitable in isolation (locked behind authentication, specific application
-    state, or another exploit that must be chained first). Full multi-step exploit
-    chaining is not yet implemented; the record is logged and returned unchanged so
-    it still lands in the final report.
+
+def _one_line(text: str, limit: int = 240) -> str:
+    """Flatten free text to a single compact line for peer summaries."""
+    if not text:
+        return ""
+    return " ".join(str(text).split())[:limit]
+
+
+class IntegrationAuditorAgent(ToolLoopAgent):
+    """Integration auditor track: chain-building tools (get_vulnerability_details
+    for peer records, get_node_connections to verify code-level links) and the
+    single terminal submit_integration_audit verdict (chained/unchainable)."""
+
+    terminal_tool = "submit_integration_audit"
+
+    def _subject(self, state) -> str:
+        return state.get("report_to_test", {}).get("vuln_id", "Unknown")
+
+    def bind_tools(self, state):
+        return smart_llm.bind_tools([
+            tools.get_vulnerability_details,
+            tools.get_node_connections,
+            tools.submit_integration_audit,
+        ])
+
+    def first_turn(self, state, llm_with_tools) -> dict:
+        sys_msg = SystemMessage(content=INTEGRATION_AUDITOR_AGENT.get("prompt", ""))
+
+        report = state.get("report_to_test", {})
+        affected = [n for n in (report.get("affected_nodes") or []) if n]
+        affected_str = (
+            ", ".join(affected) if affected else report.get("node_id", "Unknown")
+        )
+        formatted_vuln = (
+            f"--- CORE VULNERABILITY (requires_chaining) ---\n"
+            f"Vulnerability ID: {report.get('vuln_id', 'Unknown')}\n"
+            f"CWE ID: {report.get('cwe_id', 'Unknown')}\n"
+            f"Affected Nodes: {affected_str}\n"
+            f"Type: {report.get('vulnerability_type', 'Code Defect')}\n"
+            f"Description: {report.get('description', '')}\n"
+            f"Reviewer Reasoning: {report.get('reviewer_reasoning', 'None')}\n"
+        )
+        if report.get("source_cve"):
+            formatted_vuln += f"Source CVE: {report.get('source_cve')}\n"
+
+        peers = state.get("confirmed_vulns", [])
+        if peers:
+            peer_lines = []
+            for v in peers:
+                peer_nodes = [n for n in (v.get("affected_nodes") or []) if n]
+                peer_lines.append(
+                    f"- vuln_id={v.get('vuln_id', '?')} | CWE={v.get('cwe_id', '?')} | "
+                    f"nodes={', '.join(peer_nodes) or '?'} | {_one_line(v.get('description', ''))}"
+                )
+            formatted_vuln += (
+                f"\n--- OTHER CONFIRMED VULNERABILITIES (candidates to chain with) ---\n"
+                f"Call `get_vulnerability_details(<vuln_id>)` to fetch the full record of "
+                f"any of these before relying on it in a chain:\n"
+                + "\n".join(peer_lines)
+            )
+        else:
+            formatted_vuln += (
+                f"\n--- OTHER CONFIRMED VULNERABILITIES ---\n"
+                f"None. There is nothing to chain this record with; you cannot emit a "
+                f"'chained' verdict without at least one other confirmed vulnerability."
+            )
+
+        steps = report.get("reproduction_steps") or []
+        steps_str = (
+            "\n".join(f"  {i}. {s}" for i, s in enumerate(steps, 1))
+            if steps else "  None provided by reviewer"
+        )
+        formatted_vuln += (
+            f"\n--- REVIEWER'S ISOLATED REPRODUCTION STEPS (this record alone) ---\n"
+            f"{steps_str}"
+        )
+
+        human_msg = HumanMessage(content=(
+            f"Audit the following `requires_chaining` vulnerability for a combinable "
+            f"multi-step exploit chain.\n\n{formatted_vuln}"
+        ))
+
+        response = llm_with_tools.invoke([sys_msg, human_msg])
+        return {"messages": [sys_msg, human_msg, response], "iterations": 1}
+
+    def fallback(self, state) -> Command:
+        """Resolve an audit that hit the iteration cap without a
+        submit_integration_audit verdict. Keeps the record as 'confirmed' (the
+        chain was never proven) and records the timeout in the reasoning."""
+        updated_vuln = dict(state.get("report_to_test", {}))
+        timeout_note = (
+            f"[integration audit timeout] No verdict after {state.get('iterations', 0)} "
+            f"tool-loop iterations; the chain was not resolved. Keeping the record as "
+            f"'confirmed' (chain inconclusive) without a chained/unchainable verdict."
+        )
+        existing = updated_vuln.get("integration_audit_reasoning") or ""
+        updated_vuln["integration_audit_reasoning"] = (
+            f"{existing}\n{timeout_note}" if existing else timeout_note
+        )
+        return Command(update={"vulnerabilities": [updated_vuln]})
+
+
+integration_auditor_agent = IntegrationAuditorAgent(
+    name="integration_auditor",
+    settings_prefix="integration_auditor",
+    compaction=CompactionConfig(prefix="integration_auditor"),
+    summary_ledger=INTEGRATION_AUDITOR_SUMMARY_LEDGER,
+    summary_llm=fast_llm,
+)
+
+# Module-level graph node callables (kept so graph.py's imports stay untouched).
+integration_auditor_node = integration_auditor_agent.agent
+integration_auditor_router = integration_auditor_agent.router
+integration_auditor_fallback_node = integration_auditor_agent.fallback
+ask_integration_auditor_for_tool = integration_auditor_agent.ask
+
+
+def route_integration_audit(state: MasterState):
+    """Conditional router after the integration auditor completes its tasks.
+
+    `chained` records (upgraded in place by submit_integration_audit) are sent to
+    the Validator, which builds a PoC from the auditor's complete combined
+    reproduction_steps. `unchainable` records are terminal — they stay in the
+    report without further validation.
     """
-    report = state.get("report_to_test", {})
-    vuln_id = report.get("vuln_id", "unknown")
+    raw_vulns = state.get("vulnerabilities", [])
+    all_vulns = [
+        v if isinstance(v, dict) else v.model_dump()
+        for v in raw_vulns
+    ]
+    chained = [v for v in all_vulns if v.get("status") == "chained"]
+
+    if not chained:
+        return END
+
+    commands = []
+    for record in chained:
+        payload = ValidatorState(
+            report_to_test=record,
+            sandbox_url=state.get("sandbox_url"),
+            container_name=state.get("container_name"),
+            messages=[],
+            iterations=0,
+            vulnerabilities=[],
+            cookies={},
+            agent_id=uuid.uuid4().hex,
+        )
+        commands.append(Send("validator_agent", payload))
+
     logging.info(
-        f"Integration Auditor (placeholder) received {vuln_id} "
-        f"('requires_chaining', {report.get('cwe_id')}) — "
-        f"exploit chaining not yet implemented; keeping record in report."
+        f"Integration auditor chained {len(commands)} vulnerability(ies); "
+        f"dispatching to the validator for PoC construction."
     )
-    return {}
+    return commands
 
 
 def route_validator_feedback(state: MasterState):
