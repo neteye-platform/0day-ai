@@ -2712,21 +2712,57 @@ def _content_hash_cache(subdir: str, prefix: str, content: dict, result: Optiona
     return None
 
 
-def cache_reviewer(node_id: str, report: dict, updated_vuln: Optional[dict] = None) -> Optional[dict]:
+def _cache_stored_record(
+    subdir: str, prefix: str, content: dict, updated_vuln: Optional[dict], token_usage: Optional[dict]
+) -> Optional[dict]:
+    """Read/write one verdict cache entry (reviewer/validator/auditor/patcher
+    share this shape) with its token accounting attached.
+
+    Write: stores ``{"record": updated_vuln, "token_usage": usage}`` — the
+    usage rides in the stored VALUE (never the hashed key), so token tracking
+    busts no cache and the record dict flowing back through the pipeline
+    channels stays schema-pure.
+    Read: returns the bare record dict and books the entry's stored usage into
+    the run token ledger (earlier-run spend counted once, on the hit).
+    Legacy entries (bare record dicts, written before token tracking) read
+    back untouched and restore nothing."""
+    from run_stats import record_cached_token_usage
+
+    result = None if updated_vuln is None else {"record": updated_vuln, "token_usage": token_usage}
+    cached = _content_hash_cache(subdir, prefix, content, result)
+    if cached is None:
+        return None
+    if isinstance(cached, dict) and "record" in cached:
+        record_cached_token_usage(subdir_rid(subdir), cached.get("token_usage"))
+        return cached["record"]
+    return cached
+
+
+def subdir_rid(subdir: str) -> str:
+    """Ledger agent name for a verdict-cache subdir ('patchers' -> 'patcher')."""
+    return {"reviewer": "reviewer", "validator": "validator",
+            "integration_auditor": "integration_auditor", "patchers": "patcher"}[subdir]
+
+
+def cache_reviewer(node_id: str, report: dict, updated_vuln: Optional[dict] = None,
+                   token_usage: Optional[dict] = None) -> Optional[dict]:
     """Read (``updated_vuln`` is None) or write a reviewer outcome cache entry.
 
     Keyed by (node_id, report content hash); shared by the normal
     ``submit_evaluation`` path and the loop-fallback path so both land in the
-    same ``.cache/reviewer/`` namespace.
+    same ``.cache/reviewer/`` namespace. ``token_usage`` (the run ledger usage
+    of the reviewing task) is persisted with the verdict; a read books the
+    stored usage into the token ledger — see _cache_stored_record.
 
     Prompt/schema changes do NOT bust entries: selective re-adjudication is
     done by deleting the individual ``<prefix>_<hash>.json`` files (grep the
     directory for the record's ``vuln_id``). Delete the whole directory only
     for a full re-review pass."""
-    return _content_hash_cache("reviewer", node_id, report, updated_vuln)
+    return _cache_stored_record("reviewer", node_id, report, updated_vuln, token_usage)
 
 
-def cache_validator(report: dict, peer_payloads: Optional[list] = None, updated_vuln: Optional[dict] = None) -> Optional[dict]:
+def cache_validator(report: dict, peer_payloads: Optional[list] = None, updated_vuln: Optional[dict] = None,
+                    token_usage: Optional[dict] = None) -> Optional[dict]:
     """Read (``updated_vuln`` is None) or write a validator outcome cache entry.
 
     Keyed by (vuln_id, content hash of the report plus the injected
@@ -2735,64 +2771,75 @@ def cache_validator(report: dict, peer_payloads: Optional[list] = None, updated_
     live ``sandbox_url`` is deliberately excluded so results survive across runs
     despite docker reassigning the port. Shared by ``mark_validation_complete``,
     ``ask_for_context``, and the loop-fallback path so all three land in the
-    same ``.cache/validator/`` namespace.
+    same ``.cache/validator/`` namespace. ``token_usage`` rides the stored
+    value and is booked back on a read — see _cache_stored_record.
     """
     vuln_id = (report or {}).get("vuln_id") or "Unknown"
     peers = sorted(
         (p for p in (peer_payloads or []) if isinstance(p, dict)),
         key=lambda p: p.get("vuln_id", ""),
     )
-    return _content_hash_cache(
-        "validator", vuln_id, {"report": report, "peer_payloads": peers}, updated_vuln
+    return _cache_stored_record(
+        "validator", vuln_id, {"report": report, "peer_payloads": peers}, updated_vuln, token_usage
     )
 
 
-def cache_integration_auditor(report: dict, peers: Optional[list] = None, updated_vuln: Optional[dict] = None) -> Optional[dict]:
+def cache_integration_auditor(report: dict, peers: Optional[list] = None, updated_vuln: Optional[dict] = None,
+                              token_usage: Optional[dict] = None) -> Optional[dict]:
     """Read (``updated_vuln`` is None) or write an integration-auditor outcome cache entry.
 
     Keyed by (vuln_id, content hash of the report plus the ``confirmed_vulns``
     peer list the auditor may chain with). Peers are sorted by vuln_id so the
     hash is order-independent. Shared by ``submit_integration_audit``, the
     deterministic no-peers ``unchainable`` resolution, and the loop-fallback
-    path so all land in the same ``.cache/integration_auditor/`` namespace.
+    path so all land in the same ``.cache/integration_auditor`` namespace.
+    ``token_usage`` rides the stored value and is booked back on a read — see
+    _cache_stored_record (the deterministic no-LLM resolution stores a zero).
     """
     vuln_id = (report or {}).get("vuln_id") or "Unknown"
     peers_sorted = sorted(
         (p for p in (peers or []) if isinstance(p, dict)),
         key=lambda p: p.get("vuln_id", ""),
     )
-    return _content_hash_cache(
-        "integration_auditor", vuln_id, {"report": report, "confirmed_vulns": peers_sorted}, updated_vuln
+    return _cache_stored_record(
+        "integration_auditor", vuln_id, {"report": report, "confirmed_vulns": peers_sorted}, updated_vuln, token_usage
     )
 
 
-def cache_patcher(report: dict, updated_vuln: Optional[dict] = None) -> Optional[dict]:
+def cache_patcher(report: dict, updated_vuln: Optional[dict] = None,
+                  token_usage: Optional[dict] = None) -> Optional[dict]:
     """Read (``updated_vuln`` is None) or write a patcher outcome cache entry.
 
     Keyed by (vuln_id, content hash of the record being patched). Shared by
     ``submit_patch`` and the loop-fallback path so both land in the same
     ``.cache/patchers/`` namespace. On a hit the stored record (patch fields set,
     files ALREADY edited by the earlier run) short-circuits the loop, so a
-    resumed/repeated run never re-applies the edits."""
+    resumed/repeated run never re-applies the edits. ``token_usage`` rides the
+    stored value and is booked back on a read — see _cache_stored_record."""
     vuln_id = (report or {}).get("vuln_id") or "Unknown"
-    return _content_hash_cache("patchers", vuln_id, report or {}, updated_vuln)
+    return _cache_stored_record("patchers", vuln_id, report or {}, updated_vuln, token_usage)
 
 
-def cache_reporter(report: dict, finding: Optional[dict] = None) -> Optional[dict]:
+def cache_reporter(report: dict, finding: Optional[dict] = None,
+                   token_usage: Optional[dict] = None) -> Optional[dict]:
     """Read (``finding`` is None) or write a per-vulnerability reporter outcome.
 
     Keyed on the content hash of the single reportable record (including its
     ``poc_payload``/``execution_logs``, so a changed validator proof busts the
     entry). The reporter runs once per vulnerability, so one cache file per
-    record. A hit returns the stored ``ReporterFinding`` dict.
-    """
+    record. A hit returns the stored ``ReporterFinding`` dict and books the
+    entry's stored token usage into the ledger (legacy entries restore
+    nothing)."""
+    from run_stats import record_cached_token_usage
+
     vuln_id = (report or {}).get("vuln_id") or "Unknown"
     if finding is None:
         cached = _content_hash_cache("reporter", vuln_id, report or {}, None)
         if isinstance(cached, dict) and isinstance(cached.get("finding"), dict):
+            record_cached_token_usage("reporter", cached.get("token_usage"))
             return cached["finding"]
         return None
-    _content_hash_cache("reporter", vuln_id, report or {}, {"finding": finding})
+    _content_hash_cache("reporter", vuln_id, report or {}, {"finding": finding, "token_usage": token_usage})
     return None
 
 

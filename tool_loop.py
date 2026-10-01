@@ -12,7 +12,7 @@ summary-ledger prompt text.
 
 import json
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from langchain_core.messages import (
     AnyMessage,
@@ -27,7 +27,13 @@ from langgraph.prebuilt.tool_node import ToolInvocationError, ToolNode, ToolRunt
 from langgraph.types import Command
 
 import settings
-from run_stats import _log_agent_completion, as_dict
+from run_stats import (
+    _log_agent_completion,
+    add_usage,
+    as_dict,
+    extract_llm_usage,
+    record_llm_usage,
+)
 from utils import estimate_message_tokens
 
 
@@ -172,17 +178,19 @@ def _render_message_transcript(messages: list[AnyMessage]) -> str:
 
 
 def _generate_agent_context_summary(
-    middle: list[AnyMessage], ledger_prompt: str, llm
-) -> SystemMessage | None:
+    middle: list[AnyMessage], ledger_prompt: str, llm, agent: str = ""
+) -> tuple[SystemMessage | None, Optional[dict]]:
     """Summarize the compressible middle of an agent history into a structured
     ledger via the cheap summarizer LLM. ``ledger_prompt`` carries the agent's
     ledger format (investigation ledger for the reviewer, validation ledger for
     the validator) and ``llm`` is the cheap model used to render the summary.
-    Returns None on any failure so the caller fails open."""
+    Returns ``(summary_or_None, usage)`` — the summarizer's token usage rides
+    back so the calling agent books it as its own cost — on any failure so the
+    caller fails open."""
     try:
         transcript = _render_message_transcript(middle)
         if not transcript.strip():
-            return None
+            return None, None
 
         human_prompt = HumanMessage(
             content=(
@@ -193,10 +201,11 @@ def _generate_agent_context_summary(
                 "Output only the ledger summary."
             )
         )
-        summary_text = llm.invoke([ledger_prompt, human_prompt])
-        summary_content = str(summary_text.content).strip()
+        response = llm.invoke([ledger_prompt, human_prompt])
+        usage = record_llm_usage(agent, response) if agent else extract_llm_usage(response)
+        summary_content = str(response.content).strip()
         if not summary_content:
-            return None
+            return None, usage
 
         return SystemMessage(
             name="context_summary",
@@ -210,10 +219,10 @@ def _generate_agent_context_summary(
                 "first user message.\n\n"
                 f"{summary_content}"
             ),
-        )
+        ), usage
     except Exception as e:
         logging.warning(f"Context compaction summarization failed, failing open: {e}")
-        return None
+        return None, None
 
 
 def concise_tool_error(e: ToolInvocationError) -> str:
@@ -479,7 +488,7 @@ class ToolLoopAgent:
 
     # -- memory management ----------------------------------------------------
 
-    def summarize(self, middle: list[AnyMessage]) -> SystemMessage | None:
+    def summarize(self, middle: list[AnyMessage]) -> tuple[SystemMessage | None, Optional[dict]]:
         # The cheap summarizer is a fast_llm call with its own output budget
         # (settings.llm_max_completion_tokens); its transcript (rendered inside
         # the summary prompt) must fit window - output budget - hard reserved.
@@ -516,14 +525,16 @@ class ToolLoopAgent:
                     estimate_message_tokens([dropped]),
                 )
         return _generate_agent_context_summary(
-            working, self.summary_ledger, self.summary_llm
+            working, self.summary_ledger, self.summary_llm, self.name
         )
 
     def prepare_history(self, full_messages, subject: str, current_turn: int):
         """Apply compaction, the hard safety cap, and the termination countdown
         to ``full_messages``.
 
-        Returns ``(messages_for_llm, updates, did_compact, hard_capped)``.
+        Returns ``(messages_for_llm, updates, did_compact, hard_capped,
+        compaction_usage)`` — ``compaction_usage`` is the merged token usage
+        of any summarizer calls this pass spent (None when no compaction ran).
         Fails open: any summarization error leaves the full history intact,
         subject only to the hard safety cap.
         """
@@ -531,6 +542,7 @@ class ToolLoopAgent:
         updates: list = []
         did_compact = False
         hard_capped = False
+        compaction_usage: Optional[dict] = None
 
         # Split with oversized-tail demotion only — NO per-message truncation.
         # A pathological single message (e.g. a ~120k-token 'finish_reason:
@@ -557,7 +569,8 @@ class ToolLoopAgent:
                 len(head) == 2
                 and compressible >= self.compaction.min_compressible
             ):
-                summary_msg = self.summarize(middle)
+                summary_msg, summary_usage = self.summarize(middle)
+                compaction_usage = add_usage(compaction_usage, summary_usage)
                 if summary_msg is not None:
                     messages_for_llm = head + [summary_msg] + tail
                     updates = [
@@ -574,7 +587,8 @@ class ToolLoopAgent:
         # maximum context window. Force-truncate to the protected head plus a
         # summary (or, failing that, the single most recent verbatim turn).
         if estimate_message_tokens(messages_for_llm) >= self.compaction.hard_cap():
-            summary_msg = self.summarize(middle)
+            summary_msg, summary_usage = self.summarize(middle)
+            compaction_usage = add_usage(compaction_usage, summary_usage)
             if summary_msg is not None:
                 forced = head + [summary_msg] + tail
             else:
@@ -605,7 +619,7 @@ class ToolLoopAgent:
             messages_for_llm = list(messages_for_llm) + [warning_msg]
             updates.append(warning_msg)
 
-        return messages_for_llm, updates, did_compact, hard_capped
+        return messages_for_llm, updates, did_compact, hard_capped, compaction_usage
 
     # -- graph node callables ---------------------------------------------------
 
@@ -623,7 +637,7 @@ class ToolLoopAgent:
         full_messages = list(state["messages"])
         subject = self._subject(state)
         current_turn = state.get("iterations", 0) + 1
-        messages_for_llm, updates, did_compact, _ = self.prepare_history(
+        messages_for_llm, updates, did_compact, _, compaction_usage = self.prepare_history(
             full_messages, subject, current_turn
         )
         # Hallucination guard: a byte-identical re-run of the previous batch adds
@@ -637,6 +651,7 @@ class ToolLoopAgent:
                 f"the call with changed arguments, or conclude with {terminal_display} now."
             ))]
         response = llm_with_tools.invoke(messages_for_llm)
+        turn_usage = record_llm_usage(self.name, response)
         updates.append(response)
         if did_compact:
             logging.info(
@@ -644,7 +659,12 @@ class ToolLoopAgent:
                 f"{estimate_message_tokens(full_messages)} est. tokens -> "
                 f"{estimate_message_tokens(messages_for_llm)} est. tokens."
             )
-        return {**self.session_state(state), "messages": updates, "iterations": 1}
+        return {
+            **self.session_state(state),
+            "messages": updates,
+            "iterations": 1,
+            "token_spent": add_usage(turn_usage, compaction_usage),
+        }
 
     def router(self, state):
         """Route the loop based on the latest message type and iteration count."""

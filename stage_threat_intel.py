@@ -8,7 +8,7 @@ from tavily import TavilyClient
 
 import settings
 from llms import fast_llm, invoke_structured_capped
-from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping
+from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping, take_cached_usage
 from schemas import THREAT_INTEL_AGENT, CVEAnalysis
 from stage_cve import _backfill_osv_cwe_ids, _finalize_cve_analysis, cve_descriptions, osv_enrichment_lines
 from state import MasterState, ThreatIntelState
@@ -108,6 +108,7 @@ def _threat_intel_node(state: ThreatIntelState) -> dict:
     cache_file = settings.cache_dir / "threat_intel" / f"{cve_id}.json"
     cached = cache(cache_file, "read")
     if cached:
+        take_cached_usage("threat_intel", cached)
         return {"cve_demands": [_backfill_osv_cwe_ids(cached, cve)]}
 
     query = f"{cve_id} {package_name} root cause writeup exploit analysis"
@@ -136,8 +137,8 @@ def _threat_intel_node(state: ThreatIntelState) -> dict:
     ))
     sys_msg = SystemMessage(content=THREAT_INTEL_AGENT.get("prompt", ""))
     structured_llm = fast_llm.with_structured_output(CVEAnalysis, method="json_schema", strict=True)
-    response = invoke_structured_capped(
-        structured_llm, [sys_msg, human_msg], f"Threat Intel {cve_id}"
+    response, usage = invoke_structured_capped(
+        structured_llm, [sys_msg, human_msg], f"Threat Intel {cve_id}", "threat_intel"
     )
     if response is None:
         # Fail open to the prior analyzer output.
@@ -150,7 +151,8 @@ def _threat_intel_node(state: ThreatIntelState) -> dict:
         logging.warning(f"{cve_id}: Threat Intel returned an invalid analysis; keeping prior output.")
         return {"cve_demands": [prior] if prior else []}
 
-    cache(cache_file, "write", enriched)
+    # token_usage rides ONLY the cache payload (see stage_cve note).
+    cache(cache_file, "write", {**enriched, "token_usage": usage})
     return {"cve_demands": [enriched]}
 
 

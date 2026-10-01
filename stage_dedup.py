@@ -22,7 +22,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 import settings
 from llms import invoke_structured_capped, smart_llm
-from run_stats import _record_stat, as_dict, as_dicts, get_embedder, raise_if_stopping
+from run_stats import _record_stat, as_dict, as_dicts, get_embedder, raise_if_stopping, take_cached_usage
 from schemas import DEDUP_AGENT, DedupAgentOutput, cwes
 from state import MasterState
 from utils import cache, get_cached_graph_data, safe_cache_filename
@@ -185,18 +185,20 @@ def _run_group(group: dict, idx: int, total: int) -> list[dict]:
     try:
         cached = cache(cache_file, "read")
         if cached is not None:
+            take_cached_usage("dedup_agent", cached)
             logging.debug("Dedup agent cache hit for group %d/%d.", idx, total)
             return [cl for cl in (cached.get("clusters") or []) if isinstance(cl, dict)]
 
         known = {str(record.get("vuln_id")) for record in group["records"]}
         structured_llm = smart_llm.with_structured_output(DedupAgentOutput, method="json_schema", strict=True)
-        output = invoke_structured_capped(
+        output, usage = invoke_structured_capped(
             structured_llm,
             [
                 SystemMessage(content=DEDUP_AGENT.get("prompt", "")),
                 HumanMessage(content=_render_group_prompt(group)),
             ],
             f"Dedup agent group {idx}/{total} ({group['cwe_id']} · {group['bucket'] or 'all'})",
+            "dedup_agent",
         )
         if output is None:
             # Uncached on purpose: the next run re-attempts this group.
@@ -226,7 +228,7 @@ def _run_group(group: dict, idx: int, total: int) -> list[dict]:
         )
         _record_stat("dedup_agent_groups_skipped_errors")
         return []
-    cache(cache_file, "write", {"clusters": clusters})
+    cache(cache_file, "write", {"clusters": clusters, "token_usage": usage})
     logging.info(
         "Dedup agent group %d/%d (%s · %s, %d records): %d duplicate cluster(s).",
         idx, total, group["cwe_id"], group["bucket"] or "all", len(group["records"]), len(clusters),

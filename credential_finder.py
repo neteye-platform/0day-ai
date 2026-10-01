@@ -19,7 +19,7 @@ import yaml
 
 import settings
 import utils
-from llms import fast_llm
+from llms import fast_llm, invoke_tracked
 from utils import COMPOSE_FILENAMES, is_path_excluded, get_container_artifacts_root, safe_cache_filename
 
 logger = logging.getLogger(__name__)
@@ -643,9 +643,11 @@ def _render_candidates(candidates: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _llm_normalize(candidates: list[dict]) -> Optional[list[dict]]:
+def _llm_normalize(candidates: list[dict]) -> tuple[Optional[list[dict]], Optional[dict]]:
     """One structured LLM call to label/dedupe raw candidates into records.
-    Returns None (and logs) on any failure so the caller fails open."""
+    Returns ``(records_or_None, token_usage)``; None records (and a log) on any
+    failure so the caller fails open. The usage is booked to the run ledger by
+    invoke_tracked; it is returned so the caller can persist it in the cache."""
     try:
         from langchain_core.messages import SystemMessage, HumanMessage
         from schemas import CREDENTIAL_FINDER_AGENT, CredentialList
@@ -657,7 +659,7 @@ def _llm_normalize(candidates: list[dict]) -> Optional[list[dict]]:
             f"{_MAX_CANDIDATES_TO_LLM} shown):\n{_render_candidates(candidates)}"
         ))
         structured = fast_llm.with_structured_output(CredentialList, method="json_schema", strict=True)
-        result = structured.invoke([sys_msg, human_msg])
+        result, usage = invoke_tracked(structured, [sys_msg, human_msg], "credential_finder")
         result = result if isinstance(result, dict) else result.model_dump()
         records = []
         for item in result.get("credentials") or []:
@@ -672,10 +674,10 @@ def _llm_normalize(candidates: list[dict]) -> Optional[list[dict]]:
                 "source": item.get("source"),
                 "notes": item.get("notes"),
             })
-        return records
+        return records, usage
     except Exception as e:
         logger.warning("Credential finder LLM pass failed; using raw candidates: %s", e)
-        return None
+        return None, None
 
 
 def _write_credentials(records: list[dict]) -> None:
@@ -752,11 +754,13 @@ def _llm_cache(candidates: list[dict]) -> tuple[Optional[list[dict]], bool]:
     cache_file = settings.cache_dir / "credential_finder" / safe_cache_filename(f"{digest}.json")
     cached = utils.cache(cache_file, "read")
     if cached and isinstance(cached.get("credentials"), list):
+        from run_stats import take_cached_usage
+        take_cached_usage("credential_finder", cached)
         return cached["credentials"], True
-    records = _llm_normalize(candidates)
+    records, usage = _llm_normalize(candidates)
     if records is None:
         return None, False
-    utils.cache(cache_file, "write", {"credentials": records})
+    utils.cache(cache_file, "write", {"credentials": records, "token_usage": usage})
     return records, False
 
 

@@ -9,7 +9,7 @@ from langgraph.types import Send
 
 import settings
 from llms import fast_llm, invoke_structured_capped
-from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping
+from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, add_usage, new_usage, raise_if_stopping, take_cached_usage
 from schemas import VERIFIER_AGENT, VerifierOutput, cwes
 from stage_cve import _normalize_cwe_ids
 from state import MasterState, VerifierState
@@ -125,6 +125,7 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
 
     cached_data = cache(cache_file, "read")
     if cached_data:
+        take_cached_usage("contract_verifier", cached_data)
         return {"vulnerabilities": cached_data.get("hypothesis", [])}, "HIT"
 
     # Map the prompt [ID: ...] back to the original demand dict so FAILED
@@ -164,6 +165,7 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
 
     evaluations = []
     skipped_demands = 0
+    node_usage = new_usage()  # tokens of THIS build: fresh batches + cached-batch spend
     for b_idx in batch_starts:
         batch = demands[b_idx : b_idx + batch_size]
         batch_hash = hashlib.md5(json.dumps(batch, sort_keys=True).encode()).hexdigest()
@@ -174,24 +176,31 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
         )
         cached_batch = cache(batch_cache_file, "read")
         if cached_batch and isinstance(cached_batch.get("evaluations"), list):
+            # The node entry must reproduce the FULL original build cost, so
+            # cached-batch spend joins node_usage too (booked live once by
+            # take_cached_usage, which pops the key before it can leak on).
+            node_usage = add_usage(node_usage, cached_batch.get("token_usage"))
+            take_cached_usage("contract_verifier", cached_batch)
             evaluations.extend(cached_batch["evaluations"])
             continue
         batch_demands_string = "\n".join(formatted_demands[b_idx : b_idx + batch_size])
         human_msg = HumanMessage(
             content=f"```python\n{target_code}\n```\n\nSecurity Demands:\n{batch_demands_string}"
         )
-        response = invoke_structured_capped(
+        response, usage = invoke_structured_capped(
             structured_llm,
             [sys_msg, human_msg],
             f"Contract verifier {target_node_id} batch{b_idx}",
+            "contract_verifier",
         )
+        node_usage = add_usage(node_usage, usage)
         if response is None:
             # Output cap exhausted: drop the batch uncached so a later run re-attempts it.
             skipped_demands += len(batch)
             continue
         response = response if isinstance(response, dict) else response.model_dump()
         batch_evals = response.get("evaluations") or []
-        cache(batch_cache_file, "write", {"evaluations": batch_evals})
+        cache(batch_cache_file, "write", {"evaluations": batch_evals, "token_usage": usage})
         evaluations.extend(batch_evals)
 
     if skipped_demands:
@@ -239,7 +248,10 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
     # An output-cap skip leaves the node under-evaluated: never cache the
     # partial result, so the next run re-attempts the skipped batch.
     if not skipped_demands:
-        cache(cache_file, "write", {"hypothesis": new_vulnerabilities})
+        cache(cache_file, "write", {
+            "hypothesis": new_vulnerabilities,
+            "token_usage": node_usage,
+        })
 
     return {"vulnerabilities": new_vulnerabilities}, "MISS"
 

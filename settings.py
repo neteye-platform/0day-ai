@@ -67,15 +67,15 @@ llm_max_completion_tokens = 16384
 
 # =============================== Agents ==================================
 
-agents_concurrency = 3
+agents_concurrency = 4
 
 # Reviewer/validator loop caps: if the terminal tool isn't called within this many
 # LLM rounds, the loop ends via the fallback node instead of hitting the recursion
 # limit. Countdown notes are injected from COUNTDOWN_LEAD_TURNS before the cap.
 reviewer_max_iterations = 25
-validator_max_iterations = 150
+validator_max_iterations = 100
 integration_auditor_max_iterations = 20
-COUNTDOWN_LEAD_TURNS = 8
+COUNTDOWN_LEAD_TURNS = 10
 reviewer_countdown_start = max(1, reviewer_max_iterations - COUNTDOWN_LEAD_TURNS)
 validator_countdown_start = max(1, validator_max_iterations - COUNTDOWN_LEAD_TURNS)
 integration_auditor_countdown_start = max(1, integration_auditor_max_iterations - COUNTDOWN_LEAD_TURNS)

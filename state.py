@@ -6,6 +6,22 @@ from schemas import AnalysisNote, ExpertTask, VulnerabilityRecord
 from utils import merge_vulnerabilities
 
 
+def merge_token_usage(prev: Optional[dict], new: Optional[dict]) -> Optional[dict]:
+    """Reducer for the per-task `token_spent` channel: running sum of one
+    subgraph run's LLM token usage ({calls, input_tokens, output_tokens}).
+    Every LLM turn of the loop writes its usage through this channel so the
+    terminal tool / fallback can persist the whole run's total into the
+    cache entry."""
+    if not prev:
+        return new
+    if not new:
+        return prev
+    return {
+        field: int(prev.get(field) or 0) + int(new.get(field) or 0)
+        for field in ("calls", "input_tokens", "output_tokens")
+    }
+
+
 class MasterState(TypedDict):
     # Minted by bootstrap (resume-safe), copied into every subagent dispatch:
     # stamped as LangSmith metadata on the main and the project-split subagent
@@ -88,6 +104,10 @@ class ReviewerState(TypedDict):
     # Number of LLM invocations in the tool loop. Bounds the loop so a model
     # that never submits a verdict ends gracefully via the fallback node.
     iterations: Annotated[int, operator.add]
+    # Tokens spent by THIS subgraph run (merged over every LLM turn via
+    # merge_token_usage); read by the terminal tool / fallback to stamp the
+    # cache entry's token_usage. Subgraph-internal: output schemas omit it.
+    token_spent: Annotated[Optional[dict], merge_token_usage]
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
     messages: Annotated[list, add_messages]
 
@@ -124,6 +144,10 @@ class ValidatorState(TypedDict):
     cache_tag: str
     # Number of LLM invocations in the tool loop (same role as ReviewerState.iterations).
     iterations: Annotated[int, operator.add]
+    # Tokens spent by THIS subgraph run (merged over every LLM turn via
+    # merge_token_usage); read by the terminal tool / fallback to stamp the
+    # cache entry's token_usage. Subgraph-internal: output schemas omit it.
+    token_spent: Annotated[Optional[dict], merge_token_usage]
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
     messages: Annotated[list, add_messages]
 
@@ -138,6 +162,10 @@ class IntegrationAuditorState(TypedDict):
     confirmed_vulns: list[dict]
     # Number of LLM invocations in the tool-loop (same role as ReviewerState.iterations).
     iterations: Annotated[int, operator.add]
+    # Tokens spent by THIS subgraph run (merged over every LLM turn via
+    # merge_token_usage); read by the terminal tool / fallback to stamp the
+    # cache entry's token_usage. Subgraph-internal: output schemas omit it.
+    token_spent: Annotated[Optional[dict], merge_token_usage]
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
     messages: Annotated[list, add_messages]
 
@@ -160,5 +188,9 @@ class PatcherState(TypedDict):
     cache_tag: str
     # Number of LLM invocations in the tool loop (same role as ReviewerState.iterations).
     iterations: Annotated[int, operator.add]
+    # Tokens spent by THIS subgraph run (merged over every LLM turn via
+    # merge_token_usage); read by the terminal tool / fallback to stamp the
+    # cache entry's token_usage. Subgraph-internal: output schemas omit it.
+    token_spent: Annotated[Optional[dict], merge_token_usage]
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
     messages: Annotated[list, add_messages]

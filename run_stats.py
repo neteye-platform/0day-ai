@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import settings
 from dedup import Embeddings
@@ -121,13 +122,104 @@ def _record_stat(key: str, amount: int = 1) -> None:
 
 
 def _reset_pipeline_stats() -> None:
+    # The token ledger rides the same bootstrap reset (one ledger per run).
     with _pipeline_stats_lock:
         _pipeline_stats.clear()
+    with _token_lock:
+        _token_totals.clear()
 
 
 def _snapshot_pipeline_stats() -> dict[str, int]:
     with _pipeline_stats_lock:
         return dict(_pipeline_stats)
+
+
+# ---------------------------------------------------------------------------
+# Token usage ledger — per-agent LLM input/output token totals for the run.
+
+USAGE_FIELDS = ("calls", "input_tokens", "output_tokens")
+
+_token_totals: dict[str, dict[str, int]] = {}
+_token_lock = threading.Lock()
+
+
+def new_usage() -> dict:
+    """Fresh zeroed usage accumulator ({calls, input_tokens, output_tokens})."""
+    return {field: 0 for field in USAGE_FIELDS}
+
+
+def normalize_usage(usage) -> Optional[dict]:
+    """Normalize any token-usage carrier (AIMessage usage_metadata dict or a
+    stored usage accumulator) to {calls, input_tokens, output_tokens}; None
+    when it carries no tokens at all (so zeroed payloads — e.g. an endpoint
+    that omits usage_metadata — never bookkeep or render as all-zero rows)."""
+    if not isinstance(usage, dict):
+        return None
+    tokens = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+    if not tokens:
+        return None
+    calls = usage.get("calls")
+    if calls is None:
+        calls = 1
+    return {
+        "calls": int(calls),
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+    }
+
+
+def add_usage(a: Optional[dict], b: Optional[dict]) -> Optional[dict]:
+    """Field-wise sum of two usage dicts (either may be None)."""
+    na, nb = normalize_usage(a), normalize_usage(b)
+    if na is None:
+        return nb
+    if nb is None:
+        return na
+    return {field: na[field] + nb[field] for field in USAGE_FIELDS}
+
+
+def extract_llm_usage(message) -> Optional[dict]:
+    """Token usage of one LLM response message (usage_metadata), normalized."""
+    return normalize_usage(getattr(message, "usage_metadata", None))
+
+
+def record_usage(agent: str, usage) -> Optional[dict]:
+    """Add one call's normalized usage to the agent's run totals; returns the
+    normalized dict (state/ledger bookkeeping) or None when nothing to add."""
+    usage = normalize_usage(usage)
+    if usage is None:
+        return None
+    with _token_lock:
+        totals = _token_totals.setdefault(agent, new_usage())
+        for field in USAGE_FIELDS:
+            totals[field] += usage[field]
+    return usage
+
+
+def record_llm_usage(agent: str, message) -> Optional[dict]:
+    """Record one chat-model response's token usage under `agent`; the
+    response's AIMessage carries usage_metadata (stream_usage is on)."""
+    return record_usage(agent, extract_llm_usage(message))
+
+
+def record_cached_token_usage(agent: str, usage) -> None:
+    """Merge token totals restored from a cache entry (work spent by an
+    earlier run) into the ledger, so report totals stay comparable across
+    cached and fresh runs. Entries predating token tracking carry nothing."""
+    record_usage(agent, usage)
+
+
+def take_cached_usage(agent: str, entry) -> None:
+    """Raw-`cache()` payload hook: pop the entry's 'token_usage' key (so it
+    never leaks into downstream consumers) and restore it into the ledger."""
+    if not isinstance(entry, dict):
+        return
+    record_cached_token_usage(agent, entry.pop("token_usage", None))
+
+
+def snapshot_token_totals() -> dict[str, dict[str, int]]:
+    with _token_lock:
+        return {agent: dict(totals) for agent, totals in _token_totals.items()}
 
 
 def _progress_file(progress_id: str) -> Path:

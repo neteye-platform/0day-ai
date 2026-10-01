@@ -13,6 +13,7 @@ from run_stats import (
     _start_agent_progress,
     affected_nodes_label,
     as_dicts,
+    record_llm_usage,
 )
 from schemas import REVIEWER_AGENT
 from stage_dedup import apply_agent_clusters, embedding_dedup
@@ -330,7 +331,11 @@ class ReviewerAgent(ToolLoopAgent):
         ))
 
         response = llm_with_tools.invoke([sys_msg, human_msg])
-        return {"messages": [sys_msg, human_msg, response], "iterations": 1}
+        return {
+            "messages": [sys_msg, human_msg, response],
+            "iterations": 1,
+            "token_spent": record_llm_usage(self.name, response),
+        }
 
     def fallback(self, state) -> Command:
         """Resolve a review that hit the iteration cap without a verdict:
@@ -345,7 +350,12 @@ class ReviewerAgent(ToolLoopAgent):
 
         # Feedback re-reviews are never cached (see cached_verdict).
         if not is_feedback_review(report):
-            cache_reviewer(reviewer_cache_key(report, state.get("node_id", "Unknown")), report, updated_vuln)
+            cache_reviewer(
+                reviewer_cache_key(report, state.get("node_id", "Unknown")),
+                report,
+                updated_vuln,
+                state.get("token_spent"),
+            )
 
         return Command(
             update={

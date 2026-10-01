@@ -9,7 +9,7 @@ from llms import fast_llm
 from llms import invoke_structured_capped
 from schemas import EXPERT_AGENTS, AnalysisNote, BatchedAnalysisResult
 from state import ExplorerState, MasterState
-from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping
+from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping, take_cached_usage
 from utils import (
     build_networkx_graph,
     get_cached_graph_data,
@@ -222,6 +222,7 @@ def _explore_single(node_id: str, role_name: str) -> tuple[dict, bool]:
     cache_file = settings.cache_dir / "notes" / safe_cache_filename(f"{node_id}-{role_name}.json")
     cached_note = cache(cache_file, "read")
     if cached_note:
+        take_cached_usage("explorer", cached_note)
         return cached_note, True
 
     source_code = get_node_code(node_id)
@@ -263,8 +264,8 @@ def _explore_single(node_id: str, role_name: str) -> tuple[dict, bool]:
     human_msg = HumanMessage(content=user_prompt)
 
     explorer_llm = fast_llm.with_structured_output(AnalysisNote, method="json_schema", strict=True)
-    note = invoke_structured_capped(
-        explorer_llm, [sys_msg, human_msg], f"Explorer single-node {node_id}"
+    note, usage = invoke_structured_capped(
+        explorer_llm, [sys_msg, human_msg], f"Explorer single-node {node_id}", "explorer"
     )
     if note is None:
         # Output cap exhausted: empty note, left uncached so a later run re-attempts.
@@ -277,7 +278,11 @@ def _explore_single(node_id: str, role_name: str) -> tuple[dict, bool]:
     # 'vulns' is kept in dict_note for later consumers (aggregate edge notes).
     extracted_vulns = _extract_hypotheses(node_id, dict_note.get("vulns", []))
 
-    cache(cache_file, "write", {"notes": [dict_note], "vulnerabilities": extracted_vulns})
+    cache(cache_file, "write", {
+        "notes": [dict_note],
+        "vulnerabilities": extracted_vulns,
+        "token_usage": usage,
+    })
 
     return {
         "notes": [dict_note],
@@ -291,6 +296,7 @@ def _explore_batch(node_ids: list[str], role_name: str) -> tuple[dict, bool]:
     cache_file = settings.cache_dir / "notes" / safe_cache_filename(f"batch-{batch_key}-{role_name}.json")
     cached_note = cache(cache_file, "read")
     if cached_note:
+        take_cached_usage("explorer", cached_note)
         return cached_note, True
 
     graph_data = get_cached_graph_data(settings.graph)
@@ -347,8 +353,8 @@ def _explore_batch(node_ids: list[str], role_name: str) -> tuple[dict, bool]:
     human_msg = HumanMessage(content=user_prompt)
 
     explorer_llm = fast_llm.with_structured_output(BatchedAnalysisResult, method="json_schema", strict=True)
-    result = invoke_structured_capped(
-        explorer_llm, [sys_msg, human_msg], f"Explorer batch of {len(node_ids)} nodes"
+    result, usage = invoke_structured_capped(
+        explorer_llm, [sys_msg, human_msg], f"Explorer batch of {len(node_ids)} nodes", "explorer"
     )
     if result is None:
         # Output cap exhausted for the batch; uncached so a later run re-attempts.
@@ -370,7 +376,11 @@ def _explore_batch(node_ids: list[str], role_name: str) -> tuple[dict, bool]:
         extracted_vulns.extend(_extract_hypotheses(node_id, dict_note.get("vulns", [])))
         notes.append(dict_note)
 
-    cache(cache_file, "write", {"notes": notes, "vulnerabilities": extracted_vulns})
+    cache(cache_file, "write", {
+        "notes": notes,
+        "vulnerabilities": extracted_vulns,
+        "token_usage": usage,
+    })
 
     return {
         "notes": notes,
