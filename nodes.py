@@ -1823,28 +1823,38 @@ class ValidatorAgent(ToolLoopAgent):
     def bind_tools(self, state):
         validator_tools = [
             tools.send_http_request,
-            # tools.list_files,
-            # tools.read_sandbox_file,
             browser_tools.browser_navigate,
             browser_tools.browser_click,
             browser_tools.browser_fill,
             browser_tools.browser_evaluate,
             browser_tools.browser_console,
-            attacker_tools.run_command,
-            attacker_tools.write_attacker_file,
-            attacker_tools.read_attacker_file,
+            tools.mark_validation_complete
         ]
+        if getattr(settings, "attacker_enabled", False):
+            validator_tools += [
+                attacker_tools.run_command,
+                attacker_tools.write_attacker_file,
+                attacker_tools.read_attacker_file
+            ]
         # ask_for_context is bound ONLY on the first validation pass. Once the
         # Reviewer has re-answered (review_round > 0), it is removed so the
-        # agent cannot be tempted to request more context a second time; it must
-        # conclude with mark_validation_complete.
+        # agent cannot be tempted to request more context a second time
         if (state.get("report_to_test", {}).get("review_round") or 0) < settings.validator_feedback_max_rounds:
             validator_tools.append(tools.ask_for_context)
-        validator_tools.append(tools.mark_validation_complete)
         return smart_llm.bind_tools(validator_tools)
 
     def first_turn(self, state, llm_with_tools) -> dict:
-        sys_msg = SystemMessage(content=VALIDATOR_AGENT.get('prompt'))
+        # Compose the validator system prompt from the capabilities this run
+        # actually grants: the attacker shell tools are only described when
+        # enabled, and the insufficient-context escape hatch is only described on
+        # the first validation pass (the tool is unbound afterwards, mirroring the
+        # gating in bind_tools).
+        sys_prompt = VALIDATOR_AGENT["prompt"]
+        if getattr(settings, "attacker_enabled", False):
+            sys_prompt += "\n\n" + VALIDATOR_AGENT.get("attacker_tools", "")
+        if (state.get("report_to_test", {}).get("review_round") or 0) < settings.validator_feedback_max_rounds:
+            sys_prompt += "\n\n" + VALIDATOR_AGENT.get("insufficient_context", "")
+        sys_msg = SystemMessage(content=sys_prompt)
         # Build a structured string for the LLM
         report = state['report_to_test']
         steps = report.get('reproduction_steps') or []
@@ -1863,32 +1873,9 @@ class ValidatorAgent(ToolLoopAgent):
             f"--- REPRODUCTION STEPS (from Reviewer, follow in order) ---\n"
             f"{steps_str}"
         )
-        round_note = ""
-        if (report.get("review_round") or 0) > 0:
-            round_note = (
-                "\n\nFINAL VALIDATION PASS: you previously flagged this record as needing "
-                "more context and the Reviewer has re-answered. The `ask_for_context` tool "
-                "is NOT available in this pass. You MUST now conclude with "
-                "`mark_validation_complete` — confirm with a working PoC and concrete "
-                "evidence, or mark `is_confirmed: false` — using the evidence available to "
-                "you. Do not fabricate evidence."
-            )
-        shell_note = ""
-        if getattr(settings, "attacker_enabled", False):
-            shell_note = (
-                "\n\n`run_command` executes inside a dedicated Kali attacker container "
-                "(nmap, curl, sqlmap, etc.). Use it to actively probe the app with real "
-                "tools or run a PoC. IMPORTANT: from that container the app is NOT at "
-                "127.0.0.1 - each run_command result prints a `SHELL TARGET:` header "
-                "(e.g. http://172.17.0.1:<port>) that you MUST use for requests inside "
-                "commands. `send_http_request` and the browser tools keep using the "
-                "sandbox URL natively. If run_command reports the attacker container "
-                "is unavailable, fall back to HTTP/browser-only proof."
-            )
         human_msg = HumanMessage(content=(
             f"Target Sandbox: {state['sandbox_url']}\n\n"
             f"Vulnerability to Prove:\n{formatted_report}"
-            f"{round_note}{shell_note}\n"
         ))
         messages = [sys_msg, human_msg]
         response = llm_with_tools.invoke(messages)
