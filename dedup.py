@@ -5,8 +5,8 @@ records describing the SAME vulnerability differently are merged so one
 reviewer/validator chain adjudicates the pattern once; ``deduplicate_demands``
 does the same for demands before the contract verifier.
 
-Hard constraints (thresholds tuned offline against the GLPI run's cached
-embeddings; see settings.py):
+Hard constraints (thresholds tuned offline against embeddings from
+representative real-world scans; see settings.py):
 
   * Clustering only within a (vulnerability_type, cwe_id) group.
   * Dependency-origin records (``source_cve``) are never merged.
@@ -204,7 +204,7 @@ class Embeddings:
             # Cascade guard: the stall watchdog covers HUNG servers, but a
             # dead one fast-fails every halved chunk and single retry in
             # milliseconds, so no stall would ever trip. A dead server must
-            # not burn ~4 attempts x 13k texts — abort once enough texts
+            # not grind through the whole text list — abort once enough texts
             # failed while NOTHING ever succeeded. Sporadic per-text failures
             # (done > 0) are always tolerated.
             if failed >= 25 and done == 0:

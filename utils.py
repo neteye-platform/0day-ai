@@ -666,8 +666,8 @@ def _merge_affected_nodes(target: dict, *sources: dict) -> None:
 def reviewer_cache_key(report: Optional[dict], default: str = "Unknown") -> str:
     """Stable reviewer-cache key prefix derived from a report's affected nodes.
 
-    Replaces the old single `node_id` prefix; the report content hash (which
-    already includes `affected_nodes`) keeps entries distinct per node set."""
+    The report content hash (which already includes `affected_nodes`) keeps
+    entries distinct per node set."""
     affected = sorted({n for n in (report or {}).get("affected_nodes") or [] if n})
     return "+".join(affected) if affected else default
 
@@ -699,9 +699,8 @@ def is_feedback_review(report: Optional[dict]) -> bool:
 # "confirmed" (auditor proved the record joins a multi-step exploit) but below
 # "exploitable" (a validator PoC outranks the auditor's static chain proof).
 # "insufficient_context" ranks above "chained": the Validator's ask must DISPLACE
-# the auditor's intermediate "chained" status (a tie used to discard the ask AND
-# its bumped review_round, so the record stayed "chained" forever and
-# route_integration_audit re-dispatched it on every wave — a livelock).
+# the auditor's intermediate "chained" status — on a tie the ask (and its bumped
+# review_round) would be discarded and the record would stay "chained" forever.
 # "unchainable" is a terminal auditor verdict that stays in the report, like
 # "false_positive".
 _STATUS_PRIORITY = {
@@ -831,12 +830,11 @@ def estimate_message_tokens(messages: list[AnyMessage]) -> int:
     """
     Conservative token estimate for a list of messages. Starts from a ~2
     chars/token base, then adds per-message metadata overhead (8 tokens each)
-    and a 15% fudge factor. Measured on real reviewer histories, deepseek-v4-
-    flash tokenizes prose at ~5 chars/token (so the 2 chars/token base alone
-    already over-estimates prose ~2.5x), while dense code can run below the 2
-    chars/token rate — the overhead + fudge keeps the estimate above the model's
-    real token count in both regimes so context compaction never races the hard
-    input limit.
+    and a 15% fudge factor. Typical chat tokenizers run prose near 4-5
+    chars/token (so the 2 chars/token base alone already over-estimates prose
+    ~2x), while dense code can run below the 2 chars/token rate — the overhead
+    + fudge keeps the estimate above the model's real token count in both
+    regimes so context compaction never races the hard input limit.
     """
     total_chars = 0
     message_count = 0
@@ -863,8 +861,8 @@ def estimate_message_tokens(messages: list[AnyMessage]) -> int:
 _PRONOUN_MODULES = frozenset({"parent", "static", "self", "this", "$this"})
 _CLASS_RELATIONS = frozenset({"inherits", "extends", "implements", "mixes_in"})
 
-# Once-per-run warning dedup (cleared at bootstrap). Flooding 19k identical
-# "Failed to find graph node" lines per run buries every other signal.
+# Once-per-run warning dedup (cleared at bootstrap). Flooding thousands of
+# identical "Failed to find graph node" lines per run buries every other signal.
 _LOG_ONCE_SEEN: set = set()
 _LOG_ONCE_LOCK = threading.Lock()
 
@@ -975,10 +973,11 @@ def _resolver_indexes() -> dict:
         exact_index.setdefault(_norm_node_label(n.get("label", "")), []).append(nid)
         labels[nid] = lower_label
     # Class-like nodes with zero extracted members (``class X extends Y {}``
-    # — GLPI's style, every behaviour inherited) must still be hintable:
-    # without registering them the ancestor walk in ``_inherited_member``
-    # can never start, and ``X::add`` misses although CommonDBTM::add has a
-    # node. Class-relation endpoints are the authoritative class-node test.
+    # declarations whose behaviour is entirely inherited) must still be
+    # hintable: without registering them the ancestor walk in
+    # ``_inherited_member`` can never start, and ``X::add`` misses although
+    # ``BaseClass::add`` has a node. Class-relation endpoints are the
+    # authoritative class-node test.
     for edge in graph_data.get("links", []):
         if edge.get("relation") not in _CLASS_RELATIONS:
             continue
@@ -1050,8 +1049,8 @@ def _caller_container(idx: dict, caller_node_id):
 
 def _inherited_member(idx: dict, class_key: str, member_key: str):
     """BFS the container inheritance closure for ``member_key``. Covers members
-    that the hint-class merely inherits (``CommonDBTM::addStandardTab``
-    defined on CommonGLPI)."""
+    that the hint-class merely inherits (``addStandardTab`` defined on a base
+    class, called through a subclass hint)."""
     if not class_key or not member_key:
         return None
     frontier = _class_ids_for_hint(idx, class_key)
@@ -1076,12 +1075,12 @@ def parse_call_target(clean_target: str) -> tuple[str, str]:
     """Split an args-stripped call target into ``(module, symbol)``.
 
     Handles ``Class::method``, ``module.method``, chained receivers
-    (``TemplateRenderer::getInstance()->display`` -> ``("TemplateRenderer",
-    "display")``) and variable receivers (``$DB->request`` -> ``("",
-    "request")``; ``$this->x`` keeps the ``$this`` module for caller-scoped
-    resolution). A bare function name stays moduleless — the buggy
-    legacy assignment put the name in ``module`` and made every global
-    function lookup miss its file-match leg.
+    (``Renderer::getInstance()->display`` -> ``("Renderer",
+    "display")``) and variable receivers (``$db->query`` -> ``("",
+    "query")``; ``$this->x`` keeps the ``$this`` module for caller-scoped
+    resolution). A bare function name stays moduleless: putting it in
+    ``module`` instead would make every global function lookup miss its
+    file-match leg.
     """
     t = (clean_target or "").strip()
     module = ""
@@ -1123,11 +1122,10 @@ def resolve_node_id(module, symbol, caller_node_id=None):
     ``parent``/``self``/``static``/``this``/``$this`` maps to the caller's own
     container (``parent`` = direct parents, ``self``/``static`` = the whole
     bounded ancestor closure, mirroring PHP's own ``self::`` lookup through
-    inherits/extends/implements/mixes_in edges), which used to be dropped
-    outright. Without any module/class hint the lookup is
-    GLOBAL-EXACT ONLY (unique normalized label); ambiguous bare method names
-    (e.g. ``getFromDB``: 61 classes) deliberately miss instead of misrouting a
-    security demand to a random class."""
+    inherits/extends/implements/mixes_in edges). Without any module/class hint
+    the lookup is GLOBAL-EXACT ONLY (unique normalized label); a bare method
+    name redefined on dozens of unrelated classes deliberately misses instead
+    of misrouting a security demand to a random class."""
     module = (module or "").strip()
     if module.lower() in ("global", "none", "null"):
         module = ""
@@ -1148,8 +1146,8 @@ def resolve_node_id(module, symbol, caller_node_id=None):
                 list(idx["parent_of"].get(container, []))
                 if lower_mod == "parent"
                 # self/static/this resolve like PHP: own class first, then the
-                # inheritance chain (canView defined on CommonGLPI, called as
-                # self::canView() from a deep subclass member).
+                # inheritance chain (``canView`` defined on the base class,
+                # called as ``self::canView()`` from a deep subclass member).
                 else [container, *_ancestor_closure(idx, [container])]
             )
             base = _norm_node_label(symbol)
@@ -1226,9 +1224,9 @@ def resolve_node_id(module, symbol, caller_node_id=None):
             return mid, ""
         # The hint may instead name an ANCESTOR of the caller while the method
         # is defined on the caller's own class (the explorer attributed a
-        # self::/static:: call to the parent it is inherited through, e.g.
-        # Group_User's members tagged as CommonDBRelation::X): retry inside
-        # the caller's container before failing.
+        # self::/static:: call to the parent it is inherited through, e.g. a
+        # subclass's members tagged as ``BaseClass::X``): retry inside the
+        # caller's container before failing.
         if caller_node_id and (caller_cls := _caller_container(idx, caller_node_id)):
             ancestor_ids = _ancestor_closure(idx, [caller_cls])
             if set(_class_ids_for_hint(idx, lower_class or base_module_name)) & set(ancestor_ids):
@@ -1241,7 +1239,7 @@ def resolve_node_id(module, symbol, caller_node_id=None):
         # No hint at all: global exact match only. When the label is shared by
         # several nodes, a bare call resolves to the function-style label node
         # (no leading dot) and only when exactly one candidate is function-style
-        # — the ambiguous ``getFromDB`` class flood must keep missing instead
+        # — a bare method name shared by many classes must keep missing instead
         # of misrouting a security demand to a random class.
         hits = idx["exact"].get(lower_symbol_member, [])
         if len(hits) == 1:
@@ -1890,8 +1888,8 @@ def _container_app_roots(container: str) -> list[str]:
 def _container_find_target(container: str, rel_path: str) -> str | None:
     """Last-resort mapping: bounded find over the candidate roots for the file's
     basename; accepts a hit whose path ends with the relative subpath (so
-    ajax/x.php matches /var/www/glpi/ajax/x.php, but an unrelated same-named
-    file elsewhere does not)."""
+    ``ajax/x.php`` matches ``/var/www/html/ajax/x.php``, but an unrelated
+    same-named file elsewhere does not)."""
     base = rel_path.rsplit("/", 1)[-1]
     ship = " ".join(_SANDBOX_APP_ROOTS)
     cmd = f"find {ship} -maxdepth 6 -name {shlex.quote(base)} -type f 2>/dev/null | head -5"
@@ -3460,9 +3458,8 @@ def _is_pure_type(root: tree_sitter.Node, ext: str) -> bool:
 
     # PHP branch: interfaces without runtime signals, or property-only classes.
     if ext == ".php":
-        # `signals - imports` === the old `signals - imports -
-        # {"namespace_use_declaration"}`: IMPORT_TYPES[".php"] is exactly that
-        # one node type.
+        # IMPORT_TYPES[".php"] holds exactly the one import node type, so this
+        # subtraction removes every import signal and nothing else.
         runtime = signals - imports
         if _has_node_type(root, PHP_INTERFACE_TYPES):
             return not _has_node_type(root, runtime)

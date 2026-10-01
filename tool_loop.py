@@ -580,7 +580,7 @@ class ToolLoopAgent:
         )
         messages_for_llm = head + middle + tail
 
-        # Opencode-style threshold compaction: once the estimated token count of
+        # Threshold compaction: once the estimated token count of
         # the history reaches the configured limit, collapse the middle into a
         # summary and keep a short verbatim tail. Fail open if summarization
         # errors; also skip when the compressible middle is trivially small.

@@ -313,8 +313,8 @@ class ReviewerAgent(ToolLoopAgent):
                     f"{target_node_source}\n"
                     f"```\n"
                 )
-            # Explorer-style graph-position block (~0.4 KB median): saves the
-            # reviewers' get_node_connections + follow-up lookup turns.
+            # Explorer-style graph-position block: saves the reviewers'
+            # get_node_connections + follow-up lookup turns.
             node_ctx = format_node_context(
                 get_cached_graph_data(settings.graph), node_id) or ""
             if len(node_ctx) > 2500:
