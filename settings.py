@@ -1,4 +1,4 @@
 import os
 
-app_path = "./web_reactoops"
+app_path = "./apps/testapp"
 graph = os.path.join(app_path, "graphify-out/graph.json")

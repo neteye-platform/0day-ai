@@ -1,6 +1,7 @@
 import networkx as nx
 import json
 import logging
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 
 
 def build_networkx_graph(graph_path: str) -> nx.DiGraph:
@@ -63,42 +64,67 @@ def extract_subgraph(G: nx.DiGraph, target_communities: list) -> nx.DiGraph:
     return subgraph
 
 
-async def run_stream(app, inputs):
-    final_state = None
-    
-    # Request BOTH messages (for token streaming) and values (for state updates)
-    async for event_type, data in app.astream(
-        inputs,
-        stream_mode=["messages", "values"]
-    ):
-        if event_type == "messages":
-            # Unpack the chunk and metadata
-            chunk, metadata = data
-            
-            reasoning = chunk.additional_kwargs.get("reasoning_content", "")
-            if reasoning:
-                # Print reasoning tokens in gray (using ANSI escape codes)
-                print(f"\033[90m{reasoning}\033[0m", end="", flush=True)
-            elif chunk.content:
-                # Print actual answer in default terminal color
-                print(chunk.content, end="", flush=True)
-            elif hasattr(chunk, "tool_calls") and chunk.tool_calls:
-                for tool_call in chunk.tool_calls:
-                    tool_name = tool_call.get("name", "UnknownTool")
-                    tool_args = tool_call.get("args", {})
+def serialize_and_truncate(obj, max_length=400):
+    """
+    Recursively parses objects and shortens long strings for clean terminal logging.
+    Ensures anything a node outputs is JSON serializable for pretty-printing.
+    """
+    if isinstance(obj, dict):
+        return {k: serialize_and_truncate(v, max_length) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [serialize_and_truncate(item, max_length) for item in obj]
+    elif isinstance(obj, str):
+        # Truncate giant source code dumps or massive summaries
+        return obj if len(obj) <= max_length else obj[:max_length] + \
+            f" ... [TRUNCATED (showing {max_length}/{len(obj)} bytes)]"
+    elif hasattr(obj, "model_dump"):
+        # Beautifully unpack Pydantic models (like your ExpertTask)
+        return serialize_and_truncate(obj.model_dump(), max_length)
+    elif hasattr(obj, "content"):
+        # Extract meaningful data from Langchain AIMessage/ToolMessage objects
+        rep = {"content": obj.content}
+        if hasattr(obj, "tool_calls") and obj.tool_calls:
+            rep["tool_calls"] = obj.tool_calls
+        return serialize_and_truncate(rep, max_length)
+    elif type(obj) in (int, float, bool, type(None)):
+        return obj
+    else:
+        return str(obj)
 
-                    # Print the tool name in cyan
-                    print(f"\n\033[96m[Tool Call Intercepted] -> {tool_name}\033[0m")
-                    # Pretty-print the structured arguments
-                    print(f"\033[96m{json.dumps(tool_args, indent=2)}\033[0m\n", flush=True)
-                    
-        elif event_type == "values":
-            # The "values" stream yields the entire state dictionary every time a node finishes.
-            # We continuously overwrite final_state so that when the loop finishes, 
-            # it holds the absolute final state of the graph.
-            final_state = data
 
-    return final_state
+def run_stream(app, inputs, config=None, vv=False):
+    print("\n\033[95m[System]\033[0m Initializing Multi-Agent Analysis...\n")
+
+    # We still need to manually accumulate the reports to return to main.py
+    accumulated_state = {"vulnerability_reports": []}
+
+    for event in app.stream(inputs, stream_mode="updates", subgraphs=True, config=config):
+
+        namespace, chunk = event
+
+        for node_name, state_update in chunk.items():
+            if vv and node_name == "execute_tools":
+                continue
+
+            # 1. Print the Node Header
+            print(f"\n" + "-"*60)
+            print(f"\033[94m[NODE EXECUTED: {node_name}]\033[0m")
+            print("-" * 60)
+
+            # 2. Parse, truncate, and dynamically format the output
+            clean_data = serialize_and_truncate(state_update)
+            formatted_json = json.dumps(clean_data, indent=2)
+
+            # 3. Print the Output to terminal
+            print(f"\033[96m-> State Update (Output):\033[0m")
+            print(f"\033[90m{formatted_json}\033[0m")
+
+            # 4. Track vulnerability reports for the final output in main.py
+            if "vulnerability_reports" in state_update and not namespace:
+                accumulated_state["vulnerability_reports"].extend(state_update["vulnerability_reports"])
+
+    print("\n\033[95m[System]\033[0m Execution Finished.")
+    return accumulated_state
 
 
 def get_agent_logger(role_name: str, target_communities: list) -> logging.Logger:
@@ -109,27 +135,28 @@ def get_agent_logger(role_name: str, target_communities: list) -> logging.Logger
     # Create a unique name, e.g., "WebSurfaceAuditor_Comm_1_3"
     comm_str = "_".join(target_communities)
     logger_name = f"{role_name}_Comm_{comm_str}"
-    
+
     logger = logging.getLogger(logger_name)
-    
+
     # Prevent adding duplicate handlers if the logger already exists
     if not logger.handlers:
         logger.setLevel(logging.DEBUG)
-        
+
         # Write to a specific file
         file_handler = logging.FileHandler(f"agent_logs/{logger_name}.log", mode='w')
         file_handler.setLevel(logging.DEBUG)
-        
+
         # Format the log output nicely
         formatter = logging.Formatter(
-            '%(asctime)s | %(levelname)s | %(message)s', 
+            '%(asctime)s | %(levelname)s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         file_handler.setFormatter(formatter)
-        
+
         logger.addHandler(file_handler)
-        
+
     return logger
+
 
 def get_master_logger() -> logging.Logger:
     """A logger for the Manager and Preprocessor that prints to the console."""
