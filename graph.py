@@ -7,7 +7,7 @@ from langgraph.types import RetryPolicy
 
 import settings
 import tools
-from nodes import preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, reviewer_agent_node, ask_reviewer_for_tool, dispatch_all_tasks, dispatch_reviewers, dispatch_validators, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
+from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, reviewer_agent_node, ask_reviewer_for_tool, dispatch_explorers, dispatch_cve_analyzers, dispatch_reviewers, dispatch_validators, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
 from reachability import reachability_filter_node
 from state import MasterState, ReviewerState, ValidatorState
 from schemas import ReviewerOutput, ValidatorOutput
@@ -83,6 +83,7 @@ def compile_validator():
 
 def build_graph(checkpointer=None, interrupt_before=None):
     workflow = StateGraph(MasterState)
+    workflow.add_node("bootstrap", bootstrap_node)
     workflow.add_node("preprocessor", preprocessor_node)
     workflow.add_node("manager", manager_agent_node)
     workflow.add_node("explorer_agent", expert_explorer_node)
@@ -95,10 +96,13 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("reachability_filter", reachability_filter_node)
     # workflow.add_node("reviewer_sync", synchronization_node)
 
-    workflow.add_edge(START, "preprocessor")
-    workflow.add_edge("preprocessor", "manager")
+    workflow.add_edge(START, "bootstrap")
+    workflow.add_edge("bootstrap", "preprocessor")
+    workflow.add_edge("bootstrap", "manager")
 
-    workflow.add_conditional_edges("manager", dispatch_all_tasks, ["explorer_agent", "cve_analyzer"])
+    workflow.add_conditional_edges("manager", dispatch_explorers, ["explorer_agent"])
+    workflow.add_conditional_edges("preprocessor", dispatch_cve_analyzers, ["cve_analyzer"])
+
     workflow.add_edge("explorer_agent", "aggregate_demands")
     workflow.add_edge("cve_analyzer", "aggregate_demands")
 

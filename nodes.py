@@ -18,7 +18,7 @@ import settings
 import tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, VerifierState, ReviewerState, ValidatorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEDemand, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context
+from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images
 
 # fast_llm = ChatOllama(model="gemma4:cloud", temperature=0.2, reasoning=False, num_ctx=32768)
 # smart_llm = ChatOllama(model="gemma4:cloud", temperature=0.6, reasoning=False, num_ctx=32768)
@@ -65,20 +65,43 @@ smart_llm = base_llm.bind(temperature=0.8, max_tokens=16384)
 
 
 # ==========================================
-# Preprocessor
+# Bootstrap
 # ==========================================
 
-def preprocessor_node(state: MasterState) -> dict[str, Any]:
-    # Ensure the knowledge graph exists; if not, build it from the target app's code
+def bootstrap_node(state: MasterState) -> dict[str, Any]:
+    """Ensure the knowledge graph exists before the parallel branches start."""
     if not settings.graph.exists():
         logging.info(f"Graph {settings.graph} not found. Running graphify extract...")
         subprocess.run(
             ["graphify", "extract", str(settings.app_path), "--code-only"],
             check=True,
         )
+    return {}
 
-    # Run the OSV scanner to parse manifests and query the database
-    raw_vulns = run_osv_scanner(settings.app_path)
+# ==========================================
+# Preprocessor
+# ==========================================
+
+def preprocessor_node(state: MasterState) -> dict[str, Any]:
+    raw_vulns = []
+
+    # Build any container image(s) found in the app repo and scan those
+    builds = find_container_builds(settings.app_path)
+    if builds:
+        for kind, build_file in builds:
+            tag = settings.docker_image_tag or f"vulnscan-{settings.app_path.name}:latest"
+            images = build_images(kind, build_file, tag)
+            if images:
+                for image in images:
+                    logging.info(f"Scanning container image {image} with osv-scanner.")
+                    raw_vulns.extend(run_osv_scanner_image(image))
+            else:
+                logging.warning(f"Failed to build image from {build_file}. Falling back to repo scan.")
+                raw_vulns = run_osv_scanner(settings.app_path)
+    else:
+        logging.warning("No Dockerfile or compose file found. Falling back to repo scan.")
+        raw_vulns = run_osv_scanner(settings.app_path)
+
     logging.info(f"Found {len(raw_vulns)} raw vulns")
     clean_vulns = deduplicate_cves(raw_vulns)
     logging.info(f"{len(clean_vulns)} remaining CVEs after deduplication")
@@ -282,13 +305,6 @@ def dispatch_explorers(state: MasterState):
         f"Dispatching {len(commands)} explorers ({batched_batches} multi-node batches, "
         f"{single_batches} single-node), skipped {skipped_nodes} inert nodes."
     )
-    return commands
-
-
-def dispatch_all_tasks(state: MasterState):
-    commands = []
-    commands.extend(dispatch_explorers(state))
-    commands.extend(dispatch_cve_analyzers(state))
     return commands
 
 

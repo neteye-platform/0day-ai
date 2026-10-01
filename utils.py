@@ -357,6 +357,116 @@ def run_osv_scanner(repo_path: Path) -> list[dict]:
     return raw_vulnerabilities
 
 
+COMPOSE_FILENAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
+DOCKERFILE_NAMES = ("Dockerfile",)
+_BUILD_IGNORED_DIRS = {".git", "node_modules", "vendor", ".cache", ".next", "graphify-out"}
+
+
+def _is_build_ignored(path: Path) -> bool:
+    return any(part in _BUILD_IGNORED_DIRS for part in path.parts)
+
+
+def find_container_builds(app_path: Path) -> list[tuple[str, Path]]:
+    """Locate container build definitions in the app repo.
+
+    Compose files take precedence over raw Dockerfiles. Returns a list of
+    ``(kind, path)`` tuples where kind is ``"compose"`` or ``"dockerfile"``.
+    """
+    compose = sorted(
+        p for p in app_path.rglob("*")
+        if p.is_file() and p.name in COMPOSE_FILENAMES and not _is_build_ignored(p)
+    )
+    if compose:
+        return [("compose", compose[0])]
+
+    dockerfiles = sorted(
+        p for p in app_path.rglob("*")
+        if p.is_file()
+        and (p.name in DOCKERFILE_NAMES or p.name.startswith("Dockerfile.") or p.name.endswith(".dockerfile"))
+        and not _is_build_ignored(p)
+    )
+    return [("dockerfile", d) for d in dockerfiles]
+
+
+def build_images(kind: str, path: Path, tag: str) -> list[str]:
+    """Build the container image(s) described by a compose file or Dockerfile.
+
+    Returns the built image tag(s). On failure logs the error and returns [].
+    """
+    try:
+        if kind == "compose":
+            build = subprocess.run(
+                ["docker", "compose", "-f", str(path), "build"],
+                capture_output=True,
+                text=True
+            )
+            if build.returncode != 0:
+                logging.error(f"docker compose build failed: {build.stderr}")
+                return []
+            result = subprocess.run(
+                ["docker", "compose", "-f", str(path), "config", "--images"],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                logging.error(f"docker compose config failed: {result.stderr}")
+                return []
+            images = [img.strip() for img in result.stdout.splitlines() if img.strip()]
+            if not images:
+                logging.error("docker compose config returned no images.")
+            return images
+
+        # Single Dockerfile build
+        build = subprocess.run(
+            ["docker", "build", "-t", tag, "-f", str(path), str(path.parent)],
+            capture_output=True,
+            text=True
+        )
+        if build.returncode != 0:
+            logging.error(f"docker build failed: {build.stderr}")
+            return []
+        return [tag]
+
+    except FileNotFoundError:
+        print("Error: docker is not installed or not in PATH.")
+        return []
+
+
+def run_osv_scanner_image(image: str) -> list[dict]:
+    """Runs `osv-scanner scan image` against a built container image and
+    extracts raw vulnerability records (same JSON shape as a source scan)."""
+    raw_vulnerabilities = []
+
+    try:
+        result = subprocess.run(
+            ["osv-scanner", "scan", "image", "--format", "json", image],
+            capture_output=True,
+            text=True
+        )
+
+        # Exit code 1 simply means "vulnerabilities found" - the JSON on
+        # stdout is still valid. Only an empty stdout indicates no results.
+        if not result.stdout.strip():
+            error = result.stderr
+            if error:
+                logging.error(f"Error running osv-scanner on image '{image}': {error}")
+            return []
+
+        data = json.loads(result.stdout)
+
+        for scan_result in data.get("results", []):
+            for package in scan_result.get("packages", []):
+                for vuln in package.get("vulnerabilities", []):
+                    raw_vulnerabilities.append(vuln)
+
+    except FileNotFoundError:
+        print("Error: osv-scanner is not installed or not in PATH.")
+    except json.JSONDecodeError:
+        print("Error: Could not parse osv-scanner output.")
+
+    return raw_vulnerabilities
+
+
 def get_canonical_id(record):
     """Extracts the underlying CVE ID from OSV record's metadata."""
 
