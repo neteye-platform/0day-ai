@@ -116,23 +116,25 @@ def _node_display_name(node_id: str) -> str:
     return name
 
 
-def _contract_verifier_node(state: VerifierState) -> dict:
+def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
     """Verify each incoming demand of one target node; FAILED ones become
-    hypotheses."""
+    hypotheses. Returns (state_update, cache tag for the progress line)."""
     target_node_id = state.get("target_node_id")
     target_code = state.get("target_code")
     demands = state.get("incoming_demands", [])
 
     if not demands or not target_code:
-        return {"vulnerabilities": []}
+        return {"vulnerabilities": []}, ""
 
     # Hash the demands so changed upstream/downstream contracts bust the cache.
+    # Deterministic across runs: deduplicate_demands() canonical-sorts the list,
+    # so the ordered hash below and the positional batch slices are stable keys.
     demands_hash = hashlib.md5(json.dumps(demands, sort_keys=True).encode()).hexdigest()
     cache_file = settings.cache_dir / "contract_verifier" / f"{target_node_id}_{demands_hash}.json"
 
     cached_data = cache(cache_file, "read")
     if cached_data:
-        return {"vulnerabilities": cached_data.get("hypothesis", [])}
+        return {"vulnerabilities": cached_data.get("hypothesis", [])}, "HIT"
 
     # Map the prompt [ID: ...] back to the original demand dict so FAILED
     # evaluations can be traced to their source (e.g. an CVE demand).
@@ -240,17 +242,14 @@ def _contract_verifier_node(state: VerifierState) -> dict:
 
     cache(cache_file, "write", {"hypothesis": new_vulnerabilities})
 
-    return {
-        "vulnerabilities": new_vulnerabilities
-    }
+    return {"vulnerabilities": new_vulnerabilities}, "MISS"
 
 
 def contract_verifier_node(state: VerifierState) -> dict:
     """Graph node wrapper: runs the verifier and advances its progress ledger."""
-    result = _contract_verifier_node(state)
-    _log_agent_completion(
-        state.get("progress_id", ""),
-        "Contract verifier",
-        f"node={state.get('target_node_id', 'unknown')}",
-    )
+    result, cache_tag = _contract_verifier_node(state)
+    detail = f"node={state.get('target_node_id', 'unknown')}"
+    if cache_tag:
+        detail += f", {cache_tag}"
+    _log_agent_completion(state.get("progress_id", ""), "Contract verifier", detail)
     return result
