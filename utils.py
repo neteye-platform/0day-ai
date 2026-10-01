@@ -6,6 +6,7 @@ import tree_sitter
 import subprocess
 import networkx as nx
 import json
+import tarfile
 import time
 import requests
 from typing import Any, Optional
@@ -324,7 +325,7 @@ def extract_subgraph(G: nx.DiGraph, target_communities: list) -> nx.DiGraph:
 
 
 # Tools that takes a lot of context
-heavy_tools = ["read_source_code", "read_file", "send_http_request", "search_codebase", "get_definition"]
+heavy_tools = ["read_source_code", "read_file", "send_http_request", "search_codebase", "get_definition", "read_container_artifact"]
 
 def compact_tool_history(messages: list[AnyMessage], safe_window: int = 4, threshold: int = 300) -> list[AnyMessage]:
     """
@@ -697,6 +698,392 @@ def run_osv_scanner_image(image: str) -> list[dict]:
         print("Error: Could not parse osv-scanner output.")
 
     return raw_vulnerabilities
+
+
+# ==========================================
+# Container artifact snapshot
+# ==========================================
+#
+# During preprocessing each built container image is snapshotted (deterministic,
+# decoupled from the live sandbox): a throwaway container is created but NEVER
+# started, its filesystem is exported, security-relevant files are extracted
+# into <target_app>/.cache/container_artifacts/<image-slug>/, and a full
+# filesystem index plus image metadata are written for the reviewer tools.
+
+# Size/count guards that keep the extracted artifacts directory small.
+ARTIFACT_MAX_FILE_BYTES = 512 * 1024      # per extracted file
+ARTIFACT_MAX_TOTAL_BYTES = 20 * 1024 * 1024  # total across one image
+ARTIFACT_MAX_FILES = 300                  # max extracted files per image
+ARTIFACT_MAX_INDEX_ENTRIES = 100_000      # max lines in filesystem_index.txt per image
+
+# Catch-all pass: alongside the curated patterns we also pull small, text-like
+# files under the app's WORKDIR that the patterns missed (e.g. an arbitrary
+# named ``next.config.mjs``, ``.eslintrc.json``). This closes the "regex blind
+# spot" for generated configs with nonstandard names, without needing to diff
+# against the base image. Source-code files are excluded (the reviewer already
+# sees the repo via the graph and read_file), as are dependency install trees.
+ARTIFACT_CATCHALL_MAX_BYTES = 256 * 1024
+_ARTIFACT_SOURCE_EXTS = tuple(sorted(set(LANGUAGE_MAP)))
+_ARTIFACT_BINARY_EXTS = (".so", ".o", ".a", ".bin", ".class", ".jar", ".woff",
+                         ".ttf", ".png", ".jpg", ".jpeg", ".gif", ".ico",
+                         ".webp", ".pdf", ".gz", ".xz", ".zip", ".whl", ".tgz",
+                         ".tar")
+# Pure build-noise files/extensions that are neither config nor source and
+# would flood the artifacts (framework build output: maps, RSC payloads,
+# bundled media, generated manifests deep in framework internals).
+_ARTIFACT_CATCHALL_NOISE_EXTS = (".map", ".rsc", ".meta", ".html", ".htm",
+                                 ".css", ".svg", ".nft.json", ".trace")
+_ARTIFACT_CATCHALL_NOISE_DIRS = ("/.next/", "/build/", "/server/", "/static/",
+                                 "/cache/", "/diagnostics/", "/media/")
+
+# Regexes matched (case-insensitive) against the FULL path inside the container.
+# These deliberately capture security-relevant configuration, entrypoints, and
+# generated build artifacts (e.g. a resolved Next.js config) while ignoring the
+# bulk of the base-image filesystem (libraries, node_modules, binaries...).
+ARTIFACT_PATTERNS = [
+    # Web / reverse proxy / app server configuration
+    r"(^|/)nginx[^/]*\.conf$",
+    r"(^|/)nginx/conf\.d/.*\.conf$",
+    r"(^|/)httpd[^/]*\.conf$",
+    r"(^|/)apache2/.*\.conf$",
+    r"(^|/)\.htaccess$",
+    r"(^|/)Caddyfile$",
+    r"(^|/)haproxy\.cfg$",
+    r"(^|/)lighttpd\.conf$",
+    r"(^|/)traefik\.(yml|yaml|toml)$",
+    r"(^|/)envoy\.ya?ml$",
+    r"(^|/)supervisord[^/]*\.conf$",
+    # Runtime interpreters / databases
+    r"(^|/)gunicorn[^/]*\.(conf|py)$",
+    r"(^|/)uwsgi[^/]*\.(ini|ya?ml|yml|json)$",
+    r"(^|/)php(-fpm)?[^/]*\.(ini|conf)$",
+    r"(^|/)my\.cnf$",
+    r"(^|/)redis\.conf$",
+    r"(^|/)mongod\.conf$",
+    # Entrypoint / startup manifests
+    r"(^|/)docker-entrypoint[^/]*$",
+    r"(^|/)entrypoint[^/]*\.sh$",
+    r"(^|/)docker-entrypoint\.d/.*",
+    r"(^|/)start\.sh$",
+    # Environment / secret-like files baked into the image
+    r"(^|/)\.env($|\.)",
+    # Generated build artifacts & installed-dependency manifests
+    r"(^|/)\.next/[^/]*\.json$",
+    r"(^|/)package\.json$",
+    r"(^|/)composer\.json$",
+    r"(^|/)Gemfile$",
+    r"(^|/)requirements[^/]*\.txt$",
+    # Catch-all for config-like files directly under /etc
+    r"(^|/)etc/[^/]*\.(conf|ini|cfg|ya?ml|yml|toml|json)$",
+]
+
+_ARTIFACT_RE = re.compile("|".join(f"(?:{p})" for p in ARTIFACT_PATTERNS), re.IGNORECASE)
+
+# Paths inside these directories are never extracted: dependency install trees
+# (already handled by the SCA layer) and VCS metadata are pure noise.
+_ARTIFACT_EXCLUDED_DIRS = ("node_modules", "vendor", ".git")
+
+
+def _slugify_image(image: str) -> str:
+    """Turn a docker image reference into a safe directory name."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", image.split("@")[0].replace("/", "_").replace(":", "_"))
+
+
+def _docker_image_metadata(image: str) -> dict:
+    """Return the interesting subset of `docker inspect` Config for an image.
+
+    Never raises: returns {} on any failure (logged)."""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", image],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            logging.warning(f"docker inspect failed for '{image}': {result.stderr.strip()}")
+            return {}
+        data = json.loads(result.stdout)
+        config = (data or [{}])[0].get("Config", {})
+        keys = ["Env", "WorkingDir", "Entrypoint", "Cmd", "ExposedPorts", "User", "Labels"]
+        return {k: config.get(k) for k in keys if config.get(k) is not None}
+    except (json.JSONDecodeError, subprocess.SubprocessError, TimeoutError) as e:
+        logging.warning(f"Failed to inspect image '{image}': {e}")
+        return {}
+
+
+def _in_excluded_dir(path: str) -> bool:
+    """True if a container path lives inside a dependency/VCS tree that we
+    never extract nor index (node_modules, vendor, .git). Those are already
+    covered by the SCA layer and would dominate both the artifacts and the
+    filesystem index without adding signal."""
+    return any(f"/{d}/" in f"/{path}" for d in _ARTIFACT_EXCLUDED_DIRS)
+
+
+def _should_extract(member_path: str) -> bool:
+    """True if a container path matches the curated artifact patterns.
+
+    Skips dependency install trees (``node_modules``, ``vendor``) entirely:
+    those manifests are already covered by the SCA layer, and extracting them
+    would flood the artifacts directory with hundreds of near-identical files.
+    """
+    if _in_excluded_dir(member_path):
+        return False
+    return bool(_ARTIFACT_RE.search(member_path))
+
+
+def _is_catchall_candidate(path: str, size: int, workdir: str) -> bool:
+    """True for a small text-like config file under WORKDIR that the curated
+    patterns did not match, e.g. an app config with a nonstandard name.
+
+    Deliberately conservative: bounded size, non-source extension, outside
+    dependency/VCS trees, and confined to the app's working directory (guarded
+    so a root or empty WORKDIR disables the pass instead of scanning /).
+    """
+    if size <= 0 or size > ARTIFACT_CATCHALL_MAX_BYTES:
+        return False
+    if not workdir or workdir.strip("/") == "":
+        return False
+    if _in_excluded_dir(path):
+        return False
+    suffix = Path(path).suffix.lower()
+    if suffix in _ARTIFACT_SOURCE_EXTS or suffix in _ARTIFACT_BINARY_EXTS:
+        return False
+    lower = path.lower()
+    if lower.endswith(_ARTIFACT_CATCHALL_NOISE_EXTS):
+        return False
+    if any(seg in f"/{lower}" for seg in _ARTIFACT_CATCHALL_NOISE_DIRS):
+        return False
+    root = workdir.rstrip("/").lstrip("/")
+    p = path.lstrip("/")
+    return p == root or p.startswith(root + "/")
+
+
+def extract_container_artifacts(images: list[str]) -> dict:
+    """Create an ephemeral snapshot of each built container image.
+
+    For every image a throwaway container is created (never started), its
+    filesystem is exported and streamed: matching files are extracted to
+    ``<target>/.cache/container_artifacts/<image-slug>/rootfs/``, non-dependency
+    members are recorded (sorted, bounded) in ``filesystem_index.txt``, and
+    image metadata
+    (ENV / WORKDIR / ENTRYPOINT / CMD / EXPOSE / USER / LABELS) is written to
+    ``image_metadata.json`` alongside an ``extraction_summary.json``.
+
+    Deliberately never raises: failures are logged and the image is skipped.
+    Returns a summary dict ``{image: {"extracted": n, "files": [...]}}``.
+    """
+    artifacts_root = settings.cache_dir / "container_artifacts"
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    summary: dict[str, dict] = {}
+
+    for image in images:
+        slug = _slugify_image(image)
+        image_dir = artifacts_root / slug
+        rootfs_dir = image_dir / "rootfs"
+
+        try:
+            # Remove any stale snapshot from a previous run so it always
+            # reflects the current build.
+            subprocess.run(["docker", "rm", "-f", slug], capture_output=True, text=True)
+        except FileNotFoundError:
+            logging.warning("docker is not installed or not in PATH. Skipping container artifact extraction.")
+            return summary
+        except Exception as e:
+            logging.warning(f"Failed to remove stale container '{slug}': {e}")
+
+        create = subprocess.run(
+            ["docker", "create", "--name", slug, image],
+            capture_output=True,
+            text=True,
+        )
+        if create.returncode != 0:
+            logging.warning(f"docker create failed for image '{image}': {create.stderr.strip()}")
+            continue
+        container_id = create.stdout.strip()
+
+        try:
+            metadata = _docker_image_metadata(image)
+            workdir = (metadata or {}).get("WorkingDir")
+            _extract_container_export(slug, image_dir, rootfs_dir, workdir)
+            image_dir.mkdir(parents=True, exist_ok=True)
+            if metadata:
+                with open(image_dir / "image_metadata.json", "w", encoding="utf-8") as f:
+                    json.dump(metadata, f, indent=2)
+            summary[image] = {"slug": slug, "dir": str(image_dir)}
+            logging.info(
+                f"Container artifacts for '{image}' written to {image_dir} "
+                f"(metadata keys: {sorted(metadata.keys())})."
+            )
+        finally:
+            try:
+                subprocess.run(["docker", "rm", "-f", slug], capture_output=True, text=True)
+            except Exception:
+                pass
+
+    # Remove snapshots for images that are no longer built (e.g. after a
+    # compose service is removed) so the tool never serves stale configs.
+    current_slugs = {summary[img]["slug"] for img in summary}
+    for existing in artifacts_root.glob("*"):
+        if existing.is_dir() and existing.name not in current_slugs:
+            logging.info(f"Removing stale artifact snapshot '{existing.name}'.")
+            for f in existing.rglob("*"):
+                if f.is_file():
+                    f.unlink()
+            for d in sorted((p for p in existing.rglob("*") if p.is_dir()), reverse=True):
+                d.rmdir()
+            existing.rmdir()
+
+    return summary
+
+
+def _extract_container_export(cid: str, image_dir: Path, rootfs_dir: Path,
+                             workdir: str | None = None) -> dict:
+    """Stream `docker export <cid>` and write extracted files + fs index.
+
+    ``workdir`` enables the catch-all pass for small text config files under the
+    app's working directory that the curated patterns miss.
+    Returns ``{"extracted": n, "skipped": [paths...]}``. Never raises; on
+    failure returns empty stats with a logged warning.
+    """
+    extracted: list[str] = []
+    catchall: list[str] = []
+    skipped: list[str] = []
+    total_bytes = 0
+    index_entries: list[str] = []
+
+    try:
+        proc = subprocess.Popen(
+            ["docker", "export", cid],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        logging.warning("docker is not installed or not in PATH.")
+        return {"extracted": 0, "skipped": []}
+    except Exception as e:
+        logging.warning(f"Failed to export container '{cid}': {e}")
+        return {"extracted": 0, "skipped": []}
+
+    try:
+        with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
+            for member in tar:
+                # Normalize to a root-relative path (docker export emits
+                # absolute member names) so stored/indexed/displayed paths are
+                # all uniform, e.g. `app/next.config.mjs`.
+                path = member.name.lstrip("/")
+                # Guard against malicious tar members escaping the rootfs dir.
+                if ".." in path.split("/"):
+                    continue
+
+                # Record interesting entries for the fs index. Dependency
+                # install trees (node_modules/vendor) and VCS metadata are
+                # skipped: they would dominate the index (and the read cost)
+                # without adding signal (already covered by the SCA layer).
+                indexed = not _in_excluded_dir(path)
+
+                if member.isdir():
+                    if indexed:
+                        index_entries.append(f"d\t0\t{path.rstrip('/')}")
+                    continue
+                if member.issym():
+                    if indexed:
+                        index_entries.append(f"l\t{member.size}\t{path}")
+                    continue
+                if not member.isfile():
+                    if indexed:
+                        index_entries.append(f"?\t0\t{path}")
+                    continue
+
+                if indexed:
+                    index_entries.append(f"f\t{member.size}\t{path}")
+
+                # Only exact-match files ever count toward the caps below, so
+                # oversized irrelevant binaries do not bloat the skipped list.
+                catchall_hit = False
+                if not _should_extract(path):
+                    if _is_catchall_candidate(path, member.size, workdir):
+                        catchall_hit = True
+                    else:
+                        continue
+                if len(extracted) >= ARTIFACT_MAX_FILES:
+                    skipped.append(path)
+                    continue
+                if total_bytes + member.size > ARTIFACT_MAX_TOTAL_BYTES:
+                    skipped.append(path)
+                    continue
+                if member.size > ARTIFACT_MAX_FILE_BYTES:
+                    skipped.append(path)
+                    continue
+
+                target = rootfs_dir / path
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with tar.extractfile(member) as src, open(target, "wb") as dst:
+                        dst.write(src.read())
+                    extracted.append(path)
+                    if catchall_hit:
+                        catchall.append(path)
+                    total_bytes += member.size
+                except (OSError, EOFError, tarfile.TarError) as e:
+                    skipped.append(path)
+                    logging.debug(f"Failed to extract '{path}': {e}")
+    except (tarfile.TarError, OSError) as e:
+        logging.warning(f"Failed to stream export of container '{cid}': {e}")
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+        try:
+            proc.wait(timeout=30)
+        except Exception:
+            # If the stream was aborted mid-read, docker blocks writing to a
+            # full, unread pipe and never exits on its own: kill it so we do
+            # not leak an orphaned `docker export` process.
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    image_dir.mkdir(parents=True, exist_ok=True)
+
+    # Bound the index size: sort, then cap (record whether we truncated so the
+    # listing tool can tell the reviewer the index is partial).
+    index_sorted = sorted(index_entries)
+    index_truncated = len(index_sorted) > ARTIFACT_MAX_INDEX_ENTRIES
+    if index_truncated:
+        index_sorted = index_sorted[:ARTIFACT_MAX_INDEX_ENTRIES]
+
+    try:
+        with open(image_dir / "filesystem_index.txt", "w", encoding="utf-8") as f:
+            f.write("# type\tsize\tpath (container filesystem index)\n")
+            f.write("\n".join(index_sorted))
+    except OSError as e:
+        logging.warning(f"Failed to write filesystem index: {e}")
+
+    try:
+        with open(image_dir / "extraction_summary.json", "w", encoding="utf-8") as f:
+            json.dump(
+                {"extracted": extracted, "catchall": catchall, "skipped": skipped,
+                 "total_extracted_bytes": total_bytes,
+                 "index_entries": len(index_sorted), "index_truncated": index_truncated},
+                f, indent=2,
+            )
+    except OSError as e:
+        logging.warning(f"Failed to write extraction summary: {e}")
+
+    if skipped or catchall:
+        logging.info(
+            f"Container '{cid}': extracted {len(extracted)} files "
+            f"({len(catchall)} via WORKDIR catch-all), skipped "
+            f"{len(skipped)} ({','.join(skipped[:5])}{'...' if len(skipped) > 5 else ''})."
+        )
+    return {"extracted": len(extracted), "skipped": skipped}
+
+
+def get_container_artifacts_root() -> Path:
+    """Root directory holding per-image container artifact snapshots."""
+    return settings.cache_dir / "container_artifacts"
 
 
 def get_canonical_id(record):

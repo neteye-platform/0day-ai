@@ -14,7 +14,7 @@ from docker.errors import NotFound, APIError
 import re
 
 from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationToolInput
-from utils import build_networkx_graph, cache, get_cached_graph_data, get_cached_symbol_index, get_node_code
+from utils import build_networkx_graph, cache, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root
 from languages import MANIFEST_NAMES
 import settings
 
@@ -50,6 +50,59 @@ def read_source_code(node_id: str, reason_for_reading: str, current_state: str, 
 READ_FILE_MAX_LINES = 150
 
 
+def _read_lines_range(file_path: str, target: Path, start_line: int,
+                      end_line: int | None, max_lines: int, *, kind: str = "File",
+                      header_path: str | None = None, continuation: str = "read_file") -> str:
+    """Read a bounded line range of an existing text file.
+
+    Shared by ``read_file`` and ``read_container_artifact`` so that paging,
+    validation, and truncation behaviour stay identical between the two.
+    """
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        return f"Error: '{file_path}' appears to be a binary file and cannot be read as text."
+    except Exception as e:
+        return f"Error reading {kind.lower()} '{file_path}': {e}"
+
+    total_lines = len(lines)
+    if total_lines == 0:
+        return f"{kind} '{file_path}' is empty (0 lines)."
+
+    requested_start = start_line
+    if start_line < 1:
+        start_line = 1
+    if start_line > total_lines:
+        return f"Error: start_line {requested_start} is beyond the end of '{file_path}' (file has {total_lines} lines)."
+
+    requested_end = end_line if end_line is not None else total_lines
+    if requested_end < start_line:
+        return f"Error: end_line ({requested_end}) is smaller than start_line ({start_line})."
+
+    end = min(requested_end, total_lines)
+
+    truncated = False
+    if end - start_line + 1 > max_lines:
+        end = start_line + max_lines - 1
+        truncated = True
+
+    body = "".join(
+        f"{i:>6}: {line}" for i, line in enumerate(lines[start_line - 1:end], start_line)
+    )
+
+    header = f"{kind}: {header_path or file_path} (lines {start_line}-{end} of {total_lines})\n"
+
+    if truncated:
+        body += (
+            f"\n... [TRUNCATED: requested lines {requested_start}-{requested_end} exceeds the "
+            f"{max_lines}-line limit. Shown lines {start_line}-{end}. "
+            f"Call {continuation} again with start_line={end + 1} to continue reading.] ..."
+        )
+
+    return f"{header}\n{body}"
+
+
 @tool
 def read_file(file_path: str, thought: str, current_state: str, start_line: int = 1, end_line: int | None = None) -> str:
     """
@@ -77,49 +130,189 @@ def read_file(file_path: str, thought: str, current_state: str, start_line: int 
     if not target.is_file():
         return f"Error: File '{file_path}' not found in the application directory."
 
-    try:
-        with open(target, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except UnicodeDecodeError:
-        return f"Error: '{file_path}' appears to be a binary file and cannot be read as text."
-    except Exception as e:
-        return f"Error reading file '{file_path}': {e}"
+    return _read_lines_range(file_path, target, start_line, end_line, READ_FILE_MAX_LINES)
 
-    total_lines = len(lines)
-    if total_lines == 0:
-        return f"File '{file_path}' is empty (0 lines)."
 
-    requested_start = start_line
-    if start_line < 1:
-        start_line = 1
-    if start_line > total_lines:
-        return f"Error: start_line {requested_start} is beyond the end of '{file_path}' (file has {total_lines} lines)."
+# Maximum number of lines read_container_artifact will return in a single call.
+CONTAINER_ARTIFACT_MAX_LINES = 150
+CONTAINER_ARTIFACT_MAX_SUMMARY_FILES = 300
 
-    requested_end = end_line if end_line is not None else total_lines
-    if requested_end < start_line:
-        return f"Error: end_line ({requested_end}) is smaller than start_line ({start_line})."
 
-    end = min(requested_end, total_lines)
+@tool
+def list_container_artifacts(thought: str, current_state: str) -> str:
+    """
+    Lists the config/build artifacts extracted from the BUILT container image(s)
+    during pre-processing, plus image metadata (WORKDIR, ENTRYPOINT, CMD, EXPOSE,
+    USER, baked-in ENV vars) and a pointer to the full filesystem index.
 
-    truncated = False
-    if end - start_line + 1 > READ_FILE_MAX_LINES:
-        end = start_line + READ_FILE_MAX_LINES - 1
-        truncated = True
+    Use this to inspect the EFFECTIVE runtime configuration of the target as it
+    exists inside the container (e.g. the resolved Next.js config in
+    .next/required-server-files.json, an nginx server config, an entrypoint
+    script, or credentials baked into the image ENV) — without touching the
+    live sandbox.
 
-    body = "".join(
-        f"{i:>6}: {line}" for i, line in enumerate(lines[start_line - 1:end], start_line)
-    )
+    Args:
+        thought (str): Explain explicitly what runtime configuration you need to verify and how it connects to the vulnerability you are investigating.
+        current_state (str): A detailed summary of your current state and the outcome of your previous command.
+    """
+    artifacts_root = get_container_artifacts_root().resolve()
 
-    header = f"File: {file_path} (lines {start_line}-{end} of {total_lines})\n"
-
-    if truncated:
-        body += (
-            f"\n... [TRUNCATED: requested lines {requested_start}-{requested_end} exceeds the "
-            f"{READ_FILE_MAX_LINES}-line limit. Shown lines {start_line}-{end}. "
-            f"Call read_file again with start_line={end + 1} to continue reading.] ..."
+    if not artifacts_root.exists() or not any(p.is_dir() for p in artifacts_root.iterdir()):
+        return (
+            "No container artifacts are available. The preprocessor did not "
+            "build/snapshot any container image for this target (no Dockerfile/"
+            "compose found, the build failed, or docker is unavailable)."
         )
 
-    return f"{header}\n{body}"
+    sections = []
+    for image_dir in sorted(p for p in artifacts_root.iterdir() if p.is_dir()):
+        slug = image_dir.name
+        lines = [f"Image snapshot: {slug}", f"  Directory: {image_dir}"]
+
+        # Image metadata (ENV / WORKDIR / ENTRYPOINT / CMD / EXPOSE / USER / LABELS)
+        meta_file = image_dir / "image_metadata.json"
+        if meta_file.is_file():
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                meta = {}
+            if meta.get("WorkingDir"):
+                lines.append(f"  WORKDIR: {meta['WorkingDir']}")
+            for key in ("Entrypoint", "Cmd", "ExposedPorts", "User", "Labels"):
+                if meta.get(key):
+                    lines.append(f"  {key}: {json.dumps(meta[key])}")
+            env = meta.get("Env") or []
+            if env:
+                lines.append("  ENV:")
+                for pair in env:
+                    key, _, value = pair.partition("=")
+                    shown = value if len(value) <= 500 else value[:500] + "...[truncated]"
+                    lines.append(f"    {key}={shown}")
+
+        # Extracted files
+        summary_file = image_dir / "extraction_summary.json"
+        summary = {}
+        extracted = []
+        catchall = []
+        if summary_file.is_file():
+            try:
+                summary = json.loads(summary_file.read_text(encoding="utf-8"))
+                extracted = summary.get("extracted", [])
+                catchall = summary.get("catchall", [])
+            except (json.JSONDecodeError, OSError):
+                extracted = []
+        rootfs_dir = image_dir / "rootfs"
+        # Fall back to walking the tree when the summary is missing.
+        if not extracted and rootfs_dir.is_dir():
+            extracted = sorted(
+                str(p.relative_to(rootfs_dir)) for p in rootfs_dir.rglob("*") if p.is_file()
+            )
+
+        lines.append(f"  Extracted files ({len(extracted)}):")
+        if catchall:
+            lines.append(
+                f"    ({len(catchall)} via WORKDIR catch-all: small text config "
+                f"files the curated patterns did not match.)"
+            )
+        for rel in extracted[:CONTAINER_ARTIFACT_MAX_SUMMARY_FILES]:
+            size = ""
+            target = rootfs_dir / rel if rootfs_dir else image_dir / rel
+            if target.is_file():
+                try:
+                    size = f" ({target.stat().st_size} bytes)"
+                except OSError:
+                    pass
+            lines.append(f"    rootfs/{rel}{size}")
+        if len(extracted) > CONTAINER_ARTIFACT_MAX_SUMMARY_FILES:
+            lines.append(f"    ... [{len(extracted) - CONTAINER_ARTIFACT_MAX_SUMMARY_FILES} more] ...")
+
+        # Pointer to the filesystem index. The entry count comes from the
+        # summary written at extraction time so we never re-read a potentially
+        # large file just to count its lines.
+        index_file = image_dir / "filesystem_index.txt"
+        if index_file.is_file():
+            count = summary.get("index_entries")
+            if count is None:
+                try:
+                    count = max(0, sum(1 for _ in index_file.open(encoding="utf-8")) - 1)
+                except OSError:
+                    count = 0
+            suffix = " (truncated)" if summary.get("index_truncated") else ""
+            lines.append(
+                f"  Filesystem index: {slug}/filesystem_index.txt "
+                f"({count} entries{suffix}). Read it with read_container_artifact "
+                f"to find files the curated patterns did not extract (dependency "
+                f"trees like node_modules are excluded)."
+            )
+
+        sections.append("\n".join(lines))
+
+    return (
+        "CONTAINER ARTIFACTS (built-image config snapshot)\n"
+        "Read any extracted file with read_container_artifact, e.g. "
+        "read_container_artifact(file_path='<slug>/rootfs/<path>').\n\n"
+        + "\n\n".join(sections)
+    )
+
+
+@tool
+def read_container_artifact(file_path: str, thought: str, current_state: str, start_line: int = 1, end_line: int | None = None) -> str:
+    """
+    Reads a specific line range of a file extracted from the BUILT container
+    image snapshot. Use this to inspect effective runtime configuration that is
+    NOT visible in the application repo (e.g. resolved framework configs,
+    server configs, entrypoint scripts, baked-in ENV files).
+
+    For files that ARE in the application graph, prefer read_source_code or
+    get_definition; for files in the application repo, prefer read_file.
+
+    Args:
+        file_path (str): Path relative to the artifacts root, as shown by
+            list_container_artifacts (e.g. 'vulnscan-web_reactoops_latest/rootfs/app/.next/required-server-files.json'
+            or 'vulnscan-web_reactoops_latest/filesystem_index.txt'). When only
+            one image was snapshotted you may omit the '<slug>/' prefix.
+        start_line (int): First line to read, 1-indexed and inclusive. Defaults to 1.
+        end_line (int): Last line to read, 1-indexed and inclusive. Defaults to the end of the file (or the 150-line cap).
+        thought (str): Explain explicitly why you need to read this artifact and what you expect to find in it.
+        current_state (str): A detailed summary of your current state and the outcome of your previous command.
+    """
+    artifacts_root = get_container_artifacts_root().resolve()
+
+    if not artifacts_root.exists():
+        return "Error: No container artifacts are available for this target."
+
+    def _resolve(candidate: Path) -> Path:
+        return (artifacts_root / candidate).resolve()
+
+    target = _resolve(file_path)
+
+    # Convenience: when there is exactly one image snapshot, allow omitting the
+    # '<slug>/' prefix (try both rootfs/ and top-level files).
+    if not target.is_relative_to(artifacts_root):
+        return (
+            f"Error: '{file_path}' resolves to '{target}', which is outside the "
+            f"artifacts directory '{artifacts_root}'. Only extracted container "
+            f"artifacts are readable."
+        )
+
+    if not target.is_file():
+        image_dirs = [p for p in artifacts_root.iterdir() if p.is_dir()]
+        if len(image_dirs) == 1:
+            slug = image_dirs[0].name
+            for candidate in (image_dirs[0] / "rootfs" / file_path, image_dirs[0] / file_path):
+                resolved = candidate.resolve()
+                if resolved.is_file() and resolved.is_relative_to(artifacts_root):
+                    target = resolved
+                    break
+        if not target.is_file():
+            return f"Error: Artifact '{file_path}' not found in the container artifacts directory."
+
+    rel = target.relative_to(artifacts_root)
+    return _read_lines_range(
+        file_path, target, start_line, end_line,
+        CONTAINER_ARTIFACT_MAX_LINES,
+        kind="Artifact", header_path=rel, continuation="read_container_artifact",
+    )
 
 
 @tool
