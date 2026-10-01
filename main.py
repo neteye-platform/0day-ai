@@ -5,7 +5,7 @@ import argparse
 from typing import List, Dict, Any
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Send
@@ -87,6 +87,7 @@ def manager_agent_node(state: MasterState) -> Dict[str, Any]:
     """The Manager LLM reads the programmatic summary and dispatches tasks."""
     logger.debug("Entering manager_agent_node. Invoking Lead Security Architect LLM.")
 
+    # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
     llm = ChatOpenAI(
         base_url="http://localhost:11434/v1",
         model="glm-5-2-3-bit",
@@ -125,6 +126,7 @@ def expert_agent_node(state: ExpertState) -> dict:
         logger.debug(f"No subgraph nodes assigned to {role_name}. Bypassing execution.")
         return {"vulnerability_reports": []}
 
+    # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
     llm = ChatOpenAI(
         base_url="http://localhost:11434/v1",
         model="glm-5-2-3-bit",
@@ -137,7 +139,7 @@ def expert_agent_node(state: ExpertState) -> dict:
         if hasattr(tools, name):
             agent_tools.append(getattr(tools, name))
 
-    llm_with_tools = llm.bind_tools(agent_tools)
+    llm_with_tools = llm.bind_tools(agent_tools, tool_choice="any")
 
     if not state.get("messages"):
         logger.debug(f"Initializing new conversation for {role_name}.")
@@ -178,7 +180,9 @@ def expert_agent_router(state: ExpertState) -> str:
         # Check if it called the termination tool
         for tc in last_message.tool_calls:
             if tc["name"] == "mark_task_complete":
-                return "__end__" 
+                return "__end__"
+            elif tc["name"] == "submit_report":
+                return "save_report"
 
         # Go to tools node
         return "tools"
@@ -188,10 +192,46 @@ def expert_agent_router(state: ExpertState) -> str:
     return "nag_agent"
 
 
+def save_report_node(state: ExpertState) -> dict:
+    """Intercepts the submit_report tool call to save findings to the graph state."""
+    role_name = state["task"].agent_role
+    logger.debug(f"Entering save_report_node for role: {role_name}")
+
+    last_message = state["messages"][-1]
+    reports = []
+    tool_responses = []
+
+    for tool_call in last_message.tool_calls:
+        if tool_call["name"] == "submit_report":
+            args = tool_call["args"]
+            finding_data = args.get("finding", args)
+
+            reports.append({
+                "role": role_name,
+                "vulnerability": finding_data.get("cwe_class", "Unknown"),
+                "details": finding_data.get("details", ""),
+                "sink_node": finding_data.get("sink_node", ""),
+                "trace_nodes": finding_data.get("trace_nodes", [])
+            })
+            logger.debug(f"Saved finding by {role_name}")
+
+            tool_responses.append(
+                ToolMessage(
+                    content=f"Successfully saved finding. Please continue your audit.",
+                    tool_call_id=tool_call["id"]
+                )
+            )
+
+    return {
+        "vulnerability_reports": reports, 
+        "messages": tool_responses
+    }
+
+
 def nag_agent_node(state: ExpertState):
     """If the agent tries to chat instead of working, hit it with a system prompt."""
-    nag_message = SystemMessage(
-        content="You did not invoke any tools. You must either use `read_source_code`, `submit_single_finding`, or `mark_task_complete` to proceed."
+    nag_message = HumanMessage(
+        content=f"You did not invoke any tools. You must either use `{'`, `'.join(TOOLS.keys())}` to proceed."
     )
     return {"messages": [nag_message]}
 
@@ -289,16 +329,18 @@ def reviewer_node(state: MasterState):
 # Build and Compile the Graph
 # ==========================================
 
-def build_graph(checkpointer=None):
+def build_graph(checkpointer=None, interrupt_before=None):
 
     # Expert Sub-Graph
     expert_workflow = StateGraph(ExpertState)
     expert_workflow.add_node("expert", expert_agent_node)
     expert_workflow.add_node("tools", ToolNode([tools.submit_report, tools.read_source_code, tools.check_package_vulnerability]))
+    expert_workflow.add_node("save_report", save_report_node)
     expert_workflow.add_node("nag_agent", nag_agent_node)
     expert_workflow.add_edge(START, "expert")
     expert_workflow.add_conditional_edges("expert", expert_agent_router)
     expert_workflow.add_edge("tools", "expert")
+    expert_workflow.add_edge("save_report", "expert")
     expert_workflow.add_edge("nag_agent", "expert")
     compiled_expert_agent = expert_workflow.compile()
 
@@ -352,7 +394,7 @@ if __name__ == "__main__":
         print("🛡️  FINAL VULNERABILITY AUDIT REPORT")
         print("="*60)
 
-        reports = final_state.get("vulnerability_reports", [])
+        reports = final_state.get("filtered_reports", [])
 
         if not reports:
             print("No vulnerabilities reported by the expert agents.")
