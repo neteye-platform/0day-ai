@@ -7,17 +7,15 @@ from langgraph.types import Command, Send
 
 import settings
 import tools
-from dedup import cluster_vulnerabilities
 from llms import fast_llm, reviewer_llm
 from run_stats import (
     _record_stat,
     _start_agent_progress,
     affected_nodes_label,
     as_dicts,
-    get_embedder,
 )
 from schemas import REVIEWER_AGENT
-from stage_dedup import apply_agent_clusters
+from stage_dedup import apply_agent_clusters, embedding_dedup
 from state import MasterState, ReviewerState
 from tool_loop import CompactionConfig, ToolLoopAgent
 from utils import (
@@ -126,23 +124,10 @@ def dispatch_reviewers(state: MasterState):
         return "reporter_dispatch"
 
     # Semantic dedup before fan-out so one reviewer adjudicates a pattern once.
-    # Fails open: exact-key dedup always runs, embedding clustering only when
-    # the embeddings server serves the configured model.
-    embedder = get_embedder(
-        settings.semantic_dedup_enabled,
-        "Semantic dedup",
-        "exact-key dedup only",
-    )
-    hypotheses = cluster_vulnerabilities(
-        hypotheses,
-        settings.semantic_dedup_threshold,
-        embedder,
-        cross_threshold=settings.dedup_cross_node_similarity,
-        anchor_confirmed_threshold=settings.dedup_anchor_confirmed_similarity,
-        anchor_min_jaccard=settings.dedup_anchor_min_jaccard,
-        max_merged_cluster=settings.dedup_max_merged_cluster,
-        disk_cache_dir=settings.cache_dir / "hypothesis_embeddings",
-    )
+    # Same deterministic pass the dedup_agent node already ran on this state
+    # (re-derived here off the embedding disk caches); fails open to exact-key
+    # dedup if the embeddings server is unavailable.
+    hypotheses = embedding_dedup(hypotheses)
 
     # LLM dedup layer (the dedup_agent node ran before this dispatch): apply
     # its equivalence classes exactly like the embedding merges above — one

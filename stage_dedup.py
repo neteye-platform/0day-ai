@@ -3,7 +3,7 @@
 The embedding pass (dedup.py) only catches surface paraphrases; reworded
 duplicates and the same sink re-anchored under different node ids survive it,
 each burning a full reviewer + validator pass. This stage asks an LLM, one
-structured call per (CWE, source-subtree) group, for the equivalence classes
+structured call per (CWE, packed batch) group, for the equivalence classes
 of records describing the SAME underlying defect. dispatch_reviewers applies
 them: one canonical survives per cluster (affected_nodes unioned, duplicates
 listed under agent_merged_from) and the duplicates are never Sent — the exact
@@ -17,11 +17,12 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
+from dedup import cluster_vulnerabilities
 from langchain_core.messages import HumanMessage, SystemMessage
 
 import settings
 from llms import invoke_structured_capped, smart_llm
-from run_stats import _record_stat, as_dict, as_dicts, raise_if_stopping
+from run_stats import _record_stat, as_dict, as_dicts, get_embedder, raise_if_stopping
 from schemas import DEDUP_AGENT, DedupAgentOutput, cwes
 from state import MasterState
 from utils import cache, get_cached_graph_data, safe_cache_filename
@@ -43,39 +44,66 @@ def _node_file_map() -> dict[str, str]:
 
 
 def _dir_key(record: dict, file_map: dict[str, str], depth: int) -> str:
-    """First `depth` path segments of the source file of the first affected
-    node with a resolvable file. Synthetic/infra nodes (dependency:, infra:)
-    and files at the app root share the coarse "_root" bucket."""
+    """First `depth` DIRECTORY segments (file name excluded) of the source file
+    of the first affected node with a resolvable file. Files shallower than the
+    requested depth keep their full directory key, so a flat directory's files
+    stay together instead of fragmenting per file. Synthetic/infra nodes
+    (dependency:, infra:) and files at the app root share "_root"."""
     for node_id in record.get("affected_nodes") or []:
         source_file = file_map.get(str(node_id))
         if source_file:
-            parts = [p for p in source_file.strip("/").split("/") if p]
-            if len(parts) > 1:
-                return "/".join(parts[:depth])
+            dirs = [p for p in source_file.strip("/").split("/") if p][:-1]
+            if dirs:
+                return "/".join(dirs[:depth])
             return "_root"
     return "_root"
 
 
-def _slice_to_cap(members: list[dict], file_map: dict[str, str], cap: int, depth: int) -> list[list[dict]]:
-    """Split an oversized bucket: one more directory level while that adds
-    signal, then deterministic contiguous chunks (records are vuln_id sorted)."""
-    if len(members) <= cap:
-        return [members]
-    if depth < 2:
-        deeper: dict[str, list[dict]] = {}
-        for record in members:
-            deeper.setdefault(_dir_key(record, file_map, depth + 1), []).append(record)
-        if len(deeper) > 1:
-            return [chunk for key in sorted(deeper) for chunk in _slice_to_cap(deeper[key], file_map, cap, depth + 1)]
-    return [members[i:i + cap] for i in range(0, len(members), cap)]
+_FULL_DEPTH = 10_000  # _dir_key depth meaning "whole directory path"
+
+
+def _bucket_label(chunk: list[dict], file_map: dict[str, str]) -> str:
+    """Chunk label for logs/prompt: the distinct depth-1 source dirs of the
+    chunk in order of appearance, max 3 then a +N suffix."""
+    dirs = list(dict.fromkeys(_dir_key(r, file_map, 1) for r in chunk))
+    return "+".join(dirs[:3]) + (f"+{len(dirs) - 3}more" if len(dirs) > 3 else "")
+
+
+def embedding_dedup(records: list[dict]) -> list[dict]:
+    """The cheap deterministic semantic-merge layer, shared by the two call
+    sites that must agree on it: dedup_agent_node collapses near-verbatim
+    twins BEFORE spending LLM calls on grouping, and dispatch_reviewers
+    re-derives the identical survivors before reviewer dispatch (same function
+    over the same channel order with disk-cached embeddings => same result,
+    so no merge state travels between them). Fails open: exact-key dedup
+    always runs, embedding clustering only when the embeddings server serves
+    the configured model."""
+    embedder = get_embedder(
+        settings.semantic_dedup_enabled,
+        "Semantic dedup",
+        "exact-key dedup only",
+    )
+    return cluster_vulnerabilities(
+        records,
+        settings.semantic_dedup_threshold,
+        embedder,
+        cross_threshold=settings.dedup_cross_node_similarity,
+        anchor_confirmed_threshold=settings.dedup_anchor_confirmed_similarity,
+        anchor_min_jaccard=settings.dedup_anchor_min_jaccard,
+        max_merged_cluster=settings.dedup_max_merged_cluster,
+        disk_cache_dir=settings.cache_dir / "hypothesis_embeddings",
+    )
 
 
 def build_groups(records: list[dict], file_map: dict[str, str]) -> list[dict]:
-    """Group review hypotheses by cwe_id; CWE groups larger than
-    settings.dedup_agent_group_max subdivide by the root directory of the
-    affected component (and further, down to settings.dedup_agent_max_group
-    records per LLM call). Groups below 2 records have no possible duplicate
-    and are skipped. Member order is vuln_id-sorted => stable cache keys."""
+    """Group review hypotheses by cwe_id; groups up to
+    settings.dedup_agent_group_max go out as ONE call (vuln_id-sorted, unlabelled
+    bucket). Larger CWE floods are ordered by (source directory, vuln_id) and cut
+    into balanced near-cap chunks (settings.dedup_agent_max_group per call):
+    directory locality is a SORT KEY, not a partition, so small sibling
+    directories co-pack into one call and cross-directory duplicates compete in
+    the same prompt. Groups below 2 records have no possible duplicate and are
+    skipped. Member order is deterministic => stable cache keys."""
     by_cwe: dict[str, list[dict]] = {}
     for record in records:
         by_cwe.setdefault(str(record.get("cwe_id") or "UNKNOWN"), []).append(record)
@@ -87,13 +115,14 @@ def build_groups(records: list[dict], file_map: dict[str, str]) -> list[dict]:
         if len(members) <= settings.dedup_agent_group_max:
             buckets = [("", members)]
         else:
-            sub: dict[str, list[dict]] = {}
-            for record in members:
-                sub.setdefault(_dir_key(record, file_map, 1), []).append(record)
+            ordered = sorted(members, key=lambda r: (_dir_key(r, file_map, _FULL_DEPTH), str(r.get("vuln_id"))))
+            per = -(-len(ordered) // -(-len(ordered) // cap))  # ceil(n / ceil(n/cap))
             buckets = [
-                (key, chunk)
-                for key in sorted(sub)
-                for chunk in _slice_to_cap(sub[key], file_map, cap, depth=1)
+                (
+                    _bucket_label(ordered[i:i + per], file_map),
+                    sorted(ordered[i:i + per], key=lambda r: str(r.get("vuln_id"))),
+                )
+                for i in range(0, len(ordered), per)
             ]
         groups.extend(
             {"cwe_id": cwe, "bucket": bucket, "records": chunk}
@@ -114,7 +143,7 @@ def _render_group_prompt(group: dict) -> str:
     label = cwes.get(cwe)
     lines = [f"CWE GROUP: {cwe}" + (f" — {label}" if label else "")]
     if group["bucket"]:
-        lines.append(f"SOURCE SUBTREE: {group['bucket']}/")
+        lines.append(f"SOURCE SUBTREE: {group['bucket']} (records may span these dirs)")
     lines.append(f"RECORDS ({len(group['records'])}):")
     for record in group["records"]:
         nodes = [str(n) for n in record.get("affected_nodes") or []]
@@ -206,20 +235,29 @@ def _run_group(group: dict, idx: int, total: int) -> list[dict]:
 
 
 def dedup_agent_node(state: MasterState) -> dict:
-    """Single synchronous node (edge-traversal pattern): deterministic CWE +
-    directory grouping, one cached structured LLM call per group, run
-    concurrently. Writes the clusters into MasterState; dispatch_reviewers
-    applies them. Touches no records itself."""
+    """Single synchronous node (edge-traversal pattern): collapses the cheap
+    embedding layer first, then deterministic CWE + directory packing, one
+    cached structured LLM call per group, run concurrently. Writes the
+    clusters into MasterState; dispatch_reviewers re-derives the same
+    embedding collapse and applies them. Touches no records itself."""
     raise_if_stopping()
     if not getattr(settings, "dedup_agent_enabled", True):
         logging.info("Dedup agent disabled via settings.dedup_agent_enabled=False.")
         return {}
 
-    hypotheses = [
+    all_hypotheses = [
         v for v in as_dicts(state.get("vulnerabilities", []))
         if v.get("status") == "hypothesis"
-        and v.get("vulnerability_type") != _PASSTHROUGH_TYPE
-        and v.get("vuln_id")
+    ]
+    # Cheap layer first: the deterministic embedding merge collapses
+    # near-verbatim twins before any LLM token is spent, so floods reach
+    # build_groups (and the cap) with far fewer copies. dispatch_reviewers
+    # later re-derives this exact survivor set with the same call.
+    collapsed = embedding_dedup(all_hypotheses)
+    dropped = len(all_hypotheses) - len(collapsed)
+    hypotheses = [
+        v for v in collapsed
+        if v.get("vulnerability_type") != _PASSTHROUGH_TYPE and v.get("vuln_id")
     ]
     groups = build_groups(hypotheses, _node_file_map())
     if not groups:
@@ -228,8 +266,8 @@ def dedup_agent_node(state: MasterState) -> dict:
 
     total = len(groups)
     logging.info(
-        "Dedup agent: %d record(s) in %d group(s) (group > %d records splits by source dir).",
-        len(hypotheses), total, settings.dedup_agent_group_max,
+        "Dedup agent: %d record(s), %d collapsed by embedding pass -> %d group(s) (group > %d records packs by source dir).",
+        len(hypotheses), dropped, total, settings.dedup_agent_group_max,
     )
     if total <= 1:
         results = [_run_group(group, 1, total) for group in groups]
