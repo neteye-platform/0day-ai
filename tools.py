@@ -18,10 +18,35 @@ LANGUAGE_MAP = {
     ".jsx": tree_sitter.Language(tree_sitter_javascript.language()),
 }
 
+# Define the AST mappings for the languages your agents will scan
+AST_GRAMMAR_MAP = {
+    ".py": {
+        "keep_whole": ["import_statement", "import_from_statement", "expression_statement"],
+        "prune_bodies": ["function_definition", "class_definition", "decorated_definition"],
+        "body_node": "block"
+    },
+    ".js": {
+        "keep_whole": ["import_statement", "lexical_declaration", "variable_declaration"],
+        "prune_bodies": ["function_declaration", "class_declaration", "arrow_function", "method_definition"],
+        "body_node": "statement_block"
+    },
+    ".go": {
+        "keep_whole": ["import_declaration"],
+        "prune_bodies": ["function_declaration", "method_declaration"],
+        "body_node": "block"
+    },
+    # Add Java, C++, etc., as needed
+}
+
 @tool
-def read_source_code(node_id: str) -> str:
+def read_source_code(node_id: str, current_analysis: str, reason_for_reading: str) -> str:
     """
     Fetches the source code for a given Node ID.
+
+    Args:
+        node_id: The exact ID of the node to read (e.g., 'src_main_query_db').
+        current_analysis: A detailed summary of the vulnerabilities, data flows, or logic flaws you have found in the code you have ALREADY read. If this is your first read, state your initial hypothesis. You MUST NOT leave this blank.
+        reason_for_reading: Explain exactly why you need to read THIS specific node next, and how you expect it to connect to your current analysis.
     """
     try:
         with open(settings.graph, "r") as f:
@@ -79,6 +104,48 @@ def read_source_code(node_id: str) -> str:
                 parser = tree_sitter.Parser(lang)
                 source_bytes = source_content.encode("utf-8")
                 tree = parser.parse(source_bytes)
+
+                is_file_node = start_line == 1 and target_node.get("label", "") == source_file.name
+                if is_file_node:
+                    skeleton = [f"--- FILE SKELETON: {source_file.name} (function/class definition omitted) ---"]
+
+                    # Fetch language-specific grammar rules (fallback to an empty dict to be safe)
+                    grammar = AST_GRAMMAR_MAP.get(source_file.suffix, {})
+                    keep_whole = grammar.get("keep_whole", [])
+                    prune_bodies = grammar.get("prune_bodies", [])
+                    body_node_type = grammar.get("body_node", "block")
+
+                    for child in tree.root_node.children:
+                        # Keep imports and top-level expressions (globals) intact
+                        if child.type in keep_whole:
+                            skeleton.append(source_bytes[child.start_byte:child.end_byte].decode("utf-8"))
+
+                        # Prune the bodies of functions and classes
+                        elif child.type in prune_bodies:
+                            def get_body_node(n):
+                                for c in n.children:
+                                    # Use the dynamic body_node_type instead of hardcoding "block"
+                                    if c.type == body_node_type:
+                                        return c
+                                    if c.type in prune_bodies:
+                                        res = get_body_node(c)
+                                        if res: return res
+                                return None
+
+                            body_node = get_body_node(child)
+                            if body_node:
+                                # Extract everything up to the start of the block (e.g., 'def init_db():')
+                                signature = source_bytes[child.start_byte:body_node.start_byte].decode("utf-8").strip()
+                                skeleton.append(f"{signature}\n    # Body omitted for context limits\n")
+                            else:
+                                # Fallback if no block is found
+                                skeleton.append(source_bytes[child.start_byte:child.end_byte].decode("utf-8"))
+
+                    # If we don't have a grammar map for this file, fallback to full text to avoid breaking
+                    if len(skeleton) == 1:
+                         return source_content
+
+                    return "\n".join(skeleton)
 
                 # Find the largest node starting on the target row
                 def find_node(node, row):
