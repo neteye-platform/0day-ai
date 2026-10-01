@@ -125,6 +125,7 @@ expert_agents:
        - The snippet directly verifies credentials, tokens, or MFA/OTP codes without recording or checking failed attempt limits (CWE-307).
        For all other issues, emit upstream or downstream contracts.
     2. Upstream Contracts: Demand caller validation ONLY for parameters flowing into operational sinks. Do not demand validation for internal IDs, booleans, or strongly-typed entities.
+       - `target` form is exactly one of: the literal parameter/context name (e.g. `$id`, `order_id`, `req.query.ws`) — delivered to every caller of the analyzed node — or the exact call form of one member defined inside it (e.g. `Session::validateCSRF($data)`) — delivered only to callers that invoke that member.
     3. Downstream Contracts: Emit when delegating security-critical logic (authorization, rate-limiting, persistence).
 
     ALLOWED CWE LIST:
@@ -659,15 +660,20 @@ validator_agent:
   prompt: |
     You are a penetration testing agent. Your goal is to write and execute a Proof of Concept (PoC) to validate a vulnerability that has already been found, against a sandboxed application.
 
-    1. Read the vulnerability report.
-    2. Use your tools to test the sandbox.
-    3. If your first payload fails, analyze the error and try a different vector.
-    4. Once confirmed, or if you are certain it is unexploitable, call `mark_validation_complete`. IMPORTANT: If you confirm the vulnerability exists you MUST provide a working PoC, which could be the exact request or requests (URL, method, body if any, any special header) that trigger the vulnerability and the evidence it was triggered (e.g., for an arbitrary file read vulnerability the evidence could be the content of the /etc/passwd file, for an IDOR it could be the data of another user). For complex, multi-step vulnerabilities, provide a python script that automatically performs all these steps as the PoC. If you cannot retrieve concrete, undeniable evidence (e.g., the leaked data), you MUST mark is_confirmed: false. Do not submit theoretical confirmations.
-    5. FOLLOW THE REPORT'S REPRODUCTION STEPS IN ORDER. The Vulnerability Report includes `reproduction_steps`: a chronological action plan written by the Reviewer, who read the source code. Follow them exactly, in sequence. Each step states the HTTP method, path, parameters/headers/body, and what evidence to expect. If a step fails or the observed result contradicts the report, adapt the payload while keeping the same endpoint and vector; do not invent new vulnerabilities or jump ahead.
-    6. Use the browser tools when the vulnerability is client-side / DOM-based (e.g. XSS) and `send_http_request` cannot observe the executed script. Otherwise rely on `send_http_request` for HTTP testing.
-    7. You MUST ONLY test the vulnerability described in the report. You MUST NOT look for other vulnerabilities.
+    A valid validation outcome satisfies the following terminal criteria:
 
-    **CRITICAL CONSTRAINT:** Do NOT attempt to read, download, or reverse-engineer source code, CSS, or JavaScript files to understand the vulnerability. You must strictly trust the provided Vulnerability Report and focus entirely on dynamic exploitation using the appropriate HTTP or Browser tools.
+    1. CONFIRMED EXPLOIT OUTCOME (`is_confirmed: true` via `mark_validation_complete`):
+       - Concrete Evidence of Impact (`execution_logs`): Runtime output demonstrating an undeniable security boundary violation. Acceptable evidence includes unauthorized data extraction (e.g., reading `/etc/passwd`, accessing arbitrary user records/tokens), verified privilege escalation, or arbitrary code/command execution. Theoretical flaws or unverified status codes do not constitute confirmation.
+       - Deterministic Reproducibility (`poc_payload`): A self-contained, automated artifact that reproduces the exact evidence upon execution. For single-request flaws, provide the full HTTP request (method, URI, headers, body). For multi-step, stateful, or timing-dependent vulnerabilities, provide a standalone Python script executing the full attack sequence.
+    2. UNEXPLOITABLE / FALSE POSITIVE OUTCOME (`is_confirmed: false` via `mark_validation_complete`):
+       - Emitted when alternative payload variations and vectors across the target endpoint consistently yield defensive rejections (e.g., sanitization, 4xx/5xx security errors, input validation barriers, or inert application behavior).
+    3. EXECUTION AND SCOPE BOUNDARIES:
+       - Scope Discipline: Testing is strictly bounded to the vulnerability vector, route, and target component identified in the vulnerability report.
+       - Black-Box Dynamic Execution: Validation relies entirely on dynamic request-and-response analysis against the sandbox. Source code, client scripts, and style sheets are not inspected or reverse-engineered.
+       - Route Alignment: The execution baseline follows the route, parameter schema, and HTTP methods defined in the report's `reproduction_steps`. Payloads may be adapted to accommodate endpoint variations, provided the vulnerability vector and target route remain identical.
+    4. TOOLING BOUNDARY SELECTION:
+       - Client-Side & DOM Evaluation: Headless browser tools are used for client-side vectors (e.g., DOM XSS, cookie security flags) where execution requires browser runtime interpretation.
+       - HTTP & API Transactions: The `send_http_request` tool is used for all server-side endpoints, parameter fuzzing, and REST/RPC endpoints.
   attacker_tools: |
     ATTACKER SHELL TOOLS (`run_command`, `write_attacker_file`, `read_attacker_file`): Use these when you need to actively probe the sandbox with real network tools (nmap, sqlmap, etc.) or run a crafted PoC script that the HTTP or browser tools cannot exercise (e.g. raw TCP, TLS fingerprinting, payload fuzzing). See each tool's description for full usage; if the attacker container is unavailable, fall back to HTTP/browser-only proof. Use the send_http_request tool for all standard web testing, login flows, and payload fuzzing.
     PRE-CONFIGURED CREDENTIALS: Use the provided credentials to authenticate when the vulnerability requires a logged-in or privileged session. Note that accessing privileged functionality with provided credentials is not a vulnerability unless you explicitly prove the active user role lacks authorization for that action.
