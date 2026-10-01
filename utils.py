@@ -26,6 +26,53 @@ def get_cached_graph_data(graph_path: Path):
         return {}
 
 
+def format_node_context(graph_data: dict, node_id: str) -> str:
+    """Render 'graphify explain' style context for a node: its summary plus connections.
+
+    Shows the node's label, id, source file/location and community, followed by
+    all incoming ('<--') and outgoing ('-->') links with their relation and confidence.
+    Returns an empty string if the target node is not found.
+    """
+    nodes = graph_data.get("nodes", [])
+    node_map = {n.get("id"): n for n in nodes}
+    target_node = node_map.get(node_id)
+    if target_node is None:
+        return ""
+
+    # Collect connections touching this node, resolved to neighbor labels.
+    connections = []
+    for edge in graph_data.get("links", []):
+        relation = edge.get("relation")
+        confidence = edge.get("confidence")
+        if edge.get("target") == node_id:
+            neighbor = node_map.get(edge.get("source"))
+            arrow = "<--"
+        elif edge.get("source") == node_id:
+            neighbor = node_map.get(edge.get("target"))
+            arrow = "-->"
+        else:
+            continue
+        neighbor_label = neighbor.get("label", edge.get("source") or edge.get("target")) if neighbor else (edge.get("source") or edge.get("target"))
+        connections.append((arrow, neighbor_label, relation, confidence, str(edge.get("source_location", ""))))
+
+    # Stable ordering by source line number.
+    connections.sort(key=lambda c: c[4])
+
+    label = target_node.get("label", node_id)
+    lines = [
+        f"Node: {label}",
+        f"  ID:        {node_id}",
+        f"  Source:    {target_node.get('source_file', '')} {target_node.get('source_location', '').strip()}",
+        f"  Community: {target_node.get('community', '')}",
+        "",
+        f"Connections ({len(connections)}):",
+    ]
+    for arrow, neighbor_label, relation, confidence, _ in connections:
+        lines.append(f"  {arrow} {neighbor_label} [{relation}] [{confidence}]")
+
+    return "\n".join(lines)
+
+
 @lru_cache(maxsize=1)
 def get_cached_symbol_index(index_path: Path) -> list[dict]:
     """Caches the AST symbol index in memory to prevent disk I/O bottlenecks."""
