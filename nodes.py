@@ -21,6 +21,7 @@ from languages import SYMBOL_QUERIES
 import settings
 import tools
 import browser_tools
+import attacker_tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
 from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer
@@ -1816,6 +1817,9 @@ class ValidatorAgent(ToolLoopAgent):
             browser_tools.browser_fill,
             browser_tools.browser_evaluate,
             browser_tools.browser_console,
+            attacker_tools.run_command,
+            attacker_tools.write_attacker_file,
+            attacker_tools.read_attacker_file,
         ]
         # ask_for_context is bound ONLY on the first validation pass. Once the
         # Reviewer has re-answered (review_round > 0), it is removed so the
@@ -1856,10 +1860,22 @@ class ValidatorAgent(ToolLoopAgent):
                 "evidence, or mark `is_confirmed: false` — using the evidence available to "
                 "you. Do not fabricate evidence."
             )
+        shell_note = ""
+        if getattr(settings, "attacker_enabled", False):
+            shell_note = (
+                "\n\n`run_command` executes inside a dedicated Kali attacker container "
+                "(nmap, curl, sqlmap, etc.). Use it to actively probe the app with real "
+                "tools or run a PoC. IMPORTANT: from that container the app is NOT at "
+                "127.0.0.1 - each run_command result prints a `SHELL TARGET:` header "
+                "(e.g. http://172.17.0.1:<port>) that you MUST use for requests inside "
+                "commands. `send_http_request` and the browser tools keep using the "
+                "sandbox URL natively. If run_command reports the attacker container "
+                "is unavailable, fall back to HTTP/browser-only proof."
+            )
         human_msg = HumanMessage(content=(
             f"Target Sandbox: {state['sandbox_url']}\n\n"
             f"Vulnerability to Prove:\n{formatted_report}"
-            f"{round_note}\n"
+            f"{round_note}{shell_note}\n"
         ))
         messages = [sys_msg, human_msg]
         response = llm_with_tools.invoke(messages)

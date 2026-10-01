@@ -83,6 +83,25 @@ browser_executable = None
 # tool (grace-perioded so in-use sessions are never reaped).
 browser_idle_timeout_sec = 600
 
+# Kali attacker container (attacker_tools.py) for the validator: run_command /
+# write_attacker_file / read_attacker_file execute inside a
+# kalilinux/kali-rolling + kali-linux-headless box started lazily on the default
+# bridge network. The sandbox is then reachable from it via the bridge gateway
+# (run_command prints the rewritten SHELL TARGET). Falls open (HTTP-only
+# validation) if docker/build/container startup fails.
+attacker_enabled = True
+attacker_image_tag = "vulnscan-kali-attacker:latest"
+attacker_container_name = "vulnscan-kali-attacker"
+# Working directory for validator shell activity; file tools confine reads and
+# writes to this tree so PoC scripts and evidence stay predictable.
+attacker_workdir = "/work"
+# Hard cap (and default) for any single run_command; commands exceeding it are
+# killed. Building kali-linux-headless on first run can take a long time, so
+# the image build has its own generous timeout.
+attacker_command_timeout = 60
+attacker_build_timeout = 3600
+attacker_output_max_chars = 8000
+
 # Validator context compaction: same mechanism as the reviewer, applied to the
 # validator's HTTP-proving loop. HTTP responses from send_http_request can grow
 # without bound over long validation sessions, so the same soft-threshold
