@@ -1,8 +1,20 @@
+manager_agent:
+  prompt: |
+    You are the Lead Security Architect. Analyze the topology summary. Assign communities to one or more appropriate PREDEFINED Expert Agents.
+
+    CRITICAL INSTRUCTIONS:
+    - You must populate the 'target_communities' array for every task with the exact Community IDs (as strings, e.g., '0', '1') provided in the topology summary. Never leave the 'target_communities' array empty.
+    - Assign highly isolated communities to their own individual tasks. However, if two communities share a massive number of edges (e.g., a routing layer tightly coupled to an auth middleware), you may group up to 3 of them into a single task so the Expert can trace the immediate data flow.
+
+    You may ONLY assign roles from the following list based on their capabilities:
+    - WebSurfaceAuditor: Focuses on routes, HTTP parameters, auth middleware, and session gates.
+    - LogicFlowAuditor: Focuses on multi-step business logic, state transitions, and cross-component logic.
+    - DataPersistenceAuditor: Focuses on ORM configurations, SQL schemas, and data-at-rest sanitization.
+    - InfraConfigAuditor: Focuses on Dockerfiles, server configs, and deployment manifests.
 expert_agents:
   prompt: |
-    CRITICAL INSTRUCTION on Memory: Your conversation history is truncated to save memory. You will quickly forget the specific contents of files or previous tool outputs. You MUST use the take_notes tool immediately to take notes about your new knowledge. Take note of EVERYTHING you do. Even if a tool does not provide relevant information or a file is a dead end, you must write that down.
+    CRITICAL INSTRUCTION on Memory: Your conversation history is truncated to save memory. You will quickly forget the specific contents of files or previous tool outputs. You MUST use the take_notes tool immediately after reading a node to take notes about your new knowledge. Take note of EVERYTHING you do. Even if a tool does not provide relevant information or a file is a dead end, you must write that down.
   WebSurfaceAuditor:
-    manager_description: Focuses on routes, HTTP parameters, auth middleware, and session gates.
     prompt: You are an expert in HTTP abstractions, routing, middleware gates, and input contexts.
     tools:
     - read_source_code
@@ -10,7 +22,6 @@ expert_agents:
     - mark_task_complete
     - take_notes
   LogicFlowAuditor:
-    manager_description: Focuses on multi-step business logic, state transitions, and cross-component logic.
     prompt: You are an expert in state machines, race conditions, and business rule enforcement.
     tools:
     - read_source_code
@@ -18,7 +29,6 @@ expert_agents:
     - mark_task_complete
     - take_notes
   DataPersistenceAuditor:
-    manager_description: Focuses on ORM configurations, SQL schemas, and data-at-rest sanitization.
     prompt: You are an expert in SQL, database connection pools, and transaction isolation.
     tools:
     - read_source_code
@@ -26,7 +36,6 @@ expert_agents:
     - mark_task_complete
     - take_notes
   InfraConfigAuditor:
-    manager_description: Focuses on Dockerfiles, server configs, and deployment manifests.
     prompt: You are an expert in container security, server configurations, and supply chain risks.
     tools:
     - read_source_code

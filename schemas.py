@@ -6,6 +6,7 @@ import yaml
 
 with open("agents.yaml", "r") as f:
     data = yaml.safe_load(f)
+    MANAGER_AGENT = data.get("manager_agent")
     EXPERT_AGENTS = data.get("expert_agents")
     TOOLS = data.get("tools")
     REVIEWER_AGENT = data.get("reviewer_agent")
