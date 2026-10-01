@@ -81,8 +81,17 @@ def compile_validator():
     return compiled_validator_agent 
 
 
+RETRY = RetryPolicy(
+    initial_interval=1.0,
+    backoff_factor=2.0,
+    max_interval=60.0,
+    max_attempts=5,
+    jitter=True,
+)
+
+
 def build_graph(checkpointer=None, interrupt_before=None):
-    workflow = StateGraph(MasterState)
+    workflow = StateGraph(MasterState).set_node_defaults(retry_policy=RETRY)
     workflow.add_node("bootstrap", bootstrap_node)
     workflow.add_node("preprocessor", preprocessor_node)
     workflow.add_node("manager", manager_agent_node)
