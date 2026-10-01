@@ -15,7 +15,7 @@ from langgraph.prebuilt import ToolNode
 import tools
 from utils import build_networkx_graph, run_stream, compact_tool_history
 from state import MasterState, ExpertState, ReviewerState, ValidatorState
-from schemas import ManagerOutput, EXPERT_AGENTS, REVIEWER_AGENT, VALIDATOR_AGENT, TOOLS
+from schemas import ManagerOutput, MANAGER_AGENT, EXPERT_AGENTS, REVIEWER_AGENT, VALIDATOR_AGENT, TOOLS
 
 # ==========================================
 # Preprocessor
@@ -97,27 +97,12 @@ def manager_agent_node(state: MasterState) -> dict[str, Any]:
     # ]}
 
     llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
-    # llm = ChatOpenAI(
-    #     base_url="http://localhost:11434/v1",
-    #     model="glm-5-2",
-    #     temperature=0
-    # )
+    # llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="glm-5-2", temperature=0)
 
     parser = PydanticOutputParser(pydantic_object=ManagerOutput)
 
-    roles_docs = ""
-    for role, config in EXPERT_AGENTS.items():
-        if role == "prompt":
-            continue
-        roles_docs += f"- {role}: {config['manager_description']}"
     sys_msg = SystemMessage(content=(
-        "You are the Lead Security Architect. Analyze the topology summary. "
-        "Assign communities to one or more appropriate PREDEFINED Expert Agents. "
-        "You may ONLY assign roles from the following list based on their capabilities:\n\n"
-        f"{roles_docs}\n\n"
-        "CRITICAL INSTRUCTIONS:\n"
-        "- You must populate the 'target_communities' array for every task with the exact Community IDs (as strings, e.g., '0', '1') provided in the topology summary. Never leave the 'target_communities' array empty.\n"
-        "- Do not assign more than 3 communities to a single task. If a complex logic flow spans, for example, 7 communities, break it down into overlapping tasks (e.g., Task 1: Comm 6,7,8. Task 2: Comm 8,9,10). This prevents context overload."
+        f"{MANAGER_AGENT.get('prompt')}\n\n"
         f"{parser.get_format_instructions()}"
     ))
     human_msg = HumanMessage(content=f"Here is the app topology:\n{state.get('app_summary')}")
@@ -138,11 +123,7 @@ def expert_agent_node(state: ExpertState) -> dict:
         return {"vulnerability_reports": []}
 
     llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
-    # llm = ChatOpenAI(
-    #     base_url="http://localhost:11434/v1",
-    #     model="glm-5-2",
-    #     temperature=0
-    # )
+    # llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="glm-5-2", temperature=0)
 
     agent_tools = [tools.submit_report]
     tool_names = EXPERT_AGENTS[role_name].get("tools", [])
@@ -166,7 +147,7 @@ def expert_agent_node(state: ExpertState) -> dict:
         response = llm_with_tools.invoke(messages)
         messages = [sys_msg, human_msg, response]
     else:
-        compacted_messages = compact_tool_history(state["messages"], safe_window=6)
+        compacted_messages = compact_tool_history(state["messages"], safe_window=8)
 
         dynamic_msgs = []
         if state.get("notes"):
@@ -179,7 +160,7 @@ def expert_agent_node(state: ExpertState) -> dict:
         messages = [sys_msg, human_msg] + dynamic_msgs + compacted_messages[2:]
 
         response = llm_with_tools.invoke(messages)
-        return {"messages": compacted_messages[2:] + [response]}
+        return {"messages": [response]}
 
     return {"messages": messages}
 
@@ -276,11 +257,7 @@ def dispatch_reviewers(state: MasterState):
 def reviewer_agent_node(state: ReviewerState) -> dict:
     """Review the vulnerability reports and keep only what is actually relevant"""
     llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
-    # llm = ChatOpenAI(
-    #     base_url="http://localhost:11434/v1",
-    #     model="glm-5-2",
-    #     temperature=0
-    # )
+    # llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="glm-5-2", temperature=0)
 
     llm_with_tools = llm.bind_tools([
         tools.read_source_code,
@@ -305,7 +282,7 @@ def reviewer_agent_node(state: ReviewerState) -> dict:
     messages_to_pass = [sys_msg, human_msg] + dynamic_msgs + compacted_messages[2:]
 
     response = llm_with_tools.invoke(messages_to_pass)
-    return {"messages": compacted_messages[2:] + [response]}
+    return {"messages": [response]}
 
 
 def reviewer_router(state: ReviewerState):
@@ -344,19 +321,15 @@ def dispatch_validators(state: MasterState):
             commands.append(Send("validator_agent", payload))
 
     if not commands:
-         # If nothing to validate, skip straight to the end
-         return END
+        # If nothing to validate, skip straight to the end
+        return END
 
     return commands
 
 
 def validator_agent_node(state: ValidatorState) -> dict:
     llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
-    # llm = ChatOpenAI(
-    #     base_url="http://localhost:11434/v1",
-    #     model="glm-5-2",
-    #     temperature=0
-    # )
+    # llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="glm-5-2", temperature=0)
 
     llm_with_tools = llm.bind_tools([
         tools.send_http_request,
@@ -384,7 +357,7 @@ def validator_agent_node(state: ValidatorState) -> dict:
                     # Merge the new cookies into the current state
                     current_cookies.update(msg.artifact)
 
-        compacted_messages = compact_tool_history(state["messages"], safe_window=6)
+        compacted_messages = compact_tool_history(state["messages"], safe_window=8)
         sys_msg = compacted_messages[0]
         human_msg = compacted_messages[1]
 
@@ -397,7 +370,7 @@ def validator_agent_node(state: ValidatorState) -> dict:
         messages_to_pass = [sys_msg, human_msg] + dynamic_msgs + compacted_messages[2:]
 
         response = llm_with_tools.invoke(messages_to_pass)
-        return {"messages": compacted_messages[2:] + [response], "cookies": current_cookies}
+        return {"messages": [response], "cookies": current_cookies}
 
 
 def validator_router(state: ValidatorState):
@@ -512,7 +485,7 @@ if __name__ == "__main__":
         messages=[]
     )
     config = {
-        "max_concurrency": 3
+        "max_concurrency": 2
     }
 
     try:

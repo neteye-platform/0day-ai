@@ -52,6 +52,8 @@ def read_source_code(node_id: str, reason_for_reading: str, state: Annotated[dic
     Args:
         node_id: The exact ID of the node to read (e.g., 'src_main_query_db').
         reason_for_reading: Explain exactly why you need to read THIS specific node next, and how you expect it to connect to your current knowledge.
+
+    WARNING: You can only call this a maximum of 4 times before you must use the `take_notes` tool. Plan your batches accordingly.
     """
     rejection = enforce_note_taking(state.get("messages", []))
     if rejection:
@@ -222,10 +224,13 @@ def take_notes(
     Saves notes (variables, logic flows, hardcoded secrets) to your persistent memory.
 
     BEST PRACTICES FOR NOTES:
-    - Keep it concise and use markdown. Do NOT write raw tools outputs, write a summary or the most relevant parts.
+    - Keep it concise and use markdown. Do NOT write raw tool outputs; write a dense summary.
     - Always include the context (e.g., file name, node ID, or endpoint).
-    - Record both positive findings (e.g., "Found SQL injection in main.py") 
-      AND negative findings (e.g., "Checked auth.py, no issues found", "Search returned no results").
+    - Record both positive findings ("Found SQL injection in main.py") AND negative findings ("Checked auth.py, no issues").
+    - DO NOT repeat information already present in old notes.
+    - DO NOT list every missing defense-in-depth measure (e.g., missing seccomp, AppArmor, cap_drop). Group them simply as "Missing hardening measures"
+    - DO NOT list entire dependency manifests. Only note high-risk packages or those with known CVEs.
+    - Focus heavily on actionable intelligence: identify the source, the sink, and the exploit path.
     """
     return Command(
         update={
@@ -314,6 +319,8 @@ def send_http_request(
     - 'text': Returns only the visible text (good for reading error messages).
     - 'raw': Returns the untouched body (use cautiously, may truncate).
     - ANY CUSTOM TAG: Enter any HTML tag (e.g., 'form', 'a', 'script', 'input', 'iframe') to extract only those elements.
+
+    WARNING: You can only call this a maximum of 4 times before you must use the `take_notes` tool. Plan your batches accordingly.
     """
 
     rejection = enforce_note_taking(state.get("messages", []))
@@ -390,7 +397,7 @@ def mark_validation_complete(
     validation: ValidationToolInput,
     state: Annotated[dict, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId]
-) -> dict:
+) -> Command:
     """
     Call this when you have definitively proven the vulnerability exists,
     or exhausted all options and believe it to be a false positive.
@@ -414,6 +421,8 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState]) -> str:
     """
     Searches the entire application codebase for a specific string. Use this
     to find where specific libraries, functions, or variables are used.
+
+    WARNING: You can only call this a maximum of 4 times before you must use the `take_notes` tool. Plan your batches accordingly.
     """
 
     rejection = enforce_note_taking(state.get("messages", []))
