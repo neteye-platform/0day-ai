@@ -378,3 +378,142 @@ def guard_usages(code: str, ext: str) -> list[dict] | None:
         if usable(tree.root_node):
             return _extract_decision_guards(tree.root_node, spec)
     return None
+
+
+# ==========================================
+# Node triage: per-language scan-signals config
+# ==========================================
+#
+# tree-sitter node-type declarations consumed by the node-triage machinery in
+# utils.py (is_node_worth_scanning / _node_code_is_worth_scanning / _is_pure_type
+# / _is_config_only). Like the maps above, these are pure data; the generic
+# triage algorithm itself stays in utils.
+
+# tree-sitter node types indicating executable logic (function calls, imports,
+# string interpolation, control flow). Nodes exposing none of these are inert.
+SCAN_SIGNAL_TYPES: dict[str, set[str]] = {
+    ".py": {
+        "call", "import_statement", "import_from_statement",
+        "if_statement", "for_statement", "while_statement", "try_statement",
+        "with_statement", "match_statement", "interpolation",
+    },
+    ".js": {
+        "call_expression", "new_expression", "import_statement",
+        "if_statement", "for_statement", "while_statement", "switch_statement",
+        "try_statement", "template_substitution",
+    },
+    ".jsx": {
+        "call_expression", "new_expression", "import_statement",
+        "if_statement", "for_statement", "while_statement", "switch_statement",
+        "try_statement", "template_substitution",
+    },
+    ".ts": {
+        "call_expression", "new_expression", "import_statement",
+        "if_statement", "for_statement", "while_statement", "switch_statement",
+        "try_statement", "template_substitution",
+    },
+    ".tsx": {
+        "call_expression", "new_expression", "import_statement",
+        "if_statement", "for_statement", "while_statement", "switch_statement",
+        "try_statement", "template_substitution",
+    },
+    # .vue scripts parse with the TypeScript grammar, so they share its signals.
+    ".vue": {
+        "call_expression", "new_expression", "import_statement",
+        "if_statement", "for_statement", "while_statement", "switch_statement",
+        "try_statement", "template_substitution",
+    },
+    ".php": {
+        "function_call_expression", "member_call_expression", "scoped_call_expression",
+        "object_creation_expression", "namespace_use_declaration", "include_expression",
+        "include_once_expression", "require_expression", "require_once_expression",
+        "echo_statement", "if_statement", "for_statement", "foreach_statement",
+        "while_statement", "switch_statement", "try_statement", "encapsed_string",
+    },
+}
+
+# Import-like declarations are tolerated inside pure type/interface/config nodes
+# (they only bring names into scope and do not execute anything by themselves).
+IMPORT_TYPES: dict[str, set[str]] = {
+    ".py": {"import_statement", "import_from_statement"},
+    ".js": {"import_statement"},
+    ".jsx": {"import_statement"},
+    ".ts": {"import_statement"},
+    ".tsx": {"import_statement"},
+    ".vue": {"import_statement"},
+    ".php": {"namespace_use_declaration"},
+}
+
+# Nodes that introduce callable/structured definitions (bodies, classes, types).
+DEFINITION_TYPES: set[str] = {
+    "function_definition", "class_definition", "decorated_definition", "method_declaration",
+    "function_declaration", "class_declaration", "arrow_function", "method_definition",
+    "function_expression", "lambda", "interface_declaration", "type_alias_declaration",
+    "enum_declaration", "type_alias_statement",
+}
+
+# Node types whose names are security-relevant when used as assignment targets.
+NAME_NODE_TYPES: set[str] = {
+    "assignment", "variable_declarator", "assignment_expression", "property_declaration",
+    "property_element", "public_field_definition", "property_signature", "pair",
+    "array_element_initializer",
+}
+
+MAGIC_METHODS: dict[str, set[str]] = {
+    ".py": {
+        "__reduce__", "__reduce_ex__", "__setstate__", "__getstate__", "__getattr__",
+        "__setattr__", "__getattribute__", "__del__", "__delattr__", "__enter__",
+        "__exit__", "__new__", "__init__", "__call__", "__getitem__", "__setitem__",
+        "__repr__", "__str__",
+    },
+    ".php": {
+        "__construct", "__destruct", "__wakeup", "__sleep", "__call", "__callstatic",
+        "__get", "__set", "__isset", "__unset", "__tostring", "__invoke", "__set_state",
+        "__clone", "__debuginfo", "__serialize", "__unserialize",
+    },
+    ".js": set(), ".jsx": set(), ".ts": set(), ".tsx": set(),
+}
+
+# ---- utils._is_pure_type() detection ------------------------------------------
+
+# ext -> AST node types that mark a node as "declares types". Languages absent
+# from this map never take the type-declaration branch (notably .vue, which
+# falls through to the behavioral/default branches exactly as before).
+_JS_TS_TYPE_CONSTRUCTS = {"type_alias_declaration", "interface_declaration", "enum_declaration"}
+_JS_TS_PURE_FORBIDDEN = {
+    "function_declaration", "class_declaration", "arrow_function",
+    "method_definition", "function_expression",
+    "assignment", "variable_declarator", "public_field_definition", "pair",
+}
+PURE_TYPE_CONSTRUCTS: dict[str, set[str]] = {
+    ext: _JS_TS_TYPE_CONSTRUCTS for ext in (".js", ".jsx", ".ts", ".tsx")
+}
+# Extra forbidden node types for the type-declaration branch, unioned with the
+# language's executable SCAN_SIGNAL_TYPES minus its IMPORT_TYPES.
+PURE_TYPE_FORBIDDEN_TYPES: dict[str, set[str]] = {
+    ext: _JS_TS_PURE_FORBIDDEN for ext in (".js", ".jsx", ".ts", ".tsx")
+}
+
+# Python branch: any behavioral node type disqualifies a "pure type" node.
+BEHAVIORAL_NODE_TYPES: dict[str, set[str]] = {
+    ".py": {
+        "call", "if_statement", "for_statement", "while_statement",
+        "try_statement", "with_statement", "match_statement",
+        "interpolation", "function_definition", "lambda",
+    },
+}
+# ext -> standalone type-alias statement types that prove purity on their own.
+TYPE_ALIAS_NODE_TYPES: dict[str, set[str]] = {".py": {"type_alias_statement"}}
+
+# PHP branch: interfaces must be runtime-free, and property-only classes count
+# as pure DTO shapes.
+PHP_INTERFACE_TYPES: set[str] = {"interface_declaration"}
+PHP_PROPERTY_TYPES: set[str] = {"property_declaration"}
+PHP_METHOD_TYPES: set[str] = {"method_declaration", "function_definition"}
+
+# Raw AST fragments extracted for some languages need a wrapper to parse: PHP
+# method/class fragments (as returned by get_node_code) omit the `<?php` tag,
+# which tree-sitter needs to avoid parsing everything as plain text. Per ext:
+# (insert prefix, detect prefix) — the insert prefix is prepended only when the
+# snippet does not already start with the detect prefix.
+FRAGMENT_WRAP: dict[str, tuple[str, str]] = {".php": ("<?php\n", "<?")}

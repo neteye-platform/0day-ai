@@ -3,6 +3,7 @@ import fnmatch
 import hashlib
 import logging
 import re
+import shutil
 from pathlib import Path
 import tree_sitter
 import subprocess
@@ -18,7 +19,13 @@ import settings
 from functools import lru_cache
 
 
-from languages import LANGUAGE_MAP, AST_GRAMMAR_MAP, SYMBOL_QUERIES, MANIFEST_NAMES, GUARD_SPEC, guard_usages
+from languages import (
+    LANGUAGE_MAP, AST_GRAMMAR_MAP, SYMBOL_QUERIES, MANIFEST_NAMES, GUARD_SPEC, guard_usages,
+    SCAN_SIGNAL_TYPES, IMPORT_TYPES, DEFINITION_TYPES, NAME_NODE_TYPES, MAGIC_METHODS,
+    PURE_TYPE_CONSTRUCTS, PURE_TYPE_FORBIDDEN_TYPES, BEHAVIORAL_NODE_TYPES,
+    TYPE_ALIAS_NODE_TYPES, PHP_INTERFACE_TYPES, PHP_PROPERTY_TYPES, PHP_METHOD_TYPES,
+    FRAGMENT_WRAP,
+)
 
 
 def _is_manifest_node(node: dict) -> bool:
@@ -346,7 +353,7 @@ def find_unsupported_code_files(graph_data: dict) -> dict[str, list[str]]:
         if not source_file:
             continue
         ext = Path(source_file).suffix.lower()
-        if not ext or ext in LANGUAGE_MAP and ext in SYMBOL_QUERIES:
+        if not ext or (ext in LANGUAGE_MAP and ext in SYMBOL_QUERIES):
             continue
         if source_file not in unsupported[ext]:
             unsupported[ext].append(source_file)
@@ -572,6 +579,24 @@ def is_feedback_review(report: Optional[dict]) -> bool:
     return (report.get("review_round") or 0) > 0 or bool(report.get("open_questions"))
 
 
+# Merge ladder: higher rank wins on vuln_id collision. "chained" ranks above
+# "confirmed" (auditor proved the record joins a multi-step exploit) but below
+# "exploitable" (a validator PoC outranks the auditor's static chain proof).
+# "unchainable" is a terminal auditor verdict that stays in the report, like
+# "false_positive".
+_STATUS_PRIORITY = {
+    "hypothesis": 0,
+    "review_error": 1,
+    "confirmed": 2,
+    "chained": 3,
+    "insufficient_context": 3,
+    "exploitable": 4,
+    "false_positive": 5,
+    "unchainable": 5,
+    "proven": 5,
+}
+
+
 def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dict]:
     vuln_map = {}
 
@@ -580,22 +605,6 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
         vid = vuln.get("vuln_id")
         if vid:
             vuln_map[vid] = vuln
-
-    status_priority = {
-        "hypothesis": 0,
-        "review_error": 1,
-        "confirmed": 2,
-        # "chained" ranks above "confirmed" (auditor proved the record joins a
-        # multi-step exploit) but below "exploitable" (a validator PoC outranks
-        # the auditor's static chain proof). "unchainable" is a terminal auditor
-        # verdict that stays in the report, like "false_positive".
-        "chained": 3,
-        "insufficient_context": 3,
-        "exploitable": 4,
-        "false_positive": 5,
-        "unchainable": 5,
-        "proven": 5
-    }
 
     # Process new incoming updates
     for update in updates:
@@ -626,7 +635,7 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
                 continue
 
             # --- STATUS UPGRADE: COMPLETELY REPLACE ---
-            if status_priority.get(new_status, 0) > status_priority.get(current_status, 0):
+            if _STATUS_PRIORITY.get(new_status, 0) > _STATUS_PRIORITY.get(current_status, 0):
                 _merge_affected_nodes(update, update, vuln_map[vid])
                 vuln_map[vid] = update
 
@@ -636,7 +645,7 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
             # Exception: records from two DISTINCT known CVEs never text-merge,
             # even if their vuln_ids ever collide — each CVE is a canonical,
             # separately-fixed flaw, so only affected_nodes are unioned.
-            elif status_priority.get(new_status, 0) == status_priority.get(current_status, 0):
+            elif _STATUS_PRIORITY.get(new_status, 0) == _STATUS_PRIORITY.get(current_status, 0):
                 current = vuln_map[vid]
                 distinct_cves = (
                     bool(current.get("source_cve"))
@@ -760,42 +769,46 @@ def resolve_node_id(module, symbol):
     return None
 
 
-def run_osv_scanner(repo_path: Path) -> list[dict]:
-    """Runs osv-scanner on a directory and extracts raw vulnerability records."""
+def _run_osv(cmd: list, label: str, skip_os: bool = False) -> list[dict]:
+    """Run an osv-scanner command and collect raw vulnerability records.
+
+    Exit code 1 simply means "vulnerabilities found" - the JSON on stdout is
+    still valid; only an empty stdout indicates no results. ``skip_os`` drops
+    OS-package scan results (image scans).
+    """
     raw_vulnerabilities = []
-
-    if not repo_path.exists():
-        logging.error(f"Input report does not exist.")
-
     try:
-        # Run the scanner recursively (-r) and output as JSON
-        result = subprocess.run(
-            ["osv-scanner", "-r", "--format", "json", repo_path],
-            capture_output=True,
-            text=True
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True)
 
-        # If stdout is empty, either no vulns were found or it failed before JSON output
         if not result.stdout.strip():
-            error = result.stderr
-            if error:
-                logging.error(f"Error running osv-scanner: {error}")
+            if result.stderr:
+                logging.error(f"Error running osv-scanner on {label}: {result.stderr}")
             return []
 
         data = json.loads(result.stdout)
 
         # Extract the vulnerability objects from the osv-scanner JSON schema
         for scan_result in data.get("results", []):
+            if skip_os and scan_result.get("source", {}).get("type") == "os":
+                logging.debug("Skipping OS-package vulnerabilities from image scan.")
+                continue
             for package in scan_result.get("packages", []):
-                for vuln in package.get("vulnerabilities", []):
-                    raw_vulnerabilities.append(vuln)
+                raw_vulnerabilities.extend(package.get("vulnerabilities", []))
 
     except FileNotFoundError:
-        print("Error: osv-scanner is not installed or not in PATH.")
+        logging.error("osv-scanner is not installed or not in PATH.")
     except json.JSONDecodeError:
-        print("Error: Could not parse osv-scanner output.")
+        logging.error("Could not parse osv-scanner output.")
 
     return raw_vulnerabilities
+
+
+def run_osv_scanner(repo_path: Path) -> list[dict]:
+    """Runs osv-scanner on a directory and extracts raw vulnerability records."""
+    if not repo_path.exists():
+        logging.error(f"Input report does not exist: {repo_path}")
+        return []
+    return _run_osv(["osv-scanner", "-r", "--format", "json", repo_path], str(repo_path))
 
 
 COMPOSE_FILENAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
@@ -829,17 +842,22 @@ def find_container_builds(app_path: Path) -> list[tuple[str, Path]]:
     return [("dockerfile", d) for d in dockerfiles]
 
 
+def _docker(*args: str, timeout: int | None = None) -> subprocess.CompletedProcess | None:
+    """Run a docker CLI command; returns the CompletedProcess, or None (with a
+    logged error) when the docker binary is missing."""
+    try:
+        return subprocess.run(
+            ["docker", *args], capture_output=True, text=True, timeout=timeout
+        )
+    except FileNotFoundError:
+        logging.error("docker is not installed or not in PATH.")
+        return None
+
+
 def _image_exists(image: str) -> bool:
     """True if a local docker image with the given tag exists."""
-    try:
-        result = subprocess.run(
-            ["docker", "image", "inspect", image],
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0
-    except FileNotFoundError:
-        return False
+    result = _docker("image", "inspect", image)
+    return result is not None and result.returncode == 0
 
 
 def _build_definition_hash(kind: str, path: Path) -> str:
@@ -883,11 +901,9 @@ def _record_build_hash(kind: str, path: Path) -> None:
 
 def _compose_images(path: Path) -> list[str]:
     """Derive the image names a compose file builds without building."""
-    result = subprocess.run(
-        ["docker", "compose", "-f", str(path), "config", "--images"],
-        capture_output=True,
-        text=True
-    )
+    result = _docker("compose", "-f", str(path), "config", "--images")
+    if result is None:
+        return []
     if result.returncode != 0:
         logging.error(f"docker compose config failed: {result.stderr}")
         return []
@@ -908,52 +924,43 @@ def build_images(kind: str, path: Path, tag: str) -> list[str]:
     content is unchanged since the last recorded build are reused as-is (the
     caller still scans/extracts artifacts from them).
     """
-    try:
-        if kind == "compose":
-            images = _compose_images(path)
-            if (
-                not settings.force_rebuild
-                and images
-                and all(_image_exists(img) for img in images)
-                and _build_definition_unchanged(kind, path)
-            ):
-                logging.info(f"Reusing existing compose image(s) {images} (build definition unchanged).")
-                return images
-
-            build = subprocess.run(
-                ["docker", "compose", "-f", str(path), "build"],
-                capture_output=True,
-                text=True
-            )
-            if build.returncode != 0:
-                logging.error(f"docker compose build failed: {build.stderr}")
-                return []
-            _record_build_hash(kind, path)
-            return _compose_images(path)
-
-        # Single Dockerfile build
+    if kind == "compose":
+        images = _compose_images(path)
         if (
             not settings.force_rebuild
-            and _image_exists(tag)
+            and images
+            and all(_image_exists(img) for img in images)
             and _build_definition_unchanged(kind, path)
         ):
-            logging.info(f"Reusing existing image {tag} (build definition unchanged).")
-            return [tag]
+            logging.info(f"Reusing existing compose image(s) {images} (build definition unchanged).")
+            return images
 
-        build = subprocess.run(
-            ["docker", "build", "-t", tag, "-f", str(path), str(path.parent)],
-            capture_output=True,
-            text=True
-        )
+        build = _docker("compose", "-f", str(path), "build")
+        if build is None:
+            return []
         if build.returncode != 0:
-            logging.error(f"docker build failed: {build.stderr}")
+            logging.error(f"docker compose build failed: {build.stderr}")
             return []
         _record_build_hash(kind, path)
+        return _compose_images(path)
+
+    # Single Dockerfile build
+    if (
+        not settings.force_rebuild
+        and _image_exists(tag)
+        and _build_definition_unchanged(kind, path)
+    ):
+        logging.info(f"Reusing existing image {tag} (build definition unchanged).")
         return [tag]
 
-    except FileNotFoundError:
-        print("Error: docker is not installed or not in PATH.")
+    build = _docker("build", "-t", tag, "-f", str(path), str(path.parent))
+    if build is None:
         return []
+    if build.returncode != 0:
+        logging.error(f"docker build failed: {build.stderr}")
+        return []
+    _record_build_hash(kind, path)
+    return [tag]
 
 
 SANDBOX_START_TIMEOUT = 30  # seconds to wait for a sandbox HTTP port to come up
@@ -961,13 +968,8 @@ SANDBOX_START_TIMEOUT = 30  # seconds to wait for a sandbox HTTP port to come up
 
 def _published_ports(container_name: str) -> list[int]:
     """Return the host ports published by a container via `docker port`."""
-    try:
-        result = subprocess.run(
-            ["docker", "port", container_name],
-            capture_output=True,
-            text=True
-        )
-    except FileNotFoundError:
+    result = _docker("port", container_name)
+    if result is None:
         return []
 
     ports = []
@@ -990,19 +992,15 @@ def docker_bridge_gateway() -> str | None:
     attacker shell) share one target URL. Returns ``None`` if it cannot be
     resolved, so callers can fall back to ``127.0.0.1``."""
     try:
-        r = subprocess.run(
-            [
-                "docker", "network", "inspect", "bridge",
-                "--format", "{{(index .IPAM.Config 0).Gateway}}",
-            ],
-            capture_output=True,
-            text=True,
+        r = _docker(
+            "network", "inspect", "bridge",
+            "--format", "{{(index .IPAM.Config 0).Gateway}}",
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
         logging.warning("Failed to resolve bridge gateway: %s", e)
         return None
-    if r.returncode != 0:
+    if r is None or r.returncode != 0:
         return None
     gw = r.stdout.strip()
     return gw or None
@@ -1053,25 +1051,23 @@ def _remove_stale_compose_containers(path: Path) -> None:
     containers from an earlier project with the same pinned name would make
     ``compose up`` fail with a "name already in use" Conflict.
     """
+    result = _docker("compose", "-f", str(path), "config", "--format", "json")
+    if result is None:
+        return
+    if result.returncode != 0:
+        logging.warning(f"docker compose config failed: {result.stderr}")
+        return
     try:
-        result = subprocess.run(
-            ["docker", "compose", "-f", str(path), "config", "--format", "json"],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode != 0:
-            logging.warning(f"docker compose config failed: {result.stderr}")
-            return
         data = json.loads(result.stdout)
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError:
         return
 
     for service in data.get("services", {}).values():
         name = service.get("container_name")
         if not name:
             continue
-        rm = subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
-        if rm.returncode == 0:
+        rm = _docker("rm", "-f", name)
+        if rm is not None and rm.returncode == 0:
             logging.info(f"Removed stale container '{name}' before compose up.")
 
 
@@ -1085,116 +1081,77 @@ def start_sandbox(kind: str, path: Path, tag: str, app_name: str) -> dict | None
     HTTP-responsive container (for compose that is the app service, not a DB sidecar),
     or ``None`` with a logged warning on any failure. Never raises.
     """
-    try:
-        if kind == "compose":
-            # The compose file may pin static `container_name:` values still held
-            # by leftover containers from another compose project (e.g. a prior
-            # run of this scanner on the same app, or a different checkout).
-            # Compose refuses to reuse a name owned by a differently-labelled
-            # container, so pre-emptively remove anything holding those names.
-            # These are throwaway scanner sandboxes - never a production service.
-            _remove_stale_compose_containers(path)
-            up = subprocess.run(
-                ["docker", "compose", "-f", str(path), "up", "-d"],
-                capture_output=True,
-                text=True
-            )
-            if up.returncode != 0:
-                logging.error(f"docker compose up failed: {up.stderr}")
-                return None
+    if kind == "compose":
+        # The compose file may pin static `container_name:` values still held
+        # by leftover containers from another compose project (e.g. a prior
+        # run of this scanner on the same app, or a different checkout).
+        # Compose refuses to reuse a name owned by a differently-labelled
+        # container, so pre-emptively remove anything holding those names.
+        # These are throwaway scanner sandboxes - never a production service.
+        _remove_stale_compose_containers(path)
+        up = _docker("compose", "-f", str(path), "up", "-d")
+        if up is None:
+            return None
+        if up.returncode != 0:
+            logging.error(f"docker compose up failed: {up.stderr}")
+            return None
 
-            ps = subprocess.run(
-                ["docker", "compose", "-f", str(path), "ps", "--format", "json"],
-                capture_output=True,
-                text=True
-            )
-            if ps.returncode != 0:
-                logging.error(f"docker compose ps failed: {ps.stderr}")
-                return None
+        ps = _docker("compose", "-f", str(path), "ps", "--format", "json")
+        if ps is None:
+            return None
+        if ps.returncode != 0:
+            logging.error(f"docker compose ps failed: {ps.stderr}")
+            return None
 
-            containers = []
-            for line in ps.stdout.splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                    if entry.get("State") == "running":
-                        containers.append(entry.get("Name", ""))
-                except json.JSONDecodeError:
-                    continue
-            containers = [c for c in containers if c]
-            if not containers:
-                logging.error("docker compose up started no running containers.")
-                return None
-        else:
-            name = f"vulnscan-{app_name}"
-            # Remove any stale container from a previous run
-            subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
-            run = subprocess.run(
-                ["docker", "run", "-d", "-P", "--name", name, tag],
-                capture_output=True,
-                text=True
-            )
-            if run.returncode != 0:
-                logging.error(f"docker run failed: {run.stderr}")
-                return None
-            containers = [name]
+        containers = []
+        for line in ps.stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+                if entry.get("State") == "running":
+                    containers.append(entry.get("Name", ""))
+            except json.JSONDecodeError:
+                continue
+        containers = [c for c in containers if c]
+        if not containers:
+            logging.error("docker compose up started no running containers.")
+            return None
+    else:
+        name = f"vulnscan-{app_name}"
+        # Remove any stale container from a previous run
+        _docker("rm", "-f", name)
+        run = _docker("run", "-d", "-P", "--name", name, tag)
+        if run is None:
+            return None
+        if run.returncode != 0:
+            logging.error(f"docker run failed: {run.stderr}")
+            return None
+        containers = [name]
 
-        # Prefer the container that publishes a responsive HTTP port
-        for container in containers:
-            port = _probe_http_ports(_published_ports(container))
-            if port:
-                url = _sandbox_url_for_port(port)
-                logging.info(f"Sandbox running: container={container} url={url}")
-                return {"container_name": container, "sandbox_url": url}
+    # Prefer the container that publishes a responsive HTTP port
+    for container in containers:
+        port = _probe_http_ports(_published_ports(container))
+        if port:
+            url = _sandbox_url_for_port(port)
+            logging.info(f"Sandbox running: container={container} url={url}")
+            return {"container_name": container, "sandbox_url": url}
 
-        logging.warning(
-            "Sandbox container(s) started but none published a responsive HTTP port "
-            f"({containers}). Validator tools will report no sandbox configured."
-        )
-        return None
-
-    except FileNotFoundError:
-        print("Error: docker is not installed or not in PATH.")
-        return None
+    logging.warning(
+        "Sandbox container(s) started but none published a responsive HTTP port "
+        f"({containers}). Validator tools will report no sandbox configured."
+    )
+    return None
 
 
 def run_osv_scanner_image(image: str) -> list[dict]:
     """Runs `osv-scanner scan image` against a built container image and
     extracts raw vulnerability records (same JSON shape as a source scan)."""
-    raw_vulnerabilities = []
-
-    try:
-        result = subprocess.run(
-            ["osv-scanner", "scan", "image", "--format", "json", image],
-            capture_output=True,
-            text=True
-        )
-
-        # Exit code 1 simply means "vulnerabilities found" - the JSON on
-        # stdout is still valid. Only an empty stdout indicates no results.
-        if not result.stdout.strip():
-            error = result.stderr
-            if error:
-                logging.error(f"Error running osv-scanner on image '{image}': {error}")
-            return []
-
-        data = json.loads(result.stdout)
-
-        for scan_result in data.get("results", []):
-            if scan_result.get("source", {}).get("type") == "os":
-                logging.debug("Skipping OS-package vulnerabilities from image scan.")
-                continue
-            for package in scan_result.get("packages", []):
-                for vuln in package.get("vulnerabilities", []):
-                    raw_vulnerabilities.append(vuln)
-
-    except FileNotFoundError:
-        print("Error: osv-scanner is not installed or not in PATH.")
-    except json.JSONDecodeError:
-        print("Error: Could not parse osv-scanner output.")
-
-    return raw_vulnerabilities
+    return _run_osv(
+        ["osv-scanner", "scan", "image", "--format", "json", image],
+        f"image '{image}'",
+        skip_os=True,
+    )
 
 
 # ==========================================
@@ -1398,7 +1355,6 @@ def extract_container_artifacts(images: list[str]) -> dict:
         if create.returncode != 0:
             logging.warning(f"docker create failed for image '{image}': {create.stderr.strip()}")
             continue
-        container_id = create.stdout.strip()
 
         try:
             metadata = _docker_image_metadata(image)
@@ -1421,16 +1377,11 @@ def extract_container_artifacts(images: list[str]) -> dict:
 
     # Remove snapshots for images that are no longer built (e.g. after a
     # compose service is removed) so the tool never serves stale configs.
-    current_slugs = {summary[img]["slug"] for img in summary}
+    current_slugs = {info["slug"] for info in summary.values()}
     for existing in artifacts_root.glob("*"):
         if existing.is_dir() and existing.name not in current_slugs:
             logging.info(f"Removing stale artifact snapshot '{existing.name}'.")
-            for f in existing.rglob("*"):
-                if f.is_file():
-                    f.unlink()
-            for d in sorted((p for p in existing.rglob("*") if p.is_dir()), reverse=True):
-                d.rmdir()
-            existing.rmdir()
+            shutil.rmtree(existing)
 
     return summary
 
@@ -1504,13 +1455,11 @@ def _extract_container_export(cid: str, image_dir: Path, rootfs_dir: Path,
                         catchall_hit = True
                     else:
                         continue
-                if len(extracted) >= ARTIFACT_MAX_FILES:
-                    skipped.append(path)
-                    continue
-                if total_bytes + member.size > ARTIFACT_MAX_TOTAL_BYTES:
-                    skipped.append(path)
-                    continue
-                if member.size > ARTIFACT_MAX_FILE_BYTES:
+                if (
+                    len(extracted) >= ARTIFACT_MAX_FILES
+                    or total_bytes + member.size > ARTIFACT_MAX_TOTAL_BYTES
+                    or member.size > ARTIFACT_MAX_FILE_BYTES
+                ):
                     skipped.append(path)
                     continue
 
@@ -1592,21 +1541,20 @@ def get_canonical_id(record):
             if alias.startswith("CVE-"):
                 return alias
 
-    # Check if the ID itself embeds the CVE
-    m = re.match(".*(CVE-20[0-9]{2}-[0-9]+).*", record["id"])
+    # Check if the ID itself embeds the CVE; fall back to the record ID.
+    m = re.search(r"CVE-20\d{2}-\d+", record.get("id", ""))
     if m:
-        return m.group(1)
-
-    # Fallback to the record ID if no CVE is found
+        return m.group(0)
     return record.get("id", "UNKNOWN")
 
 
-def _cvss_v3_base_score(vector: str | None) -> float | None:
-    """Calculate a CVSS v3.x base score from a CVSS vector.
+def cvss_v3_base_score(vector: str | None) -> float | None:
+    """Calculate a CVSS v3.x base score (0.0-10.0) from a CVSS vector.
 
-    OSV commonly stores the CVSS vector rather than a numeric score.  This
-    small implementation is only used for the coarse HIGH threshold; vectors
-    from other CVSS generations are intentionally ignored.
+    OSV commonly stores the CVSS vector rather than a numeric score, and the
+    reporter uses this to score each finding deterministically instead of
+    trusting model arithmetic. Returns None when the vector is missing,
+    malformed, or from another CVSS generation.
     """
     if not isinstance(vector, str) or not vector.startswith("CVSS:3."):
         return None
@@ -1665,18 +1613,7 @@ def is_high_severity(record: dict) -> bool:
     label = str(record.get("severity_label") or "").upper()
     if label:
         return label in {"HIGH", "CRITICAL"}
-    return (_cvss_v3_base_score(record.get("cvss_vector")) or 0.0) >= 7.0
-
-
-def cvss_v3_base_score(vector: str | None) -> float | None:
-    """Public wrapper over ``_cvss_v3_base_score``.
-
-    Computes the CVSS v3.x base score (0.0-10.0) from a vector string, or
-    returns None when the vector is missing, malformed, or from another CVSS
-    generation. The reporter uses it to score each finding deterministically
-    from the LLM-emitted vector instead of trusting model arithmetic.
-    """
-    return _cvss_v3_base_score(vector)
+    return (cvss_v3_base_score(record.get("cvss_vector")) or 0.0) >= 7.0
 
 
 def cvss_severity_label(score: float | None) -> str:
@@ -1763,15 +1700,17 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
 
         canonical_id = get_canonical_id(vuln)
         current_details = vuln.get("details", "")
-        affected_packages = [affected.get("package", {}) for affected in vuln.get("affected", [])]
-        packages = [pkg.get("name", pkg.get("name", "unknown")) for pkg in affected_packages]
+        packages = [
+            affected.get("package", {}).get("name", "unknown")
+            for affected in vuln.get("affected", [])
+        ]
 
         if canonical_id not in best_records:
             best_records[canonical_id] = {
                 "id": canonical_id,
                 "details": current_details,
                 "descriptions": [current_details] if current_details else [],
-                "package": packages[0] if len(packages) >= 1 else "unknown",
+                "package": packages[0] if packages else "unknown",
                 "fixed_version": extract_fixed_version(vuln),
                 "cwe_ids": extract_cwe_ids(vuln),
                 "severity_label": extract_severity_label(vuln),
@@ -1790,12 +1729,10 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
             record["details"] = best
             record["original_osv_id"] = vuln.get("id")
 
-        # Enrichment is best-effort and advisory-order independent: backfill any
-        # missing field from ANOTHER advisory for the same canonical CVE. This
-        # used to be gated on the `details` replacement above, which silently
-        # dropped enrichment carried only by a shorter advisory (e.g. a GHSA
-        # entry's cwe_ids sitting next to a longer PYSEC description) — leaving
-        # `cwe_ids` empty even though the OSV output classified the CVE.
+        # Enrichment is best-effort: backfill any missing field from ANY
+        # advisory for this canonical CVE — never gate it on the `details`
+        # replacement above, so a field carried only by a shorter advisory
+        # (e.g. a GHSA entry's cwe_ids) is not silently dropped.
         if not record.get("fixed_version"):
             record["fixed_version"] = extract_fixed_version(vuln)
         if not record.get("cwe_ids"):
@@ -1848,6 +1785,19 @@ def cache(file: Path, action: str, content: dict = {}) -> Optional[dict]:
         logging.error(f"Unknown action: {action}")
 
 
+def _content_hash_cache(subdir: str, prefix: str, content: dict, result: Optional[dict] = None) -> Optional[dict]:
+    """Read (``result`` is None) or write one content-hash cache entry under
+    ``.cache/<subdir>/<prefix>_<md5(content)>.json``. Callers must keep the
+    hashed ``content`` payload byte-identical across stages so entries neither
+    miss spuriously nor collide."""
+    digest = hashlib.md5(json.dumps(content, sort_keys=True).encode()).hexdigest()
+    cache_file = settings.cache_dir / subdir / safe_cache_filename(f"{prefix}_{digest}.json")
+    if result is None:
+        return cache(cache_file, "read")
+    cache(cache_file, "write", result)
+    return None
+
+
 def cache_reviewer(node_id: str, report: dict, updated_vuln: Optional[dict] = None) -> Optional[dict]:
     """Read (``updated_vuln`` is None) or write a reviewer outcome cache entry.
 
@@ -1855,12 +1805,7 @@ def cache_reviewer(node_id: str, report: dict, updated_vuln: Optional[dict] = No
     ``submit_evaluation`` path and the loop-fallback path so both land in the
     same ``.cache/reviewer/`` namespace.
     """
-    report_hash = hashlib.md5(json.dumps(report, sort_keys=True).encode()).hexdigest()
-    cache_file = settings.cache_dir / "reviewer" / safe_cache_filename(f"{node_id}_{report_hash}.json")
-    if updated_vuln is None:
-        return cache(cache_file, "read")
-    cache(cache_file, "write", updated_vuln)
-    return None
+    return _content_hash_cache("reviewer", node_id, report, updated_vuln)
 
 
 def cache_validator(report: dict, peer_payloads: Optional[list] = None, updated_vuln: Optional[dict] = None) -> Optional[dict]:
@@ -1879,13 +1824,9 @@ def cache_validator(report: dict, peer_payloads: Optional[list] = None, updated_
         (p for p in (peer_payloads or []) if isinstance(p, dict)),
         key=lambda p: p.get("vuln_id", ""),
     )
-    content = {"report": report, "peer_payloads": peers}
-    report_hash = hashlib.md5(json.dumps(content, sort_keys=True).encode()).hexdigest()
-    cache_file = settings.cache_dir / "validator" / safe_cache_filename(f"{vuln_id}_{report_hash}.json")
-    if updated_vuln is None:
-        return cache(cache_file, "read")
-    cache(cache_file, "write", updated_vuln)
-    return None
+    return _content_hash_cache(
+        "validator", vuln_id, {"report": report, "peer_payloads": peers}, updated_vuln
+    )
 
 
 def cache_integration_auditor(report: dict, peers: Optional[list] = None, updated_vuln: Optional[dict] = None) -> Optional[dict]:
@@ -1902,15 +1843,9 @@ def cache_integration_auditor(report: dict, peers: Optional[list] = None, update
         (p for p in (peers or []) if isinstance(p, dict)),
         key=lambda p: p.get("vuln_id", ""),
     )
-    content = {"report": report, "confirmed_vulns": peers_sorted}
-    report_hash = hashlib.md5(json.dumps(content, sort_keys=True).encode()).hexdigest()
-    cache_file = (
-        settings.cache_dir / "integration_auditor" / safe_cache_filename(f"{vuln_id}_{report_hash}.json")
+    return _content_hash_cache(
+        "integration_auditor", vuln_id, {"report": report, "confirmed_vulns": peers_sorted}, updated_vuln
     )
-    if updated_vuln is None:
-        return cache(cache_file, "read")
-    cache(cache_file, "write", updated_vuln)
-    return None
 
 
 def cache_reporter(report: dict, finding: Optional[dict] = None) -> Optional[dict]:
@@ -1921,15 +1856,13 @@ def cache_reporter(report: dict, finding: Optional[dict] = None) -> Optional[dic
     entry). The reporter runs once per vulnerability, so one cache file per
     record. A hit returns the stored ``ReporterFinding`` dict.
     """
-    report_hash = hashlib.md5(json.dumps(report or {}, sort_keys=True).encode()).hexdigest()
     vuln_id = (report or {}).get("vuln_id") or "Unknown"
-    cache_file = settings.cache_dir / "reporter" / safe_cache_filename(f"{vuln_id}_{report_hash}.json")
     if finding is None:
-        cached = cache(cache_file, "read")
+        cached = _content_hash_cache("reporter", vuln_id, report or {}, None)
         if isinstance(cached, dict) and isinstance(cached.get("finding"), dict):
             return cached["finding"]
         return None
-    cache(cache_file, "write", {"finding": finding})
+    _content_hash_cache("reporter", vuln_id, report or {}, {"finding": finding})
     return None
 
 
@@ -2224,6 +2157,7 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
         # Reconstruction: Always return the ENTIRE file content now!
         start_boundary = 0
         end_boundary = len(source_bytes)
+        comment = grammar.get("comment", "//")
 
         result_chunks = []
         last_idx = start_boundary
@@ -2232,7 +2166,6 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
             if start_byte < start_boundary or end_byte > end_boundary:
                 continue
 
-            comment = AST_GRAMMAR_MAP.get(source_file.suffix, {}).get("comment", "//")
             result_chunks.append(source_bytes[last_idx:start_byte].decode("utf-8"))
             if reviewer_mode:
                 stripped_note = f"[Body omitted: use read_source_code with node_id '{child_id}' to read this content]"
@@ -2251,76 +2184,11 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
 
 
 # --- Node triage: decide if a graph node deserves LLM-based vulnerability scanning ---
-
-# tree-sitter node types indicating executable logic (function calls, imports,
-# string interpolation, control flow). Nodes exposing none of these are inert.
-SCAN_SIGNAL_TYPES: dict[str, set[str]] = {
-    ".py": {
-        "call", "import_statement", "import_from_statement",
-        "if_statement", "for_statement", "while_statement", "try_statement",
-        "with_statement", "match_statement", "interpolation",
-    },
-    ".js": {
-        "call_expression", "new_expression", "import_statement",
-        "if_statement", "for_statement", "while_statement", "switch_statement",
-        "try_statement", "template_substitution",
-    },
-    ".jsx": {
-        "call_expression", "new_expression", "import_statement",
-        "if_statement", "for_statement", "while_statement", "switch_statement",
-        "try_statement", "template_substitution",
-    },
-    ".ts": {
-        "call_expression", "new_expression", "import_statement",
-        "if_statement", "for_statement", "while_statement", "switch_statement",
-        "try_statement", "template_substitution",
-    },
-    ".tsx": {
-        "call_expression", "new_expression", "import_statement",
-        "if_statement", "for_statement", "while_statement", "switch_statement",
-        "try_statement", "template_substitution",
-    },
-    # .vue scripts parse with the TypeScript grammar, so they share its signals.
-    ".vue": {
-        "call_expression", "new_expression", "import_statement",
-        "if_statement", "for_statement", "while_statement", "switch_statement",
-        "try_statement", "template_substitution",
-    },
-    ".php": {
-        "function_call_expression", "member_call_expression", "scoped_call_expression",
-        "object_creation_expression", "namespace_use_declaration", "include_expression",
-        "include_once_expression", "require_expression", "require_once_expression",
-        "echo_statement", "if_statement", "for_statement", "foreach_statement",
-        "while_statement", "switch_statement", "try_statement", "encapsed_string",
-    },
-}
-
-# Import-like declarations are tolerated inside pure type/interface/config nodes
-# (they only bring names into scope and do not execute anything by themselves).
-_IMPORT_TYPES: dict[str, set[str]] = {
-    ".py": {"import_statement", "import_from_statement"},
-    ".js": {"import_statement"},
-    ".jsx": {"import_statement"},
-    ".ts": {"import_statement"},
-    ".tsx": {"import_statement"},
-    ".vue": {"import_statement"},
-    ".php": {"namespace_use_declaration"},
-}
-
-# Nodes that introduce callable/structured definitions (bodies, classes, types).
-_DEFINITION_TYPES: set[str] = {
-    "function_definition", "class_definition", "decorated_definition", "method_declaration",
-    "function_declaration", "class_declaration", "arrow_function", "method_definition",
-    "function_expression", "lambda", "interface_declaration", "type_alias_declaration",
-    "enum_declaration", "type_alias_statement",
-}
-
-# Node types whose names are security-relevant when used as assignment targets.
-_NAME_NODE_TYPES: set[str] = {
-    "assignment", "variable_declarator", "assignment_expression", "property_declaration",
-    "property_element", "public_field_definition", "property_signature", "pair",
-    "array_element_initializer",
-}
+#
+# All per-language node-type data this triage consumes (scan signals, import /
+# definition / name node types, magic methods, pure-type detection sets, and the
+# PHP fragment wrap) lives in languages.py; what follows is the generic
+# algorithm that reads those constants.
 
 _SECURITY_KEYWORDS: tuple[str, ...] = (
     "verify", "auth", "authenticate", "authorize", "permission", "secret", "token",
@@ -2331,21 +2199,6 @@ _SECURITY_KEYWORDS: tuple[str, ...] = (
 _CRITICAL_SUBSTRINGS: tuple[str, ...] = (
     "secret", "password", "passwd", "token", "credential", "privatekey", "apikey", "csrf",
 )
-
-_MAGIC_METHODS: dict[str, set[str]] = {
-    ".py": {
-        "__reduce__", "__reduce_ex__", "__setstate__", "__getstate__", "__getattr__",
-        "__setattr__", "__getattribute__", "__del__", "__delattr__", "__enter__",
-        "__exit__", "__new__", "__init__", "__call__", "__getitem__", "__setitem__",
-        "__repr__", "__str__",
-    },
-    ".php": {
-        "__construct", "__destruct", "__wakeup", "__sleep", "__call", "__callstatic",
-        "__get", "__set", "__isset", "__unset", "__tostring", "__invoke", "__set_state",
-        "__clone", "__debuginfo", "__serialize", "__unserialize",
-    },
-    ".js": set(), ".jsx": set(), ".ts": set(), ".tsx": set(),
-}
 
 
 def _walk(node: tree_sitter.Node):
@@ -2386,7 +2239,7 @@ def _has_security_names(root: tree_sitter.Node, label: str) -> bool:
         return True
 
     for n in _walk(root):
-        if n.type in _NAME_NODE_TYPES:
+        if n.type in NAME_NODE_TYPES:
             text = n.text.decode()
             text = re.split(r"[=:]", text, 1)[0]
             for tok in re.split(r"[^A-Za-z0-9_]+", text):
@@ -2430,13 +2283,13 @@ def _unwrap_root(root: tree_sitter.Node) -> tree_sitter.Node:
     detection applies. Files with many top-level definitions are left intact.
     """
     defs = [n for n in _walk(root)
-            if n.type in _DEFINITION_TYPES and n.type != "decorated_definition"]
+            if n.type in DEFINITION_TYPES and n.type != "decorated_definition"]
     return defs[0] if len(defs) == 1 else root
 
 
 def _is_empty_skeleton(root: tree_sitter.Node, ext: str) -> bool:
     node = _unwrap_root(root)
-    if node.type not in _DEFINITION_TYPES:
+    if node.type not in DEFINITION_TYPES:
         return False
     if node.type in ("interface_declaration", "type_alias_declaration", "enum_declaration", "type_alias_statement"):
         return False
@@ -2455,7 +2308,7 @@ def _has_substantive_docstring(root: tree_sitter.Node) -> bool:
 
 def _is_magic_method(label: str, ext: str) -> bool:
     n = label.lower().strip().strip("()")
-    return n in _MAGIC_METHODS.get(ext, set())
+    return n in MAGIC_METHODS.get(ext, set())
 
 
 def _has_field_defaults(root: tree_sitter.Node) -> bool:
@@ -2513,26 +2366,24 @@ def _class_is_field_only(class_node: tree_sitter.Node) -> bool:
 
 def _is_pure_type(root: tree_sitter.Node, ext: str) -> bool:
     signals = SCAN_SIGNAL_TYPES.get(ext, set())
-    imports = _IMPORT_TYPES.get(ext, set())
+    imports = IMPORT_TYPES.get(ext, set())
 
-    if ext in (".ts", ".tsx", ".js", ".jsx"):
-        type_constructs = {"type_alias_declaration", "interface_declaration", "enum_declaration"}
+    # Type-declaration branch (js/ts family): the node must declare types and
+    # hold nothing executable/definitional beyond imports.
+    type_constructs = PURE_TYPE_CONSTRUCTS.get(ext)
+    if type_constructs is not None:
         if not _has_node_type(root, type_constructs):
             return False
-        forbidden = (signals - imports) | {
-            "function_declaration", "class_declaration", "arrow_function",
-            "method_definition", "function_expression",
-            "assignment", "variable_declarator", "public_field_definition", "pair",
-        }
+        forbidden = (signals - imports) | PURE_TYPE_FORBIDDEN_TYPES.get(ext, set())
         return not _has_node_type(root, forbidden)
 
-    if ext == ".py":
-        behavioral = {"call", "if_statement", "for_statement", "while_statement",
-                      "try_statement", "with_statement", "match_statement",
-                      "interpolation", "function_definition", "lambda"}
+    # Python branch: no behavioral node at all, plus a type alias statement or
+    # a field-only (dataclass/pydantic shape) class.
+    behavioral = BEHAVIORAL_NODE_TYPES.get(ext)
+    if behavioral is not None:
         if _has_node_type(root, behavioral):
             return False
-        if _has_node_type(root, {"type_alias_statement"}):
+        if _has_node_type(root, TYPE_ALIAS_NODE_TYPES.get(ext, set())):
             return True
         for n in _walk(root):
             if n.type == "class_definition" and _class_is_field_only(n):
@@ -2542,15 +2393,19 @@ def _is_pure_type(root: tree_sitter.Node, ext: str) -> bool:
                     return True
         return False
 
+    # PHP branch: interfaces without runtime signals, or property-only classes.
     if ext == ".php":
-        runtime = signals - imports - {"namespace_use_declaration"}
-        if _has_node_type(root, {"interface_declaration"}):
+        # `signals - imports` === the old `signals - imports -
+        # {"namespace_use_declaration"}`: IMPORT_TYPES[".php"] is exactly that
+        # one node type.
+        runtime = signals - imports
+        if _has_node_type(root, PHP_INTERFACE_TYPES):
             return not _has_node_type(root, runtime)
         for n in _walk(root):
             if n.type == "class_declaration":
                 body = _body_of(n)
-                if body is not None and _has_node_type(n, {"property_declaration"}):
-                    if not _has_node_type(n, {"method_declaration", "function_definition"}):
+                if body is not None and _has_node_type(n, PHP_PROPERTY_TYPES):
+                    if not _has_node_type(n, PHP_METHOD_TYPES):
                         return True
         return False
 
@@ -2558,9 +2413,9 @@ def _is_pure_type(root: tree_sitter.Node, ext: str) -> bool:
 
 
 def _is_config_only(root: tree_sitter.Node, ext: str) -> bool:
-    if _has_node_type(root, _DEFINITION_TYPES):
+    if _has_node_type(root, DEFINITION_TYPES):
         return False
-    imports = _IMPORT_TYPES.get(ext, set())
+    imports = IMPORT_TYPES.get(ext, set())
     forbidden = SCAN_SIGNAL_TYPES.get(ext, set()) - imports
     if _has_node_type(root, forbidden):
         return False
@@ -2599,10 +2454,13 @@ def _node_code_is_worth_scanning(source_code: str, label: str, ext: str, min_sig
     if not lang or ext not in SCAN_SIGNAL_TYPES:
         return True
 
-    # PHP method/class raw fragments (as returned by get_node_code) omit the `<?php`
-    # tag, which tree-sitter needs to avoid parsing everything as plain text.
-    if ext == ".php" and not source_code.lstrip().startswith("<?"):
-        source_code = "<?php\n" + source_code
+    # Raw fragments of wrapped languages are re-prefixed before parsing (see
+    # languages.FRAGMENT_WRAP): PHP method/class fragments (as returned by
+    # get_node_code) omit the `<?php` tag, which tree-sitter needs to avoid
+    # parsing everything as plain text.
+    insert, detect = FRAGMENT_WRAP.get(ext, ("", ""))
+    if insert and not source_code.lstrip().startswith(detect):
+        source_code = insert + source_code
 
     try:
         tree = tree_sitter.Parser(lang).parse(source_code.encode("utf-8"))
@@ -2843,27 +2701,22 @@ def index_file(filepath: str | Path) -> list[dict]:
 
     symbol_index = {}
 
+    def _as_list(nodes):
+        return [nodes] if nodes and not isinstance(nodes, list) else nodes
+
     # Standardized extraction loop
     for match in matches:
         captures = match[1] 
 
         # Method captures
-        class_nodes = captures.get("class_name")
-        parent_nodes = captures.get("parent_class")
-        method_name_nodes = captures.get("method_name")
-        method_body_nodes = captures.get("method_body")
+        class_nodes = _as_list(captures.get("class_name"))
+        parent_nodes = _as_list(captures.get("parent_class"))
+        method_name_nodes = _as_list(captures.get("method_name"))
+        method_body_nodes = _as_list(captures.get("method_body"))
 
         # Function captures
-        function_name_nodes = captures.get("function_name")
-        function_body_nodes = captures.get("function_body")
-
-        # Normalize to lists
-        if class_nodes and not isinstance(class_nodes, list): class_nodes = [class_nodes]
-        if method_name_nodes and not isinstance(method_name_nodes, list): method_name_nodes = [method_name_nodes]
-        if method_body_nodes and not isinstance(method_body_nodes, list): method_body_nodes = [method_body_nodes]
-        if parent_nodes and not isinstance(parent_nodes, list): parent_nodes = [parent_nodes]
-        if function_name_nodes and not isinstance(function_name_nodes, list): function_name_nodes = [function_name_nodes]
-        if function_body_nodes and not isinstance(function_body_nodes, list): function_body_nodes = [function_body_nodes]
+        function_name_nodes = _as_list(captures.get("function_name"))
+        function_body_nodes = _as_list(captures.get("function_body"))
 
         # Scenario A: It's a class method
         if class_nodes and method_name_nodes and method_body_nodes:
