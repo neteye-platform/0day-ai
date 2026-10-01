@@ -1,4 +1,5 @@
 from collections import defaultdict
+import fnmatch
 import hashlib
 import logging
 import re
@@ -191,11 +192,18 @@ def load_code_corpus() -> dict[str, str]:
 
     corpus: dict[str, str] = {}
     for source_file in code_files:
+        if is_path_excluded(source_file):
+            continue
         content = read_file_text(source_file)
         if content is not None:
             corpus[source_file] = content
 
-    logging.debug(f"Code corpus: indexed {len(corpus)}/{len(code_files)} code files.")
+    included = len(corpus)
+    skipped = len(code_files) - included
+    logging.debug(
+        f"Code corpus: indexed {included}/{len(code_files)} code files "
+        f"({skipped} excluded by path filter)."
+    )
     return corpus
 
 
@@ -2300,6 +2308,97 @@ def _node_code_is_worth_scanning(source_code: str, label: str, ext: str, min_sig
 
     # Default: executable signal count (or a runtime validation wrapper)
     return _is_pydantic_like(root) or _count_signal_nodes(root, ext, min_signals) >= min_signals
+
+
+# --------------------------------------------------------------------------
+# File/path-level scan exclusion
+#
+# Complements the per-node code-signal filter ``is_node_worth_scanning`` with a
+# whole-path relevance gate: nodes/code whose ``source_file`` matches any of
+# these patterns are dropped before the expensive LLM stages (explorer fan-out,
+# CVE keyword corpus, contract verifier) and blocked from reviewer file reads.
+# This lets a full repo (including third-party trees, tests, docs) be scanned
+# without manually pruning non-relevant paths first.
+# --------------------------------------------------------------------------
+
+# Directory fragments dropped by default (matched as any path component).
+_DEFAULT_EXCLUDE_DIRS = {
+    # dependency / third-party install trees
+    "vendor", "node_modules", "third_party", "thirdparty", "external",
+    "site-packages", "bower_components",
+    # build / cache / VCS / tooling noise
+    ".git", ".cache", ".next", "dist", "build", "__pycache__", ".venv",
+    "venv", "env", "graphify-out", ".idea", ".vscode", ".gradle", "target",
+    # non-app-source trees the user typically trims by hand
+    "tests", "__tests__", "spec", "specs", "docs", ".github", ".gitlab",
+}
+
+# Basename globs dropped by default (docs + test files).
+_DEFAULT_EXCLUDE_NAME_GLOBS = (
+    "*.md", "*.markdown", "*.txt", "*.rst", "*.adoc", "*.rdoc",
+    "*.test.*", "*.spec.*", "test_*", "*_test.*", "*_spec.*",
+)
+
+
+def _parse_exclude_patterns(patterns: list[str]) -> tuple[set[str], list[str]]:
+    """Split ``scan_exclude_paths`` into (dir fragments, full-path globs).
+
+    A bare token (no '/' and no '*') is treated as a directory fragment to
+    match against any path component. Anything else is a fnmatch glob matched
+    against the relative path (trailing '/' expands to '/**').
+    """
+    dirs: set[str] = set()
+    globs: list[str] = []
+    for raw in patterns or []:
+        pat = raw.strip()
+        if not pat:
+            continue
+        if "/" not in pat and "*" not in pat:
+            dirs.add(pat)
+        else:
+            if pat.endswith("/"):
+                globs.append(pat + "**")
+            else:
+                globs.append(pat)
+    return dirs, globs
+
+
+def is_path_excluded(source_file: str) -> bool:
+    """Return True if ``source_file`` should be skipped during scanning.
+
+    Matching is relative to ``settings.app_path``. A path is excluded when any
+    of its components is a configured directory fragment, or its relative path
+    fnmatch-matches a configured glob, or its basename fnmatch-matches a
+    configured name glob. Honors the built-in defaults unless
+    ``settings.scan_exclude_defaults`` is False.
+    """
+    if not source_file:
+        return False
+
+    try:
+        rel = str(Path(source_file).resolve().relative_to(settings.app_path.resolve()))
+    except (ValueError, OSError):
+        rel = str(Path(source_file).as_posix())
+    rel_posix = rel
+    parts = Path(rel).parts
+    name = parts[-1] if parts else ""
+
+    user_dirs, user_globs = _parse_exclude_patterns(getattr(settings, "scan_exclude_paths", []))
+
+    dir_fragments = _DEFAULT_EXCLUDE_DIRS | user_dirs if getattr(settings, "scan_exclude_defaults", True) else user_dirs
+    if any(d in parts for d in dir_fragments):
+        return True
+
+    for pat in user_globs:
+        if fnmatch.fnmatch(rel_posix, pat):
+            return True
+
+    name_globs = _DEFAULT_EXCLUDE_NAME_GLOBS if getattr(settings, "scan_exclude_defaults", True) else ()
+    for pat in name_globs:
+        if fnmatch.fnmatch(name, pat):
+            return True
+
+    return False
 
 
 def is_node_worth_scanning(node_id: str, min_signals: int = 1) -> bool:

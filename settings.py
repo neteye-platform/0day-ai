@@ -145,6 +145,18 @@ docker_image_tag = None
 # None = all
 communities_to_analyze = None # [32, 33, 54, 61]
 
+# File/path-level scan exclusion. Nodes/code whose source_file matches any
+# pattern are skipped before the explorer/contract-verifier work, dropped from
+# the CVE keyword-corpus, and blocked from reviewer file reads (search_codebase,
+# read_file). This lets a full repo (including third-party trees, tests, docs)
+# be scanned without manually pruning non-relevant paths first. Bare directory
+# names ("vendor") and globs ("tests/*", "*.md", "**/migrations/*") are both
+# supported, matched relative to the app root.
+scan_exclude_paths = []          # e.g. ["tests/", "docs/api/*", "**/migrations/*"]
+# Auto-exclude well-known dependency/test/doc paths even when the list above is
+# empty. Set to False to rely solely on scan_exclude_paths.
+scan_exclude_defaults = True
+
 # When True, the explorer dispatches multiple small nodes sharing a file in a
 # single batch. Set to False to force one dispatch per node (no batching).
 explorer_batching_enabled = True

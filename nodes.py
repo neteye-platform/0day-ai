@@ -24,7 +24,7 @@ import browser_tools
 import attacker_tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState, IntegrationAuditorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, INTEGRATION_AUDITOR_AGENT, cwes
-from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, reviewer_cache_key
+from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, is_path_excluded, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, reviewer_cache_key
 from tool_loop import CompactionConfig, ToolLoopAgent
 
 
@@ -152,6 +152,10 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
     # Recursively find all files in the application directory
     for filepath in settings.app_path.rglob("*"):
         if filepath.is_file():
+            # Skip files in excluded paths (dependency trees, tests, docs) so
+            # the AST symbol index stays focused on scannable application code.
+            if is_path_excluded(str(filepath)):
+                continue
             # Quick check to avoid passing irrelevant files (like images or binaries)
             if filepath.suffix.lower() in SYMBOL_QUERIES:
                 try:
@@ -319,6 +323,14 @@ def dispatch_explorers(state: MasterState):
             if not is_node_worth_scanning(node_id):
                 skipped_nodes += 1
                 logging.debug(f"Skipping inert node {node_id} (no executable signals).")
+                continue
+
+            # Drop nodes whose source file lives in an excluded path
+            # (dependency trees, tests, docs) before spending LLM budget on it.
+            source_file = node_data.get("source_file", "")
+            if is_path_excluded(source_file):
+                skipped_nodes += 1
+                logging.debug(f"Skipping excluded-path node {node_id} ({source_file}).")
                 continue
 
             files[node_data.get("source_file", "")].append(node_id)
@@ -1375,7 +1387,16 @@ def dispatch_verifiers(state: MasterState):
     commands: list[Send] = []
     progress_id = uuid.uuid4().hex
 
+    graph_data = get_cached_graph_data(settings.graph)
+    node_source_map = {n.get("id"): n.get("source_file") for n in graph_data.get("nodes", [])}
+
     for target_node_id, demands_list in grouped_demands.items():
+        # Skip demands whose target node lives in an excluded path (dependency
+        # trees, tests, docs) — nothing to verify there.
+        if is_path_excluded(node_source_map.get(target_node_id) or ""):
+            logging.debug(f"Skipping contract verification of excluded-path node {target_node_id}.")
+            continue
+
         target_code = get_node_code(target_node_id)
 
         # If we don't have code (e.g., it's a 3rd party library), skip it

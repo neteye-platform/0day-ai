@@ -12,7 +12,7 @@ import re
 import networkx as nx
 
 from schemas import EvaluationToolInput, ValidationToolInput, AskForContextInput, IntegrationAuditInput, VulnerabilityDetailsInput, cwes
-from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer, reviewer_cache_key
+from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer, reviewer_cache_key, is_path_excluded
 from languages import MANIFEST_NAMES
 import settings
 import browser_tools
@@ -126,6 +126,12 @@ def read_file(file_path: str, start_line: int = 1, end_line: int | None = None) 
         return (
             f"Error: '{file_path}' resolves to '{target}', which is outside the "
             f"application directory '{app_dir}'. Only files within the app are readable."
+        )
+
+    if is_path_excluded(file_path):
+        return (
+            f"Error: '{file_path}' is in an excluded scan path (dependency trees, "
+            f"tests, or docs). It is not part of the analyzed application surface."
         )
 
     if not target.is_file():
@@ -815,6 +821,14 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState], regex: 
         if any((part.startswith('.') and not part.startswith('..')) or \
             part in ['venv', '__pycache__', 'node_modules', 'graphify-out'] for part in file_path.parts) or \
             not file_path.is_file():
+            continue
+        # Respect the scan path-exclusion filter so the reviewer never spends
+        # tokens roaming into dependency trees, tests, or docs.
+        try:
+            rel = str(file_path.relative_to(app_dir))
+        except ValueError:
+            rel = str(file_path)
+        if is_path_excluded(rel):
             continue
 
         try:
