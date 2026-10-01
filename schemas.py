@@ -67,7 +67,7 @@ class VulnerabilityRecord(BaseModel):
     vuln_id: Optional[str] = None
 
     # Lifecycle tracking
-    status: Literal["hypothesis", "unreachable", "confirmed", "exploitable", "false_positive"] = "hypothesis"
+    status: Literal["hypothesis", "unreachable", "confirmed", "exploitable", "false_positive", "review_error"] = "hypothesis"
 
     # Core details (from Explorer/Verifier)
     node_id: str

@@ -14,6 +14,13 @@ ollama_base_url = "http://localhost:11434"
 # Concurrency
 simple_agents_concurrency = 1
 
+# Tool-loop guards for the compiled reviewer/validator subgraphs. If the model
+# never calls submit_evaluation / mark_validation_complete within this many LLM
+# rounds, the loop terminates gracefully via the fallback node instead of
+# crashing on the LangGraph recursion limit.
+reviewer_max_iterations = 10
+validator_max_iterations = 15
+
 
 graph = app_path / "graphify-out" / "graph.json"
 cache_dir = app_path / ".cache"

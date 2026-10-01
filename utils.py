@@ -290,6 +290,7 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
 
     status_priority = {
         "hypothesis": 0,
+        "review_error": 1,
         "unreachable": 1,
         "confirmed": 2,
         "false_positive": 3,
@@ -1477,6 +1478,21 @@ def cache(file: Path, action: str, content: dict = {}) -> Optional[dict]:
 
     else:
         logging.error(f"Unknown action: {action}")
+
+
+def cache_reviewer(node_id: str, report: dict, updated_vuln: Optional[dict] = None) -> Optional[dict]:
+    """Read (``updated_vuln`` is None) or write a reviewer outcome cache entry.
+
+    Keyed by (node_id, report content hash); shared by the normal
+    ``submit_evaluation`` path and the loop-fallback path so both land in the
+    same ``.cache/reviewer/`` namespace.
+    """
+    report_hash = hashlib.md5(json.dumps(report, sort_keys=True).encode()).hexdigest()
+    cache_file = settings.cache_dir / "reviewer" / f"{node_id}_{report_hash}.json"
+    if updated_vuln is None:
+        return cache(cache_file, "read")
+    cache(cache_file, "write", updated_vuln)
+    return None
 
 
 def _extract_namespace_aliases(source_file: str, target_namespace: str) -> Optional[set[str]]:
