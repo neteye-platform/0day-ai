@@ -1,6 +1,6 @@
 import operator
 from pathlib import Path
-from typing import TypedDict, Any, Annotated
+from typing import TypedDict, Any, Annotated, Optional
 from langgraph.graph.message import add_messages
 from schemas import AnalysisNote, ExpertTask, ValidationResult, VulnerabilityEvaluation, VulnerabilityRecord
 from utils import merge_vulnerabilities
@@ -9,6 +9,11 @@ from utils import merge_vulnerabilities
 class MasterState(TypedDict):
     known_vulns: list[dict]
     expert_tasks: list[ExpertTask]
+
+    # Container runtime data, populated by the preprocessor after it starts the
+    # built image in the background. None when no sandbox could be started.
+    sandbox_url: Optional[str]
+    container_name: Optional[str]
 
     notes: Annotated[list[AnalysisNote], operator.add]
     cve_demands: Annotated[list[dict], operator.add]
@@ -37,7 +42,8 @@ class ReviewerState(TypedDict):
 
 class ValidatorState(TypedDict):
     report_to_test: dict # The specific vulnerability to validate
-    sandbox_url: str     # The endpoint/IP of the sandbox
+    sandbox_url: Optional[str]     # The endpoint/IP of the sandbox
+    container_name: Optional[str]  # The running sandbox container
     cookies: dict
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
     messages: Annotated[list, add_messages]

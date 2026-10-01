@@ -6,6 +6,8 @@ import tree_sitter
 import subprocess
 import networkx as nx
 import json
+import time
+import requests
 from typing import Any, Optional
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AnyMessage, AIMessage
 from schemas import VulnerabilityRecord
@@ -463,6 +465,129 @@ def build_images(kind: str, path: Path, tag: str) -> list[str]:
     except FileNotFoundError:
         print("Error: docker is not installed or not in PATH.")
         return []
+
+
+SANDBOX_START_TIMEOUT = 30  # seconds to wait for a sandbox HTTP port to come up
+
+
+def _published_ports(container_name: str) -> list[int]:
+    """Return the host ports published by a container via `docker port`."""
+    try:
+        result = subprocess.run(
+            ["docker", "port", container_name],
+            capture_output=True,
+            text=True
+        )
+    except FileNotFoundError:
+        return []
+
+    ports = []
+    for line in result.stdout.splitlines():
+        # Format: "8080/tcp -> 0.0.0.0:32768" (or IPv6 "[::]:32768")
+        if "->" in line:
+            host = line.split("->", 1)[1].strip()
+            port = host.rsplit(":", 1)[-1]
+            if port.isdigit():
+                ports.append(int(port))
+    return ports
+
+
+def _probe_http_ports(ports: list[int]) -> str | None:
+    """Wait up to ``SANDBOX_START_TIMEOUT`` for any candidate host port to
+    answer an HTTP request. Returns the first responsive ``http://127.0.0.1:<port>``
+    URL or ``None`` if none ever responds."""
+    deadline = time.monotonic() + SANDBOX_START_TIMEOUT
+    remaining_ports = list(ports)
+
+    while remaining_ports:
+        if time.monotonic() >= deadline:
+            break
+        next_ports = []
+        for port in remaining_ports:
+            try:
+                requests.get(f"http://127.0.0.1:{port}", timeout=1)
+                return f"http://127.0.0.1:{port}"
+            except requests.RequestException:
+                next_ports.append(port)
+        remaining_ports = next_ports
+        time.sleep(1)
+    return None
+
+
+def start_sandbox(kind: str, path: Path, tag: str, app_name: str) -> dict | None:
+    """Start the built container image(s) in the background and return runtime data.
+
+    Detaches the container(s) (compose: ``up -d``; Dockerfile: ``docker run -d -P``),
+    discovers the published host ports, and waits for one of them to answer HTTP.
+
+    Returns ``{"container_name": str, "sandbox_url": str}`` pointing at the first
+    HTTP-responsive container (for compose that is the app service, not a DB sidecar),
+    or ``None`` with a logged warning on any failure. Never raises.
+    """
+    try:
+        if kind == "compose":
+            up = subprocess.run(
+                ["docker", "compose", "-f", str(path), "up", "-d"],
+                capture_output=True,
+                text=True
+            )
+            if up.returncode != 0:
+                logging.error(f"docker compose up failed: {up.stderr}")
+                return None
+
+            ps = subprocess.run(
+                ["docker", "compose", "-f", str(path), "ps", "--format", "json"],
+                capture_output=True,
+                text=True
+            )
+            if ps.returncode != 0:
+                logging.error(f"docker compose ps failed: {ps.stderr}")
+                return None
+
+            containers = []
+            for line in ps.stdout.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if entry.get("State") == "running":
+                        containers.append(entry.get("Name", ""))
+                except json.JSONDecodeError:
+                    continue
+            containers = [c for c in containers if c]
+            if not containers:
+                logging.error("docker compose up started no running containers.")
+                return None
+        else:
+            name = f"vulnscan-{app_name}"
+            # Remove any stale container from a previous run
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+            run = subprocess.run(
+                ["docker", "run", "-d", "-P", "--name", name, tag],
+                capture_output=True,
+                text=True
+            )
+            if run.returncode != 0:
+                logging.error(f"docker run failed: {run.stderr}")
+                return None
+            containers = [name]
+
+        # Prefer the container that publishes a responsive HTTP port
+        for container in containers:
+            url = _probe_http_ports(_published_ports(container))
+            if url:
+                logging.info(f"Sandbox running: container={container} url={url}")
+                return {"container_name": container, "sandbox_url": url}
+
+        logging.warning(
+            "Sandbox container(s) started but none published a responsive HTTP port "
+            f"({containers}). Validator tools will report no sandbox configured."
+        )
+        return None
+
+    except FileNotFoundError:
+        print("Error: docker is not installed or not in PATH.")
+        return None
 
 
 def run_osv_scanner_image(image: str) -> list[dict]:
