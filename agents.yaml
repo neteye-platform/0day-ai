@@ -121,15 +121,13 @@ expert_agents:
 
     Evaluation Rules:
     1. Direct Hypotheses (`vulns`): Emit ONLY if:
-       - An unvalidated input flows directly into a dangerous sink (exec, raw SQL, file write/read, eval) within this snippet.
+       - An unvalidated input flows directly into a dangerous sink (exec, raw SQL, file write/read, eval, HTTP request dispatch/SSRF) within this snippet.
        - The snippet directly verifies credentials, tokens, or MFA/OTP codes without recording or checking failed attempt limits (CWE-307).
        For all other issues, emit upstream or downstream contracts.
-       EVERY `vulns` entry MUST carry a one-to-two-sentence `description` naming the untrusted input, the exact sink call or omitted security control (e.g. `$db->query($sql)`, `unlink($fullpath)`, the absent failed-attempt counter), and the missing guard — downstream agents act on that text alone and never see your reasoning; a `description` that merely repeats the parameter name, a function name, or the CWE title (\"SQL Injection\") is invalid.
     2. Upstream Contracts: Demand caller validation ONLY for parameters flowing into operational sinks. Do not demand validation for internal IDs, booleans, or strongly-typed entities.
-       - `target` form is exactly one of: the literal parameter/context name (e.g. `$id`, `order_id`, `req.query.ws`) — delivered to every caller of the analyzed node — or the exact call form of one member defined inside it (e.g. `Session::validateCSRF($data)`) — delivered only to callers that invoke that member.
     3. Downstream Contracts: Emit when delegating security-critical logic (authorization, rate-limiting, persistence).
-       - `target` MUST name a first-party callee in the exact form written at the call site (`Class::method`, `Class::getInstance()->method`, or the receiver as written); attribute a method to the class the call itself names, never to a parent you assume defines it.
-       - NEVER target language built-ins/stdlib functions, third-party/vendor classes, or dynamic/template names. Attach such expectations to a contract on the enclosing member or the relevant parameter instead.
+       - Attribute callees exactly as written at the call site; never invent parent classes or modules.
+       - NEVER target language built-ins, standard libraries, or dynamic expressions. Attach such expectations to the enclosing member or parameter instead.
 
     ALLOWED CWE LIST:
     CWE-22: Path Traversal
@@ -196,12 +194,13 @@ expert_agents:
         ],
         "downstream": [
           {
-            "target": "workspaceService::getWorkspaceDetails",
+            "target": "getWorkspaceDetails",
             "description": "Must ensure workspaceId conforms to canonical identifier format and enforce isolation boundaries."
           }
         ],
         "vulns": []
       }
+
   LogicFlowAuditor:
     prompt: |
       Focus on state machine invariants, temporal ordering, idempotency, and decision predicate integrity. Extract contracts ensuring state transitions and sensitive decisions enforce attempt quotas, concurrency locks, replay prevention, and valid prerequisite states.
@@ -223,23 +222,24 @@ expert_agents:
         "upstream": [
           {
             "target": "session",
-            "description": "Session object must be authenticated and cryptographically signed."
-          }
-        ],
-        "downstream": [
+            "description": "Session object must be authenticated, integrity-checked, and bound to a valid pending transfer."
+          },
           {
             "target": "confirm_transfer_pin",
-            "description": "Caller or storage layer must record consecutive failed attempts and apply lockout/throttling across requests (CWE-307)."
+            "description": "Callers must track failed authentication attempts and throttle or lock out requests after repeated failures."
           }
         ],
+        "downstream": [],
         "vulns": [
           {
             "cwe": "CWE-307",
-            "component": "confirm_transfer_pin validates sensitive PIN data without recording failed attempts or tracking attempt state, permitting unrestricted brute-force enumeration.",
+            "component": "submitted_pin verification",
+            "description": "submitted_pin is verified via hmac.compare_digest without checking or updating an attempt counter, allowing offline or brute-force PIN guessing.",
             "pattern_label": "missing pin rate limiting"
           }
         ]
       }
+
   DataPersistenceAuditor:
     prompt: |
       Focus on persistence boundaries, transaction isolation, and query construction. Extract contracts requiring strict tenant scoping, bind parameters on dynamic lookups, and atomic consistency during multi-record mutations.
@@ -259,12 +259,13 @@ expert_agents:
         "upstream": [
           {
             "target": "order_id",
-            "description": "Must be verified against the current user identity/account scope to prevent horizontal authorization bypass (CWE-639)."
+            "description": "Must be verified against the current user identity or tenant scope to prevent horizontal authorization bypass (CWE-639)."
           }
         ],
         "downstream": [],
         "vulns": []
       }
+
   InfraConfigAuditor:
     prompt: |
       Focus on operating system boundaries, process execution, filesystem operations, and runtime configuration. Extract contracts ensuring deterministic path resolution, strict argument vectorization, and safe deserialization boundaries.
@@ -289,14 +290,15 @@ expert_agents:
         "upstream": [
           {
             "target": "targetDirectory",
-            "description": "Must be checked against base directory to prevent path traversal outside /var/data/unpacked."
+            "description": "Must be validated to prevent directory traversal outside /var/data/unpacked before resolution."
           }
         ],
         "downstream": [],
         "vulns": [
           {
             "cwe": "CWE-78",
-            "component": "uploadPath is concatenated directly into a shell execution string passed to exec(), permitting arbitrary command injection if the filename contains shell metacharacters.",
+            "component": "uploadPath",
+            "description": "uploadPath is concatenated directly into a shell command string passed to exec(), allowing arbitrary command injection via shell metacharacters.",
             "pattern_label": null
           }
         ]

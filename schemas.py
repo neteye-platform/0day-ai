@@ -546,11 +546,15 @@ class PatcherOutput(BaseModel):
     vulnerabilities: list[VulnerabilityRecord]
 
 class UpstreamDemand(BaseModel):
-    target: str = Field(description="Parameter or context variable requiring upstream restriction.")
+    target: str = Field(
+        description="Target parameter name (e.g. '$id', 'order_id') or member call form defined in this node."
+    )
     description: str = Field(description="The security invariant required of the caller.")
 
 class DownstreamDemand(BaseModel):
-    target: str = Field(description="External symbol or route called (format: 'module::symbol').")
+    target: str = Field(
+        description="First-party callee in the exact form written at the call site (e.g., 'Class::method' or 'function_name')."
+    )
     description: str = Field(description="The security requirement the callee must enforce.")
 
 class Hypothesis(BaseModel):
@@ -668,11 +672,11 @@ CVSS_V31_BASE_EXAMPLES = (
 
 class EvaluationToolInput(BaseModel):
     reasoning: str = Field(
-        description="Brief technical explanation for the decision."
+        description="THINKING SPACE. Freely reason through the evidence you gathered, the code you traced, and the defenses present before committing to a final verdict below."
     )
     mitigation_bypass: Optional[str] = Field(
         default=None,
-        description="Optionally describe how an attacker bypasses the defenses or can abuse the application logic. Optional — do NOT set it to justify a false positive; the blocking defense goes in `mitigation`."
+        description="Optionally describe how an attacker bypasses the defenses or can abuse the application logic. Do NOT set it to justify a false positive; the blocking defense goes in `mitigation`."
     )
     untrusted_uses: Optional[list[str]] = Field(
         default=None,

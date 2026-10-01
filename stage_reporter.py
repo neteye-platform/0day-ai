@@ -1,5 +1,7 @@
 """Reporter stage: single-shot per-vulnerability findings + final timestamped
-report directory (report.pdf + bundled poc/ scripts) assembly."""
+report directory assembly: a main report.pdf (header, statistics, token usage,
+glance table) plus one self-contained PDF per finding under findings/ (each
+with its own poc/ and patches/ bundles)."""
 
 import logging
 import re
@@ -339,10 +341,53 @@ def _step_block(index: int, step: str) -> list[str]:
     return out
 
 
+def _ranked_rows(records: list[dict], findings_by_id: dict[str, dict]) -> list[tuple]:
+    """(record, finding, vector, score, label) per reportable record,
+    severity-ranked: highest CVSS first, then vuln_id for stability. The rank
+    index also names every finding's report folder, so the main table's
+    numbering and the findings/<NN>_ directory names never disagree."""
+    rows = []
+    for record in records:
+        finding = findings_by_id.get(record.get("vuln_id")) or {}
+        score, vector, label = _assessment_for(finding, record)
+        rows.append((record, finding, vector, score, label))
+    rows.sort(key=lambda r: (r[3] is None, -(r[3] or 0.0), r[0].get("vuln_id", "")))
+    return rows
+
+
+def _vuln_slug(vuln_id: str) -> str:
+    """Filesystem-safe id slug, capped so paths never overflow a PDF page."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(vuln_id or "")).strip("_")[:60].strip("_")
+    return slug or "finding"
+
+
+def _finding_folder(index: int, vuln_id: str) -> str:
+    return f"{index:02d}_{_vuln_slug(vuln_id)}"
+
+
+# Inline embedding caps for the finding PDFs: a PoC script or patch diff is
+# reproduced inside the PDF only when it stays small AND its longest line
+# cannot overflow the typeset page; anything bigger stays a separate file.
+_INLINE_MAX_LINES = 20
+_INLINE_MAX_LINE_CHARS = 90
+
+
+def _fits_inline(text: str) -> bool:
+    lines = text.splitlines()
+    return (
+        0 < len(lines) <= _INLINE_MAX_LINES
+        and all(len(line) <= _INLINE_MAX_LINE_CHARS for line in lines)
+        and "```" not in text
+    )
+
+
 def _patch_section_lines(record: dict, patch_file: str | None) -> list[str]:
     """Deterministic `#### Proposed fix` block for the patch lifecycle: the
     banked summary/diff plus a verification line derived ONLY from the record's
-    final status (never reinterpreted by any LLM)."""
+    final status (never reinterpreted by any LLM). The diff is reproduced
+    inline only when it fits the PDF caps (_fits_inline); otherwise the bundled
+    patches/ file is referenced (and embedded as a fail-open when bundling
+    failed and no file exists)."""
     diff = record.get("patch_diff")
     if not diff:
         if record.get("patch_state") == "failed":
@@ -383,35 +428,35 @@ def _patch_section_lines(record: dict, patch_file: str | None) -> list[str]:
     ]
     if record.get("patched_files"):
         lines.append(f"**Files changed:** {', '.join(record['patched_files'])}  ")
-    if patch_file:
-        lines.append(f"**Patch file:** `patches/{patch_file}`  ")
-    files = ", ".join(record.get("patched_files") or []) or "n/a"
-    lines += ["", f"```diff\n# {files}\n{str(diff).rstrip()}\n```"]
+    # The finding PDF's metadata block already lists `patches/<file>`; the
+    # too-long fallback below still names it.
+    diff_text = str(diff).rstrip()
+    if _fits_inline(diff_text) or not patch_file:
+        files = ", ".join(record.get("patched_files") or []) or "n/a"
+        lines += ["", f"```diff\n# {files}\n{diff_text}\n```"]
+    else:
+        lines += ["", f"_The diff is too long to reproduce here; it is bundled as `patches/{patch_file}`._"]
     return lines
 
 
-def _render_report_markdown(
-    records: list[dict],
-    findings_by_id: dict[str, dict],
-    statistics: str | None = None,
-    poc_files: dict[str, str] | None = None,
-    patch_files: dict[str, str] | None = None,
-) -> str:
-    """Assemble the report markdown (summary + rewritten steps) that
-    _write_report renders to PDF. poc_files maps vuln_id -> the PoC script
-    filename _copy_poc_scripts delivered into <report_dir>/poc/. Raw
-    description/reviewer_reasoning/poc_payload/execution_logs are deliberately
-    NOT written out — the reporter distilled them."""
-    rows = []
-    for record in records:
-        finding = findings_by_id.get(record.get("vuln_id")) or {}
-        score, vector, label = _assessment_for(finding, record)
-        rows.append((record, finding, vector, score, label))
-    # Severity rank: highest CVSS score first, then vuln_id for stability.
-    rows.sort(
-        key=lambda r: (r[3] is None, -(r[3] or 0.0), r[0].get("vuln_id", "")),
-    )
+def _display_title(finding: dict, record: dict) -> str:
+    """Section/glance heading: the reporter's title, falling back to the raw
+    vuln_id with underscores spaced out — the id's underscore-only runs are
+    otherwise unbreakable tokens that can stretch the glance table past the
+    page width (weasyprint then clips columns and misfragments the table)."""
+    title = str(finding.get("title") or "").strip()
+    return title or str(record.get("vuln_id", "Unknown")).replace("_", " ")
 
+
+def _render_main_report(rows: list[tuple], statistics: str | None = None) -> str:
+    """Assemble the MAIN report markdown: header counts, statistics, token
+    usage and the glance table — NO per-finding detail sections. Every finding
+    is documented in its own PDF under findings/ (each self-contained: its own
+    poc/ and patches/ bundles), referenced from the table's Report column.
+    Rows come from _ranked_rows so numbering matches the finding folders. Raw
+    description/reviewer_reasoning/poc_payload/execution_logs are deliberately
+    NOT written out — the reporter distilled them into the finding PDFs."""
+    records = [r[0] for r in rows]
     exploitable = sum(1 for r in records if r.get("status") == "exploitable")
     patched_verified = sum(
         1 for r in records
@@ -452,74 +497,107 @@ def _render_report_markdown(
     lines += [
         "## Findings at a Glance",
         "",
-        "| # | Title | Vulnerability ID | CWE | CVSS v3.1 | Severity |",
-        "|---|-------|------------------|-----|-----------|----------|",
+        "_Every finding is documented in detail in its own report — see the Report column._",
+        "",
+        "| # | Title | CWE | CVSS v3.1 | Severity | Report |",
+        "|---|-------|-----|-----------|----------|--------|",
     ]
-    for i, (record, finding, vector, score, label) in enumerate(rows, 1):
+    for i, (record, finding, _vector, score, label) in enumerate(rows, 1):
         cwe = record.get("cwe_id", "OTHER_UNCATEGORIZED")
         score_str = f"{score:.1f}" if score is not None else "N/A"
-        title = str(finding.get("title") or "").strip() or record.get("vuln_id", "Unknown")
+        title = _display_title(finding, record)
+        # Display-only abbreviation: a full slug is an unbreakable ~80-char
+        # code token and would stretch the table past the page (cf. the
+        # no-overflow-wrap CSS note); the real folder keeps the full name.
+        folder = _finding_folder(i, record.get("vuln_id", ""))
+        shown = folder if len(folder) <= 28 else folder[:24] + "…"
         lines.append(
-            f"| {i} | {title.replace('|', chr(92) + '|')} | `{record.get('vuln_id', 'Unknown')}` "
-            f"| {cwe} | {score_str} | {label} |"
+            f"| {i} | {title.replace('|', chr(92) + '|')} | {cwe} | {score_str} | {label} "
+            f"| `findings/{shown}/report.pdf` |"
         )
+    return "\n".join(lines).rstrip() + "\n"
 
-    lines += ["", "## Findings", ""]
-    for i, (record, finding, vector, score, label) in enumerate(rows, 1):
-        cwe = record.get("cwe_id", "OTHER_UNCATEGORIZED")
-        cwe_desc = cwes.get(cwe, "")
-        score_str = f"{score:.1f}" if score is not None else "N/A"
-        title = str(finding.get("title") or "").strip() or record.get("vuln_id", "Unknown")
+
+def _render_finding_report(
+    record: dict,
+    finding: dict,
+    vector: str,
+    score: float | None,
+    label: str,
+    artifacts: dict,
+) -> str:
+    """Assemble ONE finding's standalone PDF markdown: metadata block, Summary
+    / Reproduction steps / Worst-case impact / Remediation, the bundled (and
+    inline when small enough) PoC script, and the Proposed fix section.
+    Artifacts come from _bundle_finding_artifacts."""
+    cwe = record.get("cwe_id", "OTHER_UNCATEGORIZED")
+    cwe_desc = cwes.get(cwe, "")
+    score_str = f"{score:.1f}" if score is not None else "N/A"
+    lines = [
+        f"# {_display_title(finding, record)}",
+        "",
+        f"_Vulnerability report for `{settings.app_path.name}` — scan overview: `../../report.pdf`._",
+        "",
+        f"- **Target application:** `{settings.app_path}`",
+        f"- **Generated:** {datetime.now().astimezone().isoformat(timespec='seconds')}",
+        f"- **ID:** `{record.get('vuln_id', 'Unknown')}`",
+        f"- **Severity:** {label}",
+        f"- **CVSS v3.1 base score:** {score_str}",
+        f"- **CVSS vector:** `{vector}`",
+        f"- **CWE:** {cwe}{f' — {cwe_desc}' if cwe_desc else ''}",
+        f"- **Type:** {record.get('vulnerability_type', 'Code Defect')}",
+    ]
+    affected = [n for n in (record.get("affected_nodes") or []) if n]
+    if affected:
+        lines.append(f"- **Affected nodes:** {', '.join(affected)}")
+    if record.get("source_cve"):
+        lines.append(f"- **Source CVE:** {record['source_cve']}")
+    if record.get("confidence_score") is not None:
+        lines.append(f"- **Audit confidence:** {record['confidence_score']}/10")
+    poc_file = artifacts.get("poc_file")
+    if poc_file:
+        lines.append(f"- **PoC script:** `poc/{poc_file}`")
+    if artifacts.get("patch_file"):
+        lines.append(f"- **Patch file:** `patches/{artifacts['patch_file']}`")
+    if _below_cvss_gate(record):
         lines += [
-            f"### {i}. {title}",
             "",
-            f"**ID:** `{record.get('vuln_id', 'Unknown')}`  ",
-            f"**Severity:** {label}  \n",
-            f"**CVSS v3.1 base score:** {score_str}  ",
-            f"**CVSS vector:** `{vector}`  ",
-            f"**CWE:** {cwe}{f' — {cwe_desc}' if cwe_desc else ''}",
-            f"**Type:** {record.get('vulnerability_type', 'Code Defect')}",
+            "**Validation:** not performed — the Reviewer's CVSS estimate fell below "
+            "the pipeline's validation gate, so this finding carries NO dynamic proof.  ",
         ]
-        affected = [n for n in (record.get("affected_nodes") or []) if n]
-        if affected:
-            lines.append(f"**Affected nodes:** {', '.join(affected)}")
-        if record.get("source_cve"):
-            lines.append(f"**Source CVE:** {record['source_cve']}")
-        if record.get("confidence_score") is not None:
-            lines.append(f"**Audit confidence:** {record['confidence_score']}/10")
-        poc_file = (poc_files or {}).get(record.get("vuln_id"))
-        if poc_file:
-            lines.append(f"**PoC script:** `poc/{poc_file}`")
-        if _below_cvss_gate(record):
-            lines.append(
-                "**Validation:** not performed — the Reviewer's CVSS estimate fell below "
-                "the pipeline's validation gate, so this finding carries NO dynamic proof.  "
-            )
 
-        summary = finding.get("summary") or record.get("description") or "_none_"
-        steps = finding.get("reproduction_steps") or record.get("reproduction_steps") or []
-        lines += ["", "#### Summary", "", str(summary).rstrip()]
-        lines += ["", "#### Reproduction steps", ""]
-        if steps:
-            for j, step in enumerate(steps, 1):
-                lines += _step_block(j, step)
-        else:
-            lines.append("_No reproduction steps available._")
-        lines += ["", "#### Worst-case impact", ""]
-        if finding.get("worst_case_scenario"):
-            lines.append(str(finding["worst_case_scenario"]).rstrip())
+    summary = finding.get("summary") or record.get("description") or "_none_"
+    steps = finding.get("reproduction_steps") or record.get("reproduction_steps") or []
+    lines += ["", "## Summary", "", str(summary).rstrip()]
+    lines += ["", "## Reproduction steps", ""]
+    if steps:
+        for j, step in enumerate(steps, 1):
+            lines += _step_block(j, step)
+    else:
+        lines.append("_No reproduction steps available._")
+    lines += ["", "## Worst-case impact", ""]
+    if finding.get("worst_case_scenario"):
+        lines.append(str(finding["worst_case_scenario"]).rstrip())
+    else:
+        lines.append("_The reporter produced no worst-case assessment for this finding._")
+    lines += ["", "## Remediation", ""]
+    if finding.get("remediation"):
+        lines.append(str(finding["remediation"]).rstrip())
+    else:
+        lines.append("_No remediation was provided._")
+    if poc_file:
+        lines += ["", "## PoC script", ""]
+        if artifacts.get("poc_inline"):
+            lines += [
+                f"_Reproduced below and bundled as `poc/{poc_file}`._", "",
+                "```", str(artifacts["poc_inline"]).rstrip(), "```",
+            ]
         else:
             lines.append(
-                "_The reporter produced no worst-case assessment for this finding._"
+                f"_Bundled alongside this report as `poc/{poc_file}` (too long to reproduce here)._"
             )
-        lines += ["", "#### Remediation", ""]
-        if finding.get("remediation"):
-            lines.append(str(finding["remediation"]).rstrip())
-        else:
-            lines.append("_No remediation was provided._")
-        lines += _patch_section_lines(record, (patch_files or {}).get(record.get("vuln_id")))
-        lines.append("")
-
+    lines += _patch_section_lines(record, artifacts.get("patch_file"))
+    lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -560,8 +638,12 @@ pre { background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 3px;
       padding: 2mm; white-space: pre-wrap; word-wrap: break-word; }
 pre code { background: none; padding: 0; }
 table { border-collapse: collapse; width: 100%; margin: 2mm 0; }
+/* No overflow-wrap on table cells: weasyprint 70 silently drops the
+   trailing rows of a paginated table when that property is set on them. */
 th, td { border: 1px solid #c9d1d9; padding: 1mm 2mm; text-align: left; }
 th { background: #eef2f5; }
+thead { display: table-header-group; }
+tr { break-inside: avoid; }
 blockquote { color: #555; border-left: 3px solid #d0d7de; margin-left: 0;
              padding-left: 3mm; }
 """
@@ -648,22 +730,24 @@ def reporter_node(state: ReporterState) -> dict:
     return {"reporter_findings": [finding]}
 
 
-def _copy_poc_scripts(records: list[dict], report_dir: Path) -> dict[str, str]:
-    """Bundle every reportable record's PoC script into <report_dir>/poc/ so the
-    human reader can run it next to the PDF.
+def _bundle_finding_artifacts(record: dict, finding_dir: Path) -> dict:
+    """Bundle ONE finding's PoC script and patch diff into ITS OWN folder
+    (<finding_dir>/poc/, <finding_dir>/patches/) so the finding directory and
+    its PDF are self-contained.
 
     Prefers the script bytes the validator staged under
     .cache/poc_scripts/<vuln_id>/<rel>; a record that declares poc_script whose
     staged file is missing gets its script rebuilt from the record's own
-    poc_payload text. Fails open per record. Returns vuln_id -> delivered
-    filename (rendered into the report as poc/<filename>)."""
-    files: dict[str, str] = {}
-    poc_dir = report_dir / "poc"
-    for record in records:
-        rel = str(record.get("poc_script") or "").strip().lstrip("/")
-        vuln_id = str(record.get("vuln_id") or "unknown")
-        if not rel or ".." in Path(rel).parts:
-            continue
+    poc_payload text. Fails open per artifact. Returns poc_file / poc_inline /
+    patch_file: the delivered filenames plus the PoC text when it fits the
+    in-report caps (_fits_inline) — rendered into the finding PDF as
+    poc/<filename> and patches/<filename> references."""
+    vuln_id = str(record.get("vuln_id") or "unknown")
+    slug = _vuln_slug(vuln_id)
+    artifacts: dict = {"poc_file": None, "poc_inline": None, "patch_file": None}
+
+    rel = str(record.get("poc_script") or "").strip().lstrip("/")
+    if rel and ".." not in Path(rel).parts:
         data: bytes | None = None
         try:
             staged = settings.cache_dir / "poc_scripts" / vuln_id / rel
@@ -673,56 +757,43 @@ def _copy_poc_scripts(records: list[dict], report_dir: Path) -> dict[str, str]:
             data = None
         if not data and record.get("poc_payload"):
             data = (str(record["poc_payload"]).rstrip() + "\n").encode()
-        if not data:
+        if data:
+            try:
+                poc_dir = finding_dir / "poc"
+                poc_dir.mkdir(parents=True, exist_ok=True)
+                name = f"{slug}{Path(rel).suffix or '.txt'}"
+                (poc_dir / name).write_bytes(data)
+                artifacts["poc_file"] = name
+                try:
+                    text = data.decode()
+                except UnicodeDecodeError:
+                    text = ""
+                if _fits_inline(text):
+                    artifacts["poc_inline"] = text.rstrip("\n")
+            except OSError as exc:
+                logging.warning(f"Reporter: could not bundle PoC script for {vuln_id}: {exc}")
+        else:
             logging.info(f"Reporter: no PoC script to bundle for {vuln_id}.")
-            continue
-        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", vuln_id).strip("_")
-        suffix = Path(rel).suffix or ".txt"
-        name, counter = f"{slug}{suffix}", 2
-        while name in files.values():
-            name = f"{slug}_{counter}{suffix}"
-            counter += 1
-        try:
-            poc_dir.mkdir(parents=True, exist_ok=True)
-            (poc_dir / name).write_bytes(data)
-        except OSError as exc:
-            logging.warning(f"Reporter: could not bundle PoC script for {vuln_id}: {exc}")
-            continue
-        files[vuln_id] = name
-    return files
 
-
-def _copy_patch_files(records: list[dict], report_dir: Path) -> dict[str, str]:
-    """Bundle every patched record's diff into <report_dir>/patches/<vuln_id>.patch
-    so the reader can `git apply`/`patch -p1` it. Mirrors _copy_poc_scripts'
-    fail-open and slug/collision conventions. Returns vuln_id -> filename."""
-    files: dict[str, str] = {}
-    patches_dir = report_dir / "patches"
-    for record in records:
-        diff = record.get("patch_diff")
-        if not diff:
-            continue
-        vuln_id = str(record.get("vuln_id") or "unknown")
-        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", vuln_id).strip("_")
-        name, counter = f"{slug}.patch", 2
-        while name in files.values():
-            name = f"{slug}_{counter}.patch"
-            counter += 1
+    diff = record.get("patch_diff")
+    if diff:
         try:
+            patches_dir = finding_dir / "patches"
             patches_dir.mkdir(parents=True, exist_ok=True)
+            name = f"{slug}.patch"
             (patches_dir / name).write_text(str(diff).rstrip() + "\n", encoding="utf-8")
+            artifacts["patch_file"] = name
         except OSError as exc:
             logging.warning(f"Reporter: could not bundle patch for {vuln_id}: {exc}")
-            continue
-        files[vuln_id] = name
-    return files
+    return artifacts
 
 
 def report_assembler_node(state: MasterState) -> dict:
     """Terminal barrier node: writes a FRESH timestamped report directory
-    (<target_app>/report_<YYYY-MM-DD_HHMMSS>/report.pdf + poc/ scripts),
-    severity-ranked, with deterministic CVSS scores and the statistics
-    section. Returns {}."""
+    (<target_app>/report_<YYYY-MM-DD_HHMMSS>/): a MAIN report.pdf (header,
+    statistics, token usage, glance table) plus one self-contained PDF per
+    finding under findings/<NN>_<vuln-id>/ (with its own poc/ and patches/
+    bundles). Severity-ranked, deterministic CVSS scores. Returns {}."""
     report_dir = settings.app_path / f"report_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
     statistics = _build_pipeline_statistics(state) + "\n\n" + _build_token_usage()
 
@@ -741,8 +812,13 @@ def report_assembler_node(state: MasterState) -> dict:
         _write_report(report_dir / "report.pdf", _render_empty_report(statistics))
         return {}
 
-    poc_files = _copy_poc_scripts(records, report_dir)
-    patch_files = _copy_patch_files(records, report_dir)
-    markdown = _render_report_markdown(records, findings_by_id, statistics, poc_files, patch_files)
-    _write_report(report_dir / "report.pdf", markdown)
+    rows = _ranked_rows(records, findings_by_id)
+    for i, (record, finding, vector, score, label) in enumerate(rows, 1):
+        finding_dir = report_dir / "findings" / _finding_folder(i, record.get("vuln_id", ""))
+        artifacts = _bundle_finding_artifacts(record, finding_dir)
+        _write_report(
+            finding_dir / "report.pdf",
+            _render_finding_report(record, finding, vector, score, label, artifacts),
+        )
+    _write_report(report_dir / "report.pdf", _render_main_report(rows, statistics))
     return {}
