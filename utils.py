@@ -62,7 +62,7 @@ def format_node_context(graph_data: dict, node_id: str) -> str:
     lines = [
         f"Node: {label}",
         f"  ID:        {node_id}",
-        f"  Source:    {target_node.get('source_file', '')} {target_node.get('source_location', '').strip()}",
+        f"  Source:    {target_node.get('source_file', '')} {(target_node.get('source_location') or '').strip()}",
         f"  Community: {target_node.get('community', '')}",
         "",
         f"Connections ({len(connections)}):",
