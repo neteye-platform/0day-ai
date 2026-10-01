@@ -15,6 +15,7 @@ with open("agents.yaml", "r") as f:
     VALIDATOR_AGENT = data.get("validator_agent")
     INTEGRATION_AUDITOR_AGENT = data.get("integration_auditor")
     EDGE_TRAVERSAL_AGENT = data.get("edge_traversal")
+    REPORTER_AGENT = data.get("reporter_agent")
 
 cwes = {
     # --- MEMORY SAFETY (C / C++ / Rust-unsafe) ---
@@ -691,4 +692,45 @@ class EdgeTraversalOutput(BaseModel):
     assertions: list[EdgeInvariantAssertion] = Field(
         default_factory=list,
         description="Edge invariant assertions: flags confirming when an upstream boundary's validation satisfies a downstream node's entry demands, pruning unnecessary false-positive evaluations. Emit one per edge you explicitly verified as safe."
+    )
+
+
+# ==========================================
+# Reporter agent
+# ==========================================
+
+class ReporterFinding(BaseModel):
+    vuln_id: str = Field(
+        description="The exact vuln_id of the vulnerability this assessment refers to (must match one of the provided records exactly)."
+    )
+    cvss_vector: str = Field(
+        description="A complete CVSS v3.1 base vector string, e.g. 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'. The pipeline recomputes the numeric base score from it."
+    )
+    severity: Literal["Critical", "High", "Medium", "Low", "None"] = Field(
+        description="Qualitative severity matching the CVSS v3 score ranges (Critical >= 9.0, High >= 7.0, Medium >= 4.0, Low >= 0.1, None = 0.0). Overridden by the pipeline if it disagrees with the vector's computed score."
+    )
+    worst_case_scenario: str = Field(
+        description="The decisive answer to 'what is the worst thing that could happen if a malicious actor exploits this vulnerability?', grounded in this vulnerability's real mechanics and the application's actual function."
+    )
+    remediation: str = Field(
+        description="The concrete fix (code change, configuration, or library upgrade) that closes this vulnerability."
+    )
+
+    @field_validator('cvss_vector')
+    @classmethod
+    def _validate_cvss_vector(cls, v: str) -> str:
+        if not isinstance(v, str):
+            return v
+        v = v.strip()
+        if not v.startswith("CVSS:3."):
+            raise ValueError("cvss_vector must be a CVSS v3.x base vector (start with 'CVSS:3.').")
+        return v
+
+
+class ReporterOutput(BaseModel):
+    executive_summary: str = Field(
+        description="2-4 sentences summarizing the security posture of the target: how many findings were proven, the overall worst-case risk, and the single most important action to take."
+    )
+    findings: list[ReporterFinding] = Field(
+        description="Exactly one assessment per provided vulnerability, keyed by vuln_id."
     )

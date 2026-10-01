@@ -8,13 +8,13 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from llm_debug import build_debug_http_client
 from tavily import TavilyClient
 from langgraph.types import Command, Send
-from langgraph.graph import END
 from typing import Any
 from collections import defaultdict
 import hashlib
 import logging
 import threading
 import uuid
+from datetime import datetime
 
 from languages import SYMBOL_QUERIES
 import settings
@@ -22,8 +22,8 @@ import tools
 import browser_tools
 import attacker_tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState, IntegrationAuditorState
-from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, INTEGRATION_AUDITOR_AGENT, EDGE_TRAVERSAL_AGENT, cwes, EdgeTraversalOutput
-from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, is_path_excluded, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, scan_codebase_for_keywords, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, cache_validator, cache_integration_auditor, reviewer_cache_key
+from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, INTEGRATION_AUDITOR_AGENT, EDGE_TRAVERSAL_AGENT, REPORTER_AGENT, ReporterOutput, cwes, EdgeTraversalOutput
+from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, is_path_excluded, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, scan_codebase_for_keywords, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, cache_validator, cache_integration_auditor, cache_reporter, reviewer_cache_key, cvss_v3_base_score, cvss_severity_label
 from boundary_edges import build_boundary_edges, cluster_boundary_edges, render_batch_prompt, boundary_batch_fingerprint, summarize_boundary_edges
 from tool_loop import CompactionConfig, ToolLoopAgent
 from dedup import Embeddings, cluster_vulnerabilities, deduplicate_demands
@@ -31,6 +31,29 @@ from dedup import Embeddings, cluster_vulnerabilities, deduplicate_demands
 
 _agent_progress: dict[str, dict[str, int]] = {}
 _agent_progress_lock = threading.Lock()
+
+# Deterministic run-local counters consumed by the Reporter to build the
+# "Pipeline Statistics" section of report.md. Reset at bootstrap so a single
+# process can run the pipeline repeatedly (e.g. langgraph dev) without stale
+# totals; incremented at the stage boundaries where the counts are knowable
+# (dispatch fan-outs, verifier evaluation verdicts). Thread-safe.
+_pipeline_stats: dict[str, int] = {}
+_pipeline_stats_lock = threading.Lock()
+
+
+def _record_stat(key: str, amount: int = 1) -> None:
+    with _pipeline_stats_lock:
+        _pipeline_stats[key] = _pipeline_stats.get(key, 0) + (amount or 0)
+
+
+def _reset_pipeline_stats() -> None:
+    with _pipeline_stats_lock:
+        _pipeline_stats.clear()
+
+
+def _snapshot_pipeline_stats() -> dict[str, int]:
+    with _pipeline_stats_lock:
+        return dict(_pipeline_stats)
 
 fast_llm = ChatOpenAI(
     base_url=settings.llm_base_url,
@@ -69,6 +92,9 @@ reviewer_llm = ChatOpenAI(
 
 def bootstrap_node(state: MasterState) -> dict[str, Any]:
     """Ensure the knowledge graph exists before the parallel branches start."""
+    # Start each pipeline invocation's statistics ledger from zero (a single
+    # process may run the graph repeatedly via langgraph dev).
+    _reset_pipeline_stats()
     if not settings.graph.exists():
         logging.info(f"Graph {settings.graph} not found. Running graphify extract...")
         subprocess.run(
@@ -1552,6 +1578,15 @@ def _contract_verifier_node(state: VerifierState) -> dict:
             cache(batch_cache_file, "write", {"evaluations": batch_evals})
         evaluations.extend(batch_evals)
 
+    # Record the deterministic demand-verdict ledger for the report statistics
+    # (only when the evaluations were actually assembled, i.e. not a whole-node
+    # cache short-circuit above).
+    _record_stat("verifier_evaluations", len(evaluations))
+    for status in ("MET", "FAILED", "DELEGATED", "OUT_OF_SCOPE"):
+        count = sum(1 for ev in evaluations if (ev or {}).get("status") == status)
+        if count:
+            _record_stat(f"verifier_{status}", count)
+
     new_vulnerabilities = []
     for eval in evaluations:
         # DELEGATED, OUT_OF_SCOPE, and MET will be safely ignored
@@ -1801,7 +1836,9 @@ def dispatch_reviewers(state: MasterState):
 
     if not hypotheses:
         logging.warning(f"No vulnerabilities hypotheses to dispatch.")
-        return END
+        # Advance straight to the Reporter: it writes an empty report rather
+        # than silently ENDing (the reviewer/validator phases are skipped).
+        return "reporter"
 
     # Semantic dedup before fan-out. Duplicate hypotheses (same real
     # flaw described differently by different agents) are merged so one reviewer
@@ -1838,6 +1875,7 @@ def dispatch_reviewers(state: MasterState):
         commands.append(Send("reviewer_agent", payload))
 
     logging.info(f"Dispatching {len(commands)} reviewers.")
+    _record_stat("reviewer_hypotheses", len(commands))
     return commands
 
 
@@ -2130,6 +2168,7 @@ def dispatch_validators(state: MasterState):
         # `requires_integration` records still reach the auditor.
         return "integration_audit_dispatch"
 
+    _record_stat("validator_records", len(commands))
     return commands
 
 
@@ -2165,7 +2204,9 @@ def dispatch_integration_audits(state: MasterState):
     )
 
     if not pending:
-        return END
+        # Everything was proven (or is terminal): the validator/auditor phases
+        # have fully drained, so the pipeline advances to the Reporter node.
+        return "reporter"
 
     commands = []
     for evaluation in pending:
@@ -2187,6 +2228,8 @@ def dispatch_integration_audits(state: MasterState):
         )
         commands.append(Send("integration_auditor", payload))
 
+    if commands:
+        _record_stat("integration_audits", len(commands))
     return commands
 
 
@@ -2431,7 +2474,9 @@ def route_integration_audit(state: MasterState):
     chained = [v for v in all_vulns if v.get("status") == "chained"]
 
     if not chained:
-        return END
+        # No record needs a final validator pass: the audit phase is done and
+        # the pipeline advances to the Reporter node.
+        return "reporter"
 
     by_id = {v.get("vuln_id"): v for v in all_vulns}
     commands = []
@@ -2469,6 +2514,7 @@ def route_integration_audit(state: MasterState):
         f"Integration auditor chained {len(commands)} vulnerability(ies); "
         f"dispatching to the validator for PoC construction."
     )
+    _record_stat("validator_chained_records", len(commands))
     return commands
 
 
@@ -2515,6 +2561,7 @@ def route_validator_feedback(state: MasterState):
         f"Validator requested more context for {len(commands)} vulnerability(ies); "
         f"dispatching reviewer feedback re-reviews."
     )
+    _record_stat("reviewer_feedback_reviews", len(commands))
     return commands
 
 
@@ -2743,3 +2790,337 @@ validator_agent_node = validator_agent.agent
 validator_router = validator_agent.router
 validator_fallback_node = validator_agent.fallback
 ask_validator_for_tool = validator_agent.ask
+
+# ==========================================
+# Reporter agent (single-shot terminal node)
+# ==========================================
+
+# A record belongs in the final report iff the Validator proved it exploitable
+# in the sandbox (status == "exploitable"), or the Reviewer accepted it as a
+# real finding with no network-reachable path (confirmed + static_finding_only).
+# Terminal non-findings (false_positive, unchainable, review_error) and
+# still-unproven records are deliberately excluded.
+def _is_reportable(record: dict) -> bool:
+    if record.get("status") == "exploitable":
+        return True
+    return (
+        record.get("status") == "confirmed"
+        and record.get("validation_strategy") == "static_finding_only"
+    )
+
+
+def _render_vulnerability_block(record: dict) -> str:
+    """Render a reportable record as compact evidence prose for the reporter."""
+    cwe = record.get("cwe_id", "OTHER_UNCATEGORIZED")
+    cwe_desc = cwes.get(cwe, "")
+    lines = [
+        f"**CWE:** {f'{cwe} — {cwe_desc}' if cwe_desc else cwe}",
+        f"**Type:** {record.get('vulnerability_type', 'Code Defect')}",
+    ]
+    nodes = [n for n in (record.get("affected_nodes") or []) if n]
+    if nodes:
+        lines.append(f"**Affected nodes:** {', '.join(nodes)}")
+    if record.get("source_cve"):
+        lines.append(f"**Source CVE:** {record['source_cve']}")
+    if record.get("confidence_score") is not None:
+        lines.append(f"**Reviewer confidence:** {record['confidence_score']}/10")
+    lines += ["", "**Description**", "", str(record.get("description") or "_none_")]
+    if record.get("reviewer_reasoning"):
+        lines += ["", "**Reviewer reasoning**", "", str(record["reviewer_reasoning"]).rstrip()]
+    steps = record.get("reproduction_steps") or []
+    if steps:
+        lines += ["", "**Reproduction steps**", ""]
+        lines += [
+            f"{i}. {re.sub(r'^\s*\d+[\.\)]\s+', '', str(s))}"
+            for i, s in enumerate(steps, 1)
+        ]
+    if record.get("poc_payload"):
+        lines += ["", "**Validated PoC payload**", "", "```", str(record["poc_payload"]).rstrip(), "```"]
+    if record.get("execution_logs"):
+        lines += ["", "**Validation evidence / execution logs**", "", str(record["execution_logs"]).rstrip()]
+    return "\n".join(lines)
+
+
+def _render_reporter_prompt(records: list[dict]) -> str:
+    """Build the single-shot human prompt: every reportable record in full."""
+    blocks = []
+    for i, record in enumerate(records, 1):
+        blocks.append(
+            f"### Finding {i}: {record.get('vuln_id', 'Unknown')}\n"
+            + _render_vulnerability_block(record)
+        )
+    return (
+        f"Target application: {settings.app_path.name} ({settings.app_path})\n\n"
+        f"Produce ONE ReporterOutput assessment for EACH of the {len(records)} "
+        f"vulnerabilities below, keyed by its exact vuln_id.\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
+def _assessment_for(finding: dict, record: dict) -> tuple[float | None, str, str]:
+    """Deterministic CVSS score + label for an LLM-emitted finding.
+
+    The numeric base score is computed from the vector (never taken from the
+    model), and the severity label is re-derived from that score so the report
+    can never disagree with the vector. Falls back to the model's label only
+    when the vector is missing or malformed."""
+    vector = str(finding.get("cvss_vector") or "").strip()
+    score = cvss_v3_base_score(vector)
+    if score is None:
+        return None, vector or "N/A", str(finding.get("severity") or "Not assessed")
+    return score, vector, cvss_severity_label(score)
+
+
+def _build_pipeline_statistics(state: MasterState) -> str:
+    """Deterministically assemble the Pipeline Statistics section.
+
+    Mixes run-local counters recorded at the stage boundaries (_pipeline_stats)
+    with counts derived straight from the final MasterState (notes, grouped
+    demands, record statuses) — never from LLM output."""
+    stats = _snapshot_pipeline_stats()
+
+    notes = state.get("notes", [])
+    upstream = downstream = note_vulns = 0
+    for note in notes:
+        n = note if isinstance(note, dict) else note.model_dump()
+        upstream += len(n.get("upstream") or [])
+        downstream += len(n.get("downstream") or [])
+        note_vulns += len(n.get("vulns") or [])
+
+    grouped = state.get("grouped_demands", {}) or {}
+    routed_demands = sum(len(d) for d in grouped.values())
+
+    status_counts: dict[str, int] = defaultdict(int)
+    for v in state.get("vulnerabilities", []):
+        rec = v if isinstance(v, dict) else v.model_dump()
+        status_counts[str(rec.get("status") or "?")] += 1
+
+    confirmed_total = status_counts.get("confirmed", 0)
+    static_accepted = sum(
+        1
+        for v in state.get("vulnerabilities", [])
+        if (v if isinstance(v, dict) else v.model_dump()).get("validation_strategy")
+        == "static_finding_only"
+    )
+
+    verified_total = stats.get("verifier_evaluations", 0)
+    lines = [
+        "## Pipeline Statistics",
+        "",
+        "_Deterministic counters recorded by the pipeline during this scan._",
+        "",
+        "| Metric | Count |",
+        "| --- | ---: |",
+        f"| CVEs identified by SCA (OSV records) | {len(state.get('known_vulns', []))} |",
+        f"| Explorer notes produced | {len(notes)} |",
+        f"| Upstream demands declared | {upstream} |",
+        f"| Downstream demands declared | {downstream} |",
+        f"| Demands routed to the contract verifier | {routed_demands} |",
+        f"| Local vulnerability hypotheses in explorer notes | {note_vulns} |",
+        f"| Hypotheses dispatched to the Reviewer | {stats.get('reviewer_hypotheses', 0)} |",
+        f"| Reviewer re-reviews (validator feedback) | {stats.get('reviewer_feedback_reviews', 0)} |",
+        f"| Records dispatched to the Validator (direct) | {stats.get('validator_records', 0)} |",
+        f"| Chained records re-dispatched to the Validator | {stats.get('validator_chained_records', 0)} |",
+        f"| Integration audits (requires_integration) | {stats.get('integration_audits', 0)} |",
+        f"| Contract-verifier evaluations (total) | {verified_total} |",
+    ]
+
+    if verified_total:
+        lines += [
+            "",
+            "**Contract-verifier verdicts**",
+            "",
+            "| Verdict | Count |",
+            "| --- | ---: |",
+            f"| MET | {stats.get('verifier_MET', 0)} |",
+            f"| FAILED | {stats.get('verifier_FAILED', 0)} |",
+            f"| DELEGATED | {stats.get('verifier_DELEGATED', 0)} |",
+            f"| OUT_OF_SCOPE | {stats.get('verifier_OUT_OF_SCOPE', 0)} |",
+        ]
+
+    lines += [
+        "",
+        "**Final vulnerability record statuses**",
+        "",
+        "| Status | Count |",
+        "| --- | ---: |",
+        f"| Exploitable (validated in the sandbox) | {status_counts.get('exploitable', 0)} |",
+        f"| Accepted static finding (no network-reachable path) | {static_accepted} |",
+        f"| Confirmed, unvalidated | {max(0, confirmed_total - static_accepted)} |",
+        f"| False positive | {status_counts.get('false_positive', 0)} |",
+        f"| Unchainable | {status_counts.get('unchainable', 0)} |",
+        f"| Review error / unresolved | {status_counts.get('review_error', 0)} |",
+        f"| Insufficient context | {status_counts.get('insufficient_context', 0)} |",
+        f"| Hypothesis (never reviewed) | {status_counts.get('hypothesis', 0)} |",
+    ]
+    return "\n".join(lines)
+
+
+def _render_report_markdown(
+    records: list[dict],
+    assessments: dict[str, dict],
+    executive_summary: str,
+    statistics: str | None = None,
+) -> str:
+    """Assemble the final report.md (severity-ranked findings + per-vuln
+    sections, each closing with the mandatory worst-case answer)."""
+    rows = []
+    for record in records:
+        finding = assessments.get(record.get("vuln_id"))
+        if finding is None:
+            rows.append((record, None, "N/A", None, "Not assessed"))
+            continue
+        score, vector, label = _assessment_for(finding, record)
+        rows.append((record, finding, vector, score, label))
+    # Severity rank: highest CVSS score first, then vuln_id for stability.
+    rows.sort(
+        key=lambda r: (r[3] is None, -(r[3] or 0.0), r[0].get("vuln_id", "")),
+    )
+
+    exploitable = sum(1 for r in records if r.get("status") == "exploitable")
+    static = len(records) - exploitable
+
+    lines = [
+        f"# Vulnerability Report — {settings.app_path.name}",
+        "",
+        f"- **Target application:** `{settings.app_path}`",
+        f"- **Generated:** {datetime.now().astimezone().isoformat(timespec='seconds')}",
+        f"- **Exploitable findings:** {exploitable}",
+        f"- **Static findings (no network-reachable path):** {static}",
+        "",
+        "## Executive Summary",
+        "",
+        (executive_summary.strip() if executive_summary and executive_summary.strip()
+         else "_No executive summary produced._"),
+        "",
+    ]
+    if statistics:
+        lines += [statistics.rstrip(), ""]
+    lines += [
+        "## Findings at a Glance",
+        "",
+        "| # | Vulnerability ID | CWE | CVSS v3.1 | Severity |",
+        "|---|------------------|-----|-----------|----------|",
+    ]
+    for i, (record, finding, vector, score, label) in enumerate(rows, 1):
+        cwe = record.get("cwe_id", "OTHER_UNCATEGORIZED")
+        score_str = f"{score:.1f}" if score is not None else "N/A"
+        lines.append(
+            f"| {i} | `{record.get('vuln_id', 'Unknown')}` | {cwe} | {score_str} | {label} |"
+        )
+
+    lines += ["", "## Findings", ""]
+    for i, (record, finding, vector, score, label) in enumerate(rows, 1):
+        cwe = record.get("cwe_id", "OTHER_UNCATEGORIZED")
+        cwe_desc = cwes.get(cwe, "")
+        score_str = f"{score:.1f}" if score is not None else "N/A"
+        lines += [
+            f"### {i}. {record.get('vuln_id', 'Unknown')}",
+            "",
+            f"**Severity:** {label}  \n",
+            f"**CVSS v3.1 base score:** {score_str}  ",
+            f"**CVSS vector:** `{vector}`  ",
+            f"**CWE:** {cwe}{f' — {cwe_desc}' if cwe_desc else ''}",
+            "",
+            "#### Evidence",
+            "",
+        ]
+        lines.append(_render_vulnerability_block(record))
+        lines += ["", "#### Worst-case impact", ""]
+        if finding is not None and finding.get("worst_case_scenario"):
+            lines.append(str(finding["worst_case_scenario"]).rstrip())
+        else:
+            lines.append(
+                "_The reporter produced no worst-case assessment for this finding._"
+            )
+        lines += ["", "#### Remediation", ""]
+        if finding is not None and finding.get("remediation"):
+            lines.append(str(finding["remediation"]).rstrip())
+        else:
+            lines.append("_No remediation was provided._")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_empty_report(statistics: str | None = None) -> str:
+    """Minimal report written when nothing was proven exploitable/accepted."""
+    lines = [
+        f"# Vulnerability Report — {settings.app_path.name}",
+        "",
+        f"- **Target application:** `{settings.app_path}`",
+        f"- **Generated:** {datetime.now().astimezone().isoformat(timespec='seconds')}",
+        "",
+        "No exploitable vulnerabilities were confirmed and no static findings were "
+        "accepted during this scan.",
+        "",
+    ]
+    if statistics:
+        lines += [statistics.rstrip(), ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _write_report(path: Path, text: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        logging.info(f"Reporter: wrote {path} ({len(text)} chars).")
+    except OSError as exc:
+        logging.error(f"Reporter: failed to write {path}: {exc}")
+
+
+def reporter_node(state: MasterState) -> dict:
+    """Single-shot terminal Reporter node.
+
+    Runs once after the validator/audit phases have fully drained. Collects
+    every proven-exploitable record plus accepted static findings, spends ONE
+    structured LLM call deriving a CVSS v3.1 vector and the worst-case
+    narrative per finding, then computes the base scores deterministically and
+    writes the full markdown report to ``<target_app>/report.md``. Returns {}
+    (no state change)."""
+    records = []
+    for v in state.get("vulnerabilities", []):
+        record = v if isinstance(v, dict) else v.model_dump()
+        if _is_reportable(record):
+            records.append(record)
+    report_path = settings.app_path / "report.md"
+    statistics = _build_pipeline_statistics(state)
+
+    if not records:
+        logging.warning("Reporter: no exploitable/static findings to report.")
+        _write_report(report_path, _render_empty_report(statistics))
+        return {}
+
+    output = cache_reporter(records)
+    if output is None:
+        sys_msg = SystemMessage(content=REPORTER_AGENT.get("prompt", ""))
+        human_msg = HumanMessage(content=_render_reporter_prompt(records))
+        reporter_llm = smart_llm.with_structured_output(
+            ReporterOutput, method="json_schema", strict=True
+        )
+        try:
+            output = reporter_llm.invoke([sys_msg, human_msg])
+            output = output if isinstance(output, dict) else output.model_dump()
+        except Exception as exc:
+            # Fail open: never leave the pipeline without a report.md. The
+            # evidence block per record is retained; only the LLM-derived
+            # assessments drop.
+            logging.error(f"Reporter: LLM assessment failed ({exc}); writing evidence-only report.")
+            output = {"executive_summary": "", "findings": []}
+        cache_reporter(records, output)
+    else:
+        logging.info("Reporter cache hit; reusing previous LLM assessments.")
+
+    assessments = {
+        f.get("vuln_id"): f
+        for f in (output.get("findings") or [])
+        if isinstance(f, dict) and f.get("vuln_id")
+    }
+    markdown = _render_report_markdown(
+        records,
+        assessments,
+        output.get("executive_summary") or "",
+        statistics,
+    )
+    _write_report(report_path, markdown)
+    return {}

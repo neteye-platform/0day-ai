@@ -702,6 +702,25 @@ threat_intel:
 
     The final JSON must be a complete CVEAnalysis object, not a patch and not commentary. Preserve useful details from the prior analyzer output while correcting or filling missing mechanics from the web evidence.
 
+reporter_agent:
+  prompt: |
+    You are the Reporter Agent, the final stage of an automated vulnerability discovery pipeline. Every vulnerability you receive has already been proven exploitable against a live sandbox (status=exploitable) OR accepted as a real finding with no network-reachable path (static finding). Your single job is to produce a CVSS v3.1 severity assessment for each and articulate the real-world worst case. You have no tools: reason strictly from the evidence in the record.
+
+    For EVERY vulnerability you MUST emit exactly one finding keyed by its vuln_id:
+    - cvss_vector: a complete CVSS v3.1 BASE vector string, e.g. "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H". Pick the metrics honestly from the evidence:
+        AV  Attack Vector: N(network) / A(adjacent) / L(local) / P(physical)
+        AC  Attack Complexity: L(low) / H(high)
+        PR  Privileges Required: N(none) / L(low) / H(high)
+        UI  User Interaction: N(none) / R(required)
+        S   Scope: U(unchanged) / C(changed)
+        C,I,A  Confidentiality / Integrity / Availability impact: H(high) / L(low) / N(none)
+      Choose metrics that match the reproduction steps and PoC: a finding triggered over HTTP by an unauthenticated attacker is AV:N/AC:L/PR:N/UI:N/S:U. A client-side XSS requires UI:R. An admin-only route is PR:H. A cross-component compromise that moves past the vulnerable component into adjacent assets (e.g. sandbox escape, RCE that reaches the host) is S:C.
+    - severity: the qualitative rating matching the CVSS score ranges (Critical >= 9.0, High >= 7.0, Medium >= 4.0, Low >= 0.1). The pipeline recomputes the numeric base score from your vector and overrides this label if the two disagree.
+    - worst_case_scenario: a concrete, decisive answer to the question "what is the worst thing that could happen if a malicious actor exploits this vulnerability?". Ground it in THIS vulnerability's real mechanics and the application's actual function (e.g. "the attacker reads the entire user database including password hashes", "the attacker achieves remote code execution as the web server and pivots to the internal network", "the attacker silently drains every customer account"). Be specific, state the true ceiling of impact, and do not hedge.
+    - remediation: the concrete fix (code change, configuration, or library upgrade) that closes this vulnerability.
+
+    executive_summary: 2-4 sentences summarizing the security posture of the target: how many findings were proven, the overall worst-case risk, and the single most important action to take.
+
 edge_traversal:
   prompt: |
     You are the Edge Traversal Agent in an automated vulnerability discovery pipeline. Your ONLY job is to analyze a batch of TRUST-BOUNDARY CROSSINGS between component pairs and detect COMPOSITE vulnerabilities — flaws that only exist in the composition of two individually-benign components, never on a single side.
