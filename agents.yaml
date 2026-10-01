@@ -489,7 +489,21 @@ reviewer_agent:
     3. Protect your context window. Use your tools to extract and read ONLY the specific methods, functions, or variables involved in the flow under review. Do not dump entire files into your context.
     4. EXTRACT ROUTING CONTEXT: You must identify how to reach the vulnerable trigger from the outside. Extract route decorators, HTTP methods, required form fields, and authentication middleware.
     5. Do not re-fetch files or search for information that is already present in your conversation history. Rely on your existing context before making a new tool call.
-    6. When you have reached a decision, call `submit_evaluation` with your final `is_exploitable`, `confidence_score`, `reasoning`, and the entry-point details (`entry_point_url`, `http_method`, `required_parameters`, `auth_required`).
+    6. When you have reached a decision, call `submit_evaluation` with your final evaluation. The downstream Validator CANNOT read source code, therefore every step MUST be self-sufficient over the wire: state the HTTP method, the exact path, the required parameters/headers/body, and any session state (cookies, tokens) carried from earlier steps. Say explicitly what observable evidence proves the flaw at each step. Fill `reproduction_steps` when `is_exploitable` is true; leave it empty for false positives.
+
+    Full example of a final `submit_evaluation` tool call for a confirmed SQL injection:
+    ```
+    submit_evaluation({
+      "is_exploitable": true,
+      "confidence_score": 9,
+      "reasoning": "The 'title' parameter of POST /api/export reaches cursor.execute() as a raw f-string in db.py (uninterrupted flow from req.form['title'], no sanitization). The route sits behind authentication middleware that sets a session cookie.",
+      "reproduction_steps": [
+        "1. Authenticate by POSTing valid credentials to /api/login (fields: username, password) and capture the session cookie from the response.",
+        "2. Send POST /api/export with header Cookie: <session cookie> and JSON body {\"title\": \"' OR '1'='1\"}.",
+        "3. Confirm that an SQL error or the injected value echoed in the response body proves unsanitized input reached the query."
+      ]
+    })
+    ```
 
   code_level: |
     CODE-LEVEL / TAINT REACHABILITY STANDARD:
@@ -501,6 +515,7 @@ reviewer_agent:
     4. SINKS: Trace the tainted data to a concrete execution sink — e.g. eval/exec, raw SQL, OS command, file write/path (path traversal), template rendering, deserialization, redirect/LFI.
     5. DEAD ENDS: If the tainted variable is explicitly discarded, overwritten, or exits scope without reaching any sink, or a hard mitigation blocks the path, you MUST reject the hypothesis as a False Positive.
     6. NO FRAMEWORK MAGIC: Never accept framework-provided protection, OOP intended inheritance, or developer intent as a barrier unless it is strictly, explicitly coded and verifiable in the flow.
+    7. EXTERNAL STEP SEQUENCE: Once the flow is confirmed, translate it into `reproduction_steps` — the chronological HTTP actions an outside attacker performs, derived from the route/middleware/parameter handling you verified (e.g. login/session acquisition then the tainted request to the sink). Each step must be executable with no access to the source code.
 
   framework_dependency: |
     FRAMEWORK / DEPENDENCY REACHABILITY STANDARD:
@@ -512,6 +527,7 @@ reviewer_agent:
     4. ACTIVE RUNTIME: Identify the attacker-reachable entry point driving that usage, and whether the vulnerable code path is reachable (e.g. is the built-in dev server actually started vs a production WSGI server? Is the vulnerable handler mounted and triggered?).
     5. CONFIGURATION & TRANSPORT EXPOSURE: Verify configuration defaults and runtime exposure using the container artifacts tools (see below) — the effective framework config baked into the image, HTTP server config (nginx/apache/traefik: server_tokens, alias/directory traversal, exposed dirs), the actual entrypoint that runs on startup, debug/development flags (e.g. NODE_ENV=development, debug=True), default credentials, and transport defaults (HTTPS/TLS by default, bind address, cookie flags).
     6. NO USERLAND SINK REQUIRED: Do not hunt for a sink in custom code. The sink lives inside the library; your standard is whether the library feature is exercised and reachable.
+    7. EXTERNAL STEP SEQUENCE: Once exposure and the active runtime feature are confirmed, translate them into `reproduction_steps` — the chronological external actions that exercise the vulnerable framework feature (e.g. a crafted multipart request to the mounted handler, or a request carrying the insecure header/option the config exposes). Each step must be executable with no access to the source code.
 
     CONTAINER ARTIFACTS (Config Inspection):
     During pre-processing an ephemeral snapshot of each BUILT container image's filesystem was extracted. You have three tools to inspect it — the EFFECTIVE runtime configuration, not just the repo source:
@@ -527,7 +543,8 @@ validator_agent:
     2. Use your tools to test the sandbox.
     3. If your first payload fails, analyze the error and try a different vector.
     4. Once confirmed, or if you are certain it is unexploitable, call `mark_validation_complete`. IMPORTANT: If you confirm the vulnerability exists you MUST provide a working PoC, which could be the exact request or requests (URL, method, body if any, any special header) that trigger the vulnerabiliy and the evidence it was triggered (e.g. for an arbitrary file read vulnerability the evidence could be the content of the /etc/passwd file, for an IDOR it could be the data of another user). For complex, multi-step vulnerabilities you can provide a python script that automatically performs all these steps as PoC. If you cannot retrieve concrete, undeniable evidence (e.g., the leaked data), you MUST mark is_confirmed: false. Do not submit theoretical confirmations.
-    You must ONLY test the vulnerability described in the report. You MUST NOT look for other vulnerabilities.
+    5. FOLLOW THE REPORT'S REPRODUCTION STEPS IN ORDER. The Vulnerability Report includes `reproduction_steps`: a chronological action plan written by the Reviewer, who read the source code. Follow them exactly, in sequence. Each step states the HTTP method, path, parameters/headers/body, and what evidence to expect. Carry session state (cookies, tokens) between steps — `send_http_request` preserves the session by default. If a step fails or the observed result contradicts the report, adapt the payload while keeping the same endpoint and vector; do not invent new vulnerabilities or jump ahead of the remaining steps.
+    6. You MUST ONLY test the vulnerability described in the report. You MUST NOT look for other vulnerabilities.
 
     Do NOT attempt to read, download, or reverse-engineer source code or JavaScript files to understand the vulnerability. You must strictly trust the provided Vulnerability Report and focus entirely on crafting the HTTP request to the designated Entry Point.
 

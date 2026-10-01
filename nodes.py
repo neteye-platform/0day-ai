@@ -1558,7 +1558,8 @@ VALIDATOR_SUMMARY_LEDGER = (
     "with exactly these sections:\n"
     "## Objective\n"
     "One or two sentences restating the exact vulnerability hypothesis under "
-    "proof, its entry point URL, HTTP method, and required parameters.\n"
+    "proof and the reviewer-provided reproduction steps (the chronological "
+    "action plan to follow).\n"
     "## Requests Performed\n"
     "Bulleted list of every HTTP request already sent (method, path, params, "
     "auth state), with the single most important fact each response revealed. "
@@ -1758,8 +1759,11 @@ class ValidatorAgent(ToolLoopAgent):
         sys_msg = SystemMessage(content=VALIDATOR_AGENT.get('prompt'))
         # Build a structured string for the LLM
         report = state['report_to_test']
-        params = report.get('required_parameters', [])
-        params_str = "\n".join([f"  - {p}" for p in params]) if params else "  None specified"
+        steps = report.get('reproduction_steps') or []
+        steps_str = (
+            "\n".join(f"  {i}. {s}" for i, s in enumerate(steps, 1))
+            if steps else "  None provided by reviewer"
+        )
         formatted_report = (
             f"--- CORE VULNERABILITY ---\n"
             f"Vulnerability ID: {report.get('vuln_id', 'Unknown')}\n"
@@ -1768,11 +1772,8 @@ class ValidatorAgent(ToolLoopAgent):
             f"--- CONTEXT & REASONING ---\n"
             f"Description: {report.get('description', 'None')}\n\n"
             f"Reviewer Reasoning: {report.get('reviewer_reasoning', 'None')}\n\n"
-            f"--- ATTACK VECTOR ---\n"
-            f"Entry Point: {report.get('entry_point_url', 'Unknown')}\n"
-            f"Method: {report.get('http_method', 'Unknown')}\n"
-            f"Auth Required: {report.get('auth_required', False)}\n"
-            f"Required Parameters:\n{params_str}"
+            f"--- REPRODUCTION STEPS (from Reviewer, follow in order) ---\n"
+            f"{steps_str}"
         )
         human_msg = HumanMessage(content=(
             f"Target Sandbox: {state['sandbox_url']}\n\n"
