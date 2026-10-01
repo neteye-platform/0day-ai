@@ -8,17 +8,14 @@ from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_core.output_parsers import PydanticOutputParser
-from langchain_core.runnables import RunnableConfig
 from langgraph.types import Send
 from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 
 import tools
 from utils import build_networkx_graph, run_stream
 from state import MasterState, ExpertState, ReviewerState, ValidatorState
 from schemas import VALIDATOR_AGENT, ExpertTask, VulnerabilityEvaluation, VulnerabilityReport, ManagerOutput, ReviewerOutput, ValidationResult, EXPERT_AGENTS, REVIEWER_AGENT, TOOLS
-
-logger = logging.getLogger(__name__)
 
 # ==========================================
 # Preprocessor
@@ -26,7 +23,6 @@ logger = logging.getLogger(__name__)
 
 def preprocessor_node(state: MasterState) -> Dict[str, Any]:
     """Reads graph.json, builds a NetworkX graph, and summarizes it for the manager node."""
-    logger.debug(f"Entering preprocessor_node. Reading graph from: {state['graph_path']}")
 
     G = build_networkx_graph(state["graph_path"])
 
@@ -77,7 +73,6 @@ def preprocessor_node(state: MasterState) -> Dict[str, Any]:
         )
         communities_map[comm_id] = node_ids
 
-    logger.debug(f"Preprocessor complete. Found {len(communities_map)} communities.")
     return {
         "app_summary": summary,
         "communities_map": communities_map
@@ -89,14 +84,13 @@ def preprocessor_node(state: MasterState) -> Dict[str, Any]:
 
 def manager_agent_node(state: MasterState) -> Dict[str, Any]:
     """The Manager LLM reads the programmatic summary and dispatches tasks."""
-    logger.debug("Entering manager_agent_node. Invoking Lead Security Architect LLM.")
 
-    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
-    # llm = ChatOpenAI(
-    #     base_url="http://localhost:11434/v1",
-    #     model="glm-5-2-3-bit",
-    #     temperature=0
-    # )
+    # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    llm = ChatOpenAI(
+        base_url="http://localhost:11434/v1",
+        model="glm-5-2",
+        temperature=0
+    )
     parser = PydanticOutputParser(pydantic_object=ManagerOutput)
 
     roles_docs = "\n".join([
@@ -118,7 +112,6 @@ def manager_agent_node(state: MasterState) -> Dict[str, Any]:
     response_msg = llm.invoke([sys_msg, human_msg])
     response = parser.invoke(response_msg)
 
-    logger.debug(f"Manager created {len(response.tasks)} expert tasks.")
     return {"expert_tasks": response.tasks, "manager_message": response_msg}
 
 # ==========================================
@@ -127,18 +120,16 @@ def manager_agent_node(state: MasterState) -> Dict[str, Any]:
 
 def expert_agent_node(state: ExpertState) -> dict:
     role_name = state["task"].agent_role
-    logger.debug(f"Entering expert_agent_node for role: {role_name}")
 
     if not state.get("subgraph_nodes"):
-        logger.debug(f"No subgraph nodes assigned to {role_name}. Bypassing execution.")
         return {"vulnerability_reports": []}
 
-    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
-    # llm = ChatOpenAI(
-    #     base_url="http://localhost:11434/v1",
-    #     model="glm-5-2-3-bit",
-    #     temperature=0
-    # )
+    # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    llm = ChatOpenAI(
+        base_url="http://localhost:11434/v1",
+        model="glm-5-2",
+        temperature=0
+    )
 
     agent_tools = [tools.submit_report]
     tool_names = EXPERT_AGENTS[role_name].get("tools", [])
@@ -149,7 +140,6 @@ def expert_agent_node(state: ExpertState) -> dict:
     llm_with_tools = llm.bind_tools(agent_tools, tool_choice="any")
 
     if not state.get("messages"):
-        logger.debug(f"Initializing new conversation for {role_name}.")
         tool_rules = ""
         for tool_name in EXPERT_AGENTS[role_name].get("tools", []):
             rule = TOOLS[tool_name].get("rule", "")
@@ -170,13 +160,11 @@ def expert_agent_node(state: ExpertState) -> dict:
         response = llm_with_tools.invoke(messages)
         messages = [sys_msg, human_msg, response]
     else:
-        logger.debug(f"Continuing existing conversation for {role_name}. Message count: {len(state['messages'])}")
         messages = state["messages"]
 
         response = llm_with_tools.invoke(messages)
         messages = [response]
 
-    logger.debug(f"Expert LLM finished generating response for {role_name}.")
     return {"messages": messages}
 
 
@@ -202,7 +190,6 @@ def expert_agent_router(state: ExpertState) -> str:
 def save_report_node(state: ExpertState) -> dict:
     """Intercepts the submit_report tool call to save findings to the graph state."""
     role_name = state["task"].agent_role
-    logger.debug(f"Entering save_report_node for role: {role_name}")
 
     last_message = state["messages"][-1]
     reports = []
@@ -217,10 +204,10 @@ def save_report_node(state: ExpertState) -> dict:
                 "role": role_name,
                 "vulnerability": finding_data.get("cwe_class", "Unknown"),
                 "details": finding_data.get("details", ""),
+                "source_node": finding_data.get("source_node", ""),
                 "sink_node": finding_data.get("sink_node", ""),
                 "trace_nodes": finding_data.get("trace_nodes", [])
             })
-            logger.debug(f"Saved finding by {role_name}")
 
             tool_responses.append(
                 ToolMessage(
@@ -245,7 +232,6 @@ def nag_agent_node(state: ExpertState):
 
 def dispatch_experts(state: MasterState):
     """Reads the Manager's instructions and creates a list of 'Send' objects."""
-    logger.debug("Entering dispatch_experts. Preparing isolated threads for assigned tasks.")
 
     commands: List[Send] = []
     for task in state["expert_tasks"]:
@@ -254,7 +240,6 @@ def dispatch_experts(state: MasterState):
             clean_id = comm_id.lower().replace("community ", "").strip()
             nodes_for_task.extend(state["communities_map"].get(clean_id, []))
 
-        logger.debug(f"Dispatching task to '{task.agent_role}' spanning communities {task.target_communities} ({len(nodes_for_task)} nodes).")
 
         payload = ExpertState(
             task=task,
@@ -270,24 +255,24 @@ def dispatch_experts(state: MasterState):
 
 def dispatch_reviewers(state: MasterState):
     """Groups reports and dispatches parallel reviewer threads using the Send API."""
-    logger.debug("Entering reviewer_node.")
 
     reports = state.get("vulnerability_reports", [])
     if not reports:
-        logger.debug("No reports to review. Skipping.")
         return END
 
     # Group the reports by vulnerability and sink_node
     grouped_reports = defaultdict(list)
     for report in reports:
         vuln = report.get("vulnerability", "Unknown")
+        source = report.get("source_node", "Unknown")
         sink = report.get("sink_node", "Unknown")
-        grouped_reports[(vuln, sink)].append(report)
+        grouped_reports[(vuln, source, sink)].append(report)
 
     commands = []
-    for (vuln, sink), group in grouped_reports.items():
+    sys_msg = SystemMessage(content=REVIEWER_AGENT.get('prompt'))
+    for (vuln, source, sink), group in grouped_reports.items():
         # Format the group into a single, clean string for the LLM
-        formatted_group_text = f"Vulnerability: {vuln}\nSink Node: {sink}\n\nInstances found:\n"
+        formatted_group_text = f"Vulnerability: {vuln}\nSource Node: {source}\nSink Node: {sink}\n\nInstances found:\n"
         for idx, item in enumerate(group, 1):
             traces = item.get("trace_nodes", [])
             trace_str = ", ".join(traces) if traces else "None"
@@ -299,11 +284,11 @@ def dispatch_reviewers(state: MasterState):
             )
 
         report_id = f"{vuln} @ {sink}"
-        sys_msg = SystemMessage(content=REVIEWER_AGENT.get('prompt'))
         human_msg = HumanMessage(content=f"Vulnerability report to evaluate:\n{formatted_group_text}")
 
         payload = ReviewerState(
             report_id=report_id,
+            expert_report=group,
             messages=[sys_msg, human_msg]
         )
         commands.append(Send("reviewer_agent", payload))
@@ -313,14 +298,14 @@ def dispatch_reviewers(state: MasterState):
 
 def reviewer_agent_node(state: ReviewerState) -> dict:
     """Review the vulnerability reports and keep only what is actually relevant"""
-    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
-    # llm = ChatOpenAI(
-    #     base_url="http://localhost:11434/v1",
-    #     model="glm-5-2-3-bit",
-    #     temperature=0
-    # )
+    # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    llm = ChatOpenAI(
+        base_url="http://localhost:11434/v1",
+        model="glm-5-2",
+        temperature=0
+    )
 
-    llm_with_tools = llm.bind_tools([tools.read_source_code, tools.submit_evaluation])
+    llm_with_tools = llm.bind_tools([tools.read_source_code, tools.search_codebase, tools.get_node_connections, tools.submit_evaluation])
 
     response = llm_with_tools.invoke(state["messages"])
     return {"messages": [response]}
@@ -346,14 +331,17 @@ def save_evaluation_node(state: ReviewerState) -> dict:
 
     for tool_call in last_message.tool_calls:
         if tool_call["name"] == "submit_evaluation":
-            # Extract arguments and return them to be appended to MasterState's filtered_reports
-            # We construct the VulnerabilityEvaluation pydantic model schema manually here
-            evaluation_result = {
-                "report_id": state.get("report_id", "Unknown"),
-                "is_exploitable": tool_call["args"].get("is_exploitable", False),
-                "confidence_score": tool_call["args"].get("confidence_score", 0),
-                "reasoning": tool_call["args"].get("reasoning", "")
-            }
+            evaluation_result = VulnerabilityEvaluation(
+                report_id=state.get("report_id", "Unknown"),
+                is_exploitable=tool_call["args"].get("is_exploitable", False),
+                confidence_score=tool_call["args"].get("confidence_score", 0),
+                reasoning=tool_call["args"].get("reasoning", ""),
+                original_report=state.get("expert_report"),
+                entry_point_url=tool_call["args"].get("entry_point_url"),
+                http_method=tool_call["args"].get("http_method"),
+                required_parameters=tool_call["args"].get("required_parameters", []),
+                auth_required=tool_call["args"].get("auth_required", False)
+            )
             return {"filtered_reports": [evaluation_result]}
 
     return {"filtered_reports": []}
@@ -364,12 +352,11 @@ def save_evaluation_node(state: ReviewerState) -> dict:
 
 def dispatch_validators(state: MasterState):
     """Creates a parallel validation thread for each vulnerability that survived the reviewer."""
-    logger.debug("Entering dispatch_validators. Spinning up validation agents.")
 
     commands = []
     # Loop over the Pydantic models generated by the reviewer
     for evaluation in state.get("filtered_reports", []):
-        if evaluation.get("is_exploitable"):
+        if evaluation.is_exploitable:
 
             payload = ValidatorState(
                 report_to_test=evaluation,
@@ -386,17 +373,16 @@ def dispatch_validators(state: MasterState):
 
 
 def validator_agent_node(state: ValidatorState) -> dict:
-    logger.debug(f"Entering validator_agent for report: {state['report_to_test'].get('report_id')}")
-
-    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
-    # llm = ChatOpenAI(
-    #     base_url="http://localhost:11434/v1",
-    #     model="glm-5-2-3-bit",
-    #     temperature=0.2
-    # )
+    # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    llm = ChatOpenAI(
+        base_url="http://localhost:11434/v1",
+        model="glm-5-2",
+        temperature=0.2
+    )
 
     validator_tools = [tools.send_http_request, tools.mark_validation_complete]
     llm_with_tools = llm.bind_tools(validator_tools, tool_choice="any")
+    current_cookies = state.get("cookies", {})
 
     if not state.get("messages"):
         sys_msg = SystemMessage(content=VALIDATOR_AGENT.get('prompt'))
@@ -408,8 +394,18 @@ def validator_agent_node(state: ValidatorState) -> dict:
         response = llm_with_tools.invoke(messages)
         return {"messages": [sys_msg, human_msg, response]}
     else:
+        # Iterate backwards through the messages to catch all recent tool calls
+        for msg in reversed(state["messages"]):
+            if getattr(msg, "type", "") == "ai":
+                # Stop looking once we hit the AI's generation that triggered these tools
+                break
+            if getattr(msg, "type", "") == "tool" and getattr(msg, "name", "") == "send_http_request":
+                if hasattr(msg, "artifact") and msg.artifact:
+                    # Merge the new cookies into the current state
+                    current_cookies.update(msg.artifact)
+
         response = llm_with_tools.invoke(state["messages"])
-        return {"messages": [response]}
+        return {"messages": [response], "cookies": current_cookies}
 
 
 def validator_router(state: ValidatorState) -> str:
@@ -462,7 +458,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     # --- Reviewer Sub-Graph ---
     reviewer_workflow = StateGraph(ReviewerState)
     reviewer_workflow.add_node("reviewer_agent", reviewer_agent_node)
-    reviewer_workflow.add_node("reviewer_tools", ToolNode([tools.read_source_code]))
+    reviewer_workflow.add_node("reviewer_tools", ToolNode([tools.read_source_code, tools.get_node_connections, tools.search_codebase]))
     reviewer_workflow.add_node("save_evaluation", save_evaluation_node)
     reviewer_workflow.add_edge(START, "reviewer_agent")
     reviewer_workflow.add_conditional_edges("reviewer_agent", reviewer_router)
@@ -522,9 +518,12 @@ if __name__ == "__main__":
         filtered_reports=[],
         messages=[]
     )
+    config = {
+        "max_concurrency": 3 # Limits parallel Send() executions to 3 at a time!
+    }
 
     try:
-        final_state = run_stream(app, initial_state)
+        final_state = run_stream(app, initial_state, config=config)
 
         # Print the aggregated findings
         print("\n\n" + "="*60)

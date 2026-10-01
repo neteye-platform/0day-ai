@@ -74,9 +74,33 @@ class ManagerOutput(BaseModel):
 
 class VulnerabilityReport(BaseModel):
     cwe_class: CWEs = Field(description="The precise CWE category.")
+    source_node: str = Field(description="The exact Node ID where the untrusted data enters the application (e.g., the API endpoint or input parameter).")
     sink_node: str = Field(description="The exact Node ID, form the assigned nodes list, where the vulnerability triggers. DO NOT append code snippets, explanations, or function calls to this string.")
-    trace_nodes: list[str] = Field(description="List of EXACT Node IDs representing the execution path to the sink. DO NOT put actual lines of code here.")
+    trace_nodes: list[str] = Field(description="List of EXACT Node IDs representing the execution path from the source to the sink.")
     details: str = Field(description="Technical explanation of the vulnerability.")
+
+class EvaluationToolInput(BaseModel):
+    is_exploitable: bool = Field(
+        description="True if the vulnerability has a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by standard mitigations, implemented by the application."
+    )
+    confidence_score: int = Field(description="Confidence in this assessment from 1 to 10.")
+    reasoning: str = Field(description="Brief technical explanation for the decision.")
+    entry_point_url: Optional[str] = Field(
+        description="The specific HTTP route or URI path required to reach the source node (e.g., '/dashboard').",
+        default=None
+    )
+    http_method: Optional[str] = Field(
+        description="The HTTP method required (e.g., 'POST', 'GET').",
+        default=None
+    )
+    required_parameters: Optional[List[str]] = Field(
+        description="List of expected input names, query parameters, headers, or form fields.",
+        default_factory=list
+    )
+    auth_required: bool = Field(
+        description="True if the route is protected by an authentication middleware.",
+        default=False
+    )
 
 class VulnerabilityEvaluation(BaseModel):
     report_id: str = Field(description="The unique identifier or title of the vulnerability report.")
@@ -85,6 +109,11 @@ class VulnerabilityEvaluation(BaseModel):
     )
     confidence_score: int = Field(description="Confidence in this assessment from 1 to 10.")
     reasoning: str = Field(description="Brief technical explanation for the decision.")
+    entry_point_url: Optional[str] = Field(description="The specific HTTP route or URI path required to reach the source node (e.g., '/dashboard').")
+    http_method: Optional[str] = Field(description="The HTTP method required (e.g., 'POST', 'GET').")
+    required_parameters: Optional[List[str]] = Field(description="List of expected input names, headers, or form fields.")
+    auth_required: bool = Field(description="True if the route is protected by an authentication middleware.")
+    original_report: list[dict]
 
 class ReviewerOutput(BaseModel):
     reports: List[VulnerabilityEvaluation]

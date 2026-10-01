@@ -2,15 +2,18 @@ from typing import Annotated
 from langchain_core.tools import tool
 import json
 from langgraph.prebuilt import InjectedState
-import settings
 import requests
 from pathlib import Path
 import tree_sitter
 import tree_sitter_python
 import tree_sitter_javascript
 import logging
+import os
+from bs4 import BeautifulSoup
 
-from schemas import VulnerabilityReport
+from schemas import EvaluationToolInput, VulnerabilityReport
+from utils import build_networkx_graph
+import settings
 
 LANGUAGE_MAP = {
     ".py": tree_sitter.Language(tree_sitter_python.language()),
@@ -209,7 +212,7 @@ def check_package_vulnerability(package_name: str, version: str) -> list:
 @tool
 def submit_report(finding: VulnerabilityReport, state: Annotated[dict, InjectedState]) -> dict:
     """
-    Call this tool whenever you find a unique, actionable vulnerability. 
+    Call this tool whenever you find a unique, actionable vulnerability.
     You can call this tool multiple times if multiple flaws exist.
     """
     report_dict = finding.model_dump()
@@ -223,43 +226,120 @@ def mark_task_complete(summary: str) -> dict:
     return {"audit_status": "completed", "summary": summary}
 
 
-@tool
-def submit_evaluation(is_exploitable: bool, confidence_score: int, reasoning: str) -> dict:
+@tool(args_schema=EvaluationToolInput)
+def submit_evaluation(
+        is_exploitable: bool,
+        confidence_score: int,
+        reasoning: str,
+        entry_point_url: str = "",
+        http_method: str = "",
+        required_parameters: list = [],
+        auth_required: bool = False
+) -> dict:
     """Call this tool when you have finished reviewing the source code and made a final decision."""
     return {
         "is_exploitable": is_exploitable,
         "confidence_score": confidence_score,
-        "reasoning": reasoning
+        "reasoning": reasoning,
+        "entry_point_url": entry_point_url,
+        "http_method": http_method,
+        "required_parameters": required_parameters,
+        "auth_required": auth_required
     }
 
 
-@tool
-def send_http_request(method: str, endpoint: str, headers: dict, body: str = "") -> str:
+@tool(response_format="content_and_artifact")
+def send_http_request(
+        method: str,
+        endpoint: str,
+        headers: dict,
+        body: str = "",
+        reset_session: bool = False,
+        extract_mode: str = "clean_html",
+        state: Annotated[dict, InjectedState] = None
+) -> tuple[str, dict]:
     """
-    Sends an HTTP request to the sandboxed application.
-    Use this for testing web endpoints.
+    Sends an HTTP request to the sandboxed application. Use this for testing web endpoints.
+    This tool preserve session by default, so that you can register and account and login.
+    Use reset_session=True to clear the current session cookies.
+
+    extract_mode options:
+    - 'clean_html' (default): Returns HTML with scripts/styles removed to save tokens.
+    - 'forms': Returns ONLY the <form> elements on the page.
+    - 'links': Returns ONLY the <a> tags.
+    - 'text': Returns only the visible text (good for reading error messages).
+    - 'raw': Returns the untouched body (use cautiously, may truncate).
+    - ANY CUSTOM TAG: Enter any HTML tag (e.g., 'form', 'a', 'script', 'input', 'iframe') to extract only those elements.
     """
     if not endpoint.startswith(settings.sandbox_url):
-        return f"You can only make requests to the sandbox application at {settings.sandbox_url}"
+        return f"You can only make requests to the sandbox application at {settings.sandbox_url}", {}
 
-    import requests
+    session = requests.Session()
+
+    if not reset_session and state and "cookies" in state:
+        session.cookies.update(state.get("cookies", {}))
+
     try:
-        response = requests.request(
+        response = session.request(
             method=method,
             url=endpoint,
             headers=headers,
             data=body,
             timeout=5
         )
-        return f"Status: {response.status_code}\nHeaders: {response.headers}\nBody: {response.text[:2000]}"
+
+        raw_headers = "\r\n".join(f"{k}: {v}" for k, v in response.headers.items())
+        http_response_head = f"HTTP/1.1 {response.status_code} {response.reason}\n{raw_headers}\r\n\r\n"
+
+        # HTML parsing
+        body_display = ""
+
+        if "text/html" in response.headers.get("Content-Type", ""):
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            if extract_mode == "forms":
+                forms = soup.find_all('form')
+                body_display = f"[Found {len(forms)} forms]:\n\n" + "\n\n".join([str(f) for f in forms])
+            elif extract_mode == "links":
+                links = soup.find_all('a', href=True)
+                body_display = f"[Found {len(links)} links]:\n" + "\n".join([str(l) for l in links])
+            elif extract_mode == "text":
+                body_display = soup.get_text(separator='\n', strip=True)
+            elif extract_mode == "clean_html":
+                # Destroy noise tags
+                for noise in soup(['script', 'style', 'svg', 'noscript', 'canvas']):
+                    noise.decompose()
+                body_display = str(soup)
+            elif extract_mode == "raw":
+                body_display = response.text
+            else:
+                tags = soup.find_all(extract_mode)
+                if tags:
+                    body_display = f"[Found {len(tags)} <{extract_mode}> tags]:\n\n"
+                    body_display += "\n\n".join([str(t) for t in tags[:50]])
+                    if len(tags) > 50:
+                        body_display += f"\n\n... [{len(tags) - 50} more tags truncated] ..."
+                else:
+                    body_display = f"[No <{extract_mode}> tags found on this page]"
+
+        else:
+            # If it's JSON or something else, just return the raw text
+            body_display = response.text
+
+        if len(body_display) > 8000:
+            body_display = body_display[:8000] + "\n\n... [TRUNCATED: Try a specific extract_mode like 'forms' or 'text'] ..."
+
+        llm_output = f"{http_response_head}{body_display}"
+
+        return llm_output, session.cookies.get_dict()
     except Exception as e:
-        return f"Request failed: {str(e)}"
+        return f"Request failed: {str(e)}", {}
 
 
 @tool
 def mark_validation_complete(is_confirmed: bool, poc_payload: str, evidence: str) -> dict:
     """
-    Call this when you have definitively proven the vulnerability exists, 
+    Call this when you have definitively proven the vulnerability exists,
     or exhausted all options and believe it to be a false positive.
     """
     return {
@@ -267,3 +347,88 @@ def mark_validation_complete(is_confirmed: bool, poc_payload: str, evidence: str
         "poc_payload": poc_payload,
         "execution_logs": evidence
     }
+
+
+@tool
+def search_codebase(keyword: str) -> str:
+    """
+    Searches the entire application codebase for a specific string. Use this
+    to find where specific libraries, functions, or variables are used.
+    """
+    app_dir = Path(settings.app_path)
+
+    # Load the graph to map physical files to Node IDs
+    with open(settings.graph, "r") as f:
+        graph_data = json.load(f)
+        # Create a lookup dictionary: {"src/main.py": "node_123"}
+        file_to_node = {
+            n.get("source_file"): n.get("id")
+            for n in graph_data.get("nodes", [])
+            if n.get("source_file")
+        }
+
+    results = []
+    match_count = 0
+    MAX_MATCHES = 30 # prevent context window overflow
+
+    # Recursively search all files
+    for file_path in app_dir.rglob("*"):
+        # Ignore hidden directories (like .git), pycache, and common heavy folders
+        if any((part.startswith('.') and not part.startswith('..')) or \
+            part in ['venv', '__pycache__', 'node_modules', 'graphify-out'] for part in file_path.parts) or \
+            not file_path.is_file():
+            continue
+
+        try:
+            # Read lines and search for the keyword
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line_num, line in enumerate(f, 1):
+                    if keyword in line:
+                        relative_path = str(file_path.relative_to(app_dir))
+                        # Match the file back to its Node ID so the agent can read it
+                        node_id = file_to_node.get(relative_path, "Unknown (Not in Graph)")
+
+                        results.append(
+                            f"File: {relative_path} | Node ID: {node_id}\n"
+                            f"Line {line_num}: {line.strip()}\n"
+                        )
+                        match_count += 1
+
+                        # Stop if we hit the limit
+                        if match_count >= MAX_MATCHES:
+                            results.append(f"... [Truncated: found more than {MAX_MATCHES} matches] ...")
+                            return "\n".join(results)
+
+        except UnicodeDecodeError:
+            # Safely skip binary files (images, compiled files, etc.)
+            continue
+
+    if not results:
+        return f"No matches found for '{keyword}'."
+
+    return "\n".join(results)
+
+
+@tool
+def get_node_connections(node_id: str) -> str:
+    """
+    Returns the neighbors of a node in the application graph.
+    Use this to identify which functions call the current node (callers)
+    or which functions/files the current node calls (callees).
+    """
+    try:
+        G = build_networkx_graph(settings.graph)
+
+        if node_id not in G:
+            return f"Node ID '{node_id}' not found in the graph structure."
+
+        successors = list(G.successors(node_id))
+        predecessors = list(G.predecessors(node_id))
+
+        return (
+            f"Node: {node_id}\n"
+            f"Called by (Predecessors): {predecessors}\n"
+            f"Calls (Successors): {successors}"
+        )
+    except Exception as e:
+        return f"Error traversing graph: {str(e)}"
