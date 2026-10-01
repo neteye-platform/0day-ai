@@ -47,15 +47,9 @@ scan_exclude_defaults = True
 
 # ========================== Model / LLM settings ==========================
 
-llm_base_url = "http://localhost:11434/v1"
-llm_model = "qwen3-8-flash-next"
-llm_api_key = os.environ.get("OPENAI_API_KEY")
-# llm_base_url = "https://openrouter.ai/api/v1"
-# llm_model = "deepseek/deepseek-v4.1-flash"
-# llm_api_key = os.environ.get("OPENROUTER_API_KEY")
-# llm_base_url = "http://localhost:11434/v1"
-# llm_model = "qwen3.6:35b"
-# llm_api_key = "ollama"
+llm_base_url = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1")
+llm_model = os.environ.get("LLM_MODEL", "qwen3.8:35b")
+llm_api_key = os.environ.get("LLM_API_KEY", "ollama")
 
 # Default model context window (registry key `context_window`); each agent's
 # tool-loop compaction caps derive from ITS effective window.

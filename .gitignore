@@ -4,6 +4,5 @@ states/
 results.json
 graphify-out/
 .langgraph_api/
-langgraph.json
 logs.txt
 attacker/.build.hash

@@ -1,0 +1,11 @@
+{
+  "graphs": {
+    "main": "./graph.py:graph",
+    "reviewer": "./graph.py:compiled_reviewer_agent",
+    "validator": "./graph.py:compiled_validator_agent",
+    "integration_auditor": "./graph.py:compiled_integration_auditor"
+  },
+  "dependencies": ["."],
+  "env": ".env"
+}
+
