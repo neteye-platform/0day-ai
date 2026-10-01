@@ -24,7 +24,7 @@ import browser_tools
 import attacker_tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer
+from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, reviewer_cache_key
 from tool_loop import CompactionConfig, ToolLoopAgent
 
 
@@ -501,7 +501,7 @@ def _explore_single(node_id: str, role_name: str) -> dict:
     raw_hypotheses = dict_note.get("vulns", [])
     for hyp in raw_hypotheses:
         extracted_vulns.append({
-            "node_id": node_id,
+            "affected_nodes": [node_id],
             "cwe_id": hyp.get("cwe", "OTHER_UNCATEGORIZED"),
             "description": hyp.get("component", ""),
             "status": "hypothesis"
@@ -593,7 +593,7 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
         raw_hypotheses = dict_note.get("vulns", [])
         for hyp in raw_hypotheses:
             extracted_vulns.append({
-                "node_id": node_id,
+                "affected_nodes": [node_id],
                 "cwe_id": hyp.get("cwe", "OTHER_UNCATEGORIZED"),
                 "description": hyp.get("component", ""),
                 "status": "hypothesis"
@@ -1172,7 +1172,7 @@ def _build_cve_hypothesis(record: dict, imports_by_namespace: dict, node_map: di
             )
 
     return {
-        "node_id": f"dependency:{package}",
+        "affected_nodes": [f"dependency:{package}"],
         "cwe_id": cwe_id,
         "description": full_desc,
         "status": "hypothesis",
@@ -1424,7 +1424,7 @@ def _contract_verifier_node(state: VerifierState) -> dict:
             original_desc = demand_lookup.get(eval.get("demand_id"), "No description found.")
 
             new_vulnerabilities.append({
-                "node_id": target_node_id,
+                "affected_nodes": [target_node_id],
                 "cwe_id": eval.get("cwe_id"),
                 "description": f"Fails to satisfy demand: '{original_desc}'. Reasoning: {eval.get("reasoning")}",
                 "status": "hypothesis",
@@ -1478,11 +1478,22 @@ FRAMEWORK_DEPENDENCY_REVIEWER_TOOLS = [
 def _reviewer_mode_for(hypothesis: dict) -> str:
     """Route a hypothesis to its reviewer track.
 
-    'framework_dependency' (Known Dependency Vulnerability) or 'code_level'.
+    'framework_dependency' (Known Dependency Vulnerability), 'systemic'
+    (Systemic Vulnerability) or 'code_level'.
     """
-    if hypothesis.get("vulnerability_type") == "Known Dependency Vulnerability":
+    vuln_type = hypothesis.get("vulnerability_type")
+    if vuln_type == "Known Dependency Vulnerability":
         return "framework_dependency"
+    if vuln_type == "Systemic Vulnerability":
+        return "systemic"
     return "code_level"
+
+
+def _primary_node(record: dict, default: str = "Unknown") -> str:
+    """First affected node of a record — the primary anchor for reviewer
+    state/cache keys. The full list rides inside `expert_report`."""
+    affected = record.get("affected_nodes") or []
+    return affected[0] if affected else default
 
 
 def synchronization_node(state: MasterState):
@@ -1506,7 +1517,7 @@ def dispatch_reviewers(state: MasterState):
     commands = []
     for hypothesis in hypotheses:
         payload = ReviewerState(
-            node_id=hypothesis.get("node_id", "Unknown"),
+            node_id=_primary_node(hypothesis),
             expert_report=hypothesis,
             mode=_reviewer_mode_for(hypothesis),
             iterations=0,
@@ -1618,9 +1629,8 @@ class ReviewerAgent(ToolLoopAgent):
 
     def pre_agent(self, state):
         if not state.get("messages"):
-            cached_data = cache_reviewer(
-                state.get("node_id"), state.get("expert_report", {})
-            )
+            report = state.get("expert_report", {})
+            cached_data = cache_reviewer(reviewer_cache_key(report, state.get("node_id", "Unknown")), report)
             if cached_data:
                 logging.info("Reviewer cache hit.")
                 return Command(
@@ -1632,12 +1642,9 @@ class ReviewerAgent(ToolLoopAgent):
 
     def first_turn(self, state, llm_with_tools) -> dict:
         # Compose the targeted system prompt: shared directives + mode-specific
-        # reachability standard.
+        # reachability standard. Mode names match agents.yaml keys exactly.
         mode = state.get("mode", "code_level")
-        if mode == "framework_dependency":
-            mode_prompt = REVIEWER_AGENT.get("framework_dependency", "")
-        else:
-            mode_prompt = REVIEWER_AGENT.get("code_level", "")
+        mode_prompt = REVIEWER_AGENT.get(mode, "")
         sys_prompt = REVIEWER_AGENT.get('prompt', '')
         if mode_prompt:
             sys_prompt = f"{sys_prompt}\n\n{mode_prompt}"
@@ -1646,8 +1653,11 @@ class ReviewerAgent(ToolLoopAgent):
         report = state.get("expert_report", {})
         node_id = state.get("node_id")
 
+        affected = [n for n in (report.get("affected_nodes") or []) if n]
+        affected_str = ", ".join(affected) if affected else node_id
         formatted_vuln = (
-            f"Target: {state['node_id']}\n\n"
+            f"Target: {node_id}\n"
+            f"Affected Nodes: {affected_str}\n\n"
             f"Potential Issue to Investigate:\n"
             f"- Type: {report.get('vulnerability_type', 'Code Defect')}\n"
             f"- CWE ID: {report.get('cwe_id', 'Unknown')}\n"
@@ -1697,7 +1707,6 @@ class ReviewerAgent(ToolLoopAgent):
         through the standard reviewer output/cache path, but marks it review_error
         instead of silently confirming or discarding it."""
         report = dict(state.get("expert_report", {}))
-        node_id = state.get("node_id", "Unknown")
 
         updated_vuln = dict(report)
         updated_vuln["status"] = "review_error"
@@ -1706,7 +1715,7 @@ class ReviewerAgent(ToolLoopAgent):
             f"without a submit_evaluation verdict (loop budget exceeded)."
         )
 
-        cache_reviewer(node_id, report, updated_vuln)
+        cache_reviewer(reviewer_cache_key(report, state.get("node_id", "Unknown")), report, updated_vuln)
 
         return Command(
             update={
@@ -1791,7 +1800,7 @@ def route_validator_feedback(state: MasterState):
     commands = []
     for record in flagged:
         payload = ReviewerState(
-            node_id=record.get("node_id", "Unknown"),
+            node_id=_primary_node(record),
             expert_report=record,
             mode=_reviewer_mode_for(record),
             iterations=0,
@@ -1816,7 +1825,11 @@ class ValidatorAgent(ToolLoopAgent):
     terminal_tool = ("ask_for_context", "mark_validation_complete")
 
     def _subject(self, state) -> str:
-        return state.get("report_to_test", {}).get("node_id", "Unknown")
+        report = state.get("report_to_test", {})
+        affected = [n for n in (report.get("affected_nodes") or []) if n]
+        if affected:
+            return ", ".join(affected)
+        return report.get("node_id", "Unknown")
 
     def bind_tools(self, state):
         validator_tools = [
@@ -1855,6 +1868,10 @@ class ValidatorAgent(ToolLoopAgent):
         sys_msg = SystemMessage(content=sys_prompt)
         # Build a structured string for the LLM
         report = state['report_to_test']
+        affected = [n for n in (report.get("affected_nodes") or []) if n]
+        affected_str = (
+            ", ".join(affected) if affected else report.get('node_id', 'Unknown')
+        )
         steps = report.get('reproduction_steps') or []
         steps_str = (
             "\n".join(f"  {i}. {s}" for i, s in enumerate(steps, 1))
@@ -1864,7 +1881,7 @@ class ValidatorAgent(ToolLoopAgent):
             f"--- CORE VULNERABILITY ---\n"
             f"Vulnerability ID: {report.get('vuln_id', 'Unknown')}\n"
             f"CWE ID: {report.get('cwe_id', 'Unknown')}\n"
-            f"Target Node: {report.get('node_id', 'Unknown')}\n\n"
+            f"Affected Nodes: {affected_str}\n\n"
             f"--- CONTEXT & REASONING ---\n"
             f"Description: {report.get('description', 'None')}\n\n"
             f"Reviewer Reasoning: {report.get('reviewer_reasoning', 'None')}\n\n"

@@ -16,6 +16,7 @@ from schemas import VulnerabilityRecord
 import settings
 from functools import lru_cache
 
+
 from languages import LANGUAGE_MAP, AST_GRAMMAR_MAP, SYMBOL_QUERIES, MANIFEST_NAMES
 
 
@@ -326,6 +327,29 @@ def build_networkx_graph(graph_path: Path, allowed_communities: Optional[list[in
     return G
 
 
+def _merge_affected_nodes(target: dict, *sources: dict) -> None:
+    """Union the `affected_nodes` of the given records into `target`, deduped
+    and in first-seen order (earlier sources win ordering). Systemic records
+    share one node-independent vuln_id, so every collision accumulates nodes."""
+    merged = []
+    seen = set()
+    for source in sources:
+        for node in source.get("affected_nodes") or []:
+            if node and node not in seen:
+                seen.add(node)
+                merged.append(node)
+    target["affected_nodes"] = merged
+
+
+def reviewer_cache_key(report: Optional[dict], default: str = "Unknown") -> str:
+    """Stable reviewer-cache key prefix derived from a report's affected nodes.
+
+    Replaces the old single `node_id` prefix; the report content hash (which
+    already includes `affected_nodes`) keeps entries distinct per node set."""
+    affected = sorted({n for n in (report or {}).get("affected_nodes") or [] if n})
+    return "+".join(affected) if affected else default
+
+
 def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dict]:
     vuln_map = {}
 
@@ -370,11 +394,13 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
             # the plain ladder would wrongly keep the flag).
             re_review_statuses = {"confirmed", "false_positive", "exploitable", "review_error"}
             if current_status == "insufficient_context" and new_status in re_review_statuses:
+                _merge_affected_nodes(update, update, vuln_map[vid])
                 vuln_map[vid] = update
                 continue
 
             # --- STATUS UPGRADE: COMPLETELY REPLACE ---
             if status_priority.get(new_status, 0) > status_priority.get(current_status, 0):
+                _merge_affected_nodes(update, update, vuln_map[vid])
                 vuln_map[vid] = update
 
             # --- SAME STAGE: MERGE CONTEXT ---
@@ -388,6 +414,7 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
                 if upd_desc and upd_desc not in curr_desc:
                     current["description"] = f"{curr_desc}\n\nAdditional context: {upd_desc}"
 
+                _merge_affected_nodes(current, current, update)
                 vuln_map[vid] = current
         else:
             # --- NEW UNIQUE VULNERABILITY ---
