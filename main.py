@@ -324,7 +324,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_conditional_edges("manager", dispatch_experts, ["expert_agent"])
     workflow.add_edge("expert_agent", "reviewer")
     workflow.add_edge("reviewer", END)
-    app = workflow.compile(checkpointer=checkpointer)
+    app = workflow.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)
 
     return app
 
