@@ -7,6 +7,7 @@ from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.callbacks import BaseCallbackHandler
+from llm_debug import build_debug_http_client
 from tavily import TavilyClient
 from langgraph.types import Command, Send
 from langgraph.graph import END
@@ -55,14 +56,15 @@ base_llm = ChatOpenAI(
     base_url="http://localhost:11434/v1",
     model="deepseek-v4-flash",
     stream_usage=True,
-    temperature=0.4
+    temperature=0.4,
+    http_client=build_debug_http_client(),
 )
 # NOTE: Retry is handled at the graph level via RetryPolicy on every node
 # (see graph.py build_graph -> set_node_defaults), so no per-call retry wrapper
 # is needed here. This avoids double retry layers on top of the openai client.
 
-fast_llm = base_llm.bind(temperature=0.2, max_tokens=4096, reasoning_effort="none")
-smart_llm = base_llm.bind(temperature=0.8, max_tokens=16384, reasoning_effort="medium")
+fast_llm = base_llm.bind(temperature=0.2, max_completion_tokens=4096, reasoning_effort="none")
+smart_llm = base_llm.bind(temperature=0.8, max_completion_tokens=16384, reasoning_effort="medium")
 
 
 # ==========================================

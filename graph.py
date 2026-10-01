@@ -1,6 +1,9 @@
 import json
 import logging
 import argparse
+import os
+import sys
+from datetime import datetime
 from pathlib import Path
 
 # Keep successful HTTP transport requests out of the application logs.
@@ -157,10 +160,25 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     log_level = logging.DEBUG if args.verbose else logging.INFO
+    log_format = "%(asctime)s [%(levelname)s] %(module)s - %(message)s"
+    log_datefmt = "%H:%M:%S"
+    log_file = Path(os.getenv("LOG_FILE", "logs.txt"))
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Keep console output while also retaining a complete run log for failures
+    # that occur after the terminal output has scrolled away.
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s [%(levelname)s] %(module)s - %(message)s",
-        datefmt="%H:%M:%S"
+        format=log_format,
+        datefmt=log_datefmt,
+        handlers=[
+            logging.StreamHandler(sys.stderr),
+            logging.FileHandler(log_file, encoding="utf-8"),
+        ],
+    )
+    logging.info(
+        "\n\n===== Pipeline run started at %s =====",
+        datetime.now().astimezone().isoformat(timespec="seconds"),
     )
 
     initial_state = MasterState(
