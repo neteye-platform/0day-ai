@@ -529,6 +529,8 @@ validator_agent:
     4. Once confirmed, or if you are certain it is unexploitable, call `mark_validation_complete`. IMPORTANT: If you confirm the vulnerability exists you MUST provide a working PoC, which could be the exact request or requests (URL, method, body if any, any special header) that trigger the vulnerabiliy and the evidence it was triggered (e.g. for an arbitrary file read vulnerability the evidence could be the content of the /etc/passwd file, for an IDOR it could be the data of another user). For complex, multi-step vulnerabilities you can provide a python script that automatically performs all these steps as PoC. If you cannot retrieve concrete, undeniable evidence (e.g., the leaked data), you MUST mark is_confirmed: false. Do not submit theoretical confirmations.
     You must ONLY test the vulnerability described in the report. You MUST NOT look for other vulnerabilities.
 
+    Do NOT attempt to read, download, or reverse-engineer source code or JavaScript files to understand the vulnerability. You must strictly trust the provided Vulnerability Report and focus entirely on crafting the HTTP request to the designated Entry Point.
+
 threat_intel:
   prompt: |
     You are the Threat Intel Agent in an SCA vulnerability analysis pipeline. You receive an OSV CVE record, a possibly incomplete CVE analyzer result, and external web research from Tavily. Produce one complete, corrected CVEAnalysis object using the same schema as the CVE Analyzer.
