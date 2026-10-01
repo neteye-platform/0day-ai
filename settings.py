@@ -242,6 +242,19 @@ semantic_dedup_enabled = True
 semantic_dedup_threshold = 0.80
 embeddings_model = "embeddinggemma"
 embeddings_base_url = "http://localhost:11434"
+
+# Demand dedup (contract-verifier input): every caller of a hub callee restates
+# the same contract in its own words, so the verifier would evaluate hundreds
+# of paraphrases of one requirement (GLPI's TemplateRenderer::display gathered
+# 225 downstream assumptions from 225 callers; embedding clustering at
+# semantic_dedup_threshold reduces them to 68). Merging runs per target node
+# after aggregation: cve_assumption demands are never merged, upstream
+# (callee-parameter) demands only merge on exact normalized identity within
+# the same (callee, parameter), downstream assumptions merge on exact identity
+# then embedding similarity. Same local Ollama embedder as the hypothesis
+# dedup; embeddings are disk-cached per (model, text) so re-runs are ~free;
+# fails open to exact-only merging when Ollama is unreachable.
+demand_dedup_enabled = True
 embeddings_timeout = 60
 
 # When True, the Threat Intel agent enriches HIGH/CRITICAL CVEs with external

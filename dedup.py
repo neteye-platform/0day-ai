@@ -32,10 +32,12 @@ hypotheses):
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import re
 from collections import defaultdict
+from pathlib import Path
 
 import requests
 
@@ -86,6 +88,46 @@ class Embeddings:
             raise ValueError(f"Ollama returned no embedding for model {self.model!r}: {resp.text[:200]}")
         self._cache[key] = vec
         return vec
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embed many texts, using Ollama's batch endpoint when available.
+
+        Tries ``/api/embed`` (one request for the whole list) and falls back to
+        sequential single-text ``embed()`` calls on older servers. The
+        per-text cache is consulted and filled either way, so repeated runs
+        only pay for unseen texts.
+        """
+        results: list[list[float] | None] = [None] * len(texts)
+        missing: list[tuple[int, str]] = []
+        for i, t in enumerate(texts):
+            cached = self._cache.get(self._key(t))
+            if cached is not None:
+                results[i] = cached
+            else:
+                missing.append((i, t))
+        if missing:
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/api/embed",
+                    json={"model": self.model, "input": [t for _, t in missing]},
+                    timeout=self.timeout,
+                )
+                resp.raise_for_status()
+                vecs = resp.json().get("embeddings") or []
+                if len(vecs) != len(missing):
+                    raise ValueError(
+                        f"batch size mismatch: {len(vecs)} embeddings for {len(missing)} texts"
+                    )
+                for (i, t), vec in zip(missing, vecs):
+                    self._cache[self._key(t)] = vec
+                    results[i] = vec
+            except Exception:
+                # Older Ollama without /api/embed (or a transient batch error):
+                # fall back to proven one-by-one requests, which raise on real
+                # unavailability so callers fail open.
+                for i, t in missing:
+                    results[i] = self.embed(t)
+        return results
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -160,17 +202,13 @@ def _merge_cluster(members: list[dict]) -> dict:
     return merged
 
 
-def _cluster_group(records: list[dict], embedder: Embeddings, threshold: float) -> list[dict]:
-    """Greedy fixed-representative clustering of one (type, cwe[, nodes]) group."""
-    if len(records) <= 1:
-        return records
-    try:
-        vectors = [embedder.embed(_normalize_text(r.get("vulnerability_type"), r.get("cwe_id"), r.get("description")))
-                   for r in records]
-    except Exception:
-        log.warning("Semantic dedup: embedding failed for a group; dispatching %d hypotheses unchanged.", len(records))
-        return records
+def _greedy_cluster_indices(vectors: list[list[float]], threshold: float) -> list[list[int]]:
+    """Greedy fixed-representative clustering over precomputed vectors.
 
+    Returns index clusters in input order; the first member of each cluster is
+    its representative. Comparing each item against cluster representatives
+    only (not all members) prevents A~B~C transitive over-merges.
+    """
     clusters: list[list[int]] = []
     reps: list[list[float]] = []
     for i, vec in enumerate(vectors):
@@ -185,9 +223,22 @@ def _cluster_group(records: list[dict], embedder: Embeddings, threshold: float) 
         else:
             clusters.append([i])
             reps.append(vec)
+    return clusters
+
+
+def _cluster_group(records: list[dict], embedder: Embeddings, threshold: float) -> list[dict]:
+    """Greedy fixed-representative clustering of one (type, cwe[, nodes]) group."""
+    if len(records) <= 1:
+        return records
+    try:
+        vectors = [embedder.embed(_normalize_text(r.get("vulnerability_type"), r.get("cwe_id"), r.get("description")))
+                   for r in records]
+    except Exception:
+        log.warning("Semantic dedup: embedding failed for a group; dispatching %d hypotheses unchanged.", len(records))
+        return records
 
     out = []
-    for cl in clusters:
+    for cl in _greedy_cluster_indices(vectors, threshold):
         out.append(_merge_cluster([records[i] for i in cl]) if len(cl) > 1 else records[cl[0]])
     return out
 
@@ -242,3 +293,136 @@ def cluster_vulnerabilities(hypotheses: list[dict], threshold: float = 0.80,
         len(hypotheses), len(outcome), len(hypotheses) - len(outcome),
     )
     return outcome
+
+
+# ---------------------------------------------------------------------------
+# Demand dedup (contract-verifier input)
+# ---------------------------------------------------------------------------
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _embed_with_disk_cache(
+    embedder: Embeddings, texts: list[str], disk_cache_dir
+) -> list[list[float]]:
+    """``embed_batch`` with an optional per-text on-disk cache keyed by
+    (model, text) hash, so re-runs with unchanged notes never re-pay the
+    embedding pass. Cache read/write errors are treated as misses."""
+    if not disk_cache_dir:
+        return embedder.embed_batch(texts)
+    cache_dir = Path(disk_cache_dir)
+    results: list[list[float] | None] = [None] * len(texts)
+    missing: list[tuple[int, str, Path]] = []
+    for i, t in enumerate(texts):
+        model = getattr(embedder, "model", "")
+        f = cache_dir / f"{hashlib.sha256(f'{model}:{t}'.encode('utf-8')).hexdigest()}.json"
+        try:
+            results[i] = json.loads(f.read_text())["embedding"]
+            continue
+        except Exception:
+            missing.append((i, t, f))
+    if missing:
+        vecs = embedder.embed_batch([t for _, t, _ in missing])
+        for (i, t, f), vec in zip(missing, vecs):
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                f.write_text(json.dumps({"embedding": vec}))
+            except Exception:
+                pass
+            results[i] = vec
+    return results
+
+
+def deduplicate_demands(
+    grouped_demands: dict,
+    embedder: Embeddings | None,
+    threshold: float,
+    disk_cache_dir=None,
+) -> dict:
+    """Merge near-duplicate demands per target node before contract verification.
+
+    Every caller of a hub callee restates the same contract in its own words,
+    and the verifier emits one evaluation per demand — so paraphrase floods
+    multiply LLM spend without adding checkable information (one GLPI renderer
+    gathered 225 near-identical downstream assumptions from 225 callers;
+    clustering at the hypothesis-dedup threshold reduces them to 68).
+
+    Merging semantics per target node:
+
+      * ``cve_assumption`` demands are NEVER merged: each is a distinct CVE
+        contract whose ``source_cve`` tags downstream records.
+      * Upstream (callee-parameter) demands merge only on exact normalized
+        identity within the same ``(source, parameter_name)`` pair — merging
+        paraphrases across parameters could drop a distinct argument check,
+        so the embedder is never consulted for them.
+      * All other explorer demands (downstream caller assumptions) merge on
+        exact normalized identity first, then embedding similarity at
+        ``threshold``. The cluster seed (first demand in order) is kept
+        as-is: unlike hypothesis merges nothing is concatenated, since the
+        paraphrase variants carry no extra checkable information and the
+        demands feed a size-sensitive prompt.
+      * Fails open: embedding errors keep the exact-merged demands for that
+        target; with ``embedder=None`` only exact merging runs.
+    """
+    total_in = sum(len(v) for v in grouped_demands.values())
+    for target, demands in grouped_demands.items():
+        if len(demands) <= 1:
+            continue
+
+        by_type: dict[str, list[int]] = defaultdict(list)
+        for i, d in enumerate(demands):
+            by_type[d.get("type") or ""].append(i)
+
+        keep: list[int] = []
+        for dtype, idxs in by_type.items():
+            if dtype == "cve_assumption" or len(idxs) == 1:
+                keep.extend(idxs)
+                continue
+
+            if dtype == "explorer_upstream_assumption":
+                exact: dict[tuple, int] = {}
+                for i in idxs:
+                    d = demands[i]
+                    key = (d.get("source"), d.get("parameter_name"), _norm(d.get("description")))
+                    if key not in exact:
+                        exact[key] = i
+                keep.extend(exact.values())
+                continue
+
+            # Downstream caller assumptions (and any other explorer type):
+            # exact-normalized pre-merge, then embedding clustering on the
+            # survivors. The kept demand is each cluster's seed, in original
+            # order.
+            exact_desc: dict[str, int] = {}
+            for i in idxs:
+                key = _norm(demands[i].get("description"))
+                if key not in exact_desc:
+                    exact_desc[key] = i
+            seeds = list(exact_desc.values())
+            if len(seeds) == 1 or embedder is None:
+                keep.extend(seeds)
+                continue
+            try:
+                texts = [_norm(demands[i].get("description")) for i in seeds]
+                vectors = _embed_with_disk_cache(embedder, texts, disk_cache_dir)
+                clusters = _greedy_cluster_indices(vectors, threshold)
+            except Exception as e:
+                log.warning(
+                    "Demand dedup: embedding failed for target %s; keeping %d "
+                    "exact-unique demands (%s)",
+                    target, len(seeds), e,
+                )
+                keep.extend(seeds)
+                continue
+            keep.extend(seeds[cl[0]] for cl in clusters)
+
+        keep.sort()
+        grouped_demands[target] = [demands[i] for i in keep]
+
+    total_out = sum(len(v) for v in grouped_demands.values())
+    if total_out != total_in:
+        log.info(
+            "Demand dedup: %d -> %d demands before contract verification (%d merged).",
+            total_in, total_out, total_in - total_out,
+        )
+    return grouped_demands
