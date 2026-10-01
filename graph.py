@@ -150,8 +150,6 @@ if __name__ == "__main__":
     )
 
     initial_state = MasterState(
-        graph={},
-        app_summary="",
         known_vulns=[],
         expert_tasks=[],
         sandbox_url=None,
@@ -159,8 +157,7 @@ if __name__ == "__main__":
         notes=[],
         cve_demands=[],
         grouped_demands={},
-        vulnerability_hypothesis=[],
-        confirmed_vulnerabilities=[]
+        vulnerabilities=[]
     )
 
     try:

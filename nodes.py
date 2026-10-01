@@ -48,15 +48,14 @@ base_llm = ChatOpenAI(
     base_url="http://localhost:11434/v1",
     model="deepseek-v4-flash",
     stream_usage=True,
-    temperature=0.4,
-    reasoning_effort="none"
+    temperature=0.4
 )
 # NOTE: Retry is handled at the graph level via RetryPolicy on every node
 # (see graph.py build_graph -> set_node_defaults), so no per-call retry wrapper
 # is needed here. This avoids double retry layers on top of the openai client.
 
-fast_llm = base_llm.bind(temperature=0.2, max_tokens=4096)
-smart_llm = base_llm.bind(temperature=0.8, max_tokens=16384)
+fast_llm = base_llm.bind(temperature=0.2, max_tokens=4096, reasoning_effort="none")
+smart_llm = base_llm.bind(temperature=0.8, max_tokens=16384, reasoning_effort="medium")
 
 
 # ==========================================
