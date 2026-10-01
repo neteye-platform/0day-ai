@@ -12,18 +12,22 @@ from pathlib import Path
 
 import settings
 from dedup import deduplicate_demands
-from run_stats import as_dict, get_embedder
+from run_stats import _record_stat, as_dict, get_embedder
 from stage_cve import _normalize_cwe_ids
 from state import MasterState
 from utils import (
+    build_container_members,
     clear_aggregate_caches,
     extract_imports,
     get_cached_graph_data,
     get_node_code,
+    info_once,
+    parse_call_target,
     read_file_text,
     resolve_node_id,
     scan_codebase_for_keywords,
     uses_namespace_in_ast,
+    warning_once,
 )
 
 
@@ -113,16 +117,9 @@ def _route_downstream(demand: dict, current_node_id: str, graph_data: dict, grou
 
     # STRIP LLM HALLUCINATIONS: Remove backticks, parentheses, and arguments
     clean_target = _TARGET_ARGS_RE.sub('', target_str).replace('`', '').strip()
+    module, symbol = parse_call_target(clean_target)
 
-    # Handle correct `::` format, OR fallback to `module.symbol` dot notation
-    if "::" in clean_target:
-        module, symbol = clean_target.split("::", 1)
-    elif "." in clean_target:
-        module, symbol = clean_target.rsplit(".", 1)
-    else:
-        module, symbol = clean_target, "unknown"
-
-    if target_node_id := resolve_node_id(module, symbol):
+    if target_node_id := resolve_node_id(module, symbol, caller_node_id=current_node_id):
         if target_node_id == current_node_id:
             # Drop assumptions about the node under analysis
             return
@@ -131,8 +128,11 @@ def _route_downstream(demand: dict, current_node_id: str, graph_data: dict, grou
             "type": "explorer_downstream_assumption",
             "description": desc
         })
-    else:
-        logging.warning(f"[{current_node_id}] DOWNSTREAM DROP: Could not resolve '{module}' / '{symbol}' (Original: {target_str})")
+    elif warning_once(
+        ("downstream_drop", module, symbol),
+        f"[{current_node_id}] DOWNSTREAM DROP: Could not resolve '{module}' / '{symbol}' (Original: {target_str})",
+    ):
+        _record_stat("demands_dropped_unresolved_unique")
 
 
 _CLASS_PROP_WINDOW_LINES = 400
@@ -141,31 +141,6 @@ _CLASS_PROP_DECL_RE = re.compile(
     r"\b(?:public|protected|private|var)\b[^;{(=]*\$([A-Za-z_]\w*)"
 )
 _MEMBER_PARAM_RE = re.compile(r"\$([A-Za-z_]\w*)")
-
-
-def _build_container_members(graph_data: dict) -> dict[str, dict[str, str]]:
-    """``container_id -> {method_name_lower: member_node_id}`` for class-like
-    nodes. Same id-derivation as ``utils._repair_call_edges``."""
-    from utils import _MEMBER_LABEL_RE
-    nodes = {n["id"]: n for n in graph_data.get("nodes", []) if n.get("id")}
-    members: dict[str, dict[str, str]] = {}
-    for nid, node in nodes.items():
-        match = _MEMBER_LABEL_RE.match(node.get("label") or "")
-        if not match:
-            continue
-        mname = match.group(1).lower()
-        if not nid.endswith("_" + mname):
-            continue
-        base = nid[: len(nid) - len(mname) - 1]
-        parent = nodes.get(base)
-        if (
-            not parent
-            or parent.get("source_file") != node.get("source_file")
-            or _MEMBER_LABEL_RE.match(parent.get("label") or "")
-        ):
-            continue
-        members.setdefault(base, {})[mname] = nid
-    return members
 
 
 def _member_param_names(member_id: str, node_map: dict, memo: dict) -> set | None:
@@ -279,6 +254,10 @@ def _route_upstream(demand: dict, current_node_id: str, callers_map: dict, group
     with no qualifying caller is dropped."""
     target_str = demand.get("target", "")
     desc = demand.get("description")
+    # The memos are required by _caller_invokes_symbol; be safe when called
+    # without the per-run dicts (the pipeline's own loops always pass them).
+    code_memo = code_memo if code_memo is not None else {}
+    pattern_memo = pattern_memo if pattern_memo is not None else {}
 
     callers = callers_map.get(current_node_id, [])
 
@@ -311,13 +290,14 @@ def _route_upstream(demand: dict, current_node_id: str, callers_map: dict, group
                 callers_map, callers)
             if scoped is not None:
                 if not scoped:
-                    if callers:
-                        logging.info(
-                            f"[{current_node_id}] UPSTREAM SCOPE DROP: bare target "
-                            f"'{target_str}' resolves to no qualifying caller of the "
-                            f"container (of {len(callers)} class caller(s)) — "
-                            f"demand dropped: {str(desc)[:120] if desc else ''}"
-                        )
+                    if callers and info_once(
+                        ("upscope_bare", target_str),
+                        f"[{current_node_id}] UPSTREAM SCOPE DROP: bare target "
+                        f"'{target_str}' resolves to no qualifying caller of the "
+                        f"container (of {len(callers)} class caller(s)) — "
+                        f"demand dropped: {str(desc)[:120] if desc else ''}"
+                    ):
+                        _record_stat("demands_dropped_scoped_unique")
                     return
                 receivers = scoped
         if receivers:
@@ -345,7 +325,7 @@ def _route_upstream(demand: dict, current_node_id: str, callers_map: dict, group
             # Bare member call on a container: deliver via the member's edges.
             qualified = list(callers_map.get(container_members[current_node_id][symbol.lower()], []))
         else:
-            resolved = resolve_node_id(module, symbol)
+            resolved = resolve_node_id(module, symbol, caller_node_id=current_node_id)
             precise_callers = []
             if resolved and resolved != current_node_id:
                 resolved_node = (node_map or {}).get(resolved) or {}
@@ -363,10 +343,12 @@ def _route_upstream(demand: dict, current_node_id: str, callers_map: dict, group
     if not qualified:
         # A member contract no caller exercises has no addressee: drop it
         # instead of burning one verifier evaluation per unrelated caller.
-        logging.info(
+        if info_once(
+            ("upscope_noinv", clean_target),
             f"[{current_node_id}] UPSTREAM SCOPE DROP: no caller invokes '{clean_target}' "
             f"(of {len(callers)} caller(s)) — demand dropped: {str(desc)[:120] if desc else ''}"
-        )
+        ):
+            _record_stat("demands_dropped_scoped_unique")
         return
 
     for caller_id in qualified:
@@ -389,7 +371,7 @@ def _route_explorer_notes(notes: list, graph_data: dict, callers_map: dict, grou
     pattern_memo: dict = {}
     # Container bare-target scoping: member index + lazy signature/property scans.
     container_members = (
-        _build_container_members(graph_data)
+        build_container_members(graph_data)
         if getattr(settings, "container_demands_scope_to_members", False)
         else None
     )

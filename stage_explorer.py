@@ -8,9 +8,10 @@ from langgraph.types import Send
 
 import settings
 from llms import fast_llm
+from llms import invoke_structured_capped
 from schemas import EXPERT_AGENTS, AnalysisNote, BatchedAnalysisResult
 from state import ExplorerState, MasterState
-from run_stats import _log_agent_completion, _start_agent_progress
+from run_stats import _log_agent_completion, _record_stat, _start_agent_progress
 from utils import (
     build_networkx_graph,
     get_cached_graph_data,
@@ -247,7 +248,14 @@ def _explore_single(node_id: str, role_name: str) -> dict:
     human_msg = HumanMessage(content=user_prompt)
 
     explorer_llm = fast_llm.with_structured_output(AnalysisNote, method="json_schema", strict=True)
-    note = explorer_llm.invoke([sys_msg, human_msg])
+    note = invoke_structured_capped(
+        explorer_llm, [sys_msg, human_msg], f"Explorer single-node {node_id}"
+    )
+    if note is None:
+        # Output cap exhausted: degrade to an empty note (uncached, so a later
+        # run re-attempts this node) instead of crashing the whole fan-out.
+        _record_stat("explorer_nodes_skipped_output_cap")
+        return {"notes": [], "vulnerabilities": []}
 
     dict_note = note if isinstance(note, dict) else note.model_dump()
     dict_note["node_id"] = node_id
@@ -313,7 +321,14 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
     human_msg = HumanMessage(content=user_prompt)
 
     explorer_llm = fast_llm.with_structured_output(BatchedAnalysisResult, method="json_schema", strict=True)
-    result = explorer_llm.invoke([sys_msg, human_msg])
+    result = invoke_structured_capped(
+        explorer_llm, [sys_msg, human_msg], f"Explorer batch of {len(node_ids)} nodes"
+    )
+    if result is None:
+        # Output cap exhausted for the whole batch (uncached, so a later run
+        # re-attempts these nodes) instead of crashing the whole fan-out.
+        _record_stat("explorer_nodes_skipped_output_cap", len(node_ids))
+        return {"notes": [], "vulnerabilities": []}
 
     result = result if isinstance(result, dict) else result.model_dump()
     raw_notes = result.get("notes", [])

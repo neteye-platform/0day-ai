@@ -13,10 +13,12 @@ import subprocess
 import networkx as nx
 import json
 import tarfile
+import threading
 import time
 import requests
 from typing import Optional
 from langchain_core.messages import AnyMessage
+from run_stats import _record_stat
 from schemas import VulnerabilityRecord
 import settings
 from functools import lru_cache
@@ -777,74 +779,336 @@ def estimate_message_tokens(messages: list[AnyMessage]) -> int:
     return int((total_chars / 2) * 1.15) + 8 * message_count
 
 
-def resolve_node_id(module, symbol):
+# --------------------------------------------------------------------------
+# Node-target resolution (demand routing)
+# --------------------------------------------------------------------------
+
+_PRONOUN_MODULES = frozenset({"parent", "static", "self", "this", "$this"})
+_CLASS_RELATIONS = frozenset({"inherits", "extends", "implements", "mixes_in"})
+
+# Once-per-run warning dedup (cleared at bootstrap). Flooding 19k identical
+# "Failed to find graph node" lines per run buries every other signal.
+_LOG_ONCE_SEEN: set = set()
+_LOG_ONCE_LOCK = threading.Lock()
+
+
+def _log_once(level: int, key: tuple, msg: str) -> bool:
+    """Log msg only the first time ``key`` is seen this run; True when logged.
+    Lock-guarded: fan-out nodes may call this from worker threads."""
+    with _LOG_ONCE_LOCK:
+        if key in _LOG_ONCE_SEEN:
+            return False
+        _LOG_ONCE_SEEN.add(key)
+    logging.log(level, msg)
+    return True
+
+
+def warning_once(key: tuple, msg: str) -> bool:
+    """``_log_once`` at WARNING level."""
+    return _log_once(logging.WARNING, key, msg)
+
+
+def info_once(key: tuple, msg: str) -> bool:
+    """``_log_once`` at INFO level (expected-but-noisy routing events)."""
+    return _log_once(logging.INFO, key, msg)
+
+
+def clear_warning_state() -> None:
+    """Reset the once-per-run warning dedup (called from bootstrap)."""
+    with _LOG_ONCE_LOCK:
+        _LOG_ONCE_SEEN.clear()
+
+
+def build_container_members(graph_data: dict) -> dict[str, dict[str, str]]:
+    """``container_id -> {method_name_lower: member_node_id}`` for class-like
+    nodes. A member node id is ``<container_id>_<method_name>``, its label is
+    ``.method()`` and it shares the container's ``source_file``; the container
+    itself is a non-member node. Same id-derivation as ``_repair_call_edges``."""
+    nodes = {n["id"]: n for n in graph_data.get("nodes", []) if n.get("id")}
+    members: dict[str, dict[str, str]] = {}
+    for nid, node in nodes.items():
+        match = _MEMBER_LABEL_RE.match(node.get("label") or "")
+        if not match:
+            continue
+        mname = match.group(1).lower()
+        if not nid.endswith("_" + mname):
+            continue
+        base = nid[: len(nid) - len(mname) - 1]
+        parent = nodes.get(base)
+        if (
+            not parent
+            or parent.get("source_file") != node.get("source_file")
+            or _MEMBER_LABEL_RE.match(parent.get("label") or "")
+        ):
+            continue
+        members.setdefault(base, {})[mname] = nid
+    return members
+
+
+def _norm_node_label(label) -> str:
+    """Match key shared by member labels (``.login()``), function labels
+    (``login()``) and bare symbols coming from LLM notes."""
+    l = str(label).strip().lower()
+    if l.startswith("."):
+        l = l[1:]
+    if l.endswith("()"):
+        l = l[:-2]
+    return l
+
+
+_RESOLVE_INDEX_CACHE: dict = {}
+
+
+def _resolver_indexes() -> dict:
+    """Process-cached lookup structures over the (lru-cached) graph. Rebuilt
+    only when ``get_cached_graph_data`` hands back a different object."""
     graph_data = get_cached_graph_data(settings.graph)
-    nodes_list = graph_data.get("nodes", [])
+    if _RESOLVE_INDEX_CACHE.get("graph") is graph_data:
+        return _RESOLVE_INDEX_CACHE
 
-    # Sanitize Inputs
-    # Handle cases where the LLM returns None, empty string, or "global"
-    if not module or module.lower() == "self":
-        module = ""
+    members = build_container_members(graph_data)
+    member_of = {mid: cid for cid, mm in members.items() for mid in mm.values()}
+    node_ids = {n.get("id") for n in graph_data.get("nodes", []) if n.get("id")}
+    parent_of: dict[str, list] = {}
+    for edge in graph_data.get("links", []):
+        if edge.get("relation") not in _CLASS_RELATIONS:
+            continue
+        src, tgt = edge.get("source"), edge.get("target")
+        if src in node_ids and tgt in node_ids and src not in member_of:
+            parents = parent_of.setdefault(src, [])
+            if tgt not in parents:
+                parents.append(tgt)
+    # (id, lowered file, lowered label) tuples for the hinted scan loop.
+    node_tuples = []
+    exact_index: dict[str, list] = {}
+    labels: dict[str, str] = {}
+    class_by_label: dict[str, list] = {}
+    by_stem: dict[str, list] = {}
+    nodes_by_id = {n["id"]: n for n in graph_data.get("nodes", []) if n.get("id")}
+    for nid, n in nodes_by_id.items():
+        source_file = n.get("source_file")
+        if not source_file:
+            continue
+        lower_label = str(n.get("label", "")).lower()
+        node_tuples.append((nid, source_file.replace("\\", "/").lower(), lower_label))
+        exact_index.setdefault(_norm_node_label(n.get("label", "")), []).append(nid)
+        labels[nid] = lower_label
+    for cid in members:
+        label_key = _norm_node_label(nodes_by_id[cid].get("label", ""))
+        if label_key:
+            class_by_label.setdefault(label_key, []).append(cid)
+        stem = Path(nodes_by_id[cid].get("source_file", "")).stem.lower()
+        if stem:
+            by_stem.setdefault(stem, []).append(cid)
 
-    if not symbol:
-        logging.warning("No symbol provided to resolve_node_id.")
+    _RESOLVE_INDEX_CACHE.clear()
+    _RESOLVE_INDEX_CACHE.update(
+        {
+            "graph": graph_data,
+            "members": members,
+            "member_of": member_of,
+            "parent_of": parent_of,
+            "nodes": node_tuples,
+            "exact": exact_index,
+            "labels": labels,
+            "class_by_label": class_by_label,
+            "by_stem": by_stem,
+        }
+    )
+    return _RESOLVE_INDEX_CACHE
+
+
+def _inherited_member(idx: dict, class_key: str, member_key: str):
+    """BFS the container inheritance closure for ``member_key``. Covers members
+    that the hint-class merely inherits (``CommonDBTM::addStandardTab``
+    defined on CommonGLPI)."""
+    if not class_key or not member_key:
         return None
+    frontier = list(dict.fromkeys(
+        idx["class_by_label"].get(class_key, []) + idx["by_stem"].get(class_key, [])
+    ))
+    visited = set()
+    for _ in range(8):  # bounded ancestor walk
+        nxt = []
+        for cid in frontier:
+            if cid in visited:
+                continue
+            visited.add(cid)
+            mid = idx["members"].get(cid, {}).get(member_key)
+            if mid:
+                return mid
+            nxt.extend(idx["parent_of"].get(cid, []))
+        if not nxt:
+            return None
+        frontier = nxt
+    return None
+
+
+def parse_call_target(clean_target: str) -> tuple[str, str]:
+    """Split an args-stripped call target into ``(module, symbol)``.
+
+    Handles ``Class::method``, ``module.method``, chained receivers
+    (``TemplateRenderer::getInstance()->display`` -> ``("TemplateRenderer",
+    "display")``) and variable receivers (``$DB->request`` -> ``("",
+    "request")``; ``$this->x`` keeps the ``$this`` module for caller-scoped
+    resolution). A bare function name stays moduleless — the buggy
+    legacy assignment put the name in ``module`` and made every global
+    function lookup miss its file-match leg.
+    """
+    t = (clean_target or "").strip()
+    module = ""
+    rest = t
+    if "::" in rest:
+        module, rest = rest.split("::", 1)
+    if "->" in rest:
+        receiver, rest = rest.rsplit("->", 1)
+        receiver = receiver.rstrip("()").strip()
+        if not module and (not receiver.startswith("$") or receiver.lower() == "$this"):
+            module = receiver
+    module = module.strip()
+    if not module and "." in rest and not rest.startswith("."):
+        module, rest = rest.rsplit(".", 1)
+    rest = re.sub(r"\(.*$", "", rest).strip()
+    return module, rest
+
+
+def resolve_node_id(module, symbol, caller_node_id=None):
+    """Resolve an explorer's ``target`` (module + symbol) to a graph node id.
+
+    ``caller_node_id`` enables caller-scoped resolution: a module of
+    ``parent``/``self``/``static``/``this``/``$this`` maps to the caller's own
+    container (parents via inherits/extends/implements/mixes_in edges), which
+    used to be dropped outright. Without any module/class hint the lookup is
+    GLOBAL-EXACT ONLY (unique normalized label); ambiguous bare method names
+    (e.g. ``getFromDB``: 61 classes) deliberately miss instead of misrouting a
+    security demand to a random class."""
+    module = (module or "").strip()
+    if module.lower() in ("global", "none", "null"):
+        module = ""
+    symbol = (symbol or "").strip()
+    if not symbol:
+        warning_once(("resolve", "no-symbol"), "No symbol provided to resolve_node_id.")
+        return None
+
+    idx = _resolver_indexes()
+    lower_mod = module.lower()
+
+    # Caller-scoped pronouns: parent::/self::/static::/$this-> resolve inside
+    # the calling member's container (or its direct parents).
+    if caller_node_id and lower_mod in _PRONOUN_MODULES:
+        container = idx["member_of"].get(caller_node_id) or (
+            caller_node_id if caller_node_id in idx["members"] else None
+        )
+        if container:
+            scope = (
+                idx["parent_of"].get(container, [])
+                if lower_mod == "parent"
+                else [container]
+            )
+            base = _norm_node_label(symbol)
+            for cid in scope:
+                mid = idx["members"].get(cid, {}).get(base)
+                if mid:
+                    _record_stat("demand_nodes_resolved_fallback")
+                    return mid
+        # A pronoun missing class scope may still be a global helper
+        # (e.g. ``parent::_n(...)``): fall through as moduleless.
+        module = ""
+        lower_mod = ""
+    elif lower_mod.startswith("$") and lower_mod not in _PRONOUN_MODULES:
+        # Instance-variable receiver ($DB, $mail...): no file hint.
+        module = ""
 
     # Handle LLM concatenating multiple symbols (e.g., "User::dropdown/Group::dropdown")
     if "/" in symbol:
         symbol = symbol.split("/")[0].strip()
 
+    base_symbol = symbol[:-2] if symbol.endswith("()") else symbol
     # Extract Class/Method from Symbol (e.g., "User::dropdown" -> "User", "dropdown")
     class_name = ""
-    if "::" in symbol:
-        class_name, symbol = symbol.split("::", 1)
-    elif "." in symbol:
-        class_name, symbol = symbol.split(".", 1)
+    if "::" in base_symbol:
+        class_name, base_symbol = base_symbol.split("::", 1)
+    elif "." in base_symbol:
+        class_name, base_symbol = base_symbol.split(".", 1)
 
     # Normalize for matching
     normalized_module = module.replace(".", "/").replace("\\", "/").lower()
     base_module_name = normalized_module.split("/")[-1] if normalized_module else ""
 
-    lower_symbol = symbol.lower()
+    lower_symbol = base_symbol.lower()
+    lower_symbol_paren = f"{lower_symbol}()"
+    lower_symbol_member = _norm_node_label(base_symbol)
     lower_class = class_name.lower()
+    hinted = bool(base_module_name or lower_class)
 
-    for n in nodes_list:
-        source_file = n.get("source_file", "")
-        if not source_file:
-            continue
-
-        lower_file = source_file.replace("\\", "/").lower()
-        label = str(n.get("label", "")).lower()
-
-        # Evaluate File/Scope Match
-        # If we have a module, use the original logic.
-        # If we have a class name, look for the class name in the file path (e.g., User.php) or label.
-        # If neither exist, allow file_match to be True and search globally.
-        file_match = True
-        if base_module_name:
-            file_match = (
-                base_module_name in lower_file or
-                normalized_module in lower_file
-            )
-        elif lower_class:
-            file_match = (lower_class in lower_file or lower_class in label)
-
-        # Evaluate Label Match
-        label_match = (
-            label == lower_symbol or
-            label == f"{lower_symbol}()" or
-            label.endswith(f"::{lower_symbol}") or
-            label.endswith(f"->{lower_symbol}") or
-            label.endswith(f".{lower_symbol}") or
-            lower_symbol in label
-        )
-
-        if file_match and label_match:
-            return n.get("id")
+    if hinted:
+        # Hints available: legacy file/scope matching, but strict label forms
+        # are preferred over the substring leg (a file containing both
+        # ``.display()`` and ``.displayXYZ()`` must route to the exact one).
+        strict_hit = loose_hit = None
+        for nid, lower_file, label in idx["nodes"]:
+            file_match = True
+            if base_module_name:
+                file_match = (
+                    base_module_name in lower_file or
+                    normalized_module in lower_file
+                )
+            elif lower_class:
+                file_match = (lower_class in lower_file or lower_class in label)
+            if not file_match:
+                continue
+            if (
+                label == lower_symbol or label == lower_symbol_paren
+                or label.endswith(f"::{lower_symbol}") or label.endswith(f"::{lower_symbol_paren}")
+                or label.endswith(f"->{lower_symbol}") or label.endswith(f"->{lower_symbol_paren}")
+                or label.endswith(f".{lower_symbol}") or label.endswith(f".{lower_symbol_paren}")
+            ):
+                strict_hit = nid
+                break
+            if loose_hit is None and lower_symbol in label:
+                loose_hit = nid
+        if strict_hit or loose_hit:
+            if strict_hit is None:
+                _record_stat("demand_nodes_resolved_fallback")
+            return strict_hit or loose_hit
+        # The hint may name a class that INHERITS the method (defined on a
+        # grand- or great-grandparent): walk the class closure before failing.
+        mid = _inherited_member(idx, lower_class or base_module_name, lower_symbol_member)
+        if mid:
+            _record_stat("demand_nodes_resolved_fallback")
+            return mid
+    else:
+        # No hint at all: global exact match only. When the label is shared by
+        # several nodes, a bare call resolves to the function-style label node
+        # (no leading dot) and only when exactly one candidate is function-style
+        # — the ambiguous ``getFromDB`` class flood must keep missing instead
+        # of misrouting a security demand to a random class.
+        hits = idx["exact"].get(lower_symbol_member, [])
+        if len(hits) == 1:
+            _record_stat("demand_nodes_resolved_fallback")
+            return hits[0]
+        fn_style = [
+            nid for nid in hits
+            if idx["labels"][nid] in (lower_symbol, lower_symbol_paren)
+        ]
+        if len(fn_style) == 1:
+            _record_stat("demand_nodes_resolved_fallback")
+            return fn_style[0]
+        if warning_once(
+            ("resolve", "moduleless", lower_symbol, len(hits), len(fn_style)),
+            f"Failed to find graph node for [global] '{symbol}' "
+            f"({'no exact-label node' if not hits else f'{len(hits)} exact-label nodes ({len(fn_style)} function-style): ambiguous'}).",
+        ):
+            _record_stat("resolve_targets_unresolved_unique")
+        return None
 
     # Better logging to help debug what was actually searched
     search_mod = module if module else "global"
-    logging.warning(f"Failed to find graph node for [{search_mod}] '{symbol}' (Class: {class_name}).")
+    if warning_once(
+        ("resolve", search_mod, lower_symbol, lower_class),
+        f"Failed to find graph node for [{search_mod}] '{symbol}' (Class: {class_name}).",
+    ):
+        _record_stat("resolve_targets_unresolved_unique")
     return None
 
 

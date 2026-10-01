@@ -101,8 +101,10 @@ hard_reserved = 8192
 ## ---- Contract verifier ----
 
 # Max demands per structured contract-verifier call: output scales with demand
-# count, so batches stay well under llm_max_completion_tokens.
-verifier_max_demands_per_call = 40
+# count, so batches stay well under llm_max_completion_tokens. 15 keeps a
+# degenerate rambling batch (~400 out-tokens/demand) far from the 16k cap; the
+# call sites also salvage a capped batch via llms.invoke_structured_capped.
+verifier_max_demands_per_call = 15
 
 ## ---- Deduplication ----
 
