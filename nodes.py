@@ -751,9 +751,10 @@ def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: de
             continue
 
         # --- application_mitigation: route as a verifiable demand ---
+        trigger = record.get("attacker_request_primitive") or record.get("trigger_condition")
         combined_desc = (
             f"Security Context: {record.get('security_assumption')} | "
-            f"Trigger: {record.get('trigger_condition')}"
+            f"Trigger: {trigger}"
         )
 
         matched_any = False
@@ -796,11 +797,10 @@ def _build_cve_hypothesis(record: dict, node_imports_map: dict) -> dict | None:
         return None
 
     fixed_version = record.get("fixed_version")
-    full_desc = f"[{source_cve}] {description}"
-    if fixed_version:
-        full_desc += f" Affected package: '{package}' (fixed in {fixed_version})."
-    else:
-        full_desc += f" Affected package: '{package}'."
+    full_desc = f"[{source_cve}] {description} Affected package: '{package}'."
+    exposure = hypothesis.get("framework_exposure_mechanism")
+    if exposure:
+        full_desc += f" Framework exposure: {exposure}"
 
     # Usage hints: nodes that import AND use the namespace, capped to bound prompt size.
     if target_import:
@@ -1035,6 +1035,38 @@ def contract_verifier_node(state: VerifierState) -> dict:
 # Reviewer agent
 # ==========================================
 
+# Hypotheses are routed to one of two reviewer tracks based on
+# vulnerability_type (see _reviewer_mode_for). Each track binds only its own
+# tool subset; the ToolNode in graph.py registers the union so both can run
+# through the same compiled subgraph.
+CODE_LEVEL_REVIEWER_TOOLS = [
+    tools.read_source_code,
+    tools.read_file,
+    tools.get_node_connections,
+    tools.search_codebase,
+    tools.get_definition,
+    tools.submit_evaluation,
+]
+FRAMEWORK_DEPENDENCY_REVIEWER_TOOLS = [
+    tools.read_file,
+    tools.get_node_connections,
+    tools.search_codebase,
+    tools.list_container_artifacts,
+    tools.read_container_artifact,
+    tools.submit_evaluation,
+]
+
+
+def _reviewer_mode_for(hypothesis: dict) -> str:
+    """Route a hypothesis to its reviewer track.
+
+    'framework_dependency' (Known Dependency Vulnerability) or 'code_level'.
+    """
+    if hypothesis.get("vulnerability_type") == "Known Dependency Vulnerability":
+        return "framework_dependency"
+    return "code_level"
+
+
 def synchronization_node(state: MasterState):
     """Dummy node to act as a Map-Reduce barrier."""
     return {}
@@ -1058,6 +1090,7 @@ def dispatch_reviewers(state: MasterState):
         payload = ReviewerState(
             node_id=hypothesis.get("node_id", "Unknown"),
             expert_report=hypothesis,
+            mode=_reviewer_mode_for(hypothesis),
             vulnerabilities=[],
             messages=[]
         )
@@ -1071,6 +1104,7 @@ def reviewer_agent_node(state: ReviewerState) -> dict | Command:
     """Review the vulnerability reports and keep only what is actually relevant"""
     node_id = state.get("node_id")
     report = state.get("expert_report", {})
+    mode = state.get("mode", "code_level")
 
     # Check Cache
     if not state.get("messages"):
@@ -1086,21 +1120,26 @@ def reviewer_agent_node(state: ReviewerState) -> dict | Command:
                 }
             )
 
-    llm_with_tools = smart_llm.bind_tools([
-            tools.read_source_code,
-            tools.read_file,
-            tools.search_codebase,
-            tools.get_node_connections,
-            tools.get_definition,
-            tools.list_container_artifacts,
-            tools.read_container_artifact,
-            tools.submit_evaluation
-        ],
+    # Bind the tool subset for the hypothesis's reviewer track
+    if mode == "framework_dependency":
+        reviewer_tools = FRAMEWORK_DEPENDENCY_REVIEWER_TOOLS
+        mode_prompt = REVIEWER_AGENT.get("framework_dependency", "")
+    else:
+        reviewer_tools = CODE_LEVEL_REVIEWER_TOOLS
+        mode_prompt = REVIEWER_AGENT.get("code_level", "")
+
+    llm_with_tools = smart_llm.bind_tools(
+        reviewer_tools,
         parallel_tool_calls=False
     )
 
     if not state.get("messages"):
-        sys_msg = SystemMessage(content=REVIEWER_AGENT.get('prompt'))
+        # Compose the targeted system prompt: shared directives + mode-specific
+        # reachability standard.
+        sys_prompt = REVIEWER_AGENT.get('prompt', '')
+        if mode_prompt:
+            sys_prompt = f"{sys_prompt}\n\n{mode_prompt}"
+        sys_msg = SystemMessage(content=sys_prompt)
 
         report = state.get("expert_report", {})
         node_id = state.get("node_id")

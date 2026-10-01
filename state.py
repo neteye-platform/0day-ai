@@ -37,6 +37,7 @@ class VerifierState(TypedDict):
 class ReviewerState(TypedDict):
     node_id: str
     expert_report: dict
+    mode: str  # "code_level" | "framework_dependency"
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
     messages: Annotated[list, add_messages]
 

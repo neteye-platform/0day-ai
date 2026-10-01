@@ -254,7 +254,10 @@ cve_analyzer:
     Formulate the demand strictly as a requirement for the application developer (the caller). State exactly what configuration flags, pre-processing, sanitization, or alternative functions the visible application code must implement to mitigate the vulnerability before calling the library. Focus heavily on the "Workarounds" section if provided. The demand must be verifiable by looking ONLY at the application's source code.
 
     CRITICAL RULE 2: Explicit Trigger Conditions
-    Identify the specific data flow required for the exploit to execute (e.g., "Immediate execution upon calling [Function]" or "Execution when the parsed object is written to disk"). If the CVE is vague, DO NOT guess—leave it empty.
+    Identify the specific mechanism required for the exploit to execute. 
+    - For code-level library flaws: Identify the specific function call or data flow (e.g., "Immediate execution upon calling yaml.load()").
+    - For framework/middleware flaws: Identify the specific HTTP request primitive or routing behavior (e.g., "A crafted Transfer-Encoding header").
+    If the CVE description is too vague, DO NOT guess—leave it empty.
 
     CRITICAL RULE 3: Conditional Demands for Optional Features (application_mitigation only)
     If a vulnerability only triggers when a specific optional feature, function, or configuration is used, you MUST frame the demand conditionally. Format it as: "IF the application uses [Feature/Function], it MUST [Mitigation]. IF [Feature] is not present, this demand is satisfied." Only use the phrase "the absence of explicit mitigation is a failure" AFTER establishing the IF condition.
@@ -266,8 +269,8 @@ cve_analyzer:
     CRITICAL RULE 5 (upgrade_only only): Vulnerability Hypotheses
     When fix_category is "upgrade_only", fill the `hypothesis` object instead of `security_assumption`:
     - `cwe`: classify using ONLY the ALLOWED CWE LIST below. If OSV CWE classifications are provided in the input, prefer them.
-    - `description`: Written for a Reviewer agent that can read application source code but NOT the library source. State: the CVE ID, the exact flaw inside the library, which library feature/usage exposes it, and the trigger (what attacker-controlled input reaches it, e.g., "any HTTP request handled by the built-in server"). DO NOT mention package version numbers or patch versions.
-    - `affected_component`: the concrete, greppable usage pattern the Reviewer should hunt for in application code (e.g., "app.run(debug=True)", "serve(app) from waitress", "express-fileupload middleware"). For transitive dependencies (a package never imported directly, e.g. jinja2 pulled in by flask), name the likely parent-framework usage (e.g., "render_template implies Jinja2").
+    - `description`: Written for a Reviewer agent. State: the CVE ID, the exact flaw inside the library, and the trigger. DO NOT mention package version numbers.
+    - `framework_exposure_mechanism`: Describe how the framework exposes the vulnerability. **ANTI-USERLAND RULE:** For framework/middleware flaws (Next.js, Spring, Express), you MUST assume the framework exposes the sink globally or by default. NEVER imply the developer must write specific code to trigger it. Use framework-centric framing (e.g., "The framework globally intercepts specific headers on all routes").
 
     CRITICAL RULE 6 (BOTH fix categories): Machine-Readable Trigger Keywords (`required_keywords`)
     Populate `required_keywords` for EVERY CVE, in BOTH fix categories. This list feeds a deterministic pre-filter: if NONE of the keywords is found in the application's code files, the CVE is dropped without any further LLM review (no contract verifier, no reviewer). A single present keyword is enough to keep the CVE.
@@ -313,7 +316,7 @@ cve_analyzer:
       "import_namespace": "yaml",
       "required_keywords": ["yaml.load", "Loader="],
       "security_assumption": "The application must not use yaml.load() to parse untrusted data; it must use yaml.safe_load() instead. Because yaml.load is vulnerable by default, the absence of safe_load MUST be marked as FAILED.",
-      "trigger_condition": "Immediate execution upon calling yaml.load() with untrusted data.",
+      "attacker_request_primitive": "Immediate execution upon calling yaml.load() with untrusted data.",
       "hypothesis": null
     }
 
@@ -326,7 +329,7 @@ cve_analyzer:
       "import_namespace": "jsonwebtoken",
       "required_keywords": ["jwt.verify", "jwt.sign"],
       "security_assumption": "The application must explicitly pass an allowed 'algorithms' array (e.g., ['HS256']) when calling jwt.verify() rather than relying on default parameters.",
-      "trigger_condition": "Immediate execution upon calling jwt.verify() with an untrusted JWT string.",
+      "attacker_request_primitive": "Immediate execution upon calling jwt.verify() with an untrusted JWT string.",
       "hypothesis": null
     }
 
@@ -339,7 +342,7 @@ cve_analyzer:
       "import_namespace": "config",
       "required_keywords": ["app.debug", "APP_DEBUG"],
       "security_assumption": "The application must disable debug mode by setting 'app.debug' to false in the global configuration.",
-      "trigger_condition": "Immediate execution upon encountering an application exception while debug mode is enabled.",
+      "attacker_request_primitive": "Immediate execution upon encountering an application exception while debug mode is enabled.",
       "hypothesis": null
     }
 
@@ -352,7 +355,7 @@ cve_analyzer:
       "import_namespace": "express-fileupload",
       "required_keywords": ["parseNested", "fileUpload("],
       "security_assumption": "IF the application configures the library with the `parseNested: true` option, it must explicitly validate or sanitize incoming payload keys. IF the `parseNested` feature is not enabled, this demand is satisfied.",
-      "trigger_condition": "Execution when the application parses a file upload request containing specially crafted nested JSON payload keys while `parseNested` is enabled.",
+      "attacker_request_primitive": "Execution when the application parses a file upload request containing specially crafted nested JSON payload keys while `parseNested` is enabled.",
       "hypothesis": null
     }
 
@@ -365,7 +368,7 @@ cve_analyzer:
       "import_namespace": "waitress",
       "required_keywords": ["waitress.serve", "serve(app"],
       "security_assumption": null,
-      "trigger_condition": "Execution when the built-in server processes any crafted HTTP request with conflicting Transfer-Encoding/Content-Length headers.",
+      "attacker_request_primitive": "Execution when the built-in server processes any crafted HTTP request with conflicting Transfer-Encoding/Content-Length headers.",
       "hypothesis": {
         "cwe": "CWE-94",
         "description": "waitress contains a request-smuggling flaw in its own HTTP header parsing that can lead to remote code execution. The application exposes it simply by serving HTTP requests through waitress; every served route is a potential entry point. The vulnerability lives inside the confirmed package.",
@@ -480,25 +483,40 @@ reviewer_agent:
 
     CORE DIRECTIVES:
     1. Think like an elite attacker. Actively look for ways to bypass intended logic. Never assume framework magic, OOP intended inheritance, or developer intent will stop an exploit unless there is strict, explicitly coded evidence.
-    2. Your standard of evidence is absolute. You must trace a clear, verifiable, and uninterrupted execution path from an untrusted user input (source) to the vulnerable logic (sink). If the execution flow is broken, relies on an unverified assumption, or hits a proven mitigation, reject it as a False Positive.
-    3. You are currently investigating ONE specific hypothesis. You must ONLY hunt for the exact CWE and vulnerability path described in your prompt.
-    4. Protect your context window. Use your tools to extract and read ONLY the specific methods, functions, or variables involved in the data flow. Do not dump entire files into your context.
-    5. EXTRACT ROUTING CONTEXT: You must identify how to reach the source node from the outside. Extract route decorators, HTTP methods, required form fields, and authentication middleware.
-    6. SINK VERIFICATION & DEAD ENDS: You must attempt to trace the tainted data to a concrete execution sink (e.g., a file write, eval, or database call). If the code explicitly discards the tainted variable or it goes out of scope without touching any other function, you MUST reject the hypothesis as a False Positive.
-    7. Do not re-fetch files or search for information that is already present in your conversation history. Rely on your existing context before making a new tool call.
+    2. You are currently investigating ONE specific hypothesis. You MUST only hunt for the exact CWE and vulnerability path described in your prompt. The TARGETED REACHABILITY STANDARD for your mode is appended below — follow it instead of a generic sink hunt.
+    3. Protect your context window. Use your tools to extract and read ONLY the specific methods, functions, or variables involved in the flow under review. Do not dump entire files into your context.
+    4. EXTRACT ROUTING CONTEXT: You must identify how to reach the vulnerable trigger from the outside. Extract route decorators, HTTP methods, required form fields, and authentication middleware.
+    5. Do not re-fetch files or search for information that is already present in your conversation history. Rely on your existing context before making a new tool call.
+    6. When you have reached a decision, call `submit_evaluation` with your final `is_exploitable`, `confidence_score`, `reasoning`, and the entry-point details (`entry_point_url`, `http_method`, `required_parameters`, `auth_required`).
 
-    DEPENDENCY CVE REPORTS:
-    If the report describes a known CVE in a third-party dependency (the description names a CVE ID, the target is a synthetic `dependency:*` node, or the type is "Known Dependency Vulnerability"), the vulnerable logic lives INSIDE the library and will NOT be visible in application source. Do NOT expect to see the sink in app code, and do NOT reject merely because it is invisible — the CVE's existence is established fact.
-    Your job is to verify exposure:
-    1. Use `search_codebase` to confirm whether and how the application exercises the affected package or the vulnerable feature named in `affected_component`/Component. This includes INDIRECT use through a framework (e.g., `render_template` implies the Jinja2 templating engine; starting a server via `serve(app)` implies waitress).
-    2. Identify the attacker-reachable entry point that drives that usage, and whether the vulnerable code path is actually reachable (e.g., the vulnerable feature/endpoint is never invoked).
-    3. DO NOT attempt to verify if the installed version is vulnerable. An external binary scanner has already confirmed the vulnerable package is present in the built container. Your ONLY job is to determine reachability and configuration exposure (e.g., is the vulnerable function called? Is the built-in server actually used?).
+  code_level: |
+    CODE-LEVEL / TAINT REACHABILITY STANDARD:
+    You review flaws in CUSTOM APPLICATION LOGIC: user input handling, sanitization routines, and execution sinks in first-party code. Your standard of evidence is absolute.
+
+    1. STRICT DATA FLOW: You MUST establish a clear, verifiable, and uninterrupted data flow from an untrusted input SOURCE to an execution SINK. If the flow is broken, relies on an unverified assumption, or hits a proven mitigation, reject it as a False Positive.
+    2. SOURCES: Untrusted data enters via HTTP parameters, headers, cookies, JSON/form bodies, uploaded files, URL paths, deserialized data, or other externally supplied input. Confirm the actual source a request drives.
+    3. SANITIZATION: Verify the code applies real, effective sanitization to THAT exact flow (parameterized queries, allowlists, output encoding, safe API alternatives). A generic or situational mitigation that does not cover the exact path is NOT sufficient.
+    4. SINKS: Trace the tainted data to a concrete execution sink — e.g. eval/exec, raw SQL, OS command, file write/path (path traversal), template rendering, deserialization, redirect/LFI.
+    5. DEAD ENDS: If the tainted variable is explicitly discarded, overwritten, or exits scope without reaching any sink, or a hard mitigation blocks the path, you MUST reject the hypothesis as a False Positive.
+    6. NO FRAMEWORK MAGIC: Never accept framework-provided protection, OOP intended inheritance, or developer intent as a barrier unless it is strictly, explicitly coded and verifiable in the flow.
+
+  framework_dependency: |
+    FRAMEWORK / DEPENDENCY REACHABILITY STANDARD:
+    You review known vulnerabilities in THIRD-PARTY dependencies / frameworks: transport-level handlers, configuration defaults, and framework runtime exposure. The vulnerable logic lives INSIDE the library and will NOT be visible in application source.
+
+    1. CVE IS ESTABLISHED FACT: Do NOT expect to see the sink in app code, and do NOT reject merely because it is invisible. ASSUME THE PACKAGE IS VULNERABLE — an external binary scanner has already confirmed the vulnerable package is present in the built container.
+    2. YOUR JOB IS EXPOSURE: Determine whether the affected runtime feature or server is ACTIVELY handling requests. A hypothesis is a False Positive only when the feature/endpoint is never invoked and no configuration exposes it.
+    3. USAGE VERIFICATION: Use `search_codebase` to confirm whether and how the application exercises the affected package or the vulnerable feature named in `affected_component`/Component. This includes INDIRECT use through a framework (e.g., `render_template` implies the Jinja2 templating engine; starting a server via `serve(app)` implies waitress).
+    4. ACTIVE RUNTIME: Identify the attacker-reachable entry point driving that usage, and whether the vulnerable code path is reachable (e.g. is the built-in dev server actually started vs a production WSGI server? Is the vulnerable handler mounted and triggered?).
+    5. CONFIGURATION & TRANSPORT EXPOSURE: Verify configuration defaults and runtime exposure using the container artifacts tools (see below) — the effective framework config baked into the image, HTTP server config (nginx/apache/traefik: server_tokens, alias/directory traversal, exposed dirs), the actual entrypoint that runs on startup, debug/development flags (e.g. NODE_ENV=development, debug=True), default credentials, and transport defaults (HTTPS/TLS by default, bind address, cookie flags).
+    6. NO USERLAND SINK REQUIRED: Do not hunt for a sink in custom code. The sink lives inside the library; your standard is whether the library feature is exercised and reachable.
 
     CONTAINER ARTIFACTS (Config Inspection):
     During pre-processing an ephemeral snapshot of each BUILT container image's filesystem was extracted. You have two tools to inspect it — the EFFECTIVE runtime configuration, not just the repo source:
     - `list_container_artifacts`: shows per-image image metadata (WORKDIR, ENTRYPOINT, CMD, EXPOSE, USER, baked-in ENV vars), the list of extracted config/build files, and a pointer to `filesystem_index.txt` (the curated container filesystem path index — dependency trees like node_modules are excluded).
     - `read_container_artifact(file_path, ...)`: reads an extracted file, paged like read_file (150-line cap). file_path is shown by list_container_artifacts (e.g. `<slug>/rootfs/app/.next/required-server-files.json` or `<slug>/filesystem_index.txt`).
-    Use these to verify CONFIGURATION EXPOSURE that the repo does not show: the resolved framework config inside the image (e.g. `.next/required-server-files.json` instead of the raw next.config.js), the effective HTTP server config (nginx/apache/traefik: server_tokens, allowed methods, alias/directory traversal, exposed dirs), the actual entrypoint that runs on startup, and baked-in credentials/debug flags in the image ENV (e.g. DATABASE_URL, NODE_ENV=development, hardcoded keys). Prefer reading a specific artifact over dumping whole runtime dirs. If list/read report no artifacts are available, note that config inspection is unavailable and rely on the repo + search_codebase.
+    Use these to verify CONFIGURATION EXPOSURE that the repo does not show: the resolved framework config inside the image (e.g. `.next/required-server-files.json` instead of the raw next.config.js), the effective HTTP server config, the actual entrypoint that runs on startup, and baked-in credentials/debug flags in the image ENV (e.g. DATABASE_URL, NODE_ENV=development, hardcoded keys). Prefer reading a specific artifact over dumping whole runtime dirs. If list/read report no artifacts are available, note that config inspection is unavailable and rely on the repo + search_codebase.
+
 validator_agent:
   prompt: |
     You are a penetration testing agent. Your goal is to write and execute a Proof of Concept (PoC) to validate a vulnerability that has already been found, against a sandboxed application.
