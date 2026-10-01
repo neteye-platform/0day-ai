@@ -3,7 +3,6 @@ import json
 import os
 import re
 import subprocess
-from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from llm_debug import build_debug_http_client
@@ -32,54 +31,36 @@ from dedup import Embeddings, cluster_vulnerabilities, deduplicate_demands
 _agent_progress: dict[str, dict[str, int]] = {}
 _agent_progress_lock = threading.Lock()
 
-if settings.llm_provider == "openai":
-    fast_llm = ChatOpenAI(
-        base_url=settings.openai_base_url,
-        model=settings.openai_model,
-        stream_usage=True,
-        temperature=0.2,
-        max_completion_tokens=settings.fast_max_completion_tokens,
-        reasoning_effort="none",
-        http_client=build_debug_http_client(),
-    )
-    smart_llm = ChatOpenAI(
-        base_url=settings.openai_base_url,
-        model=settings.openai_model,
-        stream_usage=True,
-        temperature=0.8,
-        max_completion_tokens=settings.smart_max_completion_tokens,
-        reasoning_effort="medium",
-        http_client=build_debug_http_client(),
-    )
-    reviewer_llm = ChatOpenAI(
-        base_url=settings.openai_base_url,
-        model=settings.openai_model,
-        stream_usage=True,
-        temperature=0.8,
-        max_completion_tokens=settings.reviewer_max_completion_tokens,
-        reasoning_effort="low",
-        http_client=build_debug_http_client(),
-    )
-elif settings.llm_provider == "ollama":
-    fast_llm = ChatOllama(
-        model=settings.ollama_model,
-        base_url=settings.ollama_base_url,
-        temperature=0.2,
-        num_predict=settings.fast_max_completion_tokens,
-        reasoning=False
-    )
-    smart_llm = ChatOllama(
-        model=settings.ollama_model,
-        base_url=settings.ollama_base_url,
-        temperature=0.8,
-        num_predict=settings.smart_max_completion_tokens,
-        reasoning=True
-    )
-    reviewer_llm = smart_llm
-else:
-    raise ValueError(
-        f"Unknown llm_provider {settings.llm_provider!r}; expected 'openai' or 'ollama'."
-    )
+fast_llm = ChatOpenAI(
+    base_url=settings.llm_base_url,
+    model=settings.llm_model,
+    api_key=settings.llm_api_key,
+    stream_usage=True,
+    temperature=0.2,
+    max_completion_tokens=settings.fast_max_completion_tokens,
+    reasoning_effort="none",
+    http_client=build_debug_http_client(),
+)
+smart_llm = ChatOpenAI(
+    base_url=settings.llm_base_url,
+    model=settings.llm_model,
+    api_key=settings.llm_api_key,
+    stream_usage=True,
+    temperature=0.8,
+    max_completion_tokens=settings.smart_max_completion_tokens,
+    reasoning_effort="medium",
+    http_client=build_debug_http_client(),
+)
+reviewer_llm = ChatOpenAI(
+    base_url=settings.llm_base_url,
+    model=settings.llm_model,
+    api_key=settings.llm_api_key,
+    stream_usage=True,
+    temperature=0.8,
+    max_completion_tokens=settings.reviewer_max_completion_tokens,
+    reasoning_effort="low",
+    http_client=build_debug_http_client(),
+)
 
 # ==========================================
 # Bootstrap

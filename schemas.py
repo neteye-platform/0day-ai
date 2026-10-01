@@ -381,7 +381,10 @@ class CVEAnalysis(BaseModel):
     )
     import_namespace: str = Field(
         description="The SINGLE top-level root module name used to import this package (e.g., 'bs4' for beautifulsoup4, 'flask' for Flask). You MUST output exactly one word. Required for BOTH fix categories to locate usage sites in application code.",
-        pattern=r"^[a-zA-Z0-9_\-]+$"
+        # No "\-" escape: ollama's regex-to-grammar converter fails on it,
+        # which 400s every json_schema structured-output call. Hyphen-last is
+        # the identical character class.
+        pattern=r"^[a-zA-Z0-9_-]+$"
     )
     required_keywords: list[str] = Field(
         default_factory=list,
@@ -510,6 +513,10 @@ class VerifierOutput(BaseModel):
 # ==========================================
 
 class EvaluationToolInput(BaseModel):
+    reasoning: str = Field(description="Brief technical explanation for the decision.")
+    is_vulnerable: bool = Field(
+        description="True if the specific node contains a defect, unsafe configuration, or lacks mitigation, regardless of whether it can currently be reached from the outside."
+    )
     is_exploitable: bool = Field(
         description="True if the vulnerability has a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by mitigations, implemented by the application."
     )
@@ -530,7 +537,6 @@ class EvaluationToolInput(BaseModel):
             "strictly requires the output of another exploit to function."
         )
     )
-    reasoning: str = Field(description="Brief technical explanation for the decision.")
     reproduction_steps: list[str] = Field(
         default_factory=list,
         description=(
