@@ -1,18 +1,20 @@
 import logging
+import re
 from pathlib import Path
 import tree_sitter
 import tree_sitter_python
 import tree_sitter_javascript
 import tree_sitter_typescript
 import tree_sitter_php
-
+import subprocess
 import networkx as nx
 import json
-from typing import Optional
+from typing import Any, Optional
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AnyMessage, AIMessage
+import settings
 
 
-def build_networkx_graph(graph_path: str) -> nx.DiGraph:
+def build_networkx_graph(graph_path: Path) -> nx.DiGraph:
     """
     Reads the Graphify JSON output and builds a NetworkX Directed Graph.
     """
@@ -45,6 +47,56 @@ def build_networkx_graph(graph_path: str) -> nx.DiGraph:
 
     print(f"Loaded Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges.")
     return G
+
+
+def get_graph_summary(G: nx.DiGraph) -> str:
+    # Group nodes by community
+    communities_map = {}
+    for node_id, data in G.nodes(data=True):
+        comm_id = str(data.get('community', 'unknown'))
+        if comm_id not in communities_map:
+            communities_map[comm_id] = []
+        communities_map[comm_id].append((node_id, data))
+
+    # Generate a summary for the Manager
+    summary = (
+        f"Application Topology Summary:\n"
+        f"- Total Nodes: {G.number_of_nodes()} | Total Edges: {G.number_of_edges()}\n"
+        f"- Total Communities: {len(communities_map)}\n\n"
+        f"Community Breakdown:\n"
+    )
+
+    for comm_id, nodes_data in communities_map.items():
+        node_ids = [n[0] for n in nodes_data]
+
+        # Node Types
+        node_types = {"functions": 0, "classes/files": 0, "docs/other": 0}
+        for _, data in nodes_data:
+            f_type = data.get('file_type', 'unknown')
+            label = data.get('label', '')
+            if f_type == 'code':
+                if '()' in label:
+                    node_types["functions"] += 1
+                else:
+                    node_types["classes/files"] += 1
+            else:
+                node_types["docs/other"] += 1
+        type_str = ", ".join([f"{v} {k}" for k, v in node_types.items() if v > 0])
+
+        # Find the "God Node" (the most connected file/function in this community)
+        subgraph = G.subgraph(node_ids)
+        if len(subgraph.nodes) > 0:
+            degrees = dict(subgraph.degree())
+            god_node = max(degrees, key=lambda x: (degrees[x], x))
+        else:
+            god_node = "None"
+
+        summary += (
+            f"- Community {comm_id} ({len(node_ids)} nodes): [{type_str}]\n"
+            f"  -> Central Hub Node: {god_node}\n"
+        )
+
+    return summary
 
 
 def extract_subgraph(G: nx.DiGraph, target_communities: list) -> nx.DiGraph:
@@ -124,140 +176,140 @@ def serialize_for_json(obj):
         return str(obj)
 
 
-def run_stream(app, inputs, config=None, output_file="trace.json"):
-    print(f"\n[System] Running Multi-Agent Analysis. Assembling state to {output_file}...")
-
-    assembled_states = {}
-    raw_main_state = {}
-
-    # Token usage stats
-    tracked_msg_ids = set()
-    agent_token_stats = {}
-    token_stats = {"input": 0, "output": 0, "total": 0}
-
-    for event in app.stream(inputs, stream_mode="values", subgraphs=True, config=config):
-        namespace, state = event
-
-        # Format the namespace so it's readable in the JSON
-        if not namespace:
-            graph_name = "Main_Graph"
-            raw_main_state = state
-        else:
-            # Subgraphs/Agents have namespaces like ('manager', 'expert', 'b3f1...')
-            graph_name = ' -> '.join(namespace)
-
-        if hasattr(state.get("task"), "agent_role"):
-            graph_name = graph_name[:17] + f" ({state.get('task').agent_role})"
-
-        # Overwrite the key with the most recent full state.
-        assembled_states[graph_name] = serialize_for_json(state)
-
-        # ==========================================
-        # --- TERMINAL PROGRESS INDICATOR ---
-        # ==========================================
-        last_msg = None
-
-        # 1. Catch Subgraph Agents (they still use the 'messages' array)
-        if namespace and "messages" in state and state["messages"]:
-            last_msg = state["messages"][-1]
-
-        # 2. Catch the Manager (runs on Main Graph, uses 'manager_message' key)
-        elif not namespace and "manager_message" in state and state["manager_message"]:
-            last_msg = state["manager_message"]
-
-        # If we successfully grabbed a message from either source, process it:
-        if last_msg:
-            msg_type = getattr(last_msg, "type", "unknown")
-            msg_id = getattr(last_msg, "id", None)
-
-            # Extract content safely, even if it's nested
-            content = getattr(last_msg, "content", "")
-            if isinstance(content, list):
-                content = str(content)
-
-            # Create a clean, single-line snippet
-            snippet = (content[:200] + "...") if len(content) > 200 else content
-            snippet = snippet.replace('\n', ' ').strip()
-
-            if msg_type == "ai":
-                # Track token usage
-                if msg_id and msg_id not in tracked_msg_ids:
-                    tracked_msg_ids.add(msg_id)
-                    usage = getattr(last_msg, "usage_metadata", {})
-                    if usage:
-                        in_tok = usage.get("input_tokens", 0)
-                        out_tok = usage.get("output_tokens", 0)
-                        tot_tok = usage.get("total_tokens", 0)
-
-                        # Initialize agent in stats dictionary if not present
-                        if graph_name not in agent_token_stats:
-                            agent_token_stats[graph_name] = {"input": 0, "output": 0, "total": 0}
-
-                        agent_token_stats[graph_name]["input"] += in_tok
-                        agent_token_stats[graph_name]["output"] += out_tok
-                        agent_token_stats[graph_name]["total"] += tot_tok
-
-                        token_stats["input"] += in_tok
-                        token_stats["output"] += out_tok
-                        token_stats["total"] += tot_tok
-
-                # Print the AI's thought process (Chain of Thought)
-                if snippet:
-                    print(f"[{graph_name}] \033[96m🧠 AI: {snippet}\033[0m", flush=True)
-
-                # Print the Tool Call (if it decided to act)
-                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                    tool_strings = []
-                    for tc in last_msg.tool_calls:
-                        name = tc.get("name", "unknown")
-                        args = tc.get("args", {})
-                        args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
-                        tool_strings.append(f"{name}({args_str})")
-
-                    print(f"[{graph_name}] \033[93m🛠️  Calling tool: {' | '.join(tool_strings)}\033[0m", flush=True)
-
-            elif msg_type == "tool":
-                tool_name = getattr(last_msg, 'name', 'unknown')
-                print(f"[{graph_name}] \033[92m✅ Tool executed: {tool_name} | Output: {snippet[:50]}\033[0m", flush=True)
-
-            elif msg_type == "human":
-                print(f"[{graph_name}] \033[94m👤 Human: {snippet}\033[0m", flush=True)
-
-            else:
-                print(f"[{graph_name}] \033[90m⚙️  {msg_type.capitalize()} message\033[0m", flush=True)
-
-        else:
-            # Tell us exactly WHICH state keys were updated in the background
-            state_keys = ", ".join([k for k in state.keys() if k not in ["messages", "manager_message"]])
-            if state_keys:
-                print(f"[{graph_name}] \033[90mState updated: [{state_keys}]\033[0m", flush=True)
-        # -----------------------------------
-
-    # Dump the cohesive final states to a JSON file
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(assembled_states, f, indent=2)
-
-    print("[System] Execution Finished.")
-
-    # --- Print Token Usage Summary ---
-    print("\n" + "="*50)
-    print("📊 \033[1mToken Usage Summary by Agent\033[0m")
-    print("-" * 50)
-
-    for agent_name in sorted(agent_token_stats.keys()):
-        stats = agent_token_stats[agent_name]
-        print(f"🔹 \033[96m{agent_name}\033[0m")
-        print(f"   In: {stats['input']:,}  |  Out: {stats['output']:,}  |  Total: {stats['total']:,}")
-
-    print("-" * 50)
-    print("🏆 \033[1mGrand Totals\033[0m")
-    print(f"   Input Tokens:  {token_stats['input']:,}")
-    print(f"   Output Tokens: {token_stats['output']:,}")
-    print(f"   Total Tokens:  \033[95m{token_stats['total']:,}\033[0m")
-    print("="*50 + "\n")
-
-    main_state = assembled_states.get("Main_Graph", {})
-    return {"vulnerability_reports": raw_main_state.get("vulnerability_reports", [])}
+# def run_stream(app, inputs, config=None, output_file="trace.json"):
+#     print(f"\n[System] Running Multi-Agent Analysis. Assembling state to {output_file}...")
+#
+#     assembled_states = {}
+#     raw_main_state = {}
+#
+#     # Token usage stats
+#     tracked_msg_ids = set()
+#     agent_token_stats = {}
+#     token_stats = {"input": 0, "output": 0, "total": 0}
+#
+#     for event in app.stream(inputs, stream_mode="values", subgraphs=True, config=config):
+#         namespace, state = event
+#
+#         # Format the namespace so it's readable in the JSON
+#         if not namespace:
+#             graph_name = "Main_Graph"
+#             raw_main_state = state
+#         else:
+#             # Subgraphs/Agents have namespaces like ('manager', 'expert', 'b3f1...')
+#             graph_name = ' -> '.join(namespace)
+#
+#         if hasattr(state.get("task"), "agent_role"):
+#             graph_name = graph_name[:17] + f" ({state.get('task').agent_role})"
+#
+#         # Overwrite the key with the most recent full state.
+#         assembled_states[graph_name] = serialize_for_json(state)
+#
+#         # ==========================================
+#         # --- TERMINAL PROGRESS INDICATOR ---
+#         # ==========================================
+#         last_msg = None
+#
+#         # 1. Catch Subgraph Agents (they still use the 'messages' array)
+#         if namespace and "messages" in state and state["messages"]:
+#             last_msg = state["messages"][-1]
+#
+#         # 2. Catch the Manager (runs on Main Graph, uses 'manager_message' key)
+#         elif not namespace and "manager_message" in state and state["manager_message"]:
+#             last_msg = state["manager_message"]
+#
+#         # If we successfully grabbed a message from either source, process it:
+#         if last_msg:
+#             msg_type = getattr(last_msg, "type", "unknown")
+#             msg_id = getattr(last_msg, "id", None)
+#
+#             # Extract content safely, even if it's nested
+#             content = getattr(last_msg, "content", "")
+#             if isinstance(content, list):
+#                 content = str(content)
+#
+#             # Create a clean, single-line snippet
+#             snippet = (content[:200] + "...") if len(content) > 200 else content
+#             snippet = snippet.replace('\n', ' ').strip()
+#
+#             if msg_type == "ai":
+#                 # Track token usage
+#                 if msg_id and msg_id not in tracked_msg_ids:
+#                     tracked_msg_ids.add(msg_id)
+#                     usage = getattr(last_msg, "usage_metadata", {})
+#                     if usage:
+#                         in_tok = usage.get("input_tokens", 0)
+#                         out_tok = usage.get("output_tokens", 0)
+#                         tot_tok = usage.get("total_tokens", 0)
+#
+#                         # Initialize agent in stats dictionary if not present
+#                         if graph_name not in agent_token_stats:
+#                             agent_token_stats[graph_name] = {"input": 0, "output": 0, "total": 0}
+#
+#                         agent_token_stats[graph_name]["input"] += in_tok
+#                         agent_token_stats[graph_name]["output"] += out_tok
+#                         agent_token_stats[graph_name]["total"] += tot_tok
+#
+#                         token_stats["input"] += in_tok
+#                         token_stats["output"] += out_tok
+#                         token_stats["total"] += tot_tok
+#
+#                 # Print the AI's thought process (Chain of Thought)
+#                 if snippet:
+#                     print(f"[{graph_name}] \033[96m🧠 AI: {snippet}\033[0m", flush=True)
+#
+#                 # Print the Tool Call (if it decided to act)
+#                 if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+#                     tool_strings = []
+#                     for tc in last_msg.tool_calls:
+#                         name = tc.get("name", "unknown")
+#                         args = tc.get("args", {})
+#                         args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
+#                         tool_strings.append(f"{name}({args_str})")
+#
+#                     print(f"[{graph_name}] \033[93m🛠️  Calling tool: {' | '.join(tool_strings)}\033[0m", flush=True)
+#
+#             elif msg_type == "tool":
+#                 tool_name = getattr(last_msg, 'name', 'unknown')
+#                 print(f"[{graph_name}] \033[92m✅ Tool executed: {tool_name} | Output: {snippet[:50]}\033[0m", flush=True)
+#
+#             elif msg_type == "human":
+#                 print(f"[{graph_name}] \033[94m👤 Human: {snippet}\033[0m", flush=True)
+#
+#             else:
+#                 print(f"[{graph_name}] \033[90m⚙️  {msg_type.capitalize()} message\033[0m", flush=True)
+#
+#         else:
+#             # Tell us exactly WHICH state keys were updated in the background
+#             state_keys = ", ".join([k for k in state.keys() if k not in ["messages", "manager_message"]])
+#             if state_keys:
+#                 print(f"[{graph_name}] \033[90mState updated: [{state_keys}]\033[0m", flush=True)
+#         # -----------------------------------
+#
+#     # Dump the cohesive final states to a JSON file
+#     with open(output_file, "w", encoding="utf-8") as f:
+#         json.dump(assembled_states, f, indent=2)
+#
+#     print("[System] Execution Finished.")
+#
+#     # --- Print Token Usage Summary ---
+#     print("\n" + "="*50)
+#     print("📊 \033[1mToken Usage Summary by Agent\033[0m")
+#     print("-" * 50)
+#
+#     for agent_name in sorted(agent_token_stats.keys()):
+#         stats = agent_token_stats[agent_name]
+#         print(f"🔹 \033[96m{agent_name}\033[0m")
+#         print(f"   In: {stats['input']:,}  |  Out: {stats['output']:,}  |  Total: {stats['total']:,}")
+#
+#     print("-" * 50)
+#     print("🏆 \033[1mGrand Totals\033[0m")
+#     print(f"   Input Tokens:  {token_stats['input']:,}")
+#     print(f"   Output Tokens: {token_stats['output']:,}")
+#     print(f"   Total Tokens:  \033[95m{token_stats['total']:,}\033[0m")
+#     print("="*50 + "\n")
+#
+#     main_state = assembled_states.get("Main_Graph", {})
+#     return {"vulnerability_reports": raw_main_state.get("vulnerability_reports", [])}
 
 
 # Tools that takes a lot of context
@@ -459,7 +511,8 @@ AST_GRAMMAR_MAP = {
 }
 
 
-def get_node_source_code(graph: Path, node_id: str):
+def get_node_source_code(node_id: str):
+    graph = settings.graph
     try:
         with open(graph, "r") as f:
             graph_data = json.load(f)
@@ -527,9 +580,9 @@ def get_node_source_code(graph: Path, node_id: str):
 
                 # Generate the skeleton context
                 skeleton = [
-                    "[FILE CONTEXT - DO NOT ANALYZE, JUST USE FOR REFERENCE]",
-                    f"File: {source_file.name}",
-                    "Imports and Structure:"
+                    "# [FILE CONTEXT - JUST USE FOR REFERENCE]",
+                    f"# File: {source_file.name}",
+                    "# Imports and Structure:"
                 ]
 
                 # Fetch language-specific grammar rules (fallback to an empty dict to be safe)
@@ -574,8 +627,8 @@ def get_node_source_code(graph: Path, node_id: str):
                     if not skeleton_text:
                         return source_content
                     return skeleton_text.replace(
-                        "[FILE CONTEXT - DO NOT ANALYZE, JUST USE FOR REFERENCE]\n", 
-                        f"--- FILE SKELETON: {source_file.name} (function/class definitions omitted) ---\n"
+                        "# [FILE CONTEXT - JUST USE FOR REFERENCE]\n", 
+                        f"# --- FILE SKELETON: {source_file.name} (function/class definitions omitted) ---\n"
                     )
 
                 # Extract specific function/class node
@@ -597,9 +650,9 @@ def get_node_source_code(graph: Path, node_id: str):
 
                     return (
                         f"{skeleton_text}\n\n"
-                        f"[NODE TO ANALYZE]\n"
-                        f"Node ID: {node_id}\n"
-                        f"Code:\n"
+                        f"# [NODE TO ANALYZE]\n"
+                        f"# Node ID: {node_id}\n"
+                        f"# Code:\n"
                         f"{node_code}"
                     )
 
@@ -616,3 +669,133 @@ def get_node_source_code(graph: Path, node_id: str):
             return lines[start_line - 1].strip()
 
     return None
+
+
+def resolve_node_id(module, symbol):
+    with open(settings.graph, "r") as f:
+        graph_data = json.load(f)
+        nodes_list = graph_data.get("nodes", [])
+
+        node = next(
+            (n for n in nodes_list 
+             if n.get("source_file", "").endswith(module.replace(".", "/") + ".py")
+             and n.get("label") in [symbol, f"{symbol}()"]),
+            None
+        )
+
+        if not node:
+            logging.warning(f"Failed to find graph node for local symbol '{module}.{symbol}'.")
+            return
+
+    return node.get("id")
+
+
+def run_osv_scanner(repo_path: str) -> list[dict]:
+    """Runs osv-scanner on a directory and extracts raw vulnerability records."""
+    raw_vulnerabilities = []
+
+    try:
+        # Run the scanner recursively (-r) and output as JSON
+        result = subprocess.run(
+            ["osv-scanner", "-r", "--format", "json", repo_path],
+            capture_output=True,
+            text=True
+        )
+
+        # If stdout is empty, either no vulns were found or it failed before JSON output
+        if not result.stdout.strip():
+            error = result.stderr
+            if error:
+                logging.warning(f"Error running osv-scanner: {error}")
+            return []
+
+        data = json.loads(result.stdout)
+
+        # Extract the vulnerability objects from the osv-scanner JSON schema
+        for scan_result in data.get("results", []):
+            for package in scan_result.get("packages", []):
+                for vuln in package.get("vulnerabilities", []):
+                    raw_vulnerabilities.append(vuln)
+
+    except FileNotFoundError:
+        print("Error: osv-scanner is not installed or not in PATH.")
+    except json.JSONDecodeError:
+        print("Error: Could not parse osv-scanner output.")
+
+    return raw_vulnerabilities
+
+
+def get_canonical_id(record):
+    """Extracts the underlying CVE ID from OSV record's metadata."""
+
+    # Check standard OSV 'aliases' or 'upstream' fields
+    for field in ["aliases", "upstream"]:
+        for alias in record.get(field, []):
+            if alias.startswith("CVE-"):
+                return alias
+
+    # Check if the ID itself embeds the CVE
+    m = re.match(".*(CVE-20[0-9]{2}-[0-9]+).*", record["id"])
+    if m:
+        return m.group(1)
+
+    # Fallback to the record ID if no CVE is found
+    return record.get("id", "UNKNOWN")
+
+
+def deduplicate_cves(vulns: list[dict]) -> list[dict]:
+    """
+    Extracts unique vulnerabilities by canonical ID and selects 
+    the most detailed description available for each.
+    """
+    best_records = {}
+
+    for vuln in vulns:
+        canonical_id = get_canonical_id(vuln)
+        current_details = vuln.get("details", "")
+        affected_packages = [affected.get("package", {}) for affected in vuln.get("affected", [])]
+        packages = [pkg.get("name", pkg.get("name", "unknown")) for pkg in affected_packages]
+
+        # If we haven't seen this CVE yet, or if the new record has a longer description
+        if canonical_id not in best_records:
+            best_records[canonical_id] = {
+                "id": canonical_id,
+                "details": current_details,
+                "package": packages[0] if len(packages) >= 1 else "unknown"
+            }
+        else:
+            # Compare the length of the details to keep the most comprehensive one
+            existing_details = best_records[canonical_id]["details"]
+            if len(current_details) > len(existing_details):
+                best_records[canonical_id]["original_osv_id"] = vuln.get("id")
+                best_records[canonical_id]["details"] = current_details
+
+    return list(best_records.values())
+
+
+def cache(file: Path, action: str, content: dict = {}) -> Optional[dict]:
+    if action == "read":
+        if not file.exists():
+            return
+
+        try:
+            with open(file, "r") as f:
+                cached_data = json.load(f)
+            logging.debug(f"Loaded note from cache ({file}).")
+            return cached_data
+        except json.JSONDecodeError:
+            logging.warning(f"Cache file {file} corrupted. Re-generating...")
+
+    elif action == "write":
+        if not file.parent.exists():
+            file.parent.mkdir(parents=True)
+
+        try:
+            with open(file, "w") as f:
+                json.dump(content, f, indent=2)
+            logging.debug(f"Saved cache file {file}.")
+        except Exception as e:
+            logging.warning(f"Failed to write cache file {file}: {e}")
+
+    else:
+        logging.error(f"Unknown action: {action}")

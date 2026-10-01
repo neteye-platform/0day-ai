@@ -8,8 +8,9 @@ from bs4 import BeautifulSoup
 from langgraph.prebuilt import InjectedState
 from langchain_core.tools import tool, InjectedToolCallId, ToolException
 from langgraph.types import Command
+from langgraph.graph import END
 
-from schemas import EvaluationToolInput, TakeNoteInput, ValidationToolInput, VulnerabilityReport, PackageCheck, VulnerabilityEvaluation
+from schemas import EvaluationToolInput, AnalysisNote, ValidationToolInput, PackageCheck, VulnerabilityEvaluation
 from utils import build_networkx_graph, enforce_note_taking, get_node_source_code
 import settings
 
@@ -26,11 +27,11 @@ def read_source_code(node_id: str, reason_for_reading: str, state: Annotated[dic
 
     WARNING: You can only call this a maximum of 4 times before you must use the `take_notes` tool. Plan your batches accordingly.
     """
-    rejection = enforce_note_taking(state.get("messages", []))
-    if rejection:
-        raise ToolException(rejection)
+    # rejection = enforce_note_taking(state.get("messages", []))
+    # if rejection:
+    #     raise ToolException(rejection)
 
-    node_code = get_node_source_code(settings.graph, node_id)
+    node_code = get_node_source_code(node_id)
 
     if not node_code:
         raise ToolException("Error: Could not extract code block.")
@@ -70,7 +71,7 @@ def check_package_vulnerability(packages: list[PackageCheck]) -> list:
     return []
 
 
-@tool(args_schema=TakeNoteInput)
+@tool(args_schema=AnalysisNote)
 def take_notes(
     tool_call_id: Annotated[str, InjectedToolCallId],
     **kwargs
@@ -80,7 +81,7 @@ def take_notes(
 
     If you confirm a vulnerability, record it in the potential_issues field of this tool, and THEN immediately call the submit_report tool.
     """
-    note = TakeNoteInput(**kwargs)
+    note = AnalysisNote(**kwargs)
     note_dict = note.model_dump()
 
     return Command(
@@ -96,32 +97,32 @@ def take_notes(
     )
 
 
-@tool(args_schema=VulnerabilityReport)
-def submit_report(
-    state: Annotated[dict, InjectedState],
-    tool_call_id: Annotated[str, InjectedToolCallId],
-    **kwargs
-) -> Command:
-    """
-    Call this tool whenever you find a unique, actionable vulnerability.
-    You can call this tool multiple times if multiple flaws exist.
-    """
-    finding = VulnerabilityReport(**kwargs)
-
-    report_dict = finding.model_dump()
-    report_dict["role"] = state["task"].get("agent_role") if isinstance(state["task"], dict) else state["task"].agent_role
-
-    return Command(
-        update={
-            "vulnerability_reports": [report_dict],
-            "messages": [
-                ToolMessage(
-                    content="Successfully saved finding. Please continue your audit.",
-                    tool_call_id=tool_call_id
-                )
-            ]
-        }
-    )
+# @tool(args_schema=VulnerabilityReport)
+# def submit_report(
+#     state: Annotated[dict, InjectedState],
+#     tool_call_id: Annotated[str, InjectedToolCallId],
+#     **kwargs
+# ) -> Command:
+#     """
+#     Call this tool whenever you find a unique, actionable vulnerability.
+#     You can call this tool multiple times if multiple flaws exist.
+#     """
+#     finding = VulnerabilityReport(**kwargs)
+#
+#     report_dict = finding.model_dump()
+#     report_dict["role"] = state["task"].get("agent_role") if isinstance(state["task"], dict) else state["task"].agent_role
+#
+#     return Command(
+#         update={
+#             "vulnerability_reports": [report_dict],
+#             "messages": [
+#                 ToolMessage(
+#                     content="Successfully saved finding. Please continue your audit.",
+#                     tool_call_id=tool_call_id
+#                 )
+#             ]
+#         }
+#     )
 
 
 @tool
@@ -144,9 +145,18 @@ def submit_evaluation(
         **evaluation.model_dump()
     )
 
+    tool_msg = ToolMessage(
+        content="Evaluation submitted successfully. Ending review.",
+        name="submit_evaluation",
+        tool_call_id=tool_call_id
+    )
+
     return Command(
-        update={"filtered_reports": [evaluation_result]},
-        goto="__end__"
+        update={
+            "filtered_reports": [evaluation_result],
+            "messages": [tool_msg]
+        },
+        goto=END
     )
 
 
@@ -176,9 +186,9 @@ def send_http_request(
     WARNING: You can only call this a maximum of 4 times before you must use the `take_notes` tool. Plan your batches accordingly.
     """
 
-    rejection = enforce_note_taking(state.get("messages", []))
-    if rejection:
-        raise ToolException(rejection)
+    # rejection = enforce_note_taking(state.get("messages", []))
+    # if rejection:
+    #     raise ToolException(rejection)
 
     if not endpoint.startswith(settings.sandbox_url):
         raise ToolException(f"You can only make requests to the sandbox application at {settings.sandbox_url}")
@@ -278,9 +288,9 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState]) -> str:
     WARNING: You can only call this a maximum of 4 times before you must use the `take_notes` tool. Plan your batches accordingly.
     """
 
-    rejection = enforce_note_taking(state.get("messages", []))
-    if rejection:
-        return rejection
+    # rejection = enforce_note_taking(state.get("messages", []))
+    # if rejection:
+    #     return rejection
 
     app_dir = Path(settings.app_path)
 
