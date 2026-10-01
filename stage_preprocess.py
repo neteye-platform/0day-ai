@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import settings
-from run_stats import _reset_pipeline_stats, gen_run_id
+from run_stats import _reset_pipeline_stats, gen_run_id, ledger_initialized
 from state import MasterState
 from utils import (
     run_osv_scanner,
@@ -25,8 +25,14 @@ from utils import (
 
 def bootstrap_node(state: MasterState) -> dict[str, Any]:
     """Ensure the knowledge graph exists before the parallel branches start."""
-    _reset_pipeline_stats()  # fresh ledger per pipeline invocation
-    clear_warning_state()    # ... and fresh once-per-run warning dedup
+    # Fresh ledgers per invocation ONLY when no scan-scoped durable ledger was
+    # pinned by the entrypoint (langgraph dev / in-process runs). Under
+    # `python graph.py` the resume path has already restored this scan's
+    # persisted token/stats totals into these ledgers; resetting here would
+    # wipe the work of every process the scan was resumed from.
+    if not ledger_initialized():
+        _reset_pipeline_stats()
+    clear_warning_state()    # fresh once-per-run warning dedup
     # Correlation id shared by the main trace and the project-split subagent
     # traces (see run_stats.langsmith_detached_node); reused on checkpoint
     # resume and on the round-2 reviewer/validator re-dispatch. `python

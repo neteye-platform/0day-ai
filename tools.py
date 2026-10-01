@@ -490,7 +490,12 @@ def submit_evaluation(
     # Reviewer CVSS estimate: schema-validated (parseable vector) on exploitable
     # verdicts, forced None on false positives. utils.cvss_gate_blocks recomputes
     # the numeric score from it to gate Validator/Auditor dispatch.
-    updated_vuln["cvss_vector"] = (kwargs.get("cvss_vector") or "").strip() or None
+    # Patch lifecycle exception: a false_positive filed on PATCHED code adjudicates
+    # the FIX, not the flaw's severity — the pre-patch estimate must survive on the
+    # record, or the reporter (whose only vector source this is) scores the patched
+    # residual risk and emits a nonsense 0.0 CVSS on the PATCHED report section.
+    if kwargs.get("is_exploitable") or not report.get("patch_state"):
+        updated_vuln["cvss_vector"] = (kwargs.get("cvss_vector") or "").strip() or None
     # Below-gate records carrying this flag are deferred to the Integration
     # Auditor instead of being gate-skipped outright (utils.boundary_deferred).
     updated_vuln["changes_security_boundary"] = bool(kwargs.get("changes_security_boundary"))
