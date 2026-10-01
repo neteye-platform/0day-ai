@@ -1756,6 +1756,17 @@ def reviewer_agent_node(state: ReviewerState) -> dict | Command:
                     ]
                     did_compact = True
 
+        current_turn = state.get("iterations", 0) + 1
+        if current_turn >= settings.reviewer_countdown_start:
+            warning_msg = HumanMessage(content=(
+                f"System Warning: You are on turn {current_turn} of "
+                f"{settings.reviewer_max_iterations}. You must call submit_evaluation "
+                f"in your next turn based on the best available evidence, or the system "
+                f"will forcefully terminate this task."
+            ))
+            messages_for_llm = list(messages_for_llm) + [warning_msg]
+            compaction_updates.append(warning_msg)
+
         response = llm_with_tools.invoke(messages_for_llm)
         compaction_updates.append(response)
         if did_compact:
@@ -1917,8 +1928,22 @@ def validator_agent_node(state: ValidatorState) -> dict:
                     # Merge the new cookies into the current state
                     current_cookies.update(msg.artifact)
 
-        response = llm_with_tools.invoke(state["messages"])
-        return {"messages": [response], "cookies": current_cookies, "iterations": 1}
+        current_turn = state.get("iterations", 0) + 1
+        messages_for_llm = list(state["messages"])
+        extra_updates: list = []
+        if current_turn >= settings.validator_countdown_start:
+            warning_msg = HumanMessage(content=(
+                f"System Warning: You are on turn {current_turn} of "
+                f"{settings.validator_max_iterations}. You must call mark_validation_complete "
+                f"in your next turn based on the best available evidence, or the system "
+                f"will forcefully terminate this task."
+            ))
+            messages_for_llm.append(warning_msg)
+            extra_updates.append(warning_msg)
+
+        response = llm_with_tools.invoke(messages_for_llm)
+        extra_updates.append(response)
+        return {"messages": extra_updates, "cookies": current_cookies, "iterations": 1}
 
 
 def validator_router(state: ValidatorState):

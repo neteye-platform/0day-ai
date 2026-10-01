@@ -215,6 +215,8 @@ if __name__ == "__main__":
 
     from langgraph.checkpoint.sqlite import SqliteSaver
 
+    Path("states").mkdir(parents=True, exist_ok=True)
+
     config = {"configurable": {"thread_id": "scan-1"}}
     done_flag = Path("states/scan-complete.flag")
 
