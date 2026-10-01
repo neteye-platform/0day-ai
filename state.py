@@ -69,7 +69,7 @@ class ValidatorState(TypedDict):
     messages: Annotated[list, add_messages]
 
 class IntegrationAuditorState(TypedDict):
-    # A single `requires_chaining` record to be combined into a multi-step exploit chain.
+    # A single `requires_integration` record to be combined into a multi-step exploit chain.
     report_to_test: dict
     # Full records of all OTHER confirmed vulnerabilities (excludes report_to_test
     # itself). Rendered as a summary for the agent and served to
