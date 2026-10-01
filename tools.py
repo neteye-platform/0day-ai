@@ -1,4 +1,4 @@
-from typing import Annotated, Literal
+from typing import Annotated
 import json
 from langchain_core.messages import ToolMessage
 import requests
@@ -6,15 +6,15 @@ from pathlib import Path
 import logging
 from bs4 import BeautifulSoup
 from langgraph.prebuilt import InjectedState
-from langchain_core.tools import tool, InjectedToolCallId, ToolException
+from langchain_core.tools import tool, InjectedToolCallId
 from langgraph.types import Command
-from langgraph.graph import END
+import docker
+from docker.errors import NotFound, APIError
 
-from schemas import EvaluationToolInput, AnalysisNote, ValidationToolInput, PackageCheck, VulnerabilityEvaluation
-from utils import build_networkx_graph, enforce_note_taking, get_node_source_code
+from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationToolInput
+from utils import build_networkx_graph, get_node_code
 import settings
 
-GUARDRAIL_MESSAGES = 8
 
 @tool
 def read_source_code(node_id: str, reason_for_reading: str, state: Annotated[dict, InjectedState]) -> str:
@@ -24,17 +24,20 @@ def read_source_code(node_id: str, reason_for_reading: str, state: Annotated[dic
     Args:
         node_id: The exact ID of the node to read (e.g., 'src_main_query_db').
         reason_for_reading: Explain exactly why you need to read THIS specific node next, and how you expect it to connect to your current knowledge.
-
-    WARNING: You can only call this a maximum of 4 times before you must use the `take_notes` tool. Plan your batches accordingly.
     """
-    # rejection = enforce_note_taking(state.get("messages", []))
-    # if rejection:
-    #     raise ToolException(rejection)
+    messages = state.get("messages", [])
+    for msg in messages[:-1]:
+        msg = msg if isinstance(msg, dict) else msg.model_dump()
+        if msg.get("type") == "ai":
+            tool_calls = msg.get("tool_calls", [])
+            for tc in tool_calls:
+                if tc.get("name") == "read_source_code" and tc.get("args", {}).get("node_id") == node_id:
+                    return f"System Notice: You have already read the source code for '{node_id}' in a previous step. The code is static and it will not change."
 
-    node_code = get_node_source_code(node_id)
+    node_code = get_node_code(node_id)
 
     if not node_code:
-        raise ToolException("Error: Could not extract code block.")
+        return "Error: Could not extract code block."
 
     return node_code
 
@@ -71,79 +74,33 @@ def check_package_vulnerability(packages: list[PackageCheck]) -> list:
     return []
 
 
-@tool(args_schema=AnalysisNote)
-def take_notes(
-    tool_call_id: Annotated[str, InjectedToolCallId],
-    **kwargs
-) -> Command:
-    """
-    Use this tool to save a structured summary of a code node IMMEDIATELY after reading it. You must call this tool exactly once for every node you analyze. Keep descriptions extremely brief and focused purely on data flow, access control, and security logic. Your notes will be preserved in your long-term memory for the duration of the audit.
-
-    If you confirm a vulnerability, record it in the potential_issues field of this tool, and THEN immediately call the submit_report tool.
-    """
-    note = AnalysisNote(**kwargs)
-    note_dict = note.model_dump()
-
-    return Command(
-        update={
-            "notes": [note_dict],
-            "messages": [
-                ToolMessage(
-                    content="Note updated successfully.",
-                    tool_call_id=tool_call_id
-                )
-            ]
-        }
-    )
-
-
-# @tool(args_schema=VulnerabilityReport)
-# def submit_report(
-#     state: Annotated[dict, InjectedState],
-#     tool_call_id: Annotated[str, InjectedToolCallId],
-#     **kwargs
-# ) -> Command:
-#     """
-#     Call this tool whenever you find a unique, actionable vulnerability.
-#     You can call this tool multiple times if multiple flaws exist.
-#     """
-#     finding = VulnerabilityReport(**kwargs)
-#
-#     report_dict = finding.model_dump()
-#     report_dict["role"] = state["task"].get("agent_role") if isinstance(state["task"], dict) else state["task"].agent_role
-#
-#     return Command(
-#         update={
-#             "vulnerability_reports": [report_dict],
-#             "messages": [
-#                 ToolMessage(
-#                     content="Successfully saved finding. Please continue your audit.",
-#                     tool_call_id=tool_call_id
-#                 )
-#             ]
-#         }
-#     )
-
-
 @tool
 def mark_task_complete(summary: str = "") -> dict:
     """Call this tool ONLY when you have analyzed EVERY single node assigned to you and are ready to finish."""
     return {"audit_status": "completed", "summary": summary}
 
 
-@tool
+@tool(args_schema=EvaluationToolInput)
 def submit_evaluation(
-    evaluation: EvaluationToolInput,
     state: Annotated[dict, InjectedState],
-    tool_call_id: Annotated[str, InjectedToolCallId]
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    **kwargs
 ) -> Command:
     """Call this tool when you have finished reviewing the source code and made a final decision."""
 
-    evaluation_result = VulnerabilityEvaluation(
-        report_id=state.get("report_id", "Unknown"),
-        original_report=state.get("expert_report"),
-        **evaluation.model_dump()
-    )
+    report = state.get("expert_report", {})
+
+    new_status = "confirmed" if kwargs.get("is_exploitable") else "false_positive"
+
+    # Mutate a copy of the single report
+    updated_vuln = dict(report)
+    updated_vuln["status"] = new_status
+    updated_vuln["confidence_score"] = kwargs.get("confidence_score")
+    updated_vuln["reviewer_reasoning"] = kwargs.get("reasoning")
+    updated_vuln["entry_point_url"] = kwargs.get("entry_point_url")
+    updated_vuln["http_method"] = kwargs.get("http_method")
+    updated_vuln["required_parameters"] = kwargs.get("required_parameters", [])
+    updated_vuln["auth_required"] = kwargs.get("auth_required", False)
 
     tool_msg = ToolMessage(
         content="Evaluation submitted successfully. Ending review.",
@@ -153,10 +110,9 @@ def submit_evaluation(
 
     return Command(
         update={
-            "filtered_reports": [evaluation_result],
+            "vulnerabilities": [updated_vuln],
             "messages": [tool_msg]
-        },
-        goto=END
+        }
     )
 
 
@@ -182,16 +138,15 @@ def send_http_request(
     - 'text': Returns only the visible text (good for reading error messages).
     - 'raw': Returns the untouched body (use cautiously, may truncate).
     - ANY CUSTOM TAG: Enter any HTML tag (e.g., 'script', 'input', 'iframe') to extract only those elements.
-
-    WARNING: You can only call this a maximum of 4 times before you must use the `take_notes` tool. Plan your batches accordingly.
     """
+    # WARNING: You can only call this a maximum of 4 times before you must use the `take_notes` tool. Plan your batches accordingly.
 
     # rejection = enforce_note_taking(state.get("messages", []))
     # if rejection:
     #     raise ToolException(rejection)
 
     if not endpoint.startswith(settings.sandbox_url):
-        raise ToolException(f"You can only make requests to the sandbox application at {settings.sandbox_url}")
+        return f"Error: You can only make requests to the sandbox application at {settings.sandbox_url}", {}
 
     session = requests.Session()
 
@@ -252,30 +207,47 @@ def send_http_request(
 
         return llm_output, session.cookies.get_dict()
     except Exception as e:
-        raise ToolException(f"Request failed: {str(e)}")
+        return f"Error: Request failed: {str(e)}", {}
 
 
-@tool
+@tool(args_schema=ValidationToolInput)
 def mark_validation_complete(
-    validation: ValidationToolInput,
     state: Annotated[dict, InjectedState],
-    tool_call_id: Annotated[str, InjectedToolCallId]
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    **kwargs
 ) -> Command:
     """
     Call this when you have definitively proven the vulnerability exists,
     or exhausted all options and believe it to be a false positive.
     """
-    report = state.get("report_to_test")
-    report_id = getattr(report, "report_id", "unknown")
+    # Get the single vulnerability assigned to this Validator agent
+    report = state.get("report_to_test", {})
 
-    result = ValidationResult(
-        report_id=report_id,
-        **validation.model_dump()
+    # Create a copy to avoid mutating the local dictionary directly
+    updated_vuln = dict(report)
+
+    # Update the lifecycle status so the custom reducer merges it correctly
+    if kwargs.get("is_exploitable"):
+        updated_vuln["status"] = "exploitable"
+    else:
+        # If the exploit fails, mark it as a false positive
+        updated_vuln["status"] = "false_positive"
+
+    # Inject the Validator's findings
+    updated_vuln["poc_payload"] = kwargs.get("poc_payload")
+    updated_vuln["execution_logs"] = kwargs.get("execution_logs")
+
+    tool_msg = ToolMessage(
+        content="Validation complete. Ending validation phase.",
+        name="mark_validation_complete",
+        tool_call_id=tool_call_id
     )
 
     return Command(
-        update={"confirmed_vulnerabilities": [result]},
-        goto="__end__"
+        update={
+            "vulnerabilities": [updated_vuln],
+            "messages": [tool_msg]
+        }
     )
 
 
@@ -284,14 +256,7 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState]) -> str:
     """
     Searches the entire application codebase for a specific string. Use this
     to find where specific libraries, functions, or variables are used.
-
-    WARNING: You can only call this a maximum of 4 times before you must use the `take_notes` tool. Plan your batches accordingly.
     """
-
-    # rejection = enforce_note_taking(state.get("messages", []))
-    # if rejection:
-    #     return rejection
-
     app_dir = Path(settings.app_path)
 
     # Load the graph to map physical files to Node IDs
@@ -369,3 +334,71 @@ def get_node_connections(node_id: str) -> str:
         )
     except Exception as e:
         return f"Error traversing graph: {str(e)}"
+
+
+
+@tool
+def list_files(path: str = ".") -> str:
+    """
+    Lists files and directories in the specified path within the sandbox container.
+
+    Args:
+        path (str): The directory path to inspect inside the container. Defaults to the current working directory.
+
+    Returns:
+        str: The raw output of the `ls -la` command, or an error message if the path doesn't exist.
+    """
+    container_name = settings.container_name
+
+    try:
+        client = docker.from_env()
+        container = client.containers.get(container_name)
+
+        # Execute the 'ls -la' command inside the container
+        exit_code, output = container.exec_run(["ls", "-la", path])
+        if not isinstance(output, bytes):
+            return f"Error: Expected bytes, got {type(output).__name__}"
+
+        decoded_output = output.decode("utf-8")
+
+        if exit_code != 0:
+            return f"Error listing files at '{path}':\n{decoded_output}"
+
+        return decoded_output
+
+    except NotFound:
+        return f"Error: Container '{container_name}' not found. Ensure the sandbox is running."
+    except Exception as e:
+        return f"An unexpected error occurred: {str(e)}"
+
+
+@tool
+def read_file(path: str) -> str:
+    """
+    Reads the content of a file from the sandbox container.
+
+    Args:
+        path: The absolute or relative path to the file inside the sandbox.
+    """
+    container_name = settings.container_name
+
+    try:
+        client = docker.from_env()
+        container = client.containers.get(container_name)
+
+        exit_code, output = container.exec_run(["cat", path])
+        if not isinstance(output, bytes):
+            return f"Error: Expected bytes, got {type(output).__name__}"
+
+        if exit_code == 0:
+            return output.decode('utf-8')
+        else:
+            error_msg = output.decode('utf-8').strip()
+            return f"Error reading file '{path}': {error_msg} (Exit code: {exit_code})"
+
+    except NotFound:
+        return f"Error: The container '{container_name}' could not be found."
+    except APIError as e:
+        return f"Error: Docker API issue occurred: {str(e)}"
+    except Exception as e:
+        return f"Error: An unexpected error occurred: {str(e)}"

@@ -17,97 +17,35 @@ import settings
 import tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, VerifierState, ReviewerState, ValidatorState
 from schemas import ManagerOutput, ExpertTask, AnalysisNote, CVEDemand, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, get_graph_summary, run_osv_scanner, deduplicate_cves, cache, get_node_source_code, resolve_node_id
+from utils import build_networkx_graph, get_cached_graph_data, get_graph_summary, get_node_code, run_osv_scanner, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast
 
 
-llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
-# llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="kimi-k2-7-code", temperature=0)
+# llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
+llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="mistral-3.5-128b", stream_usage=True, temperature=0)
 
 # ==========================================
 # Preprocessor
 # ==========================================
 
-# def preprocessor_node(state: MasterState) -> dict[str, Any]:
-#     """Reads graph.json, builds a NetworkX graph, and summarizes it for the manager node."""
-#
-#     G = build_networkx_graph(settings.graph)
-#     summary = get_graph_summary(G)
-#
-#     # Run the OSV scanner to parse manifests and query the database
-#     raw_vulns = run_osv_scanner(str(settings.app_path))
-#     clean_vulns = deduplicate_cves(raw_vulns)
-#     logging.debug(f"Found {len(raw_vulns)} raw vulns")
-#     logging.debug(f"{len(clean_vulns)} remaining CVEs after deduplication")
-#
-#     return {
-#         "app_summary": summary,
-#         "graph": nx.node_link_data(G),
-#         "known_vulns": clean_vulns
-#     }
-
-
 def preprocessor_node(state: MasterState) -> dict[str, Any]:
-    """Reads graph.json, builds a NetworkX graph, filters for top 10 communities, and summarizes."""
+    """Reads graph.json, builds a NetworkX graph, and summarizes it for the manager node."""
 
-    G = build_networkx_graph(settings.graph)
-
-    # 1. Group nodes by community
-    communities = defaultdict(list)
-    for node_id, data in G.nodes(data=True):
-        com_id = data.get("community")
-        if com_id is not None:
-            communities[com_id].append((node_id, data))
-
-    # 2. Score communities based on security relevance
-    # GLPI is PHP, so we look for standard web/auth/db terminology
-    security_keywords = [
-        'auth', 'login', 'session', 'db', 'sql', 'query', 
-        'upload', 'admin', 'api', 'exec', 'password', 'token', 
-        'crypto', 'hash', 'csrf', 'plugin'
-    ]
-
-    community_scores = {}
-    for com_id, nodes in communities.items():
-        score = 0
-        for node_id, data in nodes:
-            # Search both the node label and its file path for sensitive keywords
-            text_to_search = (str(data.get("label", "")) + " " + str(data.get("source_file", ""))).lower()
-
-            for kw in security_keywords:
-                if kw in text_to_search:
-                    score += 10  # Heavy weight for security concepts
-
-            # Add minor weight for community size (ignore tiny, 1-node orphan communities)
-            score += 1 
-
-        community_scores[com_id] = score
-
-    # 3. Select the Top 10 highest-scoring communities
-    top_10_coms = sorted(community_scores, key=community_scores.get, reverse=True)[:10]
-    logging.info(f"Selected top 10 communities: {top_10_coms}")
-
-    # 4. Filter the NetworkX Graph
-    nodes_to_keep = [
-        node_id for node_id, data in G.nodes(data=True) 
-        if data.get("community") in top_10_coms
-    ]
-    G_filtered = G.subgraph(nodes_to_keep).copy()
-
-    # 5. Generate summary ONLY for the filtered graph
-    summary = get_graph_summary(G_filtered)
+    # communities_to_analyze = [0, 1, 2, 5, 7, 29, 81, 18, 127, 238, 298]
+    communities_to_analyze = None
+    G = build_networkx_graph(settings.graph, communities_to_analyze)
+    summary = get_graph_summary(G)
 
     # Run the OSV scanner to parse manifests and query the database
     raw_vulns = run_osv_scanner(str(settings.app_path))
+    logging.info(f"Found {len(raw_vulns)} raw vulns")
     clean_vulns = deduplicate_cves(raw_vulns)
-    logging.debug(f"Found {len(raw_vulns)} raw vulns")
-    logging.debug(f"{len(clean_vulns)} remaining CVEs after deduplication")
+    logging.info(f"{len(clean_vulns)} remaining CVEs after deduplication")
 
     return {
         "app_summary": summary,
-        "graph": nx.node_link_data(G_filtered), # Pass the filtered graph to the state!
+        # "graph": nx.node_link_data(G),
         "known_vulns": clean_vulns
     }
-
 
 # ==========================================
 # Manager
@@ -148,11 +86,13 @@ def manager_agent_node(state: MasterState) -> dict[str, Any]:
 def dispatch_explorers(state: MasterState):
     """Reads the Manager's instructions and creates a list of 'Send' objects."""
 
-    G = nx.node_link_graph(state["graph"])
+    # G = nx.node_link_graph(state["graph"])
+    G = build_networkx_graph(settings.graph)
     commands: list[Send] = []
 
     for task in state["expert_tasks"]:
-        clean_id = task.target_community.lower().replace("community ", "").strip()
+        task = task if isinstance(task, dict) else task.model_dump()
+        clean_id = task.get("target_community", "").lower().replace("community ", "").strip()
         community_nodes = [n for n, attr in G.nodes(data=True) if str(attr.get("community")) == clean_id]
 
         # Filter out skeleton nodes, but keep functions, classes, and non-code files
@@ -169,8 +109,8 @@ def dispatch_explorers(state: MasterState):
 
             payload = ExplorerState(
                 node_id=node_id,
-                role=task.agent_role,
-                task_description=task.task_description
+                role=task.get("agent_role", ""),
+                task_description=task.get("task_description", "")
             )
 
             commands.append(Send("explorer_agent", payload))
@@ -194,10 +134,10 @@ def expert_explorer_node(state: ExplorerState) -> dict:
     cache_file = settings.cache_dir / "notes" / f"{node_id}-{role_name}.json"
     cached_note = cache(cache_file, "read")
     if cached_note:
-        return {"notes": [cached_note]}
+        return cached_note
 
     # LLM invocation
-    source_code = get_node_source_code(node_id)
+    source_code = get_node_code(node_id)
 
     parser = PydanticOutputParser(pydantic_object=AnalysisNote)
     sys_msg = SystemMessage(content=(
@@ -205,19 +145,57 @@ def expert_explorer_node(state: ExplorerState) -> dict:
         f"{EXPERT_AGENTS['explorer_prompt']}\n\n"
         f"{parser.get_format_instructions()}"
     ))
-    human_msg = HumanMessage(content=(
-        f"Analyze this node: {node_id}\n\n```python\n{source_code}\n```"
-    ))
+
+    graph_data = get_cached_graph_data(settings.graph)
+    target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), {})
+
+    if target_node.get("source_file", "").endswith(target_node.get("label", "")):
+        user_prompt = (
+            f"Analyze this entire file skeleton.\n\n"
+            f"```python\n{source_code}\n```"
+        )
+    else:
+        label = target_node.get("label", "node")
+        user_prompt = (
+            f"Analyze the specific logic inside '{label}'.\n"
+            f"The rest of the file is provided solely as context. "
+            f"Do NOT look for vulnerabilities outside of '{label}'.\n\n"
+            f"```python\n{source_code}\n```"
+        )
+    human_msg = HumanMessage(content=user_prompt)
 
     response = llm.invoke([sys_msg, human_msg])
-    note = parser.invoke(response)
+
+    try:
+        fixed_json_string = repair_json(response.content)
+        note = parser.invoke(fixed_json_string)
+    except Exception as e:
+        logging.error(f"Failed to parse LLM output. Agent: {role_name}. Node: {node_id}. Error: {e}\n\n{response.content}")
+        return {
+            "notes": []
+        }
+
     dict_note = note if isinstance(note, dict) else note.model_dump()
+    dict_note["node_id"] = node_id
+
+    extracted_vulns = []
+
+    # Extract and remove the list from dict_note
+    raw_hypotheses = dict_note.pop("vulnerability_hypothesis", [])
+    for hyp in raw_hypotheses:
+        extracted_vulns.append({
+            "node_id": node_id,
+            "cwe_id": hyp.get("cwe_id", "OTHER_UNCATEGORIZED"), 
+            "description": hyp.get("description", ""),
+            "status": "hypothesis"
+        })
 
     # Save to cache
-    cache(cache_file, "write", dict_note)
+    cache(cache_file, "write", {"notes": [dict_note], "vulnerabilities": extracted_vulns})
 
     return {
-        "notes": [dict_note]
+        "notes": [dict_note],
+        "vulnerabilities": extracted_vulns
     }
 
 # ==========================================
@@ -320,20 +298,24 @@ def aggregate_demands_node(state: MasterState):
 
     # Process CVE Demands
     for demand in state.get("cve_demands", []):
-        target_import = demand.get("import_namespace") 
+        target_import = demand.get("import_namespace", "")
 
         for node_id, imports in node_imports_map.items():
             # Matches exact namespace (e.g., 'bs4' in ['os', 'bs4', 'sys'])
             if target_import in imports:
-                if node_id not in grouped_demands:
-                    grouped_demands[node_id] = []
 
-                grouped_demands[node_id].append({
-                    "source": demand.get("source_cve"),
-                    "type": "cve_assumption",
-                    "description": demand.get("security_assumption")
-                })
+                # AST-Verification: Confirm the node's body actually uses the namespace.
+                if uses_namespace_in_ast(node_id, target_import):
+                    if node_id not in grouped_demands:
+                        grouped_demands[node_id] = []
 
+                    grouped_demands[node_id].append({
+                        "source": demand.get("source_cve"),
+                        "type": "cve_assumption",
+                        "description": demand.get("security_assumption")
+                    })
+
+    logging.info(f"Grouped {len(grouped_demands)} demands.")
     return {"grouped_demands": grouped_demands}
 
 # ==========================================
@@ -350,7 +332,7 @@ def dispatch_verifiers(state: MasterState):
     commands: list[Send] = []
 
     for target_node_id, demands_list in grouped_demands.items():
-        target_code = get_node_source_code(target_node_id)
+        target_code = get_node_code(target_node_id)
 
         # If we don't have code (e.g., it's a 3rd party library), skip it
         if not target_code:
@@ -396,8 +378,7 @@ def contract_verifier_node(state: VerifierState) -> dict:
 
     formatted_demands = "\n".join([f"- {d.get('description')} (Requested by {d.get('source_node')})" for d in demands])
     human_msg = HumanMessage(content=(
-        f"Target Node: {target_node_id}\n\n"
-        f"Source Code:\n```python\n{target_code}\n```\n\n"
+        f"```\n{target_code}\n```\n\n"
         f"Security Demands to Verify:\n{formatted_demands}"
     ))
 
@@ -406,23 +387,23 @@ def contract_verifier_node(state: VerifierState) -> dict:
     parsed_output: VerifierOutput = parser.invoke(fixed_json_string)
 
     # Process the Results
-    new_hypothesis = []
+    new_vulnerabilities = []
 
     for eval in parsed_output.evaluations:
         if eval.status == "FAILED":
-            # If the contract is broken, it's a vulnerability
-            new_hypothesis.append({
-                "vulnerability_type": "Broken Trust Assumption / Interface Desync",
-                "description": f"Node {target_node_id} fails to satisfy demand: '{eval.demand_description}'. Reasoning: {eval.reasoning}",
-                "source_node": target_node_id
+            # Map the failed contract to the new unified schema
+            new_vulnerabilities.append({
+                "node_id": target_node_id,
+                "cwe_id": eval.cwe_id,
+                "description": f"Fails to satisfy demand: '{eval.demand_description}'. Reasoning: {eval.reasoning}",
+                "status": "hypothesis"
             })
 
-    # Save to cache
-    cache(cache_file, "write", {"hypothesis": new_hypothesis})
+    # Save to cache (update cache keys as needed)
+    cache(cache_file, "write", {"hypothesis": new_vulnerabilities})
 
-    # The operator.add reducer in MasterState safely appends this list
     return {
-        "vulnerability_hypothesis": new_hypothesis
+        "vulnerabilities": new_vulnerabilities
     }
 
 # ==========================================
@@ -436,33 +417,27 @@ def synchronization_node(state: MasterState):
 
 def dispatch_reviewers(state: MasterState):
     """Groups reports and dispatches parallel reviewer threads using the Send API."""
-    logging.warning(f"Running dispatch_reviewers")
+    raw_vulns = state.get("vulnerabilities", [])
+    all_vulns = [
+        v if isinstance(v, dict) else v.model_dump() 
+        for v in raw_vulns
+    ]
+    hypotheses = [v for v in all_vulns if v.get("status") == "hypothesis"]
 
-    hypotheses = state.get("vulnerability_hypothesis", [])
     if not hypotheses:
         logging.warning(f"No vulnerabilities hypotheses to dispatch.")
         return END
 
-    # Group all findings by the node they occurred in
-    grouped_reports = defaultdict(list)
-    for hypothesis in hypotheses:
-        # Extract the node ID where the issue was found
-        node_id = hypothesis.get("source_node", "Unknown")
-        grouped_reports[node_id].append(hypothesis)
-
     commands = []
-    for node_id, group in grouped_reports.items():
+    for hypothesis in hypotheses:
         payload = ReviewerState(
-            node_id=node_id,
-            expert_report=group,
-            messages=[],
-            filtered_reports=[]
+            node_id=hypothesis.get("node_id", "Unknown"),
+            expert_report=hypothesis,
+            messages=[]
         )
         commands.append(Send("reviewer_agent", payload))
 
-        logging.warning(f"Sending payload: {payload}")
-
-    logging.info(f"Dispatching {len(commands)} reviewers for {len(grouped_reports)} unique nodes.")
+    logging.info(f"Dispatching {len(commands)} reviewers.")
     return commands
 
 
@@ -478,36 +453,20 @@ def reviewer_agent_node(state: ReviewerState) -> dict:
     if not state.get("messages"):
         sys_msg = SystemMessage(content=REVIEWER_AGENT.get('prompt'))
 
-        # Format the group into a single, clean string for the LLM
-        formatted_group_text = f"Target {state['node_id']}\n\nPotential Issues to Investigate:\n"
+        report = state.get("expert_report", {})
 
-        for idx, item in enumerate(state.get("expert_report", []), 1):
-            # Check if this is an Explorer Hypothesis
-            if "vulnerability_type" in item:
-                formatted_group_text += (
-                    f"  --- Issue {idx} ---\n"
-                    f"  Type: {item.get('vulnerability_type', 'Unknown')}\n"
-                    f"  Description: {item.get('description', '')}\n\n"
-                )
-            # Check if this is a Failed Contract Demand
-            elif "demand_description" in item:
-                formatted_group_text += (
-                    f"  --- Issue {idx} (Failed Security Contract) ---\n"
-                    f"  Unmet Demand: {item.get('demand_description', '')}\n"
-                    f"  Verifier Reasoning: {item.get('reasoning', '')}\n\n"
-                )
-            else:
-                # Fallback for any other structure
-                formatted_group_text += f"  --- Issue {idx} ---\n  {str(item)}\n\n"
-
-        human_msg_content = (
-            f"Review the following potential issues found in the target node.\n\n"
-            f"{formatted_group_text}\n"
-            f"INSTRUCTION: You must actively trace the execution path using your tools to prove or disprove reachability. "
-            f"You MUST call `submit_evaluation` for EACH distinct issue listed above to log whether it is exploitable or a false positive."
+        formatted_vuln = (
+            f"Target {state['node_id']}\n\n"
+            f"Potential Issue to Investigate:\n"
+            f"CWE ID: {report.get('cwe_id', 'Unknown')}\n"
+            f"Component: {report.get('vulnerable_component', 'Unknown')}\n"
+            f"Description: {report.get('description', '')}\n"
         )
 
-        human_msg = HumanMessage(content=human_msg_content)
+        human_msg = HumanMessage(content=(
+            f"Review the following potential issues found in the target node.\n\n"
+            f"{formatted_vuln}"
+        ))
 
         response = llm_with_tools.invoke([sys_msg, human_msg])
         return {"messages": [sys_msg, human_msg, response]}
@@ -547,18 +506,25 @@ def ask_reviewer_for_tool(state: ReviewerState):
 
 def dispatch_validators(state: MasterState):
     """Creates a parallel validation thread for each vulnerability that survived the reviewer."""
+    raw_vulns = state.get("vulnerabilities", [])
+    all_vulns = [
+        v if isinstance(v, dict) else v.model_dump() 
+        for v in raw_vulns
+    ]
+    # Filter for vulnerabilities that were confirmed by the Reviewer
+    confirmed_vulns = [v for v in all_vulns if v.get("status") == "confirmed"]
 
     commands = []
     # Loop over the Pydantic models generated by the reviewer
-    for evaluation in state.get("filtered_reports", []):
-        if evaluation.is_exploitable:
-
-            payload = ValidatorState(
-                report_to_test=evaluation,
-                sandbox_url=settings.sandbox_url,
-                messages=[]
-            )
-            commands.append(Send("validator_agent", payload))
+    for evaluation in confirmed_vulns:
+        payload = ValidatorState(
+            report_to_test=evaluation, 
+            sandbox_url=settings.sandbox_url,
+            messages=[],
+            confirmed_vulnerabilities=[], 
+            cookies={}
+        )
+        commands.append(Send("validator_agent", payload))
 
     if not commands:
         # If nothing to validate, skip straight to the end
@@ -568,53 +534,50 @@ def dispatch_validators(state: MasterState):
 
 
 def validator_agent_node(state: ValidatorState) -> dict:
-    return {}
-    # llm_with_tools = llm.bind_tools([
-    #     tools.send_http_request,
-    #     tools.mark_validation_complete,
-    #     tools.take_notes
-    # ])
-    # current_cookies = state.get("cookies", {})
-    #
-    # if not state.get("messages"):
-    #     sys_msg = SystemMessage(content=VALIDATOR_AGENT.get('prompt'))
-    #     human_msg = HumanMessage(content=(
-    #         f"Target Sandbox: {state['sandbox_url']}\n\n"
-    #         f"Vulnerability to Prove:\n{state['report_to_test']}\n"
-    #     ))
-    #     messages = [sys_msg, human_msg]
-    #     response = llm_with_tools.invoke(messages)
-    #     return {"messages": [sys_msg, human_msg, response]}
-    # else:
-    #     # Update cookies from the recent history
-    #     for msg in reversed(state["messages"]):
-    #         if getattr(msg, "type", "") == "ai":
-    #             break
-    #         if getattr(msg, "type", "") == "tool" and getattr(msg, "name", "") == "send_http_request":
-    #             if hasattr(msg, "artifact") and msg.artifact:
-    #                 # Merge the new cookies into the current state
-    #                 current_cookies.update(msg.artifact)
-    #
-    #     compacted_messages = compact_tool_history(state["messages"], safe_window=8)
-    #     sys_msg = compacted_messages[0]
-    #     human_msg = compacted_messages[1]
-    #
-    #     dynamic_msgs = []
-    #     if state.get("notes"):
-    #         notes_str = "\n".join([f"- {n}" for n in state["notes"]])
-    #         saved_notes = f"\n\n### Persistent Scratchpad\n{notes_str}\n"
-    #         dynamic_msgs.append(HumanMessage(content=saved_notes))
-    #
-    #     messages_to_pass = [sys_msg, human_msg] + dynamic_msgs + compacted_messages[2:]
-    #
-    #     response = llm_with_tools.invoke(messages_to_pass)
-    #     return {"messages": [response], "cookies": current_cookies}
+    llm_with_tools = llm.bind_tools([
+        tools.send_http_request,
+        tools.list_files,
+        tools.read_file,
+        tools.mark_validation_complete
+    ])
+    current_cookies = state.get("cookies", {})
+
+    if not state.get("messages"):
+        sys_msg = SystemMessage(content=VALIDATOR_AGENT.get('prompt'))
+        human_msg = HumanMessage(content=(
+            f"Target Sandbox: {state['sandbox_url']}\n\n"
+            f"Vulnerability to Prove:\n{state['report_to_test']}\n"
+        ))
+        messages = [sys_msg, human_msg]
+        response = llm_with_tools.invoke(messages)
+        return {"messages": [sys_msg, human_msg, response]}
+    else:
+        # Update cookies from the recent history
+        for msg in reversed(state["messages"]):
+            if getattr(msg, "type", "") == "ai":
+                break
+            if getattr(msg, "type", "") == "tool" and getattr(msg, "name", "") == "send_http_request":
+                if hasattr(msg, "artifact") and msg.artifact:
+                    # Merge the new cookies into the current state
+                    current_cookies.update(msg.artifact)
+
+        response = llm_with_tools.invoke(state["messages"])
+        return {"messages": [response], "cookies": current_cookies}
 
 
 def validator_router(state: ValidatorState):
     last_message = state["messages"][-1]
-    if last_message.tool_calls:
-        return "validator_tools"
+
+    if last_message.type == "ai":
+        if last_message.tool_calls:
+            return "validator_tools"
+        # The LLM failed to call a tool
+        return "ask_validator_for_tool"
+
+    elif last_message.type == "tool":
+        if getattr(last_message, "name", "") == "mark_validation_complete":
+            return "__end__"
+        return "validator_agent"
 
     # The LLM failed to call a tool
     return "ask_validator_for_tool"

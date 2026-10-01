@@ -11,24 +11,46 @@ import networkx as nx
 import json
 from typing import Any, Optional
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AnyMessage, AIMessage
+from schemas import VulnerabilityRecord
 import settings
+from functools import lru_cache
 
 
-def build_networkx_graph(graph_path: Path) -> nx.DiGraph:
+@lru_cache(maxsize=1)
+def get_cached_graph_data(graph_path: Path):
+    """Caches the graph JSON in memory to prevent disk I/O bottlenecks."""
+    try:
+        with open(graph_path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logging.error(f"'{graph_path}' not found.")
+        return {}
+
+
+def build_networkx_graph(graph_path: Path, allowed_communities: Optional[list[int]] = None) -> nx.DiGraph:
     """
     Reads the Graphify JSON output and builds a NetworkX Directed Graph.
+    Optionally filters the graph to only include specific communities.
     """
-    with open(graph_path, 'r') as f:
-        graph_data = json.load(f)
+    graph_data = get_cached_graph_data(graph_path)
 
     # Initialize a Directed Graph
     G = nx.DiGraph()
+
+    # Convert list to set for faster lookups
+    allowed_set = set(allowed_communities) if allowed_communities is not None else None
 
     # Add Nodes with their attributes (community, type, file_path, etc.)
     for node in graph_data.get('nodes', []):
         node_id = node.get('id')
         if not node_id:
             continue
+
+        # FILTERING LOGIC: Skip node if it doesn't belong to the allowed communities
+        if allowed_set is not None:
+            community_id = node.get('community')
+            if community_id not in allowed_set:
+                continue
 
         # Copy all other key-value pairs as node attributes
         attributes = {k: v for k, v in node.items() if k != 'id'}
@@ -41,12 +63,70 @@ def build_networkx_graph(graph_path: Path) -> nx.DiGraph:
         if not source or not target:
             continue
 
-        # Copy all other key-value pairs as edge attributes
-        attributes = {k: v for k, v in edge.items() if k not in ['source', 'target']}
-        G.add_edge(source, target, **attributes)
+        # CRITICAL: Only add edges if BOTH nodes survived the community filter.
+        # Otherwise, NetworkX will silently re-create the deleted nodes.
+        if source in G and target in G:
+            # Copy all other key-value pairs as edge attributes
+            attributes = {k: v for k, v in edge.items() if k not in ['source', 'target']}
+            G.add_edge(source, target, **attributes)
 
     print(f"Loaded Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges.")
     return G
+
+
+def merge_vulnerabilities(
+    existing: list[dict], 
+    updates: list[dict]
+) -> list[dict]:
+    """Custom reducer to merge vulnerabilities using standard dictionaries."""
+    vuln_map = {}
+
+    # Map existing state
+    for vuln in existing:
+        vid = vuln.get("vuln_id") if isinstance(vuln, dict) else getattr(vuln, "vuln_id", None)
+        if vid:
+            vuln_map[vid] = vuln
+
+    # Process updates
+    for update in updates:
+        # Failsafe: if a Pydantic model accidentally slips in, dump it to a dict
+        if not isinstance(update, dict):
+            update = update.model_dump() if hasattr(update, "model_dump") else dict(update)
+
+        vid = update.get("vuln_id")
+        if not vid:
+            node_id = update.get("node_id", "Unknown")
+            cwe_id = update.get("cwe_id", "OTHER_UNCATEGORIZED")
+            vid = f"{node_id}:{cwe_id}"
+
+            # Inject it into the dictionary so it stays tracked forever
+            update["vuln_id"] = vid 
+
+        if vid in vuln_map:
+            current = vuln_map[vid]
+
+            if isinstance(current, dict):
+                # Update status if we are upgrading from a hypothesis
+                if update.get("status") and update.get("status") != "hypothesis":
+                    current["status"] = update.get("status")
+
+                # Merge descriptions without losing context
+                curr_desc = current.get("description", "")
+                upd_desc = update.get("description", "")
+                if upd_desc and upd_desc not in curr_desc:
+                    current["description"] = f"{curr_desc}\n\nAdditional context: {upd_desc}"
+
+                # Merge any new tool fields (e.g., confidence_score) dynamically
+                for key, value in update.items():
+                    if key not in ["status", "description"] and value is not None:
+                        current[key] = value
+
+            vuln_map[vid] = current
+        else:
+            # It's a completely new vulnerability
+            vuln_map[vid] = update
+
+    return list(vuln_map.values())
 
 
 def get_graph_summary(G: nx.DiGraph) -> str:
@@ -176,142 +256,6 @@ def serialize_for_json(obj):
         return str(obj)
 
 
-# def run_stream(app, inputs, config=None, output_file="trace.json"):
-#     print(f"\n[System] Running Multi-Agent Analysis. Assembling state to {output_file}...")
-#
-#     assembled_states = {}
-#     raw_main_state = {}
-#
-#     # Token usage stats
-#     tracked_msg_ids = set()
-#     agent_token_stats = {}
-#     token_stats = {"input": 0, "output": 0, "total": 0}
-#
-#     for event in app.stream(inputs, stream_mode="values", subgraphs=True, config=config):
-#         namespace, state = event
-#
-#         # Format the namespace so it's readable in the JSON
-#         if not namespace:
-#             graph_name = "Main_Graph"
-#             raw_main_state = state
-#         else:
-#             # Subgraphs/Agents have namespaces like ('manager', 'expert', 'b3f1...')
-#             graph_name = ' -> '.join(namespace)
-#
-#         if hasattr(state.get("task"), "agent_role"):
-#             graph_name = graph_name[:17] + f" ({state.get('task').agent_role})"
-#
-#         # Overwrite the key with the most recent full state.
-#         assembled_states[graph_name] = serialize_for_json(state)
-#
-#         # ==========================================
-#         # --- TERMINAL PROGRESS INDICATOR ---
-#         # ==========================================
-#         last_msg = None
-#
-#         # 1. Catch Subgraph Agents (they still use the 'messages' array)
-#         if namespace and "messages" in state and state["messages"]:
-#             last_msg = state["messages"][-1]
-#
-#         # 2. Catch the Manager (runs on Main Graph, uses 'manager_message' key)
-#         elif not namespace and "manager_message" in state and state["manager_message"]:
-#             last_msg = state["manager_message"]
-#
-#         # If we successfully grabbed a message from either source, process it:
-#         if last_msg:
-#             msg_type = getattr(last_msg, "type", "unknown")
-#             msg_id = getattr(last_msg, "id", None)
-#
-#             # Extract content safely, even if it's nested
-#             content = getattr(last_msg, "content", "")
-#             if isinstance(content, list):
-#                 content = str(content)
-#
-#             # Create a clean, single-line snippet
-#             snippet = (content[:200] + "...") if len(content) > 200 else content
-#             snippet = snippet.replace('\n', ' ').strip()
-#
-#             if msg_type == "ai":
-#                 # Track token usage
-#                 if msg_id and msg_id not in tracked_msg_ids:
-#                     tracked_msg_ids.add(msg_id)
-#                     usage = getattr(last_msg, "usage_metadata", {})
-#                     if usage:
-#                         in_tok = usage.get("input_tokens", 0)
-#                         out_tok = usage.get("output_tokens", 0)
-#                         tot_tok = usage.get("total_tokens", 0)
-#
-#                         # Initialize agent in stats dictionary if not present
-#                         if graph_name not in agent_token_stats:
-#                             agent_token_stats[graph_name] = {"input": 0, "output": 0, "total": 0}
-#
-#                         agent_token_stats[graph_name]["input"] += in_tok
-#                         agent_token_stats[graph_name]["output"] += out_tok
-#                         agent_token_stats[graph_name]["total"] += tot_tok
-#
-#                         token_stats["input"] += in_tok
-#                         token_stats["output"] += out_tok
-#                         token_stats["total"] += tot_tok
-#
-#                 # Print the AI's thought process (Chain of Thought)
-#                 if snippet:
-#                     print(f"[{graph_name}] \033[96m🧠 AI: {snippet}\033[0m", flush=True)
-#
-#                 # Print the Tool Call (if it decided to act)
-#                 if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-#                     tool_strings = []
-#                     for tc in last_msg.tool_calls:
-#                         name = tc.get("name", "unknown")
-#                         args = tc.get("args", {})
-#                         args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
-#                         tool_strings.append(f"{name}({args_str})")
-#
-#                     print(f"[{graph_name}] \033[93m🛠️  Calling tool: {' | '.join(tool_strings)}\033[0m", flush=True)
-#
-#             elif msg_type == "tool":
-#                 tool_name = getattr(last_msg, 'name', 'unknown')
-#                 print(f"[{graph_name}] \033[92m✅ Tool executed: {tool_name} | Output: {snippet[:50]}\033[0m", flush=True)
-#
-#             elif msg_type == "human":
-#                 print(f"[{graph_name}] \033[94m👤 Human: {snippet}\033[0m", flush=True)
-#
-#             else:
-#                 print(f"[{graph_name}] \033[90m⚙️  {msg_type.capitalize()} message\033[0m", flush=True)
-#
-#         else:
-#             # Tell us exactly WHICH state keys were updated in the background
-#             state_keys = ", ".join([k for k in state.keys() if k not in ["messages", "manager_message"]])
-#             if state_keys:
-#                 print(f"[{graph_name}] \033[90mState updated: [{state_keys}]\033[0m", flush=True)
-#         # -----------------------------------
-#
-#     # Dump the cohesive final states to a JSON file
-#     with open(output_file, "w", encoding="utf-8") as f:
-#         json.dump(assembled_states, f, indent=2)
-#
-#     print("[System] Execution Finished.")
-#
-#     # --- Print Token Usage Summary ---
-#     print("\n" + "="*50)
-#     print("📊 \033[1mToken Usage Summary by Agent\033[0m")
-#     print("-" * 50)
-#
-#     for agent_name in sorted(agent_token_stats.keys()):
-#         stats = agent_token_stats[agent_name]
-#         print(f"🔹 \033[96m{agent_name}\033[0m")
-#         print(f"   In: {stats['input']:,}  |  Out: {stats['output']:,}  |  Total: {stats['total']:,}")
-#
-#     print("-" * 50)
-#     print("🏆 \033[1mGrand Totals\033[0m")
-#     print(f"   Input Tokens:  {token_stats['input']:,}")
-#     print(f"   Output Tokens: {token_stats['output']:,}")
-#     print(f"   Total Tokens:  \033[95m{token_stats['total']:,}\033[0m")
-#     print("="*50 + "\n")
-#
-#     main_state = assembled_states.get("Main_Graph", {})
-#     return {"vulnerability_reports": raw_main_state.get("vulnerability_reports", [])}
-
-
 # Tools that takes a lot of context
 heavy_tools = ["read_source_code", "send_http_request", "search_codebase"]
 
@@ -419,54 +363,6 @@ def enforce_note_taking(messages: list[AnyMessage], max_consecutive: int = 4) ->
     return None
 
 
-def format_notes(notes_list: list[dict]) -> str:
-    """
-    Takes a list of note dictionaries and converts them into a structured 
-    Markdown prompt for the Researcher agent.
-    """
-    notes_str = "### Current Audit Memory\n\n"
-
-    for item in notes_list:
-        notes_str += f"#### Node ID: `{item.get('node_id')}`\n"
-        notes_str += f"{item.get('role_in_system')}\n\n"
-
-        assumptions = item.get("assumptions_to_verify", [])
-        if assumptions:
-            notes_str += "**Assumptions to Verify:**\n"
-            for asm in assumptions:
-                notes_str += f"- {asm.get('description')}\n"
-
-                snippet = asm.get('snippet', '').strip()
-                if snippet:
-                    notes_str += f"  ```python\n  {snippet}\n  ```\n"
-
-                dep = asm.get("depends_on")
-                if dep:
-                    resolved_id = dep.get("resolved_node_id", "External / Unresolved")
-                    notes_str += f"  - Depends on: `{dep.get('module')}.{dep.get('symbol')}` (Target Node: `{resolved_id}`)\n"
-            notes_str += "\n"
-
-        issues = item.get("potential_issues", [])
-        if issues:
-            notes_str += "**Potential Issues:**\n"
-            for issue in issues:
-                notes_str += f"- {issue.get('description')}\n"
-
-                snippet = issue.get('snippet', '').strip()
-                if snippet:
-                    notes_str += f"  ```python\n  {snippet}\n  ```\n"
-
-                dep = issue.get("depends_on")
-                if dep:
-                    resolved_id = dep.get("resolved_node_id", "External / Unresolved")
-                    notes_str += f"  - Flows into: `{dep.get('module')}.{dep.get('symbol')}` (Target Node: `{resolved_id}`)\n"
-            notes_str += "\n"
-
-        notes_str += "---\n\n"
-
-    return notes_str
-
-
 LANGUAGE_MAP = {
     ".py": tree_sitter.Language(tree_sitter_python.language()),
     ".js": tree_sitter.Language(tree_sitter_javascript.language()),
@@ -511,174 +407,23 @@ AST_GRAMMAR_MAP = {
 }
 
 
-def get_node_source_code(node_id: str):
-    graph = settings.graph
-    try:
-        with open(graph, "r") as f:
-            graph_data = json.load(f)
-    except FileNotFoundError:
-        logging.error(f"'{graph}' not found.")
-        return None
-
-    target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), None)
-    if not target_node:
-        return f"Error: Node ID '{node_id}' not found in graph."
-
-    if not target_node.get("source_file"):
-        logging.error(f"Node '{node_id}' does not have a source file mapped.")
-        return None
-
-    source_file = graph.parent.parent / Path(target_node.get("source_file"))
-    source_location = target_node.get("source_location")
-    file_type = target_node.get("file_type")
-
-    if not source_file.exists():
-        logging.error(f"Source file '{source_file}' not found on disk. Ensure paths are correct.")
-        return None
-
-    if file_type == "document" or not source_location:
-        try:
-            # Enforce utf-8 encoding. If it is not a text file it will trigger a UnicodeDecodeError
-            with open(source_file, "r", encoding="utf-8") as f:
-                content = f.read()
-        except UnicodeDecodeError:
-            return f"Error: '{source_file}' is a binary file and cannot be read as plain text."
-        except Exception as e:
-            logging.error(f"Error reading '{source_file}': {str(e)}")
-            return None
-
-        if len(content) > 20000:
-            return (
-                f"Warning: File is too large. Showing first {20000}/{len(content)} characters:\n\n"
-                f"{content[:20000]}\n\n"
-            )
-        return content
-
-    elif file_type in ["code", "rationale"]:
-        with open(source_file, "r", encoding="utf-8") as f:
-            source_content = f.read()
-
-        # Convert line location string "L53" to integer 53
-        try:
-            start_line = int(source_location.replace("L", ""))
-            target_row = start_line - 1  # Tree-sitter rows are 0-indexed
-        except ValueError:
-            logging.error(f"Invalid source_location format '{source_location}'.")
-            return None
-
-        # Determine if this is a file
-        is_file_node = start_line == 1 and target_node.get("label", "") == source_file.name
-
-        lines = source_content.splitlines()
-        lang = LANGUAGE_MAP.get(source_file.suffix)
-
-        if lang:
-            try:
-                parser = tree_sitter.Parser(lang)
-                source_bytes = source_content.encode("utf-8")
-                tree = parser.parse(source_bytes)
-
-                # Generate the skeleton context
-                skeleton = [
-                    "# [FILE CONTEXT - JUST USE FOR REFERENCE]",
-                    f"# File: {source_file.name}",
-                    "# Imports and Structure:"
-                ]
-
-                # Fetch language-specific grammar rules (fallback to an empty dict to be safe)
-                grammar = AST_GRAMMAR_MAP.get(source_file.suffix, {})
-                keep_whole = grammar.get("keep_whole", [])
-                prune_bodies = grammar.get("prune_bodies", [])
-                body_node_type = grammar.get("body_node", "block")
-
-                for child in tree.root_node.children:
-                    # Keep imports and top-level expressions (globals) intact
-                    if child.type in keep_whole:
-                        skeleton.append(source_bytes[child.start_byte:child.end_byte].decode("utf-8"))
-
-                    # Prune the bodies of functions and classes
-                    elif child.type in prune_bodies:
-                        def get_body_node(n):
-                            for c in n.children:
-                                # Check if body_node_type is a list/tuple to support multiple block node types
-                                if isinstance(body_node_type, (list, tuple)) and c.type in body_node_type:
-                                    return c
-                                elif c.type == body_node_type:
-                                    return c
-
-                                if c.type in prune_bodies:
-                                    res = get_body_node(c)
-                                    if res: return res
-                            return None
-
-                        body_node = get_body_node(child)
-                        if body_node:
-                            # Extract everything up to the start of the block (e.g., 'def init_db():')
-                            signature = source_bytes[child.start_byte:body_node.start_byte].decode("utf-8").strip()
-                            skeleton.append(f"{signature}\n    # Body omitted for context limits\n")
-                        else:
-                            # Fallback if no block is found
-                            skeleton.append(source_bytes[child.start_byte:child.end_byte].decode("utf-8"))
-
-                skeleton_text = "\n".join(skeleton) if len(skeleton) > 3 else ""
-
-                # If it's a file node, return skeleton (or full file if no grammar rules applied)
-                if is_file_node:
-                    if not skeleton_text:
-                        return source_content
-                    return skeleton_text.replace(
-                        "# [FILE CONTEXT - JUST USE FOR REFERENCE]\n", 
-                        f"# --- FILE SKELETON: {source_file.name} (function/class definitions omitted) ---\n"
-                    )
-
-                # Extract specific function/class node
-                def find_node(node, row):
-                    if node.start_point[0] == row:
-                        return node
-                    for child in node.children:
-                        if child.start_point[0] <= row <= child.end_point[0]:
-                            found = find_node(child, row)
-                            if found:
-                                return found
-                    return None
-
-                target_ast_node = find_node(tree.root_node, target_row)
-
-                if target_ast_node:
-                    extracted_bytes = source_bytes[target_ast_node.start_byte:target_ast_node.end_byte]
-                    node_code = extracted_bytes.decode("utf-8")
-
-                    return (
-                        f"{skeleton_text}\n\n"
-                        f"# [NODE TO ANALYZE]\n"
-                        f"# Node ID: {node_id}\n"
-                        f"# Code:\n"
-                        f"{node_code}"
-                    )
-
-            except Exception as e:
-                logging.warning(f"Tree-sitter failed to parse or walk '{source_file}': {e}")
-                pass
-
-        # If the node represents the whole file, return the entire raw text
-        if is_file_node:
-            return source_content
-
-        # If it represents a specific line inside a non-AST file, return just that line
-        if 0 < start_line <= len(lines):
-            return lines[start_line - 1].strip()
-
-    return None
-
-
 def resolve_node_id(module, symbol):
     with open(settings.graph, "r") as f:
         graph_data = json.load(f)
         nodes_list = graph_data.get("nodes", [])
 
+        normalized_module = module.replace(".", "/").replace("\\", "/")
+        module_with_symbol = f"{normalized_module}/{symbol}" # PHP/Java style path
+
         node = next(
             (n for n in nodes_list 
-             if n.get("source_file", "").endswith(module.replace(".", "/") + ".py")
+             if n.get("source_file") 
+             and (
+                 # Python/JS style: the module maps directly to the file path
+                 str(Path(n.get("source_file")).with_suffix("")).replace("\\", "/").endswith(normalized_module) or
+                 # PHP/Java style: the file is named after the class/symbol inside the module folder
+                 str(Path(n.get("source_file")).with_suffix("")).replace("\\", "/").endswith(module_with_symbol)
+             )
              and n.get("label") in [symbol, f"{symbol}()"]),
             None
         )
@@ -799,3 +544,199 @@ def cache(file: Path, action: str, content: dict = {}) -> Optional[dict]:
 
     else:
         logging.error(f"Unknown action: {action}")
+
+
+def uses_namespace_in_ast(node_id: str, target_namespace: str) -> bool:
+    """
+    Checks if a specific namespace is used within a node's AST, 
+    using the semantically folded source code.
+    """
+    source_code = get_node_code(node_id)
+    if not source_code:
+        return False
+
+    # Extract node data to determine the file extension
+    graph = settings.graph
+    graph_data = get_cached_graph_data(graph)
+    if not graph_data:
+        return False
+
+    target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), None)
+    if not target_node or not target_node.get("source_file"):
+        logging.error(f"Node '{node_id}' does not have a valid source file mapped.")
+        return False
+
+    source_file = target_node.get("source_file")
+    ext = Path(source_file).suffix.lower()
+
+    # Map extension to tree-sitter language
+    if ext not in LANGUAGE_MAP:
+        logging.warning(f"Unsupported extension '{ext}' for AST parsing on node '{node_id}'.")
+        return False
+
+    # Initialize parser
+    parser = tree_sitter.Parser(LANGUAGE_MAP[ext])
+
+    # Parse the folded code
+    source_bytes = source_code.encode("utf-8")
+    tree = parser.parse(source_bytes)
+
+    def walk(node: tree_sitter.Node) -> bool:
+        # Ignore import/require statements so we only match actual usage
+        if any(keyword in node.type for keyword in ["import", "include", "use_declaration"]):
+            return False
+
+        # If it's a leaf node, check its text
+        if len(node.children) == 0:
+            # Safely ignore comments and string literals
+            if "comment" not in node.type and "string" not in node.type:
+                token_text = source_bytes[node.start_byte:node.end_byte].decode("utf-8")
+                if token_text == target_namespace:
+                    return True
+
+        # Recurse through children
+        for child in node.children:
+            if walk(child):
+                return True
+
+        return False
+
+    return walk(tree.root_node)
+
+
+def get_node_code(node_id: str) -> str | None:
+    graph = settings.graph
+    graph_data = get_cached_graph_data(graph)
+
+    target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), None)
+    if not target_node:
+        logging.error(f"Error: Node ID '{node_id}' not found in graph.")
+        return None
+
+    source_file_path = target_node.get("source_file")
+    if not source_file_path:
+        logging.error(f"Node '{node_id}' does not have a source file mapped.")
+        return None
+
+    source_file = graph.parent.parent / Path(source_file_path)
+    source_location = target_node.get("source_location")
+    file_type = target_node.get("file_type")
+
+    if not source_file.exists():
+        logging.error(f"Source file '{source_file}' not found on disk.")
+        return None
+
+    # Handle standard text/document files
+    if file_type == "document" or not source_location:
+        try:
+            with open(source_file, "r", encoding="utf-8") as f:
+                return f.read()
+        except UnicodeDecodeError:
+            return f"Error: '{source_file}' is binary."
+        except Exception as e:
+            return None
+
+    # Read source bytes for Tree-sitter
+    with open(source_file, "r", encoding="utf-8") as f:
+        source_content = f.read()
+    source_bytes = source_content.encode("utf-8")
+
+    # Resolve target row
+    try:
+        start_line = int(source_location.replace("L", ""))
+        target_row = start_line - 1  # 0-indexed for Tree-sitter
+    except ValueError:
+        return None
+
+    # If the node represents the whole file, target_row becomes None (prune everything)
+    is_file_node = (start_line == 1 and target_node.get("label", "") == source_file.name)
+    active_target_row = None if is_file_node else target_row
+
+    lang = LANGUAGE_MAP.get(source_file.suffix)
+    if not lang:
+        # Fallback to returning raw code if no parser exists
+        return source_content
+
+    try:
+        parser = tree_sitter.Parser(lang)
+        tree = parser.parse(source_bytes)
+
+        grammar = AST_GRAMMAR_MAP.get(source_file.suffix, {})
+        prune_bodies = grammar.get("prune_bodies", [])
+        body_node_type = grammar.get("body_node", "block")
+
+        def get_body_node(n):
+            for c in n.children:
+                if isinstance(body_node_type, (list, tuple)) and c.type in body_node_type:
+                    return c
+                elif c.type == body_node_type:
+                    return c
+                if c.type in prune_bodies:
+                    res = get_body_node(c)
+                    if res: return res
+            return None
+
+        # Identify the specific target AST node first
+        target_ast_node = None
+        if active_target_row is not None:
+            def find_target(n):
+                deepest = None
+                # If this node matches criteria, it is a candidate
+                if n.type in prune_bodies and n.start_point[0] <= active_target_row <= n.end_point[0]:
+                    deepest = n
+                # Check children for a deeper match
+                for c in n.children:
+                    res = find_target(c)
+                    if res:
+                        deepest = res
+                return deepest
+
+            target_ast_node = find_target(tree.root_node)
+
+        # Walk the AST and collect byte ranges of bodies to prune
+        ranges_to_prune = []
+
+        def find_prunable_ranges(node, inside_target=False):
+            # Once we hit the target node, flag it and all its children as protected
+            is_target_now = inside_target or (node == target_ast_node)
+
+            if node.type in prune_bodies:
+                # Only attempt to prune if we are NOT inside the target block
+                if not is_target_now:
+                    contains_target = False
+                    if active_target_row is not None:
+                        contains_target = node.start_point[0] <= active_target_row <= node.end_point[0]
+
+                    # If it doesn't contain the target, prune its body and stop traversing this branch
+                    if not contains_target:
+                        body = get_body_node(node)
+                        if body:
+                            ranges_to_prune.append((body.start_byte, body.end_byte))
+                        return 
+
+            # Recurse into children, passing down the protection flag
+            for child in node.children:
+                find_prunable_ranges(child, is_target_now)
+
+        find_prunable_ranges(tree.root_node)
+
+        # Reconstruct the source code using byte replacement
+        ranges_to_prune.sort(key=lambda x: x[0])
+        result_chunks = []
+        last_idx = 0
+
+        for start_byte, end_byte in ranges_to_prune:
+            # Append code up to the start of the pruned body
+            result_chunks.append(source_bytes[last_idx:start_byte].decode("utf-8"))
+            # Insert our folded marker
+            result_chunks.append("\n    # ... [Body omitted] ...\n")
+            last_idx = end_byte
+
+        # Append the remaining code
+        result_chunks.append(source_bytes[last_idx:].decode("utf-8"))
+
+        return "".join(result_chunks)
+
+    except Exception as e:
+        logging.warning(f"Tree-sitter failed on '{source_file}': {e}")
+        return source_content
