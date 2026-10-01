@@ -18,7 +18,7 @@ import settings
 import tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, VerifierState, ReviewerState, ValidatorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, load_code_corpus
+from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, load_code_corpus, find_unsupported_code_files
 
 # fast_llm = ChatOllama(model="gemma4:cloud", temperature=0.2, reasoning=False, num_ctx=32768)
 # smart_llm = ChatOllama(model="gemma4:cloud", temperature=0.6, reasoning=False, num_ctx=32768)
@@ -103,6 +103,15 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
     logging.info(f"Found {len(raw_vulns)} raw vulns")
     clean_vulns = deduplicate_cves(raw_vulns)
     logging.info(f"{len(clean_vulns)} remaining CVEs after deduplication")
+
+    # Log an error for any code files in a language we cannot analyze, so the
+    # operator knows some of the codebase is invisible to AST-based analysis.
+    unsupported = find_unsupported_code_files(get_cached_graph_data(settings.graph))
+    for ext, files in unsupported.items():
+        logging.error(
+            f"Unsupported language '{ext}': {len(files)} code file(s) "
+            f"cannot be analyzed ({', '.join(files)})."
+        )
 
     # Build the Global Symbol Index
     global_symbol_index = []

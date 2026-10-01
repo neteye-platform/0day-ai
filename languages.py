@@ -3,6 +3,7 @@ import tree_sitter_python
 import tree_sitter_javascript
 import tree_sitter_typescript
 import tree_sitter_php
+import tree_sitter_go
 
 LANGUAGE_MAP = {
     ".py": tree_sitter.Language(tree_sitter_python.language()),
@@ -11,6 +12,7 @@ LANGUAGE_MAP = {
     ".php": tree_sitter.Language(tree_sitter_php.language_php()),
     ".ts": tree_sitter.Language(tree_sitter_typescript.language_typescript()),
     ".tsx": tree_sitter.Language(tree_sitter_typescript.language_tsx()),
+    ".go": tree_sitter.Language(tree_sitter_go.language()),
 }
 
 # Dependency manifest and lockfile names across all supported ecosystems.
@@ -129,8 +131,8 @@ SYMBOL_QUERIES = {
 
         (function_definition name: (name) @function_name) @function_body
     """,
-    # TODO: Capture the Parent Class for the following languages
     ".py": """
+        (class_definition name: (identifier) @class_name superclasses: (argument_list (_) @parent_class) body: (block (function_definition name: (identifier) @method_name) @method_body))
         (class_definition name: (identifier) @class_name body: (block (function_definition name: (identifier) @method_name) @method_body))
         (function_definition name: (identifier) @function_name) @function_body
     """,
@@ -138,9 +140,29 @@ SYMBOL_QUERIES = {
         (class_declaration name: (identifier) @class_name body: (class_body (method_definition name: (property_identifier) @method_name) @method_body))
         (function_declaration name: (identifier) @function_name) @function_body
         (lexical_declaration (variable_declarator name: (identifier) @function_name value: [(arrow_function) (function_expression)] @function_body))
-    """
+    """,
+    ".ts": """
+        (class_declaration name: (type_identifier) @class_name body: (class_body (method_definition name: (property_identifier) @method_name) @method_body))
+        (function_declaration name: (identifier) @function_name) @function_body
+        (lexical_declaration (variable_declarator name: (identifier) @function_name value: [(arrow_function) (function_expression)] @function_body))
+    """,
+    ".tsx": """
+        (class_declaration name: (type_identifier) @class_name body: (class_body (method_definition name: (property_identifier) @method_name) @method_body))
+        (function_declaration name: (identifier) @function_name) @function_body
+        (lexical_declaration (variable_declarator name: (identifier) @function_name value: [(arrow_function) (function_expression)] @function_body))
+    """,
+    ".go": """
+        (method_declaration
+          receiver: (parameter_list (parameter_declaration type: (type_identifier) @class_name))
+          name: (field_identifier) @method_name
+          body: (block) @method_body)
+        (method_declaration
+          receiver: (parameter_list (parameter_declaration type: (pointer_type (type_identifier) @class_name)))
+          name: (field_identifier) @method_name
+          body: (block) @method_body)
+        (function_declaration name: (identifier) @function_name body: (block) @function_body)
+    """,
 }
 
 # .jsx and .tsx use the exact same AST structure for methods as their base languages
 SYMBOL_QUERIES[".jsx"] = SYMBOL_QUERIES[".js"]
-# SYMBOL_QUERIES[".tsx"] = SYMBOL_QUERIES[".ts"]
