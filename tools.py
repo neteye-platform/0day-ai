@@ -222,3 +222,39 @@ def submit_report(finding: VulnerabilityReport, state: Annotated[dict, InjectedS
 def mark_task_complete(summary: str) -> dict:
     """Call this tool ONLY when you have analyzed EVERY single node assigned to you and are ready to finish."""
     return {"audit_status": "completed", "summary": summary}
+
+@tool
+def send_http_request(method: str, endpoint: str, headers: dict, body: str = "") -> str:
+    """
+    Sends an HTTP request to the sandboxed application.
+    Use this for testing XSS, SQLi, SSRF, and command injection via web endpoints.
+    """
+    if not endpoint.startswith(settings.sandbox_url):
+        return f"You can only make requests to the sandbox application at {settings.sandbox_url}"
+
+    import requests
+    # Ensure endpoint is pointing to the sandbox environment!
+    try:
+        response = requests.request(
+            method=method,
+            url=endpoint,
+            headers=headers,
+            data=body,
+            timeout=5
+        )
+        return f"Status: {response.status_code}\nHeaders: {response.headers}\nBody: {response.text[:2000]}"
+    except Exception as e:
+        return f"Request failed: {str(e)}"
+
+
+@tool
+def mark_validation_complete(is_confirmed: bool, poc_payload: str, evidence: str) -> dict:
+    """
+    Call this when you have definitively proven the vulnerability exists, 
+    or exhausted all options and believe it to be a false positive.
+    """
+    return {
+        "is_confirmed": is_confirmed,
+        "poc_payload": poc_payload,
+        "execution_logs": evidence
+    }

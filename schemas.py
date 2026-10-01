@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Literal
+from typing import List, Literal, Optional
 import json
 import yaml
 
@@ -9,6 +9,7 @@ with open("agents.yaml", "r") as f:
     EXPERT_AGENTS = data.get("expert_agents")
     TOOLS = data.get("tools")
     REVIEWER_AGENT = data.get("reviewer_agent")
+    VALIDATOR_AGENT = data.get("validator_agent")
 
 CWEs = Literal[
     # --- MEMORY SAFETY (C / C++ / Rust-unsafe) ---
@@ -87,4 +88,10 @@ class VulnerabilityEvaluation(BaseModel):
 
 class ReviewerOutput(BaseModel):
     reports: List[VulnerabilityEvaluation]
+
+class ValidationResult(BaseModel):
+    report_id: str = Field(description="The ID/title of the vulnerability being tested.")
+    is_confirmed: bool = Field(description="True if the exploit successfully triggered in the sandbox.")
+    poc_payload: Optional[str] = Field(description="The exact payload, script, or HTTP request that triggered the vulnerability.")
+    execution_logs: str = Field(description="Relevant logs or output from the sandbox confirming the exploit.")
 
