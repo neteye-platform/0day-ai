@@ -896,6 +896,28 @@ def clear_warning_state() -> None:
         _LOG_ONCE_SEEN.clear()
 
 
+_FEEDBACK_DISPATCHED: set[tuple[str, int]] = set()
+
+
+def take_feedback_dispatch(vuln_id: str, review_round: int) -> bool:
+    """True the first time a (vuln_id, review_round) pair is claimed, False on
+    every repeat. Dedups the validator->reviewer feedback re-review fan-out:
+    ``route_validator_feedback`` fires after EVERY validator superstep while
+    earlier re-reviews are still in flight (the record keeps its
+    insufficient_context status until the re-answer lands), and every duplicate
+    dispatch burns a full cache-exempt reviewer run."""
+    key = (vuln_id, review_round)
+    if key in _FEEDBACK_DISPATCHED:
+        return False
+    _FEEDBACK_DISPATCHED.add(key)
+    return True
+
+
+def clear_feedback_dispatch_state() -> None:
+    """Reset the once-per-run feedback-dispatch dedup (called from bootstrap)."""
+    _FEEDBACK_DISPATCHED.clear()
+
+
 def build_container_members(graph_data: dict) -> dict[str, dict[str, str]]:
     """``container_id -> {method_name_lower: member_node_id}`` for class-like
     nodes. Membership comes from the graph's ``method`` edges, with the id

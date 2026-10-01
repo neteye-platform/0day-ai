@@ -19,6 +19,7 @@ from utils import (
     find_unsupported_code_files,
     get_cached_graph_data,
     build_symbol_index,
+    clear_feedback_dispatch_state,
     clear_warning_state,
 )
 
@@ -33,6 +34,7 @@ def bootstrap_node(state: MasterState) -> dict[str, Any]:
     if not ledger_initialized():
         _reset_pipeline_stats()
     clear_warning_state()    # fresh once-per-run warning dedup
+    clear_feedback_dispatch_state()    # fresh validator-feedback dispatch dedup
     # Correlation id shared by the main trace and the project-split subagent
     # traces (see run_stats.langsmith_detached_node); reused on checkpoint
     # resume and on the round-2 reviewer/validator re-dispatch. `python
