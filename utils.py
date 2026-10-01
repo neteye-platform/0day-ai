@@ -18,7 +18,7 @@ import settings
 from functools import lru_cache
 
 
-from languages import LANGUAGE_MAP, AST_GRAMMAR_MAP, SYMBOL_QUERIES, MANIFEST_NAMES
+from languages import LANGUAGE_MAP, AST_GRAMMAR_MAP, SYMBOL_QUERIES, MANIFEST_NAMES, GUARD_SPEC, guard_usages
 
 
 def _is_manifest_node(node: dict) -> bool:
@@ -242,11 +242,77 @@ def find_unsupported_code_files(graph_data: dict) -> dict[str, list[str]]:
     return dict(unsupported)
 
 
+@lru_cache(maxsize=512)
+def guard_map_for_node(node_id: str) -> dict[str, tuple[str, ...]]:
+    """Map callee base names to their decision-guard usage contexts in a node's code.
+
+    Analyzes the node's raw (unpruned) source slice with tree-sitter; languages
+    without a GUARD_SPEC entry yield an empty map. Returns
+    {base_name: (context, ...)} with unique contexts in source order.
+    """
+    node = next(
+        (n for n in get_cached_graph_data(settings.graph).get("nodes", []) if n.get("id") == node_id),
+        None,
+    )
+    if not node:
+        return {}
+    source_file = node.get("source_file")
+    ext = Path(source_file).suffix.lower() if source_file else ""
+    if ext not in GUARD_SPEC:
+        return {}
+    code = get_node_code(node_id, raw=True)
+    if not code:
+        return {}
+    guards = guard_usages(code, ext)
+    if not guards:
+        return {}
+
+    guard_map: dict[str, list[str]] = {}
+    for guard in guards:
+        base = guard["callee"]
+        context = guard["context"]
+        contexts = guard_map.setdefault(base, [])
+        if context not in contexts:
+            contexts.append(context)
+    return {k: tuple(v) for k, v in guard_map.items()}
+
+
+def _name_base(name: str) -> str:
+    """Normalize a graph node label to a comparable lowercase function name.
+
+    '.login()' / 'isAPI()' / 'Auth::check()' / 'login_required()' all reduce to
+    their bare function name so connection labels match the base names produced
+    by guard analysis.
+    """
+    return (
+        name.strip().rstrip("()").split("->")[-1].split("::")[-1]
+        .lstrip("$").lstrip(".").lower()
+    )
+
+
+def _guard_annotation(source_node_id: Optional[str], target_base: str) -> str:
+    """Render the '(participates in: ...)' suffix for a connection.
+
+    Looks up target_base among the guard usages found in source_node_id's code
+    (the analyzed node for outgoing connections, the caller for incoming ones).
+    """
+    if not source_node_id or not target_base:
+        return ""
+    contexts = guard_map_for_node(source_node_id).get(target_base)
+    if not contexts:
+        return ""
+    return f" (participates in: {', '.join(contexts[:3])})"
+
+
 def format_node_context(graph_data: dict, node_id: str) -> str:
     """Render 'graphify explain' style context for a node: its summary plus connections.
 
     Shows the node's label, id, source file/location and community, followed by
-    all incoming ('<--') and outgoing ('-->') links with their relation and confidence.
+    all incoming ('<--') and outgoing ('-->') links with their relation.
+    Connections to functions sharing a language with GUARD_SPEC are additionally
+    annotated with how the connected function is used in decision guards —
+    outgoing links from the analyzed node's own guard analysis, incoming links
+    from the caller's ('(participates in: $check_mfa)').
     Returns an empty string if the target node is not found.
     """
     nodes = graph_data.get("nodes", [])
@@ -255,11 +321,12 @@ def format_node_context(graph_data: dict, node_id: str) -> str:
     if target_node is None:
         return ""
 
+    self_base = _name_base(target_node.get("label", node_id))
+
     # Collect connections touching this node, resolved to neighbor labels.
     connections = []
     for edge in graph_data.get("links", []):
         relation = edge.get("relation")
-        confidence = edge.get("confidence")
         if edge.get("target") == node_id:
             neighbor = node_map.get(edge.get("source"))
             arrow = "<--"
@@ -269,7 +336,8 @@ def format_node_context(graph_data: dict, node_id: str) -> str:
         else:
             continue
         neighbor_label = neighbor.get("label", edge.get("source") or edge.get("target")) if neighbor else (edge.get("source") or edge.get("target"))
-        connections.append((arrow, neighbor_label, relation, confidence, str(edge.get("source_location", ""))))
+        neighbor_id = edge.get("source") if arrow == "<--" else edge.get("target")
+        connections.append((arrow, neighbor_id, neighbor_label, relation, str(edge.get("source_location", ""))))
 
     # Stable ordering by source line number.
     connections.sort(key=lambda c: c[4])
@@ -283,8 +351,13 @@ def format_node_context(graph_data: dict, node_id: str) -> str:
         "",
         f"Connections ({len(connections)}):",
     ]
-    for arrow, neighbor_label, relation, confidence, _ in connections:
-        lines.append(f"  {arrow} {neighbor_label} [{relation}] [{confidence}]")
+    for arrow, neighbor_id, neighbor_label, relation, _ in connections:
+        line = f"  {arrow} {neighbor_label} [{relation}]"
+        if arrow == "-->":
+            line += _guard_annotation(node_id, _name_base(neighbor_label))
+        else:
+            line += _guard_annotation(neighbor_id, self_base)
+        lines.append(line)
 
     return "\n".join(lines)
 

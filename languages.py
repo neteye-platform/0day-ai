@@ -1,9 +1,11 @@
+import re
 import tree_sitter
 import tree_sitter_python
 import tree_sitter_javascript
 import tree_sitter_typescript
 import tree_sitter_php
 import tree_sitter_go
+from functools import lru_cache
 
 LANGUAGE_MAP = {
     ".py": tree_sitter.Language(tree_sitter_python.language()),
@@ -179,3 +181,200 @@ SYMBOL_QUERIES = {
 # .jsx and .tsx use the exact same AST structure for methods as their base languages
 SYMBOL_QUERIES[".jsx"] = SYMBOL_QUERIES[".js"]
 SYMBOL_QUERIES[".vue"] = SYMBOL_QUERIES[".ts"]
+
+# Decision-guard extraction ("how is this function used?"): calls appearing
+# inside if/else-if conditions or assigned (as boolean/guard-named expressions)
+# to variables are surfaced as usage contexts, e.g. 'isAPI() (participates in:
+# $check_mfa)'. GUARD_SPEC holds the per-language AST node types; missing keys
+# mean the language has no guard analysis (format_node_context fails open).
+
+GUARD_VAR_REGEX = re.compile(
+    r"(?i)(auth|mfa|2fa|check|allow|deny|valid|perm|role|access|guard|admin|is_)"
+)
+
+_PHP_GUARD_SPEC = {
+    "call_fields": {
+        "function_call_expression": "function",
+        "scoped_call_expression": "name",
+        "member_call_expression": "name",
+    },
+    "condition_nodes": {"if_statement": "condition", "else_if_clause": "condition"},
+    "assignment_nodes": {"assignment_expression": ("left", "right")},
+    "boolean_types": ("binary_expression", "unary_op_expression", "parenthesized_expression"),
+    "builtins": {
+        "isset", "empty", "count", "sizeof", "is_array", "is_string", "is_null",
+        "is_numeric", "strtolower", "strtoupper", "trim", "explode", "implode",
+        "in_array", "array_key_exists", "sprintf", "printf",
+    },
+    "wrap": ("<?php\nclass _SnippetScope {\n", "\n}"),
+    "text_node": "text",
+}
+
+_PY_GUARD_SPEC = {
+    "call_fields": {
+        "call": "function",
+    },
+    "condition_nodes": {"if_statement": "condition"},
+    "assignment_nodes": {"assignment": ("left", "right")},
+    "boolean_types": ("boolean_operator", "not_operator", "unary_operator", "binary_operator", "parenthesized_expression"),
+    "builtins": {
+        "len", "isinstance", "issubclass", "callable", "hasattr", "getattr",
+        "setattr", "delattr", "print", "bool", "int", "str", "float", "list",
+        "dict", "set", "tuple", "type", "super", "vars", "dir", "id", "hash",
+        "iter", "next", "any", "all", "sum", "min", "max", "abs", "sorted",
+        "reversed", "enumerate", "zip", "map", "filter", "range", "open",
+        "repr", "format", "classmethod", "staticmethod", "property",
+    },
+}
+
+# js/ts/tsx/jsx/vue share one spec: && / || are binary_expression in the
+# tree-sitter-javascript grammar, and const/let declarators are the idiomatic
+# guard assignments. Builtins are lowercase to match the normalized callees.
+_JS_GUARD_SPEC = {
+    "call_fields": {
+        "call_expression": "function",
+    },
+    "condition_nodes": {"if_statement": "condition"},
+    "assignment_nodes": {
+        "assignment_expression": ("left", "right"),
+        "variable_declarator": ("name", "value"),
+    },
+    "boolean_types": ("binary_expression", "unary_expression", "parenthesized_expression"),
+    "builtins": {
+        "boolean", "string", "number", "bigint", "symbol", "object", "array",
+        "json", "math", "date", "regexp", "error", "typeerror", "rangeerror",
+        "parseint", "parsefloat", "isnan", "isfinite", "encodeuri",
+        "encodeuricomponent", "decodeuri", "decodeuricomponent", "require",
+    },
+    "wrap": ("class _SnippetScope {\n", "\n}"),
+}
+
+_GO_GUARD_SPEC = {
+    "call_fields": {
+        "call_expression": "function",
+    },
+    "condition_nodes": {"if_statement": "condition"},
+    "assignment_nodes": {
+        "assignment_statement": ("left", "right"),
+        "short_var_declaration": ("left", "right"),
+    },
+    "boolean_types": ("binary_expression", "unary_expression", "parenthesized_expression"),
+    "builtins": {
+        "len", "cap", "make", "new", "append", "copy", "delete", "panic",
+        "recover", "print", "println", "close", "complex", "real", "imag",
+        "min", "max", "clear",
+    },
+}
+
+GUARD_SPEC = {
+    ".php": _PHP_GUARD_SPEC,
+    ".py": _PY_GUARD_SPEC,
+    ".go": _GO_GUARD_SPEC,
+}
+for _ext in (".js", ".jsx", ".ts", ".tsx", ".vue"):
+    GUARD_SPEC[_ext] = _JS_GUARD_SPEC
+
+
+@lru_cache(maxsize=len(LANGUAGE_MAP))
+def _guard_parser(ext: str) -> tree_sitter.Parser:
+    return tree_sitter.Parser(LANGUAGE_MAP[ext])
+
+
+def extract_function_calls(node, call_fields: dict) -> list[str]:
+    """Recursively collect bare, lowercased callee names under an AST subtree.
+
+    Uses the language's ``call_fields`` ({node_type: field_name}); the captured
+    field text is already the comparable base name (e.g. 'isAPI', 'is2FAEnabled'),
+    so no scope/prefix normalization is needed here.
+    """
+    calls = []
+
+    field = call_fields.get(node.type)
+    if field:
+        name = node.child_by_field_name(field)
+        if name:
+            calls.append(name.text.decode("utf-8", errors="ignore").lower())
+
+    for child in node.children:
+        calls.extend(extract_function_calls(child, call_fields))
+
+    return calls
+
+
+def _extract_decision_guards(root_node, spec: dict) -> list[dict]:
+    """Extract decision-guard call usages from an AST: calls used inside
+    spec condition nodes or assigned (as boolean/guard-named expressions) via
+    spec assignment nodes. Returns [{'callee', 'context'}, ...] where ``callee``
+    is a bare lowercased name and ``context`` is '$var' or 'if ...'."""
+    guards = []
+    call_fields = spec["call_fields"]
+    condition_nodes = spec["condition_nodes"]
+    assignment_nodes = spec["assignment_nodes"]
+    boolean_types = spec["boolean_types"]
+    builtins = spec["builtins"]
+
+    def collect(expr_node, context: str) -> None:
+        for call in extract_function_calls(expr_node, call_fields):
+            if call not in builtins:
+                guards.append({"callee": call, "context": context})
+
+    def walk(node):
+        assignment = assignment_nodes.get(node.type)
+        if assignment:
+            var_field, value_field = assignment
+            left = node.child_by_field_name(var_field)
+            right = node.child_by_field_name(value_field)
+
+            if left and right:
+                var_name = left.text.decode("utf-8", errors="ignore").lstrip("$")
+                if GUARD_VAR_REGEX.search(var_name) or right.type in boolean_types:
+                    collect(right, f"${var_name}")
+
+        elif node.type in condition_nodes:
+            cond = node.child_by_field_name(condition_nodes[node.type])
+            if cond:
+                raw_cond = cond.text.decode("utf-8", errors="ignore").strip()
+                cond_clean = " ".join(raw_cond.split())
+                if len(cond_clean) > 60:
+                    cond_clean = cond_clean[:57] + "..."
+                collect(cond, f"if {cond_clean}")
+
+        for child in node.children:
+            walk(child)
+
+    walk(root_node)
+    return guards
+
+
+def guard_usages(code: str, ext: str) -> list[dict] | None:
+    """Extract decision-guard usages from a source slice, or None if unparseable.
+
+    Whole-file slices parse bare; slices that error bare (e.g. class methods)
+    are retried wrapped in the language's class shell. A bare result holding
+    nothing but text nodes (PHP slices without a <?php tag are silently parsed
+    as inline HTML) is treated as a misparse and retried wrapped too. Returns
+    None for languages without a guard spec or when both parses fail, else the
+    list from _extract_decision_guards (possibly empty).
+    """
+    spec = GUARD_SPEC.get(ext)
+    if spec is None:
+        return None
+    parser = _guard_parser(ext)
+
+    def usable(root) -> bool:
+        if root.has_error:
+            return False
+        text_node = spec.get("text_node")
+        if text_node and all(child.type == text_node for child in root.children):
+            return False
+        return True
+
+    sources = [code]
+    wrap = spec.get("wrap")
+    if wrap:
+        sources.append(f"{wrap[0]}{code}{wrap[1]}")
+    for source in sources:
+        tree = parser.parse(source.encode("utf-8"))
+        if usable(tree.root_node):
+            return _extract_decision_guards(tree.root_node, spec)
+    return None
