@@ -852,6 +852,9 @@ def dispatch_threat_intel(state: MasterState):
     `aggregate_demands` requires `threat_intel` to run exactly once even when
     there is nothing to enrich, so the empty case emits a no-op task instead of
     routing `aggregate_demands` directly."""
+    if not getattr(settings, "threat_intel_enabled", True):
+        logging.info("Threat Intel disabled via settings.threat_intel_enabled=False.")
+        return _noop_threat_intel_send()
     if not os.environ.get("TAVILY_API_KEY"):
         logging.warning("Threat Intel disabled: TAVILY_API_KEY is not configured.")
         return _noop_threat_intel_send()
