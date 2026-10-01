@@ -2,8 +2,6 @@ import json
 import sys
 import os
 import settings
-from enum import Enum
-import asyncio
 import operator
 from typing import TypedDict, List, Dict, Any, Annotated, Literal
 from langgraph.prebuilt import ToolNode
@@ -12,11 +10,10 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
-import httpx
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 from typing import Annotated
 from langgraph.graph.message import add_messages
-from tools import *
+import tools
 from utils import *
 
 # ==========================================
@@ -30,7 +27,7 @@ class MasterState(TypedDict):
     expert_tasks: List[ExpertTask]
     vulnerability_reports: Annotated[List[Dict[str, Any]], operator.add] # Aggregated findings
 
-class ExpertState(TypedDict, total=False):
+class ExpertState(TypedDict):
     task: ExpertTask
     subgraph_nodes: List[str]
     messages: Annotated[list, add_messages] # Tracks the conversation and tool calls
@@ -41,7 +38,9 @@ class ExpertState(TypedDict, total=False):
 # ==========================================
 
 with open("agents.json", "r") as f:
-    EXPERT_AGENTS = json.load(f)
+    data = json.load(f)
+    EXPERT_AGENTS = data.get("agents")
+    TOOLS = data.get("tools")
 
 class ExpertTask(BaseModel):
     agent_role: str = Field(
@@ -76,36 +75,65 @@ class SubmitReport(BaseModel):
 def preprocessor_node(state: MasterState) -> Dict[str, Any]:
     """
     Reads graph.json, builds a NetworkX graph, and summarizes it
-    to avoid overloading the LLM's context window.
+    for the manager node.
     """
     G = build_networkx_graph(state["graph_path"])
 
+    # Group nodes by community
     communities_map = {}
     for node_id, data in G.nodes(data=True):
         comm_id = str(data.get('community', 'unknown'))
-
         if comm_id not in communities_map:
             communities_map[comm_id] = []
-        communities_map[comm_id].append(node_id)
+        communities_map[comm_id].append((node_id, data))
 
-    # Generate a lightweight summary for the Manager
+    # Generate a summary for the Manager
     summary = (
         f"Application Topology Summary:\n"
-        f"- Total Nodes (Files/Functions/Classes): {G.number_of_nodes()}\n"
-        f"- Total Edges (Calls/Imports): {G.number_of_edges()}\n"
-        f"- Number of distinct Communities (Modules): {len(communities_map)}\n\n"
+        f"- Total Nodes: {G.number_of_nodes()} | Total Edges: {G.number_of_edges()}\n"
+        f"- Total Communities: {len(communities_map)}\n\n"
         f"Community Breakdown:\n"
     )
 
-    for comm_id, node_names in communities_map.items():
-        # Just send a sample of nodes per community to save context
-        sample_nodes = ", ".join(node_names[:5])
-        summary += f"- Community ID {comm_id}: {len(node_names)} nodes. Samples: {sample_nodes}\n"
+    for comm_id, nodes_data in communities_map.items():
+        node_ids = [n[0] for n in nodes_data]
+
+        # Node Types
+        node_types = {"functions": 0, "classes/files": 0, "docs/other": 0}
+        for _, data in nodes_data:
+            f_type = data.get('file_type', 'unknown')
+            label = data.get('label', '')
+            if f_type == 'code':
+                if '()' in label:
+                    node_types["functions"] += 1
+                else:
+                    node_types["classes/files"] += 1
+            else:
+                node_types["docs/other"] += 1
+        type_str = ", ".join([f"{v} {k}" for k, v in node_types.items() if v > 0])
+
+        # Find the "God Node" (the most connected file/function in this community)
+        subgraph = G.subgraph(node_ids)
+        if len(subgraph.nodes) > 0:
+            degrees = dict(subgraph.degree())
+            god_node = max(degrees, key=degrees.__getitem__)
+        else:
+            god_node = "None"
+
+        # Build a highly dense, low-token summary block
+        summary += (
+            f"- Community {comm_id} ({len(node_ids)} nodes): [{type_str}]\n"
+            f"  -> Central Hub Node: {god_node}\n"
+        )
+
+        # Store the list of IDs in the state map for routing later
+        communities_map[comm_id] = node_ids
 
     return {
         "app_summary": summary,
         "communities_map": communities_map
     }
+
 
 def manager_agent_node(state: MasterState) -> Dict[str, Any]:
     """
@@ -115,10 +143,8 @@ def manager_agent_node(state: MasterState) -> Dict[str, Any]:
     # llm = ChatOllama(model="gemma4:26b", temperature=0)
     llm = ChatOpenAI(
         base_url="http://localhost:11434/v1",
-        api_key=os.getenv("API_KEY"),
         model="mistral-3.5-128b",
-        temperature=0,
-        http_client=httpx.Client(verify=False)
+        temperature=0
     )
     structured_llm = llm.with_structured_output(ManagerOutput)
 
@@ -137,6 +163,7 @@ def manager_agent_node(state: MasterState) -> Dict[str, Any]:
     ))
     human_msg = HumanMessage(content=f"Here is the app topology:\n{state.get('app_summary')}")
     response = structured_llm.invoke([sys_msg, human_msg])
+    assert isinstance(response, ManagerOutput), "LLM failed to return structured output!"
 
     return {"expert_tasks": response.tasks}
 
@@ -151,22 +178,34 @@ def expert_agent_node(state: ExpertState) -> dict:
     # llm = ChatOllama(model="gemma4:26b", temperature=0)
     llm = ChatOpenAI(
         base_url="http://localhost:11434/v1",
-        api_key=os.getenv("API_KEY"),
         model="mistral-3.5-128b",
-        temperature=0,
-        http_client=httpx.Client(verify=False)
+        temperature=0
     )
-    llm_with_tools = llm.bind_tools([read_source_code, SubmitReport])
+
+    agent_tools = [SubmitReport]
+    tool_names = EXPERT_AGENTS[role_name].get("tools", [])
+    for name in tool_names:
+        if hasattr(tools, name):
+            agent_tools.append(getattr(tools, name))
+
+    llm_with_tools = llm.bind_tools(agent_tools)
 
     if not state.get("messages"):
-        sys_msg = SystemMessage(content=EXPERT_AGENTS[role_name]["prompt"])
+        tool_rules = ""
+        for tool_name in EXPERT_AGENTS[role_name].get("tools", []):
+            rule = TOOLS[tool_name].get("rule", "")
+            tool_rules += f"- {tool_name}: {rule}\n"
+
+        sys_msg_content = (
+            f"{EXPERT_AGENTS[role_name]["prompt"]}\n\n"
+            f"Operational Rules:\n{tool_rules}\n"
+            "When you have found vulnerabilities OR finished your audit, you MUST call the 'SubmitReport' tool to output your findings."
+        )
+        sys_msg = SystemMessage(content=sys_msg_content)
+
         human_msg = HumanMessage(content=(
             f"Your Task: {state['task'].task_description}\n\n"
             f"Your Assigned Nodes: {state['subgraph_nodes']}\n\n"
-            "Instructions:\n"
-            "1. Analyze the context of your assigned nodes.\n"
-            "2. Use the 'read_source_code' tool to investigate specific logic implementations. CRITICAL: Do not read more than 3 files at the same time.\n"
-            "3. When you have found vulnerabilities OR finished your audit, you MUST call the 'SubmitReport' tool to output your findings."
         ))
 
         messages = [sys_msg, human_msg]
@@ -251,7 +290,7 @@ def dispatch_experts(state: MasterState):
 expert_workflow = StateGraph(ExpertState)
 
 expert_workflow.add_node("expert", expert_agent_node)
-expert_workflow.add_node("execute_tools", ToolNode([read_source_code]))
+expert_workflow.add_node("execute_tools", ToolNode([tools.read_source_code]))
 expert_workflow.add_node("save_report", save_report_node)
 
 expert_workflow.add_edge(START, "expert")

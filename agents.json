@@ -1,18 +1,32 @@
 {
-    "WebSurfaceAuditor": {
-        "manager_description": "Focuses on routes, HTTP parameters, auth middleware, and session gates.",
-        "prompt": "You are an expert in HTTP abstractions, routing, middleware gates, and input contexts."
+    "agents": {
+        "WebSurfaceAuditor": {
+            "manager_description": "Focuses on routes, HTTP parameters, auth middleware, and session gates.",
+            "prompt": "You are an expert in HTTP abstractions, routing, middleware gates, and input contexts.",
+            "tools": ["read_source_code"]
+        },
+        "LogicFlowAuditor": {
+            "manager_description": "Focuses on multi-step business logic, state transitions, and cross-component logic.",
+            "prompt": "You are an expert in state machines, race conditions, and business rule enforcement.",
+            "tools": ["read_source_code"]
+        },
+        "DataPersistenceAuditor": {
+            "manager_description": "Focuses on ORM configurations, SQL schemas, and data-at-rest sanitization.",
+            "prompt": "You are an expert in SQL, database connection pools, and transaction isolation.",
+            "tools": ["read_source_code"]
+        },
+        "InfraConfigAuditor": {
+            "manager_description": "Focuses on Dockerfiles, server configs, and deployment manifests.",
+            "prompt": "You are an expert in container security, server configurations, and supply chain risks.",
+            "tools": ["read_source_code", "check_package_vulnerability"]
+        }
     },
-    "LogicFlowAuditor": {
-        "manager_description": "Focuses on multi-step business logic, state transitions, and cross-component logic.",
-        "prompt": "You are an expert in state machines, race conditions, and business rule enforcement."
-    },
-    "DataPersistenceAuditor": {
-        "manager_description": "Focuses on ORM configurations, SQL schemas, and data-at-rest sanitization.",
-        "prompt": "You are an expert in SQL, database connection pools, and transaction isolation."
-    },
-    "InfraConfigAuditor": {
-        "manager_description": "Focuses on Dockerfiles, server configs, and deployment manifests.",
-        "prompt": "You are an expert in container security, server configurations, and supply chain risks."
+    "tools": {
+        "read_source_code": {
+            "rule": "Use this tool to investigate specific logic implementations. CRITICAL: Do not read more than 3 files at the same time."
+        },
+        "check_package_vulnerability": {
+            "rule": "Use this tool immediately whenever you parse a dependency manifest (like package.json or requirements.txt) to check for known vulnerabilities."
+        }
     }
 }
