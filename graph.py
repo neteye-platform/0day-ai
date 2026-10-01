@@ -1,6 +1,11 @@
 import json
 import logging
 import argparse
+
+# Keep successful HTTP transport requests out of the application logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from langgraph.types import RetryPolicy
@@ -142,7 +147,7 @@ if __name__ == "__main__":
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging.")
     args = parser.parse_args()
 
-    log_level = logging.DEBUG if args.verbose else logging.WARNING
+    log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s [%(levelname)s] %(module)s - %(message)s",

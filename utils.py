@@ -561,6 +561,10 @@ def build_images(kind: str, path: Path, tag: str) -> list[str]:
             images = [img.strip() for img in result.stdout.splitlines() if img.strip()]
             if not images:
                 logging.error("docker compose config returned no images.")
+            # Compose emits build-only services (and unqualified `image:` refs)
+            # without a tag (e.g. "<project>-<service>"); osv-scanner rejects
+            # untagged references, so normalize them to :latest.
+            images = [img if ":" in img else f"{img}:latest" for img in images]
             return images
 
         # Single Dockerfile build
@@ -626,6 +630,36 @@ def _probe_http_ports(ports: list[int]) -> str | None:
     return None
 
 
+def _remove_stale_compose_containers(path: Path) -> None:
+    """Remove any existing container holding one of the compose file's static
+    container names, so ``docker compose up`` can reuse it.
+
+    The preprocessor restarts its own disposable sandbox each run; stale
+    containers from an earlier project with the same pinned name would make
+    ``compose up`` fail with a "name already in use" Conflict.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "-f", str(path), "config", "--format", "json"],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            logging.warning(f"docker compose config failed: {result.stderr}")
+            return
+        data = json.loads(result.stdout)
+    except (json.JSONDecodeError, OSError):
+        return
+
+    for service in data.get("services", {}).values():
+        name = service.get("container_name")
+        if not name:
+            continue
+        rm = subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+        if rm.returncode == 0:
+            logging.info(f"Removed stale container '{name}' before compose up.")
+
+
 def start_sandbox(kind: str, path: Path, tag: str, app_name: str) -> dict | None:
     """Start the built container image(s) in the background and return runtime data.
 
@@ -638,6 +672,13 @@ def start_sandbox(kind: str, path: Path, tag: str, app_name: str) -> dict | None
     """
     try:
         if kind == "compose":
+            # The compose file may pin static `container_name:` values still held
+            # by leftover containers from another compose project (e.g. a prior
+            # run of this scanner on the same app, or a different checkout).
+            # Compose refuses to reuse a name owned by a differently-labelled
+            # container, so pre-emptively remove anything holding those names.
+            # These are throwaway scanner sandboxes - never a production service.
+            _remove_stale_compose_containers(path)
             up = subprocess.run(
                 ["docker", "compose", "-f", str(path), "up", "-d"],
                 capture_output=True,
