@@ -20,6 +20,14 @@ class MasterState(TypedDict):
     # Set only by the preprocessor; validator output is constrained to
     # `vulnerabilities` by compile_validator's output_schema.
     sandbox_url: Optional[str]
+    # Name of the running sandbox container (set by the preprocessor next to
+    # sandbox_url). Used by the Patcher's sandbox resync to docker-cp patched
+    # files into the right container when the image is not built from source.
+    sandbox_container: Optional[str]
+    # Outcome note of the last post-patch sandbox resync ("rebuilt", "copied N
+    # file(s) + restarted", "partial: ...", "skipped: ..."). Rendered into the
+    # validator's patched-target block; None = never resynced.
+    sandbox_resync_note: Optional[str]
 
     notes: Annotated[list[AnalysisNote], operator.add]
     cve_demands: Annotated[list[dict], operator.add]
@@ -82,6 +90,10 @@ class ValidatorState(TypedDict):
     pipeline_run_id: Optional[str]
     report_to_test: dict # The specific vulnerability to validate
     sandbox_url: Optional[str]     # The endpoint/IP of the sandbox
+    # Outcome of the Patcher's last sandbox resync (rebuilt / copied+restarted /
+    # skipped). Rendered into the validator's first turn for patched records so
+    # it knows whether the running sandbox already contains the proposed fix.
+    sandbox_resync_note: Optional[str]
     cookies: dict
     # Proven results (vuln_id / cwe_id / description / poc_payload / execution_logs)
     # of the OTHER validated vulnerabilities a `chained` record depends on, sent
@@ -118,6 +130,28 @@ class IntegrationAuditorState(TypedDict):
     # itself). Rendered as a summary for the agent and served to
     # get_vulnerability_details for deep dives into a specific peer.
     confirmed_vulns: list[dict]
+    # Number of LLM invocations in the tool-loop (same role as ReviewerState.iterations).
+    iterations: Annotated[int, operator.add]
+    vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
+    messages: Annotated[list, add_messages]
+
+class PatcherState(TypedDict):
+    # LangSmith correlation id inherited from MasterState at dispatch.
+    pipeline_run_id: Optional[str]
+    # The single exploitable record whose flow this run must patch out.
+    report_to_test: dict
+    # Target sandbox URL (context only: the patcher edits SOURCE, it never
+    # attacks the sandbox, and the sandbox still runs the pre-patch build).
+    sandbox_url: Optional[str]
+    # Edits applied this run by patch_source_file ({file, diff} per entry).
+    # Subgraph-internal: PatcherOutput's output_schema keeps it out of MasterState.
+    patch_log: Annotated[list[dict], operator.add]
+    # Ledger id from dispatch_patchers; the base router advances it on every
+    # terminal route so the run log tracks patcher fan-out.
+    progress_id: str
+    # 'HIT' written by pre_agent on a cached-verdict short-circuit; rendered
+    # as the HIT/MISS tag on the progress completion line (absent => MISS).
+    cache_tag: str
     # Number of LLM invocations in the tool loop (same role as ReviewerState.iterations).
     iterations: Annotated[int, operator.add]
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]

@@ -20,6 +20,7 @@ import settings
 import tools
 import browser_tools
 import attacker_tools
+import patch_tools
 from stage_aggregate import aggregate_demands_node
 from stage_cve import cve_analyzer_node, dispatch_cve_analyzers
 from stage_edge_traversal import edge_traversal_node
@@ -33,6 +34,16 @@ from stage_integration_auditor import (
     route_integration_audit,
 )
 from stage_manager import manager_agent_node
+from stage_patcher import (
+    ask_patcher_for_tool,
+    dispatch_patch_reviews,
+    dispatch_patchers,
+    patcher_agent_node,
+    patcher_fallback_node,
+    patcher_router,
+    route_patch_reviews,
+    sandbox_resync_node,
+)
 from stage_preprocess import bootstrap_node, preprocessor_node
 from stage_reporter import dispatch_reporters, report_assembler_node, reporter_node
 from stage_reviewer import (
@@ -55,8 +66,14 @@ from stage_verifier import contract_verifier_node, dispatch_verifiers
 from run_stats import RunStopped, gen_run_id, install_signal_handlers, langsmith_detached_node
 from tool_loop import SequentialToolNode, concise_tool_error
 from credential_finder import credential_finder_node
-from state import MasterState, ReviewerState, ValidatorState, IntegrationAuditorState
-from schemas import ReviewerOutput, ValidatorOutput
+from state import (
+    IntegrationAuditorState,
+    MasterState,
+    PatcherState,
+    ReviewerState,
+    ValidatorState,
+)
+from schemas import PatcherOutput, ReviewerOutput, ValidatorOutput
 
 
 def compile_reviewer():
@@ -147,6 +164,48 @@ def compile_validator():
     return compiled_validator_agent 
 
 
+def compile_patcher():
+    patcher_workflow = StateGraph(PatcherState, output_schema=PatcherOutput)
+    patcher_workflow.add_node("patcher_agent", patcher_agent_node, retry_policy=RETRY)
+    patcher_workflow.add_node("ask_patcher_for_tool", ask_patcher_for_tool)
+    patcher_workflow.add_node("patcher_fallback", patcher_fallback_node)
+    # Sequential: same-response batches may chain multi-hunk edits of one file,
+    # whose line ranges must apply strictly in the listed order.
+    patcher_workflow.add_node("patcher_tools", SequentialToolNode([
+        tools.read_source_code,
+        tools.read_file,
+        tools.search_codebase,
+        tools.get_definition,
+        patch_tools.patch_source_file,
+        patch_tools.submit_patch,
+    ], handle_tool_errors=concise_tool_error))
+    patcher_workflow.add_edge(START, "patcher_agent")
+    patcher_workflow.add_conditional_edges(
+        "patcher_agent",
+        patcher_router,
+        {
+            "patcher_tools": "patcher_tools",
+            "ask_patcher_for_tool": "ask_patcher_for_tool",
+            "patcher_fallback": "patcher_fallback",
+            "__end__": END
+        }
+    )
+    patcher_workflow.add_conditional_edges(
+        "patcher_tools",
+        patcher_router,
+        {
+            "patcher_agent": "patcher_agent",
+            "patcher_fallback": "patcher_fallback",
+            "__end__": END
+        }
+    )
+    patcher_workflow.add_edge("ask_patcher_for_tool", "patcher_agent")
+    patcher_workflow.add_edge("patcher_fallback", END)
+    compiled_patcher_agent = patcher_workflow.compile()
+
+    return compiled_patcher_agent
+
+
 def compile_integration_auditor():
     integration_auditor_workflow = StateGraph(IntegrationAuditorState)
     integration_auditor_workflow.add_node("integration_auditor_agent", integration_auditor_node, retry_policy=RETRY)
@@ -229,6 +288,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     # dispatch runs the subgraph as its own root trace in the agent's dedicated LangSmith project.
     workflow.add_node("reviewer_agent", langsmith_detached_node(compiled_reviewer_agent, "reviewer"), retry_policy=RetryPolicy(max_attempts=1))
     workflow.add_node("validator_agent", langsmith_detached_node(compiled_validator_agent, "validator"), retry_policy=RetryPolicy(max_attempts=1))
+    workflow.add_node("patcher_agent", langsmith_detached_node(compiled_patcher_agent, "patcher"), retry_policy=RetryPolicy(max_attempts=1))
     workflow.add_node("integration_auditor", langsmith_detached_node(compiled_integration_auditor, "integration_auditor"), retry_policy=RetryPolicy(max_attempts=1))
     # Barrier for the contract-verifier fan-out: edge_traversal runs once after every verifier task has written.
     workflow.add_node("synchronization", lambda state: {})
@@ -236,6 +296,14 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("validator_dispatch_gate", lambda state: {})
     # Barrier after the validator superstep: fans deferred `requires_integration` records to the auditor once their peers carry proven poc_payloads.
     workflow.add_node("integration_audit_dispatch", lambda state: {})
+    # Barrier after a validator superstep whose exploitable records are due a fix:
+    # one fan-out point so the patch loop cannot collide with the audit phase's
+    # superstep bookkeeping. Unreachable while settings.patcher_enabled is False.
+    workflow.add_node("patch_dispatch", lambda state: {})
+    # Deterministic pause where the sandbox adopts freshly patched source
+    # (image rebuild or docker-cp + restart) before the patched records return
+    # to the Reviewer.
+    workflow.add_node("sandbox_resync", sandbox_resync_node)
     # Terminal barrier: one single-shot reporter per reportable vuln, then report_assembler writes the report dir.
     workflow.add_node("reporter_dispatch", lambda state: {})
     workflow.add_node("reporter", reporter_node)
@@ -274,15 +342,34 @@ def build_graph(checkpointer=None, interrupt_before=None):
             "__end__": "reporter_dispatch",
         },
     )
-    # Stage 2: after the validator superstep, bounce insufficient_context records to the Reviewer; otherwise advance to the audit phase.
+    # Stage 2: after the validator superstep, bounce insufficient_context records to the Reviewer;
+    # otherwise route due-for-fix exploitable records to the Patcher (flag off => never) or advance.
     workflow.add_conditional_edges(
         "validator_agent",
         route_validator_feedback,
         {
             "reviewer_agent": "reviewer_agent",
+            "patch_dispatch": "patch_dispatch",
             "integration_audit_dispatch": "integration_audit_dispatch",
             "__end__": "reporter_dispatch",
         },
+    )
+    # Stage 2a: patcher fan-out; banked patches first resync the sandbox, then
+    # return to the Reviewer as cache-exempt PATCH APPLIED re-adjudications.
+    workflow.add_conditional_edges(
+        "patch_dispatch",
+        dispatch_patchers,
+        ["patcher_agent", "integration_audit_dispatch"],
+    )
+    workflow.add_conditional_edges(
+        "patcher_agent",
+        route_patch_reviews,
+        ["sandbox_resync", "integration_audit_dispatch"],
+    )
+    workflow.add_conditional_edges(
+        "sandbox_resync",
+        dispatch_patch_reviews,
+        ["reviewer_agent", "integration_audit_dispatch"],
     )
     # Stage 2b: fan deferred records to the auditor, or advance to reporter dispatch when none remain.
     workflow.add_conditional_edges(
@@ -304,6 +391,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
 
 compiled_reviewer_agent = compile_reviewer()
 compiled_validator_agent = compile_validator()
+compiled_patcher_agent = compile_patcher()
 compiled_integration_auditor = compile_integration_auditor()
 graph = build_graph()
 

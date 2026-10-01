@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import re
+import shlex
 import shutil
 from pathlib import Path
 import tree_sitter
@@ -672,21 +673,25 @@ def reviewer_cache_key(report: Optional[dict], default: str = "Unknown") -> str:
 
 
 def is_feedback_review(report: Optional[dict]) -> bool:
-    """True when the report is a Validator->Reviewer feedback re-review rather
-    than a first-pass hypothesis review.
+    """True when the report is a Validator->Reviewer feedback re-review or a
+    Patcher->Reviewer patch-verification re-review rather than a first-pass
+    hypothesis review.
 
     `ask_for_context` bumps `review_round` and fills `open_questions`, and
     `route_validator_feedback` re-dispatches exactly those flagged records to the
-    reviewer. Feedback re-reviews must NEVER be served from (or written to) the
-    reviewer cache: their whole purpose is to genuinely re-answer the Validator's
-    questions and emit self-sufficient reproduction steps for re-validation.
-    Round-0 hypothesis reviews are pure/idempotent analyses whose caching is
-    safe, but a round-N feedback report is byte-identical across every replay of
-    the same dispatch (e.g. resuming a checkpoint inside the feedback cycle), so
-    a content-hash cache would silently collapse each replay into the earlier
+    reviewer. Patch-verification re-reviews carry `patch_state` (the Patcher has
+    edited the source under the record). Both kinds must NEVER be served from
+    (or written to) the reviewer cache: their whole purpose is to genuinely
+    re-answer (the Validator's questions / the patched code) and emit a fresh
+    verdict. Round-0 hypothesis reviews are pure/idempotent analyses whose caching
+    is safe, but a round-N feedback report is byte-identical across every replay
+    of the same dispatch (e.g. resuming a checkpoint inside the feedback cycle),
+    so a content-hash cache would silently collapse each replay into the earlier
     verdict with zero LLM turns — the reviewer appears to "not run again"."""
     if not report:
         return False
+    if report.get("patch_state"):
+        return True
     return (report.get("review_round") or 0) > 0 or bool(report.get("open_questions"))
 
 
@@ -749,6 +754,36 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
             # the plain ladder would wrongly keep the flag).
             re_review_statuses = {"confirmed", "false_positive", "exploitable", "review_error"}
             if current_status == "insufficient_context" and new_status in re_review_statuses:
+                _merge_affected_nodes(update, update, vuln_map[vid])
+                vuln_map[vid] = update
+                continue
+
+            # --- PATCHER LIFECYCLE (mirrors the insufficient_context rules) ---
+            # A Patcher write (patch_state applied/failed) must land verbatim on top
+            # of the EXPLOITABLE status it just patched: its own status ("confirmed"
+            # on success, unchanged on failure) ranks below or equal to `exploitable`,
+            # so the plain ladder would silently drop the patch fields.
+            if update.get("patch_state") in ("applied", "failed"):
+                _merge_affected_nodes(update, update, vuln_map[vid])
+                vuln_map[vid] = update
+                continue
+            # Conversely the patch-verification re-answer replaces the patch-pending
+            # record unconditionally: its "confirmed" (2) is BELOW the patched record's
+            # carried-over status and would only text-merge, losing the fresh verdict.
+            if (
+                vuln_map[vid].get("patch_state") == "applied"
+                and update.get("patch_state") == "reviewed"
+            ):
+                _merge_affected_nodes(update, update, vuln_map[vid])
+                vuln_map[vid] = update
+                continue
+            # The Validator's fix adjudication (verified/rejected) replaces
+            # unconditionally: `rejected` carries status exploitable BELOW the
+            # false_positive the reviewer re-review left on the record (plain
+            # ladder would drop the retry trigger), and `verified` lands on a
+            # same-status FP where the ladder would merely text-merge the
+            # dynamic outcome into the static one.
+            if update.get("patch_state") in ("verified", "rejected"):
                 _merge_affected_nodes(update, update, vuln_map[vid])
                 vuln_map[vid] = update
                 continue
@@ -1545,17 +1580,21 @@ def _built_images_match_definitions(kind: str, images: list[str], path: Path) ->
     return len(to_check) == len(built) and _images_newer_than_definitions(to_check, _build_definition_files(kind, path))
 
 
-def build_images(kind: str, path: Path, tag: str) -> list[str]:
+def build_images(kind: str, path: Path, tag: str, force: bool = False) -> list[str]:
     """Build the container image(s) described by a compose file or Dockerfile;
     returns the image refs, [] on failure.
 
     Reuse unless settings.force_rebuild: images are reused when their recorded
     build-definition hash is unchanged; with no stamp (fresh cache), built
     images predating every definition file are reused and the stamp back-filled
-    (pull-only services are exempt — no local definition governs them)."""
+    (pull-only services are exempt — no local definition governs them).
+    ``force=True`` skips every reuse path (the Patcher's resync: patched SOURCE
+    files changed, which the build-definition stamp does not track)."""
     images = _compose_images(path) if kind == "compose" else [tag]
 
-    if settings.force_rebuild:
+    if force:
+        reason = "forced rebuild (sandbox resync after patching)"
+    elif settings.force_rebuild:
         reason = "force_rebuild is set"
     elif kind == "compose" and not images:
         reason = "compose image references could not be resolved"
@@ -1708,11 +1747,17 @@ def _remove_stale_compose_containers(path: Path) -> None:
             logging.info(f"Removed stale container '{name}' before compose up.")
 
 
-def start_sandbox(kind: str, path: Path, tag: str, app_name: str) -> dict | None:
+def start_sandbox(kind: str, path: Path, tag: str, app_name: str, force_recreate: bool = False) -> dict | None:
     """Start the built container image(s) in the background and return runtime data.
 
     Detaches the container(s) (compose: ``up -d``; Dockerfile: ``docker run -d -P``),
     discovers the published host ports, and waits for one of them to answer HTTP.
+
+    ``force_recreate`` rebuilds compose containers from the pristine image even
+    when an identical one is already running: a previous scan whose Patcher
+    docker-cp'd fixes into the live container left those bytes ONLY in that
+    container's layer — reuse would silently pre-patch this scan's sandbox.
+    (The Dockerfile path already rm -f's its container, so it is clean anyway.)
 
     Returns ``{"container_name": str, "sandbox_url": str}`` pointing at the first
     HTTP-responsive container (for compose that is the app service, not a DB sidecar),
@@ -1726,7 +1771,10 @@ def start_sandbox(kind: str, path: Path, tag: str, app_name: str) -> dict | None
         # container, so pre-emptively remove anything holding those names.
         # These are throwaway scanner sandboxes - never a production service.
         _remove_stale_compose_containers(path)
-        up = _docker("compose", "-f", str(path), "up", "-d")
+        up_args = ["compose", "-f", str(path), "up", "-d"]
+        if force_recreate:
+            up_args.append("--force-recreate")
+        up = _docker(*up_args)
         if up is None:
             return None
         if up.returncode != 0:
@@ -1779,6 +1827,188 @@ def start_sandbox(kind: str, path: Path, tag: str, app_name: str) -> dict | None
         f"({containers}). Validator tools will report no sandbox configured."
     )
     return None
+
+
+SANDBOX_RESTART_TIMEOUT = 120  # seconds allowed for one `docker restart` of the sandbox
+# Filesystem roots probed when mapping an app-relative path into the sandbox
+# container for a docker-cp resync (the container WORKDIR is tried first).
+_SANDBOX_APP_ROOTS = (
+    "/var/www", "/var/www/html", "/app", "/srv", "/opt", "/usr/share",
+    "/code", "/workspace",
+)
+
+
+def _container_running(container: str) -> bool:
+    result = _docker("inspect", "-f", "{{.State.Running}}", container, timeout=30)
+    return result is not None and result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def _container_app_roots(container: str) -> list[str]:
+    """Candidate deployment roots inside the sandbox container, WORKDIR first,
+    filtered to the ones that actually exist."""
+    roots: list[str] = []
+    result = _docker("inspect", "-f", "{{.Config.WorkingDirectory}}", container, timeout=30)
+    if result is not None and result.returncode == 0:
+        wd = result.stdout.strip()
+        if wd and wd != "/":
+            roots.append(wd.rstrip("/"))
+    roots.extend(_SANDBOX_APP_ROOTS)
+    existing = []
+    for root in roots:
+        check = _docker("exec", container, "test", "-d", root, timeout=30)
+        if check is not None and check.returncode == 0 and root not in existing:
+            existing.append(root)
+    return existing
+
+
+def _container_find_target(container: str, rel_path: str) -> str | None:
+    """Last-resort mapping: bounded find over the candidate roots for the file's
+    basename; accepts a hit whose path ends with the relative subpath (so
+    ajax/x.php matches /var/www/glpi/ajax/x.php, but an unrelated same-named
+    file elsewhere does not)."""
+    base = rel_path.rsplit("/", 1)[-1]
+    ship = " ".join(_SANDBOX_APP_ROOTS)
+    cmd = f"find {ship} -maxdepth 6 -name {shlex.quote(base)} -type f 2>/dev/null | head -5"
+    found = _docker("exec", container, "sh", "-c", cmd, timeout=60)
+    if found is None or found.returncode != 0:
+        return None
+    for line in found.stdout.splitlines():
+        candidate = line.strip()
+        if candidate.strip("/").endswith(rel_path):
+            return candidate
+    return None
+
+
+def _cp_patched_into_container(container: str, patched_files: list[str]) -> tuple[int, list[str]]:
+    """Best-effort docker-cp of patched app-relative files into the running
+    sandbox container. Returns (copied, unresolved): anything whose container
+    path cannot be verified BEFORE the copy (the pre-patch file must exist at
+    the mapped path) is skipped, never blindly created. The caller restarts the
+    container once when at least one file landed."""
+    copied = 0
+    unresolved: list[str] = []
+    roots = _container_app_roots(container)
+    for rel in patched_files:
+        rel_norm = str(rel).replace("\\", "/").strip("/")
+        host_file = settings.app_path / rel_norm
+        if not rel_norm or ".." in Path(rel_norm).parts or not host_file.is_file():
+            unresolved.append(str(rel))
+            continue
+        target = None
+        for root in roots:
+            candidate = f"{root}/{rel_norm}"
+            check = _docker("exec", container, "test", "-f", candidate, timeout=30)
+            if check is not None and check.returncode == 0:
+                target = candidate
+                break
+        if target is None:
+            target = _container_find_target(container, rel_norm)
+        if target is None:
+            unresolved.append(rel_norm)
+            continue
+        ok = _docker("cp", str(host_file), f"{container}:{target}", timeout=60)
+        if ok is None or ok.returncode != 0:
+            unresolved.append(rel_norm)
+            continue
+        logging.info(f"Patcher resync: docker cp {rel_norm} -> {container}:{target}")
+        copied += 1
+    return copied, unresolved
+
+
+def resync_sandbox(patched_files: list[str], sandbox_container: str | None) -> dict:
+    """Bring the sandbox in line with freshly patched source (tiered, fail-open).
+
+    - Tier 1 (source-built targets — Dockerfile, or compose with a `build:`
+      service): force-rebuild the image(s) (patched files are COPY'd at build
+      time; the build-definition stamp does not track them) and restart the
+      sandbox on the rebuilt image.
+    - Tier 2 (stock pull-only images, and any file a rebuild cannot prove):
+      copy the patched files into the running sandbox container via docker-cp
+      (path verified against the pre-patch tree first) and `docker restart` it
+      once — volumes AND the container layer survive, so installed app state is
+      kept; the restart covers opcache-in-PHP and in-memory-code runtimes.
+    - Nothing resolvable: no-op. Every tier only ever degrades into a note; the
+      Validator always re-runs afterwards (against the fresh sandbox when
+      resynced, against the unchanged one otherwise) and the reviewer's static
+      re-review of the patched source stays the primary patch gate either way.
+
+    Returns ``{"note", "sandbox_url", "sandbox_container"}`` — None values in
+    the last two fields mean the MasterState channel stays unchanged."""
+    patched_files = [str(f).strip() for f in (patched_files or []) if str(f).strip()]
+    tag = f"vulnscan-{settings.app_path.name.lower()}:latest"
+    rebuilt = False
+    new_url = None
+    container = sandbox_container
+
+    target = None  # (kind, build_file) of the last buildable definition (sandbox target)
+    for kind, build_file in find_container_builds(settings.app_path):
+        if kind == "dockerfile" or _compose_built_refs(build_file):
+            target = (kind, build_file)
+    if target:
+        kind, build_file = target
+        images = build_images(kind, build_file, tag, force=True)
+        if images:
+            sandbox_data = start_sandbox(kind, build_file, tag, settings.app_path.name)
+            if sandbox_data:
+                rebuilt = True
+                new_url = sandbox_data["sandbox_url"]
+                container = sandbox_data["container_name"]
+            else:
+                logging.warning(
+                    "Patcher resync: image(s) rebuilt but the sandbox failed to "
+                    "restart; the validator will re-test the old container."
+                )
+        else:
+            logging.warning("Patcher resync: forced image rebuild failed.")
+
+    copied, unresolved = 0, []
+    # A Tier-1 rebuild already shipped the patched files through the image
+    # (COPY) — docker-cp'ing them again into the fresh container only makes the
+    # resync note misleadingly credit the copy.
+    if patched_files and not rebuilt:
+        if container and _container_running(container):
+            copied, unresolved = _cp_patched_into_container(container, patched_files)
+            if copied:
+                restart = _docker("restart", "-t", "10", container, timeout=SANDBOX_RESTART_TIMEOUT)
+                restarted = restart is not None and restart.returncode == 0
+                if not restarted:
+                    logging.warning(
+                        f"Patcher resync: docker restart of {container} failed; "
+                        "long-lived runtimes may still serve the pre-patch code."
+                    )
+                note = f"copied {copied} patched file(s) into {container}"
+                note += " and restarted it" if restarted else " (container restart FAILED)"
+            else:
+                note = f"no patched file could be mapped into {container}"
+        else:
+            note = "no running sandbox container to copy patched files into"
+        if unresolved:
+            note += f"; unmapped: {', '.join(unresolved)}"
+        if rebuilt:
+            note = "rebuilt image; " + note
+    else:
+        note = "rebuilt image" if rebuilt else (
+            "skipped: sandbox image is stock (not built from this repo) and "
+            "no patched file was ready to copy; the dynamic re-test runs on the "
+            "pre-patch build"
+        )
+
+    if rebuilt and container:
+        # Re-probe after the forced restart: the published port may have moved.
+        port = _probe_http_ports(_published_ports(container))
+        if port:
+            new_url = _sandbox_url_for_port(port)
+        else:
+            logging.warning(
+                "Patcher resync: rebuilt sandbox publishes no responsive HTTP "
+                "port; keeping the previous sandbox_url."
+            )
+    logging.info(f"Patcher resync: {note}")
+    return {
+        "note": note,
+        "sandbox_url": new_url,
+        "sandbox_container": container if sandbox_container != container else None,
+    }
 
 
 def run_osv_scanner_image(image: str) -> list[dict]:
@@ -2534,6 +2764,18 @@ def cache_integration_auditor(report: dict, peers: Optional[list] = None, update
     return _content_hash_cache(
         "integration_auditor", vuln_id, {"report": report, "confirmed_vulns": peers_sorted}, updated_vuln
     )
+
+
+def cache_patcher(report: dict, updated_vuln: Optional[dict] = None) -> Optional[dict]:
+    """Read (``updated_vuln`` is None) or write a patcher outcome cache entry.
+
+    Keyed by (vuln_id, content hash of the record being patched). Shared by
+    ``submit_patch`` and the loop-fallback path so both land in the same
+    ``.cache/patchers/`` namespace. On a hit the stored record (patch fields set,
+    files ALREADY edited by the earlier run) short-circuits the loop, so a
+    resumed/repeated run never re-applies the edits."""
+    vuln_id = (report or {}).get("vuln_id") or "Unknown"
+    return _content_hash_cache("patchers", vuln_id, report or {}, updated_vuln)
 
 
 def cache_reporter(report: dict, finding: Optional[dict] = None) -> Optional[dict]:

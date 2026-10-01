@@ -226,15 +226,22 @@ class ReviewerAgent(ToolLoopAgent):
 
     def first_turn(self, state, llm_with_tools) -> dict:
         # System prompt = shared directives + the mode-specific reachability
-        # standard (mode names match agents.yaml keys).
+        # standard (mode names match agents.yaml keys); patch-verification
+        # re-reviews additionally get the dedicated PATCH RE-VERIFICATION
+        # section attached (agents.yaml `reviewer_agent.patch_verification`) —
+        # only when the record actually carries a pending patch, so first-pass
+        # prompts stay byte-identical.
         mode = state.get("mode", "code_level")
         mode_prompt = REVIEWER_AGENT.get(mode, "")
         sys_prompt = REVIEWER_AGENT.get('prompt', '')
         if mode_prompt:
             sys_prompt = f"{sys_prompt}\n\n{mode_prompt}"
-        sys_msg = SystemMessage(content=sys_prompt)
 
         report = state.get("expert_report", {})
+        if report.get("patch_state") == "applied":
+            sys_prompt = f"{sys_prompt}\n\n{REVIEWER_AGENT.get('patch_verification', '')}"
+        sys_msg = SystemMessage(content=sys_prompt)
+
         node_id = state.get("node_id")
 
         affected_str = affected_nodes_label(report, node_id)
@@ -261,6 +268,34 @@ class ReviewerAgent(ToolLoopAgent):
                 f"parameters/headers/body, and any session state) with `submit_evaluation`. "
                 f"This is feedback round {report.get('review_round', 0)}.\n"
                 f"{qs_str}\n"
+            )
+
+        # Patch re-verification dispatch (stage_patcher): the source on disk was
+        # just edited to block the previously proven flow; the verdict must be
+        # re-issued against the CURRENT code (agents.yaml patch_verification
+        # section, attached to the system prompt in this same turn).
+        if report.get("patch_state") == "applied":
+            patch_files = ", ".join(report.get("patched_files") or []) or "_none_"
+            formatted_vuln += (
+                f"\n--- PATCH APPLIED (re-adjudicate the PATCHED code) ---\n"
+                f"A Patcher agent edited the source to block this previously "
+                f"PROVEN-EXPLOITABLE flow"
+                + (
+                    f" — this is patch attempt {report.get('patch_round', 1)}"
+                    if (report.get('patch_round') or 0) > 1 else ""
+                )
+                + ".\n"
+                f"Fix summary: {report.get('patch_summary') or '_none_'}\n"
+                f"Files touched: {patch_files}\n"
+                f"Unified diff of the applied change:\n"
+                f"```\n{report.get('patch_diff') or '_none_'}\n```\n"
+                f"The on-disk source has CHANGED: old line numbers may have shifted, "
+                f"so re-read the touched files fresh. Verify per the PATCH "
+                f"RE-VERIFICATION section of your instructions that the patch (a) "
+                f"blocks the proven exploit path, (b) does NOT disable/bypass the "
+                f"feature, and (c) introduces no new flaw — then submit your verdict "
+                f"on the CURRENT code (reproduction_steps must reflect post-patch "
+                f"behavior). Do not edit any file yourself.\n"
             )
 
         # Synthetic nodes (dependency:/infra:) don't exist in the app graph:

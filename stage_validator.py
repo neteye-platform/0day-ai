@@ -15,6 +15,7 @@ import tools
 from llms import fast_llm, validator_llm
 from run_stats import _record_stat, _start_agent_progress, affected_nodes_label, as_dicts, steps_block
 from schemas import VALIDATOR_AGENT
+from stage_patcher import patchable_records
 from state import MasterState, ValidatorState
 from stage_reviewer import build_reviewer_payload
 from tool_loop import CompactionConfig, ToolLoopAgent
@@ -50,6 +51,7 @@ def _validator_payload(
         report_to_test=seed,
         validation_variants=variants,
         sandbox_url=state.get("sandbox_url"),
+        sandbox_resync_note=state.get("sandbox_resync_note"),
         messages=[],
         iterations=0,
         vulnerabilities=[],
@@ -115,6 +117,11 @@ def dispatch_validators(state: MasterState):
     # channel as its own record; only the sandbox work is shared.
     groups: dict[tuple, list[dict]] = {}
     for evaluation in direct:
+        # Patched records ride alone: their validation is a two-step fix-check
+        # (expired PoC + smoke test) bound to THEIR diff, so sharing one verdict
+        # across a (cwe, component) group could mark an unverified fix proven.
+        if evaluation.get("patch_state") or evaluation.get("patch_diff"):
+            continue
         if key := _validation_group_key(evaluation):
             groups.setdefault(key, []).append(evaluation)
     batched = {k: v for k, v in groups.items() if 1 < len(v) <= settings.validator_variant_max_group}
@@ -133,6 +140,22 @@ def dispatch_validators(state: MasterState):
         if id(evaluation) in shared_ids:
             continue
         payloads.append((evaluation, None))
+
+    # Dynamically prove patched records the re-review cleared statically: the
+    # reviewer's false_positive on the PATCHED code is not the deliverable proof
+    # — the rule-7 re-test (exploit dead AND legit flow healthy) is what flips
+    # patch_state to 'verified'; an exploit that still fires flips it to
+    # 'rejected' (retry-eligible). These always ride alone (never batched).
+    for evaluation in all_vulns:
+        if (
+            evaluation.get("status") == "false_positive"
+            and evaluation.get("patch_state") == "reviewed"
+        ):
+            logging.info(
+                f"{evaluation.get('vuln_id')} is a reviewer-cleared PATCHED fix — "
+                f"dispatching dynamic fix-proof."
+            )
+            payloads.append((evaluation, None))
 
     if not payloads:
         # Nothing to validate directly: advance to the integration-audit phase
@@ -159,7 +182,9 @@ def route_validator_feedback(state: MasterState):
 
     'insufficient_context' records within validator_feedback_max_rounds go back
     to the Reviewer for a re-review; the review_round cap drains the loop.
-    Otherwise return the `integration_audit_dispatch` marker."""
+    Otherwise, freshly `exploitable` records due a fix attempt (flag-gated) head
+    to the patch dispatch; else return the `integration_audit_dispatch` marker.
+    """
     all_vulns = as_dicts(state.get("vulnerabilities", []))
     max_rounds = settings.validator_feedback_max_rounds
     flagged = [
@@ -169,6 +194,8 @@ def route_validator_feedback(state: MasterState):
     ]
 
     if not flagged:
+        if settings.patcher_enabled and patchable_records(state):
+            return "patch_dispatch"
         return "integration_audit_dispatch"
 
     progress_id = _start_agent_progress(len(flagged))
@@ -329,6 +356,29 @@ class ValidatorAgent(ToolLoopAgent):
                 "Observed source-to-sink flow beyond this record's hypothesis: "
                 "if the steps above do not exercise it, test it in the sandbox and "
                 f"log the outcome with evidence in execution_logs.\n{concern}"
+            )
+        # Patched records: the fix lives in PROPOSED PATCH; the sandbox either
+        # already runs it or does not (SANDBOX SYNC decides what a replay proves).
+        # Two-step contract per validator prompt rule 7.
+        if report.get("patch_diff"):
+            patch_files = ", ".join(report.get("patched_files") or []) or "_none_"
+            sync_note = (
+                state.get("sandbox_resync_note")
+                or "unknown: no resync outcome was recorded — treat the sandbox's "
+                   "patch state as UNVERIFIED."
+            )
+            formatted_report += (
+                f"\n\n--- PROPOSED PATCH (attempt {report.get('patch_round', 1)}; applied "
+                f"to source after the last exploit proof) ---\n"
+                f"Fix summary: {report.get('patch_summary') or '_none_'}\n"
+                f"Files touched: {patch_files}\n"
+                f"Unified diff:\n```\n{report['patch_diff']}\n```\n"
+                f"--- SANDBOX SYNC ---\n{sync_note}\n"
+                f"Adjudicate per the PATCHED TARGET rule: replay the reproduction "
+                f"steps above; if the sandbox contains the patch, an exploit that "
+                f"still fires means the fix FAILED, and an exploit that stays dead "
+                f"still requires the legitimate-flow smoke test before any false "
+                f"positive. Log both outcomes with evidence in execution_logs."
             )
         # Chained records carry the proven poc_payloads of the peers they chain
         # with, so the final exploit reuses real proven primitives.

@@ -17,6 +17,7 @@ with open("agents.yaml", "r") as f:
     EDGE_TRAVERSAL_AGENT = data.get("edge_traversal")
     REPORTER_AGENT = data.get("reporter_agent")
     CREDENTIAL_FINDER_AGENT = data.get("credential_finder")
+    PATCHER_AGENT = data.get("patcher_agent")
 
 cwes = {
     # --- MEMORY SAFETY (C / C++ / Rust-unsafe) ---
@@ -223,6 +224,53 @@ class VulnerabilityRecord(BaseModel):
         description=(
             "vuln_ids of the other confirmed vulnerabilities this record chains "
             "with into a single multi-step exploit (set when status is 'chained')."
+        ),
+    )
+
+    # Patcher additions (post-validator source-code fix; inert when
+    # settings.patcher_enabled is False — these fields stay None on every record).
+    patch_summary: Optional[str] = Field(
+        default=None,
+        description=(
+            "Patcher's one-paragraph statement of the applied fix: what hunk "
+            "changes and exactly which step of the proven exploit it blocks."
+        ),
+    )
+    patch_diff: Optional[str] = Field(
+        default=None,
+        description="Unified diff of every edit the Patcher applied for this record.",
+    )
+    patched_files: Optional[list[str]] = Field(
+        default=None,
+        description="App-relative paths of the files the Patcher modified.",
+    )
+    patch_round: int = Field(
+        default=0,
+        description=(
+            "How many patch attempts the Patcher has spent on this record; caps "
+            "the fix loop at settings.patcher_max_attempts."
+        ),
+    )
+    patch_history: Optional[list[dict]] = Field(
+        default=None,
+        description=(
+            "Prior patch attempts for this record ({round, summary, diff, files, "
+            "outcome}), each appended by submit_patch before it overwrites the "
+            "current patch_* fields. Rendered into the Patcher's first turn on "
+            "attempt > 1 so a retry neither repeats a proven-failing edit nor "
+            "discards the audit trail; may be empty/None on the first attempt."
+        ),
+    )
+    patch_state: Optional[Literal["applied", "reviewed", "verified", "rejected", "failed"]] = Field(
+        default=None,
+        description=(
+            "Patch lifecycle marker: 'applied' = edits landed, re-review pending; "
+            "'reviewed' = the Reviewer re-adjudicated the patched code; 'verified' "
+            "= the Validator confirmed the fix (exploit dead, legitimate flow "
+            "intact); 'rejected' = the exploit still fired on the patched build "
+            "(retry-eligible until patch_round reaches settings."
+            "patcher_max_attempts, then terminal); 'failed' = the Patcher produced "
+            "no edit (terminal)."
         ),
     )
 
@@ -469,6 +517,11 @@ class ValidatorOutput(BaseModel):
     # those scalars raised "Can receive only one value per step" at checkpoint time.
     vulnerabilities: list[VulnerabilityRecord]
 
+class PatcherOutput(BaseModel):
+    # Same constraint as ValidatorOutput: the patcher subgraph writes ONLY the
+    # patched record back to MasterState (patch_log stays subgraph-internal).
+    vulnerabilities: list[VulnerabilityRecord]
+
 class UpstreamDemand(BaseModel):
     target: str = Field(description="Parameter or context variable requiring upstream restriction.")
     description: str = Field(description="The security invariant required of the caller.")
@@ -679,6 +732,18 @@ class AskForContextInput(BaseModel):
             "testable (e.g. 'What is the exact HTTP method and path to reach the export "
             "endpoint?', 'What credentials/session state are needed to reach it?', 'Is the "
             "route exposed publicly or behind an unauthenticated login?')."
+        )
+    )
+
+
+class SubmitPatchInput(BaseModel):
+    summary: str = Field(
+        description=(
+            "One paragraph describing the applied fix: which file/hunk changed, the "
+            "mechanism of the defense (e.g. prepared statement, allowlist, escape at "
+            "the sink), and exactly which step of the proven exploit this blocks. "
+            "Reference the edits actually applied via patch_source_file — a summary "
+            "with no applied edit is rejected."
         )
     )
 
