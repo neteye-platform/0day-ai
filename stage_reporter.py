@@ -5,6 +5,7 @@ with its own poc/ and patches/ bundles)."""
 
 import logging
 import re
+import shutil
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -37,14 +38,21 @@ def _below_cvss_gate(record: dict) -> bool:
     return cvss_gate_blocks({**record, "validation_strategy": strategy}, settings.validator_min_cvss)
 
 
-def _is_reportable(record: dict) -> bool:
-    if record.get("status") == "exploitable":
-        return True
-    if (
+def _is_patched_closure(record: dict) -> bool:
+    """The false_positive that _is_reportable admits because the auto-fix IS the
+    deliverable: the section documents the original flaw; the status it conveys
+    is PATCHED, never 'false positive'."""
+    return (
         record.get("status") == "false_positive"
         and record.get("patch_diff")
         and record.get("patch_state") in ("reviewed", "verified")
-    ):
+    )
+
+
+def _is_reportable(record: dict) -> bool:
+    if record.get("status") == "exploitable":
+        return True
+    if _is_patched_closure(record):
         return True
     if record.get("status") == "confirmed" and record.get("validation_strategy") == "static_finding_only":
         return True
@@ -125,6 +133,16 @@ def _render_reporter_prompt(record: dict) -> str:
             "steps from the Reviewer's evidence and NEVER phrase the finding as "
             "proven, triggered, or confirmed in a live sandbox."
         )
+    if record.get("patch_state"):
+        lines.append(
+            "This finding went through the automatic-fix lifecycle: the report "
+            "section describes the ORIGINAL vulnerability as it existed BEFORE the "
+            "fix — the pipeline itself stamps the fixed state onto the finding, so "
+            "never title or phrase it as a false positive or as 'mitigated'. Your "
+            "cvss_vector MUST therefore score the UNPATCHED flaw: never zero out the "
+            "C/I/A metrics because the fix works — a C:N/I:N/A:N vector (base score "
+            "0.0) is NEVER a valid assessment here."
+        )
     return "\n".join(lines)
 
 
@@ -142,6 +160,15 @@ def _assessment_for(finding: dict, record: dict) -> tuple[float | None, str, str
         if reviewer_score is not None:
             return reviewer_score, reviewer_vector, cvss_severity_label(reviewer_score)
         return None, vector or "N/A", str(finding.get("severity") or "Not assessed")
+    # Patch-lifecycle guard: a reportable finding (exploitable, FP-with-patch,
+    # gate-skipped, static) always carries a real flaw, so a 0.0 recomputed score
+    # can only mean the model scored the PATCHED residual risk instead of the
+    # flaw. Fall back to the record's (pre-patch) vector in that case.
+    if score == 0.0 and record.get("patch_state"):
+        reviewer_vector = str(record.get("cvss_vector") or "").strip()
+        reviewer_score = cvss_v3_base_score(reviewer_vector)
+        if reviewer_score is not None and reviewer_score > 0.0:
+            return reviewer_score, reviewer_vector, cvss_severity_label(reviewer_score)
     return score, vector, cvss_severity_label(score)
 
 
@@ -448,6 +475,25 @@ def _display_title(finding: dict, record: dict) -> str:
     return title or str(record.get("vuln_id", "Unknown")).replace("_", " ")
 
 
+_ZWSP = "\u200b"
+# Even with punctuation break points, a punctuation-free identifier run longer
+# than this could still outstretch its column; one ZWSP every N chars caps the
+# minimum content width so the table can never exceed the page margins.
+_ZWSP_RUN_CAP_RE = re.compile(rf"(?P<w>[^\s{_ZWSP}]{{24}})(?=[^\s{_ZWSP}])")
+
+
+def _soft_break(text: str) -> str:
+    """Insert zero-width-space wrap opportunities after the characters that
+    glue long path segments and identifiers into one unbreakable token. The
+    glance table renders such tokens (slug paths in code spans, `Class::method`
+    titles) and overflow-wrap is NOT an option (see the _PDF_CSS bug note:
+    weasyprint drops trailing rows of a paginated table when it is set on
+    cells); ZWSP gives Pango legal break points through the markup alone."""
+    for ch in ("_", "/", ".", ":"):
+        text = text.replace(ch, ch + _ZWSP)
+    return _ZWSP_RUN_CAP_RE.sub(rf"\g<w>{_ZWSP}", text)
+
+
 def _render_main_report(rows: list[tuple], statistics: str | None = None) -> str:
     """Assemble the MAIN report markdown: header counts, statistics, token
     usage and the glance table — NO per-finding detail sections. Every finding
@@ -499,21 +545,24 @@ def _render_main_report(rows: list[tuple], statistics: str | None = None) -> str
         "",
         "_Every finding is documented in detail in its own report — see the Report column._",
         "",
-        "| # | Title | CWE | CVSS v3.1 | Severity | Report |",
-        "|---|-------|-----|-----------|----------|--------|",
+        "| # | Title | CVSS v3.1 | Severity | Report |",
+        "|---|-------|-----------|----------|--------|",
     ]
     for i, (record, finding, _vector, score, label) in enumerate(rows, 1):
-        cwe = record.get("cwe_id", "OTHER_UNCATEGORIZED")
         score_str = f"{score:.1f}" if score is not None else "N/A"
         title = _display_title(finding, record)
-        # Display-only abbreviation: a full slug is an unbreakable ~80-char
-        # code token and would stretch the table past the page (cf. the
-        # no-overflow-wrap CSS note); the real folder keeps the full name.
+        if _is_patched_closure(record):
+            title += " **(PATCHED)**"
+        title = _soft_break(title.replace("|", chr(92) + "|"))
+        # Display-only abbreviation: a full slug is a ~60-char code token and
+        # the real folder keeps the full name. The ZWSP wrap points from
+        # _soft_break then guarantee the remaining path segments can break,
+        # so the table can never exceed the page margins.
         folder = _finding_folder(i, record.get("vuln_id", ""))
         shown = folder if len(folder) <= 28 else folder[:24] + "…"
         lines.append(
-            f"| {i} | {title.replace('|', chr(92) + '|')} | {cwe} | {score_str} | {label} "
-            f"| `findings/{shown}/report.pdf` |"
+            f"| {i} | {title} | {score_str} | {label} "
+            f"| `{_soft_break(f'findings/{shown}/report.pdf')}` |"
         )
     return "\n".join(lines).rstrip() + "\n"
 
@@ -564,6 +613,22 @@ def _render_finding_report(
             "",
             "**Validation:** not performed — the Reviewer's CVSS estimate fell below "
             "the pipeline's validation gate, so this finding carries NO dynamic proof.  ",
+        ]
+    if _is_patched_closure(record):
+        verified = record.get("patch_state") == "verified"
+        lines += [
+            "",
+            f"**Status: PATCHED** — an automatic fix was applied; this section "
+            f"describes the ORIGINAL vulnerability as proven exploitable BEFORE the "
+            f"fix. "
+            + (
+                "Dynamic re-validation on the patched build confirmed the exploit no "
+                "longer reproduces and the legitimate flow still works (see "
+                "_Proposed fix_ below)."
+                if verified
+                else "The fix was accepted on re-review; no dynamic re-proof was "
+                "executed (see _Proposed fix_ below)."
+            ),
         ]
 
     summary = finding.get("summary") or record.get("description") or "_none_"
@@ -789,12 +854,27 @@ def _bundle_finding_artifacts(record: dict, finding_dir: Path) -> dict:
 
 
 def report_assembler_node(state: MasterState) -> dict:
-    """Terminal barrier node: writes a FRESH timestamped report directory
-    (<target_app>/report_<YYYY-MM-DD_HHMMSS>/): a MAIN report.pdf (header,
+    """Terminal barrier node: writes THIS SCAN's report directory
+    (<app_path>/report_<YYYY-MM-DD_HHMMSS>/): a MAIN report.pdf (header,
     statistics, token usage, glance table) plus one self-contained PDF per
     finding under findings/<NN>_<vuln-id>/ (with its own poc/ and patches/
-    bundles). Severity-ranked, deterministic CVSS scores. Returns {}."""
-    report_dir = settings.app_path / f"report_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
+    bundles). Severity-ranked, deterministic CVSS scores.
+
+    One directory per scan: the name is minted on the first write and banked
+    into MasterState.report_dir, and every later arrival rewrites ITS OWN
+    directory from scratch. The reporter dispatch is fed by several terminal
+    branches, so feedback-loop waves re-trigger this node; the LAST render is
+    the one that survives, carrying the fullest record set. Returns
+    {"report_dir": <name>}."""
+    name = str(state.get("report_dir") or "").strip().strip("/")
+    if not (name.startswith("report_") and Path(name).name == name):
+        name = f"report_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
+    report_dir = settings.app_path / name
+    if report_dir.exists():
+        # Re-triggered arrival: wipe the previous render, because findings
+        # folders are severity-ranked (NN_slugs shift between waves) and a
+        # stale leftover would masquerade as a current finding.
+        shutil.rmtree(report_dir, ignore_errors=True)
     statistics = _build_pipeline_statistics(state) + "\n\n" + _build_token_usage()
 
     findings_by_id = {}
@@ -810,7 +890,7 @@ def report_assembler_node(state: MasterState) -> dict:
 
     if not records:
         _write_report(report_dir / "report.pdf", _render_empty_report(statistics))
-        return {}
+        return {"report_dir": name}
 
     rows = _ranked_rows(records, findings_by_id)
     for i, (record, finding, vector, score, label) in enumerate(rows, 1):
@@ -821,4 +901,4 @@ def report_assembler_node(state: MasterState) -> dict:
             _render_finding_report(record, finding, vector, score, label, artifacts),
         )
     _write_report(report_dir / "report.pdf", _render_main_report(rows, statistics))
-    return {}
+    return {"report_dir": name}

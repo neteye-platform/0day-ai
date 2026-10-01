@@ -844,10 +844,12 @@ dedup_agent:
     MERGE records into one cluster when they share:
     - the same execution sink at the same code location (same function/method/line region) reached by the same kind of untrusted input — even if their node ids differ or the wording does not match; or
     - one shared root cause whose fix is a single change at one place (e.g. the same missing authorization check on the same shared handler, the same unsafe helper invoked the same way, the same insecure configuration line); or
-    - the same missing validation/authorization at one SHARED callee or helper: several records anchored to DIFFERENT caller nodes but all describing that caller's untrusted value flowing unchecked into the SAME callee/handler are duplicates — the fix happens once inside that callee, and differing caller nodes do NOT make them different defects (this overrides the 'different code location' caution for this case).
+    - the same missing validation/authorization at one SHARED callee or helper: several records anchored to DIFFERENT caller nodes but all describing that caller's untrusted value flowing unchecked into the SAME callee/handler are duplicates — the fix happens once inside that callee, and differing caller nodes do NOT make them different defects (this overrides the 'different code location' caution for this case); or
+    - one and the same protective control absent at every call site along a SINGLE protected operation's call chain: e.g. a missing login throttle reported at the login page AND at the login/authenticate functions that page invokes — the absence is one, the fix lands once at the operation's chokepoint, so records at different files/functions of the SAME operation/flow describe one defect (this likewise overrides the 'different code location' caution — but ONLY within one operation).
 
     NEVER MERGE:
-    - different sinks or different code locations, even when the CWE, wording, and parameter names are nearly identical — a guard may protect one site and not the other;
+    - different sinks or different code locations, even when the CWE, wording, and parameter names are nearly identical — a guard may protect one site and not the other (a MISSING-control merge needs the records to sit on the same operation's call chain, not merely share a CWE mechanic);
+    - DIFFERENT protected operations that each independently lack the same class of control — login throttling vs password-reset throttling vs API throttling are separate absences fixed at separate places;
     - different attacker-controlled parameters/fields reaching the same sink through DIFFERENT code paths or under different validation;
     - records naming DIFFERENT CVE ids (the CVE is part of the finding);
     - records that only rhyme at the generic risk level ('user input not validated') without demonstrably the same sink/root cause.

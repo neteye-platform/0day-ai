@@ -13,6 +13,7 @@ one.
 
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -119,6 +120,7 @@ _pipeline_stats_lock = threading.Lock()
 def _record_stat(key: str, amount: int = 1) -> None:
     with _pipeline_stats_lock:
         _pipeline_stats[key] = _pipeline_stats.get(key, 0) + (amount or 0)
+    _flush_ledger()
 
 
 def _reset_pipeline_stats() -> None:
@@ -193,6 +195,7 @@ def record_usage(agent: str, usage) -> Optional[dict]:
         totals = _token_totals.setdefault(agent, new_usage())
         for field in USAGE_FIELDS:
             totals[field] += usage[field]
+    _flush_ledger()
     return usage
 
 
@@ -220,6 +223,103 @@ def take_cached_usage(agent: str, entry) -> None:
 def snapshot_token_totals() -> dict[str, dict[str, int]]:
     with _token_lock:
         return {agent: dict(totals) for agent, totals in _token_totals.items()}
+
+
+# ---------------------------------------------------------------------------
+# Durable scan-scoped ledgers (token totals + pipeline stats).
+#
+# A `python graph.py` scan spans MANY process starts (restarts/resumes): with
+# the ledgers kept purely in memory, every stopped process took its live LLM
+# spend (and the usage banked by the cache hits it read) down with it — the
+# report of a scan resumed N times could only ever show the LAST process's
+# numbers. init_usage_ledger() pins both ledgers to
+# states/token_usage_<thread>.json; every record flushes the file, so even a
+# hard-exited process leaves its spend durable, and a resume restores the
+# totals BEFORE bootstrap's reset would wipe them (the reset is skipped once
+# the ledger is initialized). A fresh scan starts from zero and drops the
+# previous scans' files (their reports were already written). Un-initialized
+# (langgraph dev, in-process runs) => process-local ledgers, exactly the old
+# per-invocation behavior.
+
+_LEDGER_DIR = Path("states")
+_ledger_file: Optional[Path] = None
+_ledger_lock = threading.Lock()
+
+
+def ledger_initialized() -> bool:
+    return _ledger_file is not None
+
+
+def _ledger_write_locked() -> None:
+    """Atomically persist both ledgers; must be called holding _ledger_lock."""
+    if _ledger_file is None:
+        return
+    payload = {
+        "pipeline_stats": _snapshot_pipeline_stats(),
+        "token_totals": snapshot_token_totals(),
+    }
+    try:
+        tmp = _ledger_file.with_name(_ledger_file.name + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        os.replace(tmp, _ledger_file)
+    except OSError as exc:
+        logging.warning(f"Failed to persist ledger {_ledger_file}: {exc}")
+
+
+def _flush_ledger() -> None:
+    if _ledger_file is None:
+        return
+    with _ledger_lock:
+        _ledger_write_locked()
+
+
+def init_usage_ledger(thread_id: str, fresh: bool) -> None:
+    """Pin the token + pipeline-stats ledgers to states/token_usage_<thread>.json
+    (called once by the pipeline entrypoint after the thread decision).
+    fresh=True starts from zero and discards previous scans' ledger files;
+    fresh=False (resume) restores the persisted totals into the in-memory
+    ledgers so the eventual report carries the whole scan's work."""
+    global _ledger_file
+    ledger = _LEDGER_DIR / f"token_usage_{thread_id}.json"
+    with _ledger_lock:
+        if fresh:
+            _LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+            with _pipeline_stats_lock:
+                _pipeline_stats.clear()
+            with _token_lock:
+                _token_totals.clear()
+            for stale in _LEDGER_DIR.glob("token_usage_*.json"):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+        _ledger_file = ledger
+        if fresh or not ledger.exists():
+            _ledger_write_locked()
+            return
+        try:
+            data = json.loads(ledger.read_text())
+        except (OSError, ValueError) as exc:
+            logging.warning(f"Corrupt ledger {ledger} ({exc}); starting from zero.")
+            _ledger_write_locked()
+            return
+        with _pipeline_stats_lock:
+            _pipeline_stats.update({
+                str(k): int(v) for k, v in (data.get("pipeline_stats") or {}).items()
+            })
+        with _token_lock:
+            for agent, totals in (data.get("token_totals") or {}).items():
+                live = _token_totals.setdefault(agent, new_usage())
+                for field in USAGE_FIELDS:
+                    live[field] += int(totals.get(field) or 0)
+    logging.info(
+        f"Restored scan ledger {ledger.name} (agents: "
+        + ", ".join(
+            f"{a}: {t['input_tokens']}in/{t['output_tokens']}out"
+            for a, t in sorted(snapshot_token_totals().items())
+        )
+        + ")."
+    )
 
 
 def _progress_file(progress_id: str) -> Path:

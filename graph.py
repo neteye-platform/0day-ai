@@ -64,7 +64,7 @@ from stage_validator import (
     validator_router,
 )
 from stage_verifier import contract_verifier_node, dispatch_verifiers
-from run_stats import RunStopped, gen_run_id, install_signal_handlers, langsmith_detached_node
+from run_stats import RunStopped, gen_run_id, init_usage_ledger, install_signal_handlers, langsmith_detached_node
 from tool_loop import SequentialToolNode, concise_tool_error
 from credential_finder import credential_finder_node
 from state import (
@@ -496,6 +496,10 @@ if __name__ == "__main__":
                 run_id = snapshot.values.get("pipeline_run_id") or run_id
                 config["metadata"]["pipeline_run_id"] = run_id
                 run_input = Command(update={"pipeline_run_id": run_id})
+                # Restore this scan's durable token/stats ledger BEFORE
+                # bootstrap runs, so a resume's report keeps the totals of the
+                # processes that were stopped earlier (they flushed on record).
+                init_usage_ledger(thread_id, fresh=False)
                 logging.info(
                     "Resuming interrupted scan on thread %s (pending step: %s).",
                     thread_id, ", ".join(dict.fromkeys(snapshot.next)),
@@ -513,6 +517,9 @@ if __name__ == "__main__":
                         pointer_thread, thread_id,
                     )
                 run_input = initial_state
+                # New scan: start the durable token/stats ledger from zero
+                # (previous scans' ledger files are dropped with their reports).
+                init_usage_ledger(thread_id, fresh=True)
                 logging.info("Starting fresh scan on thread %s.", thread_id)
 
             run_live.set()

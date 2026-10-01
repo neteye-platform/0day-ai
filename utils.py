@@ -3558,6 +3558,17 @@ _DEFAULT_EXCLUDE_DIRS = {
     "tests", "__tests__", "spec", "specs", "docs", ".github", ".gitlab",
 }
 
+# Component globs dropped by default. THE PIPELINE ITSELF writes these into the
+# target app: a report_<timestamp>/ dir from a previous scan left inside the app
+# tree gets extracted by graphify as if it were application code, and its PoC
+# scripts come back as "vulnerabilities" of the scanner's own tooling (self-
+# feeding). Matched with fnmatch against the FULL component — the exact
+# report_<YYYY-MM-DD_HHMMSS> form the reporter mints — so legitimately named
+# app trees (report_generator/, report_builder/) are never blinded.
+_DEFAULT_EXCLUDE_DIR_GLOBS = (
+    "report_[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]",
+)
+
 # Basename globs dropped by default (docs + test files).
 _DEFAULT_EXCLUDE_NAME_GLOBS = (
     "*.md", "*.markdown", "*.txt", "*.rst", "*.adoc", "*.rdoc",
@@ -3616,6 +3627,10 @@ def is_path_excluded(source_file: str) -> bool:
 
     dir_fragments = _DEFAULT_EXCLUDE_DIRS | user_dirs if getattr(settings, "scan_exclude_defaults", True) else user_dirs
     if any(d in parts for d in dir_fragments):
+        return True
+    if getattr(settings, "scan_exclude_defaults", True) and any(
+        fnmatch.fnmatch(part, pat) for part in parts for pat in _DEFAULT_EXCLUDE_DIR_GLOBS
+    ):
         return True
 
     for pat in user_globs:

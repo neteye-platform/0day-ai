@@ -62,6 +62,13 @@ class MasterState(TypedDict):
     # the reporter fan-out writes them concurrently.
     reporter_findings: Annotated[list[dict], operator.add]
 
+    # Name of THIS scan's report directory (relative to settings.app_path),
+    # minted by report_assembler_node on its first write and reused by every
+    # later arrival (a validator/auditor feedback wave that re-reaches the
+    # reporter dispatch overwrites the SAME dir instead of leaving a second
+    # partial report behind). Single writer: plain overwrite field.
+    report_dir: Optional[str]
+
 class ExplorerState(TypedDict):
     node_ids: list[str]
     role: str
