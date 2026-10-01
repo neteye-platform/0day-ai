@@ -5,7 +5,6 @@ import re
 import subprocess
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
-from llm_debug import build_debug_http_client
 from tavily import TavilyClient
 from langgraph.types import Command, Send
 from typing import Any
@@ -64,7 +63,6 @@ fast_llm = ChatOpenAI(
     temperature=0.2,
     max_completion_tokens=settings.llm_max_completion_tokens,
     reasoning_effort="none",
-    http_client=build_debug_http_client(),
 )
 smart_llm = ChatOpenAI(
     base_url=settings.llm_base_url,
@@ -74,7 +72,6 @@ smart_llm = ChatOpenAI(
     temperature=0.8,
     max_completion_tokens=settings.llm_max_completion_tokens,
     reasoning_effort="medium",
-    http_client=build_debug_http_client(),
 )
 reviewer_llm = ChatOpenAI(
     base_url=settings.llm_base_url,
@@ -84,7 +81,6 @@ reviewer_llm = ChatOpenAI(
     temperature=0.8,
     max_completion_tokens=settings.llm_max_completion_tokens,
     reasoning_effort="low",
-    http_client=build_debug_http_client(),
 )
 
 # ==========================================
