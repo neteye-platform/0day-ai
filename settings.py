@@ -170,6 +170,21 @@ edge_traversal_require_note = True
 # Cap on candidate edges per boundary category before batching.
 edge_traversal_max_edges_per_category = 150
 
+## ---- Credential finder ----
+
+# Preprocessing agent that discovers pre-configured credentials (default
+# accounts, DB passwords, baked-in secrets) from the container artifacts,
+# docker-compose/.env files, and application source, writing them to
+# `<target_app>/.cache/credentials.json` for downstream consumers (validators).
+credential_finder_enabled = True
+# Optional single structured-LLM pass that labels/dedupes the raw deterministic
+# candidates into {service, kind, username, secret, notes}. Off -> the raw
+# (paired) candidates are written as-is. Fails open to raw candidates on error.
+credential_finder_use_llm = True
+# Per-file size cap (bytes) and total scan budget for the source/artifact walk.
+credential_finder_max_file_bytes = 2 * 1024 * 1024
+credential_finder_max_scan_bytes = 64 * 1024 * 1024
+
 ## ---- Threat intel / build ----
 
 # Enrich HIGH/CRITICAL CVEs with external web evidence (Tavily); False runs the

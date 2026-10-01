@@ -19,6 +19,7 @@ import tools
 import browser_tools
 import attacker_tools
 from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, dispatch_integration_audits, integration_auditor_node, integration_auditor_router, integration_auditor_fallback_node, ask_integration_auditor_for_tool, route_integration_audit, route_validator_feedback, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node, edge_traversal_node, reporter_node
+from credential_finder import credential_finder_node
 from state import MasterState, ReviewerState, ValidatorState, IntegrationAuditorState
 from schemas import ReviewerOutput, ValidatorOutput
 
@@ -168,6 +169,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow = StateGraph(MasterState).set_node_defaults(retry_policy=RETRY)
     workflow.add_node("bootstrap", bootstrap_node)
     workflow.add_node("preprocessor", preprocessor_node)
+    workflow.add_node("credential_finder", credential_finder_node)
     workflow.add_node("manager", manager_agent_node)
     workflow.add_node("explorer_agent", expert_explorer_node)
     workflow.add_node("cve_analyzer", cve_analyzer_node)
@@ -208,7 +210,11 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_edge("bootstrap", "manager")
 
     workflow.add_conditional_edges("manager", dispatch_explorers, ["explorer_agent"])
-    workflow.add_conditional_edges("preprocessor", dispatch_cve_analyzers, ["cve_analyzer"])
+    # The credential finder runs right after the preprocessor finishes the
+    # container build/sandbox/artifact-setup phase, on the same linear branch
+    # that fans out into the CVE analyzers.
+    workflow.add_edge("preprocessor", "credential_finder")
+    workflow.add_conditional_edges("credential_finder", dispatch_cve_analyzers, ["cve_analyzer"])
 
     workflow.add_edge("cve_analyzer", "threat_intel_gate")
     # AND-join barrier: aggregate_demands only fires once both the explorer
