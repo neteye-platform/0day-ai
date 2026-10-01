@@ -193,15 +193,37 @@ class Hypothesis(BaseModel):
     component: str = Field(description="The exact parameter, state transition, or function call that is flawed.")
 
 class AnalysisNote(BaseModel):
-    sources: list[str] = Field(default_factory=list, description="External data entering this snippet.")
-    sinks: list[str] = Field(default_factory=list, description="Dangerous operations performed with data.")
-    upstream: list[UpstreamDemand] = Field(default_factory=list)
-    downstream: list[DownstreamDemand] = Field(default_factory=list)
-    vulns: list[Hypothesis] = Field(default_factory=list)
+    """
+    Analysis note for the snippet.
+
+    CRITICAL SCHEMA RULE: If any list field (sources, sinks, upstream, downstream, vulns)
+    would be empty, omit the key entirely from the JSON output instead of returning [].
+    """
+    sources: list[str] | None = Field(default=None, description="External data entering this snippet.")
+    sinks: list[str] | None = Field(default=None, description="Dangerous operations performed with data.")
+    upstream: list[UpstreamDemand] | None = Field(default=None)
+    downstream: list[DownstreamDemand] | None = Field(default=None)
+    vulns: list[Hypothesis] | None = Field(default=None)
+
+    @model_validator(mode='after')
+    def set_empty_lists(self) -> "AnalysisNote":
+        if self.sources is None: self.sources = []
+        if self.sinks is None: self.sinks = []
+        if self.upstream is None: self.upstream = []
+        if self.downstream is None: self.downstream = []
+        if self.vulns is None: self.vulns = []
+        return self
+
+class BatchedAnalysisNote(AnalysisNote):
+    node_id: str = Field(description="The exact graph node ID this analysis note refers to.")
+
+class BatchedAnalysisResult(BaseModel):
+    notes: list[BatchedAnalysisNote] = Field(
+        description="One analysis note per node analyzed in this batch."
+    )
 
 class DemandEvaluation(BaseModel):
     demand_id: str = Field(description="The exact ID extracted from the [ID: ...] tag provided in the demand description.")
-    # demand_description: str = Field(description="The exact demand being evaluated")
     status: Literal["MET", "FAILED", "DELEGATED", "OUT_OF_SCOPE"] = Field(
         description=(
             "MET: If the visible code explicitly implements standard, robust security controls (e.g., parameterized queries) that neutralize the threat.\n"
