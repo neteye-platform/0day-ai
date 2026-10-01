@@ -280,10 +280,15 @@ class VulnerabilityRecord(BaseModel):
         if not self.vuln_id:
             # Known Dependency Vulnerability records (from CVE analyzer,
             # upgrade_only path) route to the framework/dependency reviewer
-            # track; their identity is node:CWE without a per-occurrence anchor.
+            # track. Identity is node:CWE:<source_cve>: several distinct CVEs
+            # can share one package (same synthetic dependency:<package> node)
+            # and the analyzer may guess the same CWE for them, so the CVE id
+            # itself must anchor the identity or the channel reducer would
+            # collapse them into one record.
             if self.vulnerability_type == "Known Dependency Vulnerability":
                 primary = self.affected_nodes[0] if self.affected_nodes else "general"
-                self.vuln_id = f"{primary}:{self.cwe_id}"
+                cve_anchor = self.source_cve or self.demand_id or "unknown-cve"
+                self.vuln_id = f"{primary}:{self.cwe_id}:{cve_anchor}"
                 return self
 
             # If it came from the Contract Verifier, use the demand_id anchor

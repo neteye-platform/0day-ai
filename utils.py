@@ -430,13 +430,23 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
             # --- SAME STAGE: MERGE CONTEXT ---
             # If two parallel agents at the same stage find the same issue
             # (e.g., two explorers finding the same hypothesis), merge the text.
+            # Exception: records from two DISTINCT known CVEs never text-merge,
+            # even if their vuln_ids ever collide — each CVE is a canonical,
+            # separately-fixed flaw, so only affected_nodes are unioned.
             elif status_priority.get(new_status, 0) == status_priority.get(current_status, 0):
                 current = vuln_map[vid]
-                curr_desc = current.get("description", "")
-                upd_desc = update.get("description", "")
+                distinct_cves = (
+                    bool(current.get("source_cve"))
+                    and bool(update.get("source_cve"))
+                    and current["source_cve"] != update["source_cve"]
+                )
 
-                if upd_desc and upd_desc not in curr_desc:
-                    current["description"] = f"{curr_desc}\n\nAdditional context: {upd_desc}"
+                if not distinct_cves:
+                    curr_desc = current.get("description", "")
+                    upd_desc = update.get("description", "")
+
+                    if upd_desc and upd_desc not in curr_desc:
+                        current["description"] = f"{curr_desc}\n\nAdditional context: {upd_desc}"
 
                 _merge_affected_nodes(current, current, update)
                 vuln_map[vid] = current
