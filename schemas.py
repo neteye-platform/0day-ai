@@ -54,6 +54,21 @@ cwes = {
     "OTHER_UNCATEGORIZED": "Use ONLY if no other CWE fits"
 }
 
+# CWE classes whose flaws are systemic/architectural (the same insecure pattern
+# repeated across many nodes, e.g. "plaintext password storage") rather than a
+# defect localized to one function. Hypotheses carrying one of these CWEs are
+# grouped into a single node-independent record during aggregation so the
+# Reviewer adjudicates the pattern once, against all affected nodes.
+SYSTEMIC_CWES = {
+    "CWE-327",  # Use of a Broken or Risky Cryptographic Algorithm
+    "CWE-319",  # Cleartext Transmission of Sensitive Information
+    "CWE-306",  # Missing Authentication for Critical Function
+    "CWE-200",  # Exposure of Sensitive Information to an Unauthorized Actor
+    "CWE-352",  # Cross-Site Request Forgery (CSRF)
+    "CWE-384",  # Session Fixation
+    "CWE-840",  # Business Logic Errors
+}
+
 CWE_KEYS = Literal[
     "CWE-119", "CWE-416", "CWE-476", "CWE-190", "CWE-362", "CWE-89",
     "CWE-78", "CWE-79", "CWE-94", "CWE-918", "CWE-862", "CWE-863",
@@ -63,14 +78,55 @@ CWE_KEYS = Literal[
 ]
 
 
+def _normalize_signature(value) -> str:
+    """Canonicalize free text into a stable grouping token (lowercase, quotes
+    stripped, non-alphanumerics collapsed to '_')."""
+    if not value or not str(value).strip():
+        return ""
+    s = re.sub(r"[`'\"]", "", str(value))
+    s = re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+    return s
+
+
+def canonical_signature(
+    vulnerable_component: Optional[str] = None,
+    demand_id: Optional[str] = None,
+    source_cve: Optional[str] = None,
+    description: Optional[str] = None,
+) -> str:
+    """Deterministic identity for grouping systemic findings across nodes.
+
+    Falls through the record's most-identity-bearing fields in order of
+    stability: the verifier's demand id, the CVE's usage pattern, and finally
+    the free-text description (the explorer's `component` label)."""
+    for candidate in (
+        vulnerable_component,
+        demand_id if demand_id and demand_id != "unknown_anchor" else None,
+        source_cve,
+        description,
+    ):
+        sig = _normalize_signature(candidate)
+        if sig:
+            return sig
+    return "general"
+
+
 class VulnerabilityRecord(BaseModel):
     vuln_id: Optional[str] = None
 
     # Lifecycle tracking
     status: Literal["hypothesis", "unreachable", "confirmed", "exploitable", "false_positive", "review_error", "insufficient_context"] = "hypothesis"
 
-    # Core details (from Explorer/Verifier)
-    node_id: str
+    # Core details (from Explorer/Verifier). Systemic records accumulate every
+    # affected graph node here; localized records carry exactly one.
+    affected_nodes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Graph node IDs affected by this vulnerability. Localized defects "
+            "list a single node; systemic patterns list every node where the "
+            "insecure pattern appears (e.g. login AND registration endpoints)."
+        ),
+    )
     cwe_id: str = Field(
         description=(
             "The exact CWE ID. Mapping:\n"
@@ -124,6 +180,24 @@ class VulnerabilityRecord(BaseModel):
         ),
     )
 
+    @model_validator(mode='before')
+    @classmethod
+    def migrate_legacy_node_id(cls, values):
+        """Back-compat: old cached records carry the removed `node_id` field.
+        Fold it into `affected_nodes` so stale cache entries keep loading."""
+        if isinstance(values, dict) and "node_id" in values:
+            legacy = values.pop("node_id")
+            if not values.get("affected_nodes"):
+                if isinstance(legacy, list):
+                    nodes = [n for n in legacy if n]
+                elif isinstance(legacy, str) and legacy.strip():
+                    nodes = [legacy.strip()]
+                else:
+                    nodes = []
+                if nodes:
+                    values["affected_nodes"] = nodes
+        return values
+
     @field_validator('cwe_id', mode='before')
     @classmethod
     def validate_cwe(cls, value: str) -> str:
@@ -138,6 +212,28 @@ class VulnerabilityRecord(BaseModel):
 
     @model_validator(mode='after')
     def set_vuln_id(self) -> 'VulnerabilityRecord':
+        # Systemic classification: deterministic CWE allowlist. Dependency-CVE
+        # records are excluded — they already carry a stable per-CVE identity
+        # and route to the framework/dependency reviewer track.
+        systemic = (
+            self.cwe_id in SYSTEMIC_CWES
+            and not self.source_cve
+            and self.vulnerability_type != "Known Dependency Vulnerability"
+        )
+        if systemic:
+            self.vulnerability_type = "Systemic Vulnerability"
+            if not self.vuln_id:
+                sig = canonical_signature(
+                    vulnerable_component=self.vulnerable_component,
+                    demand_id=self.demand_id,
+                    source_cve=self.source_cve,
+                    description=self.description,
+                )
+                # Node-independent: identical patterns from different nodes
+                # share one vuln_id, so merge_vulnerabilities groups them.
+                self.vuln_id = f"systemic:{self.cwe_id}:{sig}"
+            return self
+
         if not self.vuln_id:
             # If it came from the Contract Verifier, use the demand_id anchor
             if self.demand_id and self.demand_id != "unknown_anchor":
@@ -150,7 +246,8 @@ class VulnerabilityRecord(BaseModel):
             else:
                 anchor = "general"
 
-            self.vuln_id = f"{self.node_id}:{self.cwe_id}:{anchor}"
+            primary = self.affected_nodes[0] if self.affected_nodes else "general"
+            self.vuln_id = f"{primary}:{self.cwe_id}:{anchor}"
         return self
 
 

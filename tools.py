@@ -13,7 +13,7 @@ from docker.errors import NotFound, APIError
 import re
 
 from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationToolInput, AskForContextInput
-from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer
+from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer, reviewer_cache_key
 from languages import MANIFEST_NAMES
 import settings
 import browser_tools
@@ -429,7 +429,6 @@ def submit_evaluation(
     """Call this tool when you have finished reviewing the source code and made a final decision."""
 
     report = state.get("expert_report", {})
-    node_id = state.get("node_id", "Unknown")
 
     # Mutate a copy of the single report
     updated_vuln = dict(report)
@@ -445,7 +444,7 @@ def submit_evaluation(
     )
 
     # Save to cache so subsequent runs skip the tool-calling loop
-    cache_reviewer(node_id, report, updated_vuln)
+    cache_reviewer(reviewer_cache_key(report, state.get("node_id", "Unknown")), report, updated_vuln)
 
     return Command(
         update={
