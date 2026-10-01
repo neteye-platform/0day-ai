@@ -25,7 +25,7 @@ ollama_model = "gemma4:cloud"
 ollama_base_url = "http://localhost:11434"
 
 # Concurrency
-simple_agents_concurrency = 4
+agents_concurrency = 1
 
 # Tool-loop guards for the compiled reviewer/validator subgraphs. If the model
 # never calls submit_evaluation / mark_validation_complete within this many LLM
