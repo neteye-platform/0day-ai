@@ -23,7 +23,7 @@ import tools
 import browser_tools
 import attacker_tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState, IntegrationAuditorState
-from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
+from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, cwes
 from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, reviewer_cache_key
 from tool_loop import CompactionConfig, ToolLoopAgent
 
@@ -644,6 +644,42 @@ def dispatch_cve_analyzers(state: MasterState):
     return commands
 
 
+def _normalize_cwe_ids(value) -> list[str]:
+    """Normalize an OSV `cwe_ids` value: strip whitespace, drop empties and
+    non-string entries, de-duplicate while preserving order. Accepts a list or
+    a single bare string."""
+    entries = value if isinstance(value, list) else ([value] if isinstance(value, str) else [])
+    seen = set()
+    normalized = []
+    for entry in entries:
+        if not isinstance(entry, str):
+            continue
+        cwe = entry.strip()
+        if not cwe:
+            continue
+        if cwe in seen:
+            continue
+        seen.add(cwe)
+        normalized.append(cwe)
+    return normalized
+
+
+def _backfill_osv_cwe_ids(cached: dict, cve: dict) -> dict:
+    """Patch deterministic OSV-suggested CWEs into a cached analyzer output.
+
+    The CVE analyzer / threat-intel caches are keyed by CVE id only, so records
+    written before `cwe_ids` existed (or when `deduplicate_cves` dropped the
+    classifications) go stale. `cwe_ids` is deterministic metadata sourced from
+    the OSV record, so on a cache hit merge it in from the current
+    `known_vulns` entry without re-running the LLM."""
+    if not isinstance(cached, dict):
+        return cached
+    cached = dict(cached)
+    osv_cwes = _normalize_cwe_ids(cve.get("cwe_ids"))
+    cached["cwe_ids"] = osv_cwes or _normalize_cwe_ids(cached.get("cwe_ids"))
+    return cached
+
+
 def _finalize_cve_analysis(dict_analysis: dict, cve: dict, *, enriched_by: str | None = None) -> dict | None:
     """Apply deterministic CVE output guards and attach routing metadata."""
     cve_id = cve.get("id", "UNKNOWN-CVE")
@@ -666,6 +702,13 @@ def _finalize_cve_analysis(dict_analysis: dict, cve: dict, *, enriched_by: str |
     dict_analysis["source_cve"] = cve_id
     dict_analysis["package"] = cve.get("package") or "unknown"
     dict_analysis["fixed_version"] = cve.get("fixed_version")
+    # Programmatically attach the CWEs the OSV scanner suggested for this CVE
+    # (from `known_vulns[i].cwe_ids`, itself extracted from
+    # `database_specific.cwe_ids`). This is deterministic — it runs after the
+    # LLM call for both the CVE analyzer and Threat Intel paths, so the output
+    # record always carries the OSV classifications regardless of what the
+    # model emitted.
+    dict_analysis["cwe_ids"] = _normalize_cwe_ids(cve.get("cwe_ids"))
     if enriched_by:
         dict_analysis["enriched_by"] = enriched_by
     return dict_analysis
@@ -698,7 +741,7 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     cache_file = settings.cache_dir / "cve_analyzer" / f"{cve_id}.json"
     cached_demand = cache(cache_file, "read")
     if cached_demand:
-        return {"cve_demands": [cached_demand]}
+        return {"cve_demands": [_backfill_osv_cwe_ids(cached_demand, cve)]}
 
     # LLM invocation
     sys_msg = SystemMessage(content=(
@@ -857,7 +900,7 @@ def _threat_intel_node(state: ThreatIntelState) -> dict:
     cache_file = settings.cache_dir / "threat_intel" / f"{cve_id}.json"
     cached = cache(cache_file, "read")
     if cached:
-        return {"cve_demands": [cached]}
+        return {"cve_demands": [_backfill_osv_cwe_ids(cached, cve)]}
 
     query = f"{cve_id} {package_name} root cause writeup exploit analysis"
     try:
@@ -1120,6 +1163,9 @@ def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: de
                 "source": source_cve,
                 "type": "cve_assumption",
                 "description": combined_desc,
+                # OSV-suggested CWEs, forwarded to the contract verifier as a
+                # hint when it picks the cwe_id for a FAILED evaluation.
+                "cwe_ids": _normalize_cwe_ids(record.get("cwe_ids")),
             })
             matched_any = True
 
@@ -1406,8 +1452,10 @@ def _contract_verifier_node(state: VerifierState) -> dict:
                 f"- [ID: {param}] [DEMAND FROM CALLEE] You call '{source}'. It demands: '{desc}'"
             )
         elif dtype == "cve_assumption":
+            suggested_cwes = _normalize_cwe_ids(d.get("cwe_ids"))
+            suffix = f" [SUGGESTED CWE: {', '.join(suggested_cwes)}]" if suggested_cwes else ""
             formatted_demands.append(
-                f"- [ID: {source}] [LIBRARY CVE MITIGATION] Known constraint: '{desc}'"
+                f"- [ID: {source}] [LIBRARY CVE MITIGATION] Known constraint: '{desc}'{suffix}"
             )
         else:
             formatted_demands.append(f"- [ID: {source}] {desc}")
@@ -1429,9 +1477,21 @@ def _contract_verifier_node(state: VerifierState) -> dict:
             # Retrieve the clean, original description from Python memory
             original_desc = demand_lookup.get(eval.get("demand_id"), "No description found.")
 
+            demand_source = demand_meta.get(eval.get("demand_id"), {})
+            verifier_cwe = eval.get("cwe")
+            if not verifier_cwe and demand_source.get("type") == "cve_assumption":
+                # Deterministic fallback for an omitted CWE: seed the FAILED
+                # evaluation from the OSV-suggested classification (first one the
+                # record schema accepts). Only fires when the model returned no
+                # CWE at all — a deliberate OTHER_UNCATEGORIZED is respected.
+                verifier_cwe = next(
+                    (c for c in _normalize_cwe_ids(demand_source.get("cwe_ids")) if c in cwes),
+                    None,
+                )
+
             new_vuln = {
                 "affected_nodes": [target_node_id],
-                "cwe_id": eval.get("cwe_id"),
+                "cwe_id": verifier_cwe,
                 "description": f"Fails to satisfy demand: '{original_desc}'. Reasoning: {eval.get("reasoning")}",
                 "status": "hypothesis",
                 "demand_id": eval.get("demand_id"),
@@ -1442,7 +1502,6 @@ def _contract_verifier_node(state: VerifierState) -> dict:
             # and the app is expected to mitigate it. Tag the record so the reviewer
             # routes it to the dependency_mitigation track (and so the CVE id is
             # visible in the reviewer prompt); explorer demands stay code-level.
-            demand_source = demand_meta.get(eval.get("demand_id"), {})
             if demand_source.get("type") == "cve_assumption":
                 new_vuln["vulnerability_type"] = "Dependency Mitigation Vulnerability"
                 new_vuln["source_cve"] = demand_source.get("source")

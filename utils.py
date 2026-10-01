@@ -1547,15 +1547,21 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
         if best and best != record["details"] and len(best) > len(record["details"]):
             record["details"] = best
             record["original_osv_id"] = vuln.get("id")
-            # Enrichment is best-effort: backfill any missing fields.
-            if not record.get("fixed_version"):
-                record["fixed_version"] = extract_fixed_version(vuln)
-            if not record.get("cwe_ids"):
-                record["cwe_ids"] = extract_cwe_ids(vuln)
-            if not record.get("severity_label"):
-                record["severity_label"] = extract_severity_label(vuln)
-            if not record.get("cvss_vector"):
-                record["cvss_vector"] = extract_cvss_vector(vuln)
+
+        # Enrichment is best-effort and advisory-order independent: backfill any
+        # missing field from ANOTHER advisory for the same canonical CVE. This
+        # used to be gated on the `details` replacement above, which silently
+        # dropped enrichment carried only by a shorter advisory (e.g. a GHSA
+        # entry's cwe_ids sitting next to a longer PYSEC description) — leaving
+        # `cwe_ids` empty even though the OSV output classified the CVE.
+        if not record.get("fixed_version"):
+            record["fixed_version"] = extract_fixed_version(vuln)
+        if not record.get("cwe_ids"):
+            record["cwe_ids"] = extract_cwe_ids(vuln)
+        if not record.get("severity_label"):
+            record["severity_label"] = extract_severity_label(vuln)
+        if not record.get("cvss_vector"):
+            record["cvss_vector"] = extract_cvss_vector(vuln)
 
     return list(best_records.values())
 
