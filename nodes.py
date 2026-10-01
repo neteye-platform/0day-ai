@@ -18,7 +18,7 @@ import settings
 import tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, VerifierState, ReviewerState, ValidatorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, load_code_corpus, find_unsupported_code_files
+from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files
 
 # fast_llm = ChatOllama(model="gemma4:cloud", temperature=0.2, reasoning=False, num_ctx=32768)
 # smart_llm = ChatOllama(model="gemma4:cloud", temperature=0.6, reasoning=False, num_ctx=32768)
@@ -84,11 +84,13 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
     # the sandbox in the background and record its runtime data in the state.
     builds = find_container_builds(settings.app_path)
     sandbox_data = None
+    built_images = []
     if builds:
         for kind, build_file in builds:
             tag = settings.docker_image_tag or f"vulnscan-{settings.app_path.name}:latest"
             images = build_images(kind, build_file, tag)
             if images:
+                built_images.extend(images)
                 for image in images:
                     logging.info(f"Scanning container image {image} with osv-scanner.")
                     raw_vulns.extend(run_osv_scanner_image(image))
@@ -99,6 +101,16 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
     else:
         logging.warning("No Dockerfile or compose file found. Falling back to repo scan.")
         raw_vulns = run_osv_scanner(settings.app_path)
+
+    # Snapshot the built container image(s): extract curated config/build
+    # artifacts + a full filesystem index so the reviewer can inspect the
+    # effective runtime configuration without touching the live sandbox.
+    # Deterministic (image-based) and independent of sandbox startup success.
+    if built_images:
+        artifact_summary = extract_container_artifacts(built_images)
+        logging.info(f"Extracted container artifacts for {len(artifact_summary)} image(s).")
+    else:
+        logging.info("No container images built; skipping container artifact extraction.")
 
     logging.info(f"Found {len(raw_vulns)} raw vulns")
     clean_vulns = deduplicate_cves(raw_vulns)
@@ -1080,6 +1092,8 @@ def reviewer_agent_node(state: ReviewerState) -> dict | Command:
             tools.search_codebase,
             tools.get_node_connections,
             tools.get_definition,
+            tools.list_container_artifacts,
+            tools.read_container_artifact,
             tools.submit_evaluation
         ],
         parallel_tool_calls=False

@@ -23,6 +23,8 @@ def compile_reviewer():
         tools.get_node_connections,
         tools.search_codebase,
         tools.get_definition,
+        tools.list_container_artifacts,
+        tools.read_container_artifact,
         tools.submit_evaluation
     ]))
     reviewer_workflow.add_edge(START, "reviewer_agent")
