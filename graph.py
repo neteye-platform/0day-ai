@@ -16,7 +16,7 @@ from langgraph.types import RetryPolicy
 
 import settings
 import tools
-from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
+from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
 from reachability import reachability_filter_node
 from state import MasterState, ReviewerState, ValidatorState
 from schemas import ReviewerOutput, ValidatorOutput
@@ -24,8 +24,12 @@ from schemas import ReviewerOutput, ValidatorOutput
 
 def compile_reviewer():
     reviewer_workflow = StateGraph(ReviewerState, output_schema=ReviewerOutput)
-    reviewer_workflow.add_node("reviewer_agent", reviewer_agent_node)
+    # The agent node is a single LLM invocation that is pure w.r.t. state until
+    # it returns, so its retry policy re-runs just the failing message -- never
+    # the whole tool loop.
+    reviewer_workflow.add_node("reviewer_agent", reviewer_agent_node, retry_policy=RETRY)
     reviewer_workflow.add_node("ask_reviewer_for_tool", ask_reviewer_for_tool)
+    reviewer_workflow.add_node("reviewer_fallback", reviewer_fallback_node)
     reviewer_workflow.add_node("reviewer_tools", ToolNode([
         tools.read_source_code,
         tools.read_file,
@@ -43,6 +47,7 @@ def compile_reviewer():
         {
             "reviewer_tools": "reviewer_tools",
             "ask_reviewer_for_tool": "ask_reviewer_for_tool",
+            "reviewer_fallback": "reviewer_fallback",
             "__end__": END
         }
     )
@@ -51,10 +56,14 @@ def compile_reviewer():
         reviewer_router,
         {
             "reviewer_agent": "reviewer_agent",
+            "reviewer_fallback": "reviewer_fallback",
             "__end__": END
         }
     )
     reviewer_workflow.add_edge("ask_reviewer_for_tool", "reviewer_agent")
+    reviewer_workflow.add_edge("reviewer_fallback", END)
+    # Loop length is bounded by the explicit iteration counter in
+    # reviewer_router/fallback_node, well under the default recursion limit.
     compiled_reviewer_agent = reviewer_workflow.compile()
 
     return compiled_reviewer_agent
@@ -62,8 +71,10 @@ def compile_reviewer():
 
 def compile_validator():
     validator_workflow = StateGraph(ValidatorState)
-    validator_workflow.add_node("validator_agent", validator_agent_node)
+    # Same scoped-retry rationale as the reviewer agent node.
+    validator_workflow.add_node("validator_agent", validator_agent_node, retry_policy=RETRY)
     validator_workflow.add_node("ask_validator_for_tool", ask_validator_for_tool)
+    validator_workflow.add_node("validator_fallback", validator_fallback_node)
     validator_workflow.add_node("validator_tools", ToolNode([
         tools.send_http_request,
         tools.list_files,
@@ -76,7 +87,8 @@ def compile_validator():
         validator_router,
         {
             "validator_tools": "validator_tools",
-            "ask_validator_for_tool": "ask_validator_for_tool"
+            "ask_validator_for_tool": "ask_validator_for_tool",
+            "validator_fallback": "validator_fallback"
         }
     )
     validator_workflow.add_conditional_edges(
@@ -84,10 +96,12 @@ def compile_validator():
         validator_router,
         {
             "validator_agent": "validator_agent",
+            "validator_fallback": "validator_fallback",
             "__end__": END
         }
     )
     validator_workflow.add_edge("ask_validator_for_tool", "validator_agent")
+    validator_workflow.add_edge("validator_fallback", END)
     compiled_validator_agent = validator_workflow.compile()
 
     return compiled_validator_agent 
@@ -113,8 +127,11 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("threat_intel", threat_intel_node)
     workflow.add_node("aggregate_demands", aggregate_demands_node)
     workflow.add_node("contract_verifier", contract_verifier_node)
-    workflow.add_node("reviewer_agent", compiled_reviewer_agent)
-    workflow.add_node("validator_agent", compiled_validator_agent)
+    # The reviewer/validator outer nodes are compiled subgraphs with internal
+    # per-message retries; explicitly disable wholesale (subgraph replay)
+    # retries here (set_node_defaults would otherwise apply RETRY to them).
+    workflow.add_node("reviewer_agent", compiled_reviewer_agent, retry_policy=RetryPolicy(max_attempts=1))
+    workflow.add_node("validator_agent", compiled_validator_agent, retry_policy=RetryPolicy(max_attempts=1))
     workflow.add_node("synchronization", synchronization_node)
     workflow.add_node("reachability_filter", reachability_filter_node)
     # workflow.add_node("reviewer_sync", synchronization_node)

@@ -22,7 +22,7 @@ import settings
 import tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity
+from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer
 
 # Maximum combined code size (in chars) for a batched explorer dispatch.
 EXPLORER_BATCH_CHAR_THRESHOLD = 10000
@@ -1495,6 +1495,7 @@ def dispatch_reviewers(state: MasterState):
             node_id=hypothesis.get("node_id", "Unknown"),
             expert_report=hypothesis,
             mode=_reviewer_mode_for(hypothesis),
+            iterations=0,
             vulnerabilities=[],
             messages=[]
         )
@@ -1512,10 +1513,7 @@ def reviewer_agent_node(state: ReviewerState) -> dict | Command:
 
     # Check Cache
     if not state.get("messages"):
-        report_hash = hashlib.md5(json.dumps(report, sort_keys=True).encode()).hexdigest()
-        cache_file = settings.cache_dir / "reviewer" / f"{node_id}_{report_hash}.json"
-        # cache_file = settings.cache_dir / "reviewer" / "converter_convert_job_convert_html_d1f9ef5218429efd22c5c9187d2c7e53.json"
-        cached_data = cache(cache_file, "read")
+        cached_data = cache_reviewer(node_id, report)
         if cached_data:
             logging.info("Reviewer cache hit.")
             return Command(
@@ -1575,12 +1573,12 @@ def reviewer_agent_node(state: ReviewerState) -> dict | Command:
         ))
 
         response = llm_with_tools.invoke([sys_msg, human_msg])
-        return {"messages": [sys_msg, human_msg, response]}
+        return {"messages": [sys_msg, human_msg, response], "iterations": 1}
 
     else:
         compacted_messages = compact_tool_history(state["messages"])
         response = llm_with_tools.invoke(compacted_messages)
-        return {"messages": [response]}
+        return {"messages": [response], "iterations": 1}
 
 
 def reviewer_router(state: ReviewerState):
@@ -1588,6 +1586,15 @@ def reviewer_router(state: ReviewerState):
     messages = state["messages"]
     if len(messages) == 0 and state.get("vulnerabilities"):
         return "__end__"
+
+    # Hard loop guard: if the model never submits a verdict, terminate
+    # gracefully instead of spinning until the recursion limit.
+    if state.get("iterations", 0) >= settings.reviewer_max_iterations:
+        logging.warning(
+            f"Reviewer on {state.get('node_id', 'Unknown')} exceeded "
+            f"{settings.reviewer_max_iterations} iterations without a verdict; falling back."
+        )
+        return "reviewer_fallback"
 
     last_message = state["messages"][-1]
 
@@ -1611,9 +1618,36 @@ def reviewer_router(state: ReviewerState):
     return "ask_reviewer_for_tool"
 
 
+def reviewer_fallback_node(state: ReviewerState) -> Command:
+    """Resolve a review that hit the iteration cap without a submit_evaluation
+    verdict. Mirrors submit_evaluation's output shape so the record flows
+    through the standard reviewer output/cache path, but marks it review_error
+    instead of silently confirming or discarding it."""
+    report = dict(state.get("expert_report", {}))
+    node_id = state.get("node_id", "Unknown")
+
+    updated_vuln = dict(report)
+    updated_vuln["status"] = "review_error"
+    updated_vuln["reviewer_reasoning"] = (
+        f"Review terminated after {state.get('iterations', 0)} tool-loop iterations "
+        f"without a submit_evaluation verdict (loop budget exceeded)."
+    )
+
+    cache_reviewer(node_id, report, updated_vuln)
+
+    return Command(
+        update={
+            "vulnerabilities": [updated_vuln],
+        }
+    )
+
+
 def ask_reviewer_for_tool(state: ReviewerState):
     """Fallback node to force the LLM to use a tool."""
-    message = HumanMessage(content=f"You did not invoke any tools. You must use a tool to proceed.")
+    message = HumanMessage(content=(
+        f"You did not invoke any tools. Keep your reasoning brief and emit a tool call "
+        f"in this same response. You must use a tool to proceed."
+    ))
     return {"messages": [message]}
 
 # ==========================================
@@ -1638,7 +1672,8 @@ def dispatch_validators(state: MasterState):
             sandbox_url=state.get("sandbox_url"),
             container_name=state.get("container_name"),
             messages=[],
-            vulnerabilities=[], 
+            iterations=0,
+            vulnerabilities=[],
             cookies={}
         )
         commands.append(Send("validator_agent", payload))
@@ -1685,7 +1720,7 @@ def validator_agent_node(state: ValidatorState) -> dict:
         ))
         messages = [sys_msg, human_msg]
         response = llm_with_tools.invoke(messages)
-        return {"messages": [sys_msg, human_msg, response]}
+        return {"messages": [sys_msg, human_msg, response], "iterations": 1}
     else:
         # Update cookies from the recent history
         for msg in reversed(state["messages"]):
@@ -1697,11 +1732,21 @@ def validator_agent_node(state: ValidatorState) -> dict:
                     current_cookies.update(msg.artifact)
 
         response = llm_with_tools.invoke(state["messages"])
-        return {"messages": [response], "cookies": current_cookies}
+        return {"messages": [response], "cookies": current_cookies, "iterations": 1}
 
 
 def validator_router(state: ValidatorState):
     last_message = state["messages"][-1]
+
+    # Hard loop guard: if the validator never calls mark_validation_complete,
+    # stop gracefully instead of spinning until the recursion limit. The
+    # record keeps its "confirmed" status (see validator_fallback_node).
+    if state.get("iterations", 0) >= settings.validator_max_iterations:
+        logging.warning(
+            f"Validator on {state.get('report_to_test', {}).get('node_id', 'Unknown')} "
+            f"exceeded {settings.validator_max_iterations} iterations without a verdict; falling back."
+        )
+        return "validator_fallback"
 
     if last_message.type == "ai":
         if last_message.tool_calls:
@@ -1718,7 +1763,33 @@ def validator_router(state: ValidatorState):
     return "ask_validator_for_tool"
 
 
+def validator_fallback_node(state: ValidatorState) -> Command:
+    """Resolve a validation that hit the iteration cap without a
+    mark_validation_complete verdict. Keeps the reviewer's "confirmed" status
+    (it was never proven exploitable, and was never proven a false positive)
+    and records the timeout in the execution logs."""
+    updated_vuln = dict(state.get("report_to_test", {}))
+
+    timeout_note = (
+        f"[validation timeout] No verdict after {state.get('iterations', 0)} "
+        f"tool-loop iterations; result on this vulnerability is unproven."
+    )
+    existing_logs = updated_vuln.get("execution_logs") or ""
+    updated_vuln["execution_logs"] = (
+        f"{existing_logs}\n{timeout_note}" if existing_logs else timeout_note
+    )
+
+    return Command(
+        update={
+            "vulnerabilities": [updated_vuln],
+        }
+    )
+
+
 def ask_validator_for_tool(state: ValidatorState):
     """Fallback node to force the LLM to use a tool."""
-    message = HumanMessage(content=f"You did not invoke any tools. You must use a tool to proceed.")
+    message = HumanMessage(content=(
+        f"You did not invoke any tools. Keep your reasoning brief and emit a tool call "
+        f"in this same response. You must use a tool to proceed."
+    ))
     return {"messages": [message]}

@@ -1,4 +1,3 @@
-import hashlib
 from typing import Annotated
 import json
 from langchain_core.messages import ToolMessage
@@ -14,7 +13,7 @@ from docker.errors import NotFound, APIError
 import re
 
 from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationToolInput
-from utils import build_networkx_graph, cache, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root
+from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer
 from languages import MANIFEST_NAMES
 import settings
 
@@ -381,9 +380,7 @@ def submit_evaluation(
     )
 
     # Save to cache so subsequent runs skip the tool-calling loop
-    report_hash = hashlib.md5(json.dumps(report, sort_keys=True).encode()).hexdigest()
-    cache_file = settings.cache_dir / "reviewer" / f"{node_id}_{report_hash}.json"
-    cache(cache_file, "write", updated_vuln)
+    cache_reviewer(node_id, report, updated_vuln)
 
     return Command(
         update={

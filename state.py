@@ -48,6 +48,9 @@ class ReviewerState(TypedDict):
     node_id: str
     expert_report: dict
     mode: str  # "code_level" | "framework_dependency"
+    # Number of LLM invocations in the tool loop. Bounds the loop so a model
+    # that never submits a verdict ends gracefully via the fallback node.
+    iterations: Annotated[int, operator.add]
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
     messages: Annotated[list, add_messages]
 
@@ -56,5 +59,7 @@ class ValidatorState(TypedDict):
     sandbox_url: Optional[str]     # The endpoint/IP of the sandbox
     container_name: Optional[str]  # The running sandbox container
     cookies: dict
+    # Number of LLM invocations in the tool loop (same role as ReviewerState.iterations).
+    iterations: Annotated[int, operator.add]
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
     messages: Annotated[list, add_messages]
