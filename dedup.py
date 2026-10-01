@@ -460,6 +460,18 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
+def _canonical_demand_key(d: dict) -> tuple:
+    """Total order over demands, independent of channel arrival order. The final
+    component breaks full-content ties, so sort output is run-invariant."""
+    return (
+        str(d.get("type") or ""),
+        str(d.get("source") or ""),
+        str(d.get("parameter_name") or ""),
+        _norm(str(d.get("description") or "")),
+        json.dumps(d, sort_keys=True),
+    )
+
+
 def _embed_with_disk_cache(
     embedder: Embeddings, texts: list[str], disk_cache_dir
 ) -> list[list[float]]:
@@ -511,13 +523,21 @@ def deduplicate_demands(
         embedder is never consulted for them.
       * All other explorer demands merge on exact normalized identity first,
         then embedding similarity at ``threshold``; the cluster seed (first
-        demand in order) is kept as-is — nothing is concatenated, as the
-        paraphrases carry no extra checkable information.
+        demand in canonical order) is kept as-is — nothing is concatenated, as
+        the paraphrases carry no extra checkable information.
       * Fails open: embedding errors keep the exact-merged demands for that
         target; with ``embedder=None`` only exact merging runs.
+
+    Each target's demands are canonically sorted on entry: the arrival order on
+    the demands channel follows parallel explorer completion and varies across
+    runs, which would make both the clustering seeds and the downstream
+    order-sensitive contract-verifier cache keys (md5 of the ordered list, and
+    positional batch slices) flip between runs — recomputing the hub nodes'
+    biggest prompts every single run.
     """
     total_in = sum(len(v) for v in grouped_demands.values())
     for target, demands in grouped_demands.items():
+        demands = grouped_demands[target] = sorted(demands, key=_canonical_demand_key)
         if len(demands) <= 1:
             continue
 
@@ -543,7 +563,7 @@ def deduplicate_demands(
 
             # Downstream caller assumptions (and any other explorer type):
             # exact-normalized pre-merge, then embedding clustering; each
-            # cluster keeps its seed demand, in original order.
+            # cluster keeps its seed demand, in canonical order.
             exact_desc: dict[str, int] = {}
             for i in idxs:
                 key = _norm(demands[i].get("description"))
