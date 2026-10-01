@@ -474,7 +474,7 @@ def uses_namespace_in_ast(node_id: str, target_namespace: str) -> bool:
     return walk(tree.root_node)
 
 
-def get_node_code(node_id: str) -> str | None:
+def get_node_code(node_id: str, raw: bool = False) -> str | None:
     graph = settings.graph
     graph_data = get_cached_graph_data(graph)
 
@@ -558,6 +558,9 @@ def get_node_code(node_id: str) -> str | None:
             if not target_ast_node:
                 return source_content
 
+        if raw:
+            return source_bytes[target_ast_node.start_byte:target_ast_node.end_byte].decode("utf-8")
+
         # Find all sub-nodes in the graph mapped to this file
         sub_nodes = []
         for n in graph_data.get("nodes", []):
@@ -631,6 +634,412 @@ def get_node_code(node_id: str) -> str | None:
     except Exception as e:
         logging.warning(f"Tree-sitter failed on '{source_file}': {e}")
         return source_content
+
+
+# --- Node triage: decide if a graph node deserves LLM-based vulnerability scanning ---
+
+# tree-sitter node types indicating executable logic (function calls, imports,
+# string interpolation, control flow). Nodes exposing none of these are inert.
+SCAN_SIGNAL_TYPES: dict[str, set[str]] = {
+    ".py": {
+        "call", "import_statement", "import_from_statement",
+        "if_statement", "for_statement", "while_statement", "try_statement",
+        "with_statement", "match_statement", "interpolation",
+    },
+    ".js": {
+        "call_expression", "new_expression", "import_statement",
+        "if_statement", "for_statement", "while_statement", "switch_statement",
+        "try_statement", "template_substitution",
+    },
+    ".jsx": {
+        "call_expression", "new_expression", "import_statement",
+        "if_statement", "for_statement", "while_statement", "switch_statement",
+        "try_statement", "template_substitution",
+    },
+    ".ts": {
+        "call_expression", "new_expression", "import_statement",
+        "if_statement", "for_statement", "while_statement", "switch_statement",
+        "try_statement", "template_substitution",
+    },
+    ".tsx": {
+        "call_expression", "new_expression", "import_statement",
+        "if_statement", "for_statement", "while_statement", "switch_statement",
+        "try_statement", "template_substitution",
+    },
+    ".php": {
+        "function_call_expression", "member_call_expression", "scoped_call_expression",
+        "object_creation_expression", "namespace_use_declaration", "include_expression",
+        "include_once_expression", "require_expression", "require_once_expression",
+        "echo_statement", "if_statement", "for_statement", "foreach_statement",
+        "while_statement", "switch_statement", "try_statement", "encapsed_string",
+    },
+}
+
+# Import-like declarations are tolerated inside pure type/interface/config nodes
+# (they only bring names into scope and do not execute anything by themselves).
+_IMPORT_TYPES: dict[str, set[str]] = {
+    ".py": {"import_statement", "import_from_statement"},
+    ".js": {"import_statement"},
+    ".jsx": {"import_statement"},
+    ".ts": {"import_statement"},
+    ".tsx": {"import_statement"},
+    ".php": {"namespace_use_declaration"},
+}
+
+# Nodes that introduce callable/structured definitions (bodies, classes, types).
+_DEFINITION_TYPES: set[str] = {
+    "function_definition", "class_definition", "decorated_definition", "method_declaration",
+    "function_declaration", "class_declaration", "arrow_function", "method_definition",
+    "function_expression", "lambda", "interface_declaration", "type_alias_declaration",
+    "enum_declaration", "type_alias_statement",
+}
+
+# Node types whose names are security-relevant when used as assignment targets.
+_NAME_NODE_TYPES: set[str] = {
+    "assignment", "variable_declarator", "assignment_expression", "property_declaration",
+    "property_element", "public_field_definition", "property_signature", "pair",
+    "array_element_initializer",
+}
+
+_SECURITY_KEYWORDS: tuple[str, ...] = (
+    "verify", "auth", "authenticate", "authorize", "permission", "secret", "token",
+    "password", "passwd", "credential", "tls", "ssl", "private_key", "privatekey",
+    "api_key", "apikey", "csrf", "jwt", "session", "cookie", "role", "admin",
+    "sudo", "root", "privilege", "debug", "trust", "allow", "bypass", "skip", "disable",
+)
+_CRITICAL_SUBSTRINGS: tuple[str, ...] = (
+    "secret", "password", "passwd", "token", "credential", "privatekey", "apikey", "csrf",
+)
+
+_MAGIC_METHODS: dict[str, set[str]] = {
+    ".py": {
+        "__reduce__", "__reduce_ex__", "__setstate__", "__getstate__", "__getattr__",
+        "__setattr__", "__getattribute__", "__del__", "__delattr__", "__enter__",
+        "__exit__", "__new__", "__init__", "__call__", "__getitem__", "__setitem__",
+        "__repr__", "__str__",
+    },
+    ".php": {
+        "__construct", "__destruct", "__wakeup", "__sleep", "__call", "__callstatic",
+        "__get", "__set", "__isset", "__unset", "__tostring", "__invoke", "__set_state",
+        "__clone", "__debuginfo", "__serialize", "__unserialize",
+    },
+    ".js": set(), ".jsx": set(), ".ts": set(), ".tsx": set(),
+}
+
+
+def _walk(node: tree_sitter.Node):
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        yield n
+        stack.extend(n.children)
+
+
+def _has_node_type(root: tree_sitter.Node, types: set[str]) -> bool:
+    for n in _walk(root):
+        if n.type in types:
+            return True
+    return False
+
+
+def _is_security_name(name: str) -> bool:
+    n = name.lower().strip().strip("()")
+    if not n:
+        return False
+
+    # Separator-delimited keywords and prefix matches (covers snake_case and camelCase)
+    for kw in _SECURITY_KEYWORDS:
+        if re.search(rf"(^|[_\-./]){re.escape(kw)}([_\-./]|$)", n) or n.startswith(kw):
+            return True
+
+    # Substring fallback for the most dangerous identifiers (e.g. mySecret, apiKey)
+    for kw in _CRITICAL_SUBSTRINGS:
+        if kw in n:
+            return True
+
+    return False
+
+
+def _has_security_names(root: tree_sitter.Node, label: str) -> bool:
+    if _is_security_name(label):
+        return True
+
+    for n in _walk(root):
+        if n.type in _NAME_NODE_TYPES:
+            text = n.text.decode()
+            text = re.split(r"[=:]", text, 1)[0]
+            for tok in re.split(r"[^A-Za-z0-9_]+", text):
+                tok = tok.strip().strip("$")
+                if tok and _is_security_name(tok):
+                    return True
+    return False
+
+
+def _body_of(def_node: tree_sitter.Node):
+    for c in def_node.children:
+        if c.type in ("block", "statement_block", "class_body", "compound_statement", "declaration_list"):
+            return c
+    return None
+
+
+def _is_docstring(stmt: tree_sitter.Node) -> bool:
+    return bool(stmt.children) and all(c.type == "string" for c in stmt.children)
+
+
+def _is_empty_body(body: tree_sitter.Node) -> bool:
+    if body is None:
+        return False
+    if body.type == "block":  # Python: `pass` and docstrings do not count as logic
+        for stmt in body.children:
+            if stmt.type == "pass_statement":
+                continue
+            if stmt.type == "expression_statement" and _is_docstring(stmt):
+                continue
+            return False
+        return True
+    # Brace-based bodies: only named children count (`{`, `}` are anonymous tokens)
+    return not any(c.is_named for c in body.children)
+
+
+def _unwrap_root(root: tree_sitter.Node) -> tree_sitter.Node:
+    """Returns the single top-level definition node if the parsed unit contains exactly one.
+
+    When tree-sitter parses a raw fragment (e.g. a method body), it wraps it in a
+    module/program. If that unit holds exactly one definition, unwrap to it so skeleton
+    detection applies. Files with many top-level definitions are left intact.
+    """
+    defs = [n for n in _walk(root)
+            if n.type in _DEFINITION_TYPES and n.type != "decorated_definition"]
+    return defs[0] if len(defs) == 1 else root
+
+
+def _is_empty_skeleton(root: tree_sitter.Node, ext: str) -> bool:
+    node = _unwrap_root(root)
+    if node.type not in _DEFINITION_TYPES:
+        return False
+    if node.type in ("interface_declaration", "type_alias_declaration", "enum_declaration", "type_alias_statement"):
+        return False
+    body = _body_of(node)
+    return _is_empty_body(body)
+
+
+def _has_substantive_docstring(root: tree_sitter.Node) -> bool:
+    for n in _walk(root):
+        if n.type == "string":
+            text = n.text.decode().strip()
+            if len(text) >= 20 or n.start_point[0] != n.end_point[0]:
+                return True
+    return False
+
+
+def _is_magic_method(label: str, ext: str) -> bool:
+    n = label.lower().strip().strip("()")
+    return n in _MAGIC_METHODS.get(ext, set())
+
+
+def _has_field_defaults(root: tree_sitter.Node) -> bool:
+    for n in _walk(root):
+        if n.type in ("assignment", "property_element", "public_field_definition", "property_signature", "enum_assignment"):
+            if "=" in n.text.decode():
+                return True
+    return False
+
+
+def _pydantic_base(class_node: tree_sitter.Node) -> bool:
+    for c in class_node.children:
+        if c.type in ("argument_list", "base_clause"):
+            for b in _walk(c):
+                if b.type in ("identifier", "attribute"):
+                    text = b.text.decode().lower()
+                    if "basemodel" in text or "pydantic" in text or text.endswith("model"):
+                        return True
+    return False
+
+
+def _is_pydantic_like(root: tree_sitter.Node) -> bool:
+    for n in _walk(root):
+        if n.type == "class_definition" and _pydantic_base(n):
+            return True
+        if n.type == "decorator" and "validator" in n.text.decode().lower():
+            return True
+        if n.type == "assignment" and n.text.decode().split("=")[0].strip() == "model_config":
+            return True
+    return False
+
+
+def _class_is_field_only(class_node: tree_sitter.Node) -> bool:
+    body = _body_of(class_node)
+    if body is None:
+        return False
+
+    has_field = False
+    for stmt in body.children:
+        if stmt.type == "pass_statement":
+            continue
+        if stmt.type in ("expression_statement", "assignment"):
+            has_field = True
+            continue
+        return False
+
+    if not has_field:
+        return False
+    if _has_node_type(class_node, {"call", "function_definition", "lambda", "if_statement",
+                                   "for_statement", "while_statement", "try_statement",
+                                   "with_statement", "match_statement"}):
+        return False
+    return True
+
+
+def _is_pure_type(root: tree_sitter.Node, ext: str) -> bool:
+    signals = SCAN_SIGNAL_TYPES.get(ext, set())
+    imports = _IMPORT_TYPES.get(ext, set())
+
+    if ext in (".ts", ".tsx", ".js", ".jsx"):
+        type_constructs = {"type_alias_declaration", "interface_declaration", "enum_declaration"}
+        if not _has_node_type(root, type_constructs):
+            return False
+        forbidden = (signals - imports) | {
+            "function_declaration", "class_declaration", "arrow_function",
+            "method_definition", "function_expression",
+            "assignment", "variable_declarator", "public_field_definition", "pair",
+        }
+        return not _has_node_type(root, forbidden)
+
+    if ext == ".py":
+        behavioral = {"call", "if_statement", "for_statement", "while_statement",
+                      "try_statement", "with_statement", "match_statement",
+                      "interpolation", "function_definition", "lambda"}
+        if _has_node_type(root, behavioral):
+            return False
+        if _has_node_type(root, {"type_alias_statement"}):
+            return True
+        for n in _walk(root):
+            if n.type == "class_definition" and _class_is_field_only(n):
+                return True
+            if n.type == "decorated_definition":
+                if any(c.type == "class_definition" and _class_is_field_only(c) for c in n.children):
+                    return True
+        return False
+
+    if ext == ".php":
+        runtime = signals - imports - {"namespace_use_declaration"}
+        if _has_node_type(root, {"interface_declaration"}):
+            return not _has_node_type(root, runtime)
+        for n in _walk(root):
+            if n.type == "class_declaration":
+                body = _body_of(n)
+                if body is not None and _has_node_type(n, {"property_declaration"}):
+                    if not _has_node_type(n, {"method_declaration", "function_definition"}):
+                        return True
+        return False
+
+    return False
+
+
+def _is_config_only(root: tree_sitter.Node, ext: str) -> bool:
+    if _has_node_type(root, _DEFINITION_TYPES):
+        return False
+    imports = _IMPORT_TYPES.get(ext, set())
+    forbidden = SCAN_SIGNAL_TYPES.get(ext, set()) - imports
+    if _has_node_type(root, forbidden):
+        return False
+    return len(root.children) > 0
+
+
+def _has_regex_literal(root: tree_sitter.Node) -> bool:
+    if _has_node_type(root, {"regex"}):
+        return True
+    for n in _walk(root):
+        if n.type in ("identifier", "name", "property_identifier", "variable_name"):
+            text = n.text.decode().lower()
+            if "regex" in text or text.endswith("_re") or text.endswith("pattern"):
+                return True
+    return False
+
+
+def _has_object_literal(root: tree_sitter.Node) -> bool:
+    return _has_node_type(root, {"dictionary", "object", "array_creation_expression"})
+
+
+def _count_signal_nodes(root: tree_sitter.Node, ext: str, limit: int) -> int:
+    signal_types = SCAN_SIGNAL_TYPES.get(ext, set())
+    count = 0
+    for n in _walk(root):
+        if n.type in signal_types:
+            count += 1
+            if count >= limit:
+                return count
+    return count
+
+
+def _node_code_is_worth_scanning(source_code: str, label: str, ext: str, min_signals: int = 1) -> bool:
+    """Core triage on raw source. Returns True when the node cannot be inspected."""
+    lang = LANGUAGE_MAP.get(ext)
+    if not lang or ext not in SCAN_SIGNAL_TYPES:
+        return True
+
+    # PHP method/class raw fragments (as returned by get_node_code) omit the `<?php`
+    # tag, which tree-sitter needs to avoid parsing everything as plain text.
+    if ext == ".php" and not source_code.lstrip().startswith("<?"):
+        source_code = "<?php\n" + source_code
+
+    try:
+        tree = tree_sitter.Parser(lang).parse(source_code.encode("utf-8"))
+    except Exception as e:
+        logging.warning(f"tree-sitter failed on node '{label}': {e}")
+        return True
+
+    root = tree.root_node
+
+    # Rule 1: Pure Types & Interfaces -> keep only with defaults, validation, or security names
+    if _is_pure_type(root, ext):
+        return (_has_field_defaults(root)
+                or _is_pydantic_like(root)
+                or _has_security_names(root, label))
+
+    # Rule 2: Empty Skeletons & No-Ops -> keep only with security/magic names or docstrings
+    if _is_empty_skeleton(root, ext):
+        return (_is_security_name(label)
+                or _is_magic_method(label, ext)
+                or _has_substantive_docstring(root))
+
+    # Rule 3: Primitive Constants & Configs -> keep only with security names, regex, or objects
+    if _is_config_only(root, ext):
+        return (_has_security_names(root, label)
+                or _has_regex_literal(root)
+                or _has_object_literal(root))
+
+    # Default: executable signal count (or a runtime validation wrapper)
+    return _is_pydantic_like(root) or _count_signal_nodes(root, ext, min_signals) >= min_signals
+
+
+def is_node_worth_scanning(node_id: str, min_signals: int = 1) -> bool:
+    """Decides whether a graph node deserves LLM-based vulnerability scanning.
+
+    Uses tree-sitter to classify the node:
+    - Pure types/interfaces are dropped unless they set default values, use runtime
+      validation (Pydantic), or carry security-sensitive names.
+    - Empty skeletons/no-ops are dropped unless security-named, magic methods, or
+      (Python) carrying substantive docstrings.
+    - Flat primitive-constant configs are dropped unless security-sensitive names,
+      regex literals, or (nested) object literals are present.
+    - Remaining nodes are kept when they contain >= `min_signals` executable signals
+      (function calls, imports, string interpolation, control flow).
+
+    Unparseable nodes (unsupported extension, parse failure) are kept.
+    """
+    source_code = get_node_code(node_id, raw=True)
+    if not source_code:
+        return False
+
+    graph_data = get_cached_graph_data(settings.graph)
+    target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), None)
+    if not target_node or not target_node.get("source_file"):
+        return False
+
+    ext = Path(target_node["source_file"]).suffix.lower()
+    label = target_node.get("label", "")
+    return _node_code_is_worth_scanning(source_code, label, ext, min_signals)
 
 
 def extract_imports(source_code: str, file_path: str) -> list[str]:

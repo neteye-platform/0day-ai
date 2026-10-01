@@ -17,7 +17,7 @@ class MasterState(TypedDict):
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
 
 class ExplorerState(TypedDict):
-    node_id: str
+    node_ids: list[str]
     role: str
     task_description: str
 

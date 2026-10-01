@@ -18,12 +18,17 @@ from languages import SYMBOL_QUERIES
 import settings
 import tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, VerifierState, ReviewerState, ValidatorState
-from schemas import ManagerOutput, ExpertTask, AnalysisNote, CVEDemand, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast
+from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEDemand, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
+from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning
 
 # llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
-fast_llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="laguna", stream_usage=True, temperature=0.0, max_retries=5, max_tokens=400) # Used for explorer and cve_analyzer
-smart_llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="laguna", stream_usage=True, temperature=0.4, max_retries=5, max_tokens=8192)
+# Maximum combined code size (in chars) for a batched explorer dispatch.
+EXPLORER_BATCH_CHAR_THRESHOLD = 7500
+
+model = "deepseek-v4-flash"
+fast_llm = ChatOpenAI(base_url="http://localhost:11434/v1", model=model, stream_usage=True, temperature=0.0, max_retries=5, max_tokens=4096, reasoning_effort="none") # Used for explorer and cve_analyzer
+smart_llm = ChatOpenAI(base_url="http://localhost:11434/v1", model=model, stream_usage=True, temperature=0.0, max_retries=5, max_tokens=4096, reasoning_effort="none") # Used for explorer and cve_analyzer
+# smart_llm = ChatOpenAI(base_url="http://localhost:11434/v1", model=model, stream_usage=True, temperature=0.3, max_retries=5, max_tokens=8192, reasoning_effort="none")
 
 # ==========================================
 # Preprocessor
@@ -138,16 +143,53 @@ def manager_agent_node(state: MasterState) -> dict[str, Any]:
 # Explorer agents
 # ==========================================
 
+def _pack_node_batches(file_nodes: list[str], threshold: int) -> list[list[str]]:
+    """Greedily pack node ids into batches whose combined code size stays below `threshold`.
+
+    Nodes are packed in the order given. A batch is closed as soon as adding the next
+    node would exceed the threshold. A single node whose code already exceeds the
+    threshold becomes its own batch.
+    """
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_len = 0
+
+    for node_id in file_nodes:
+        length = len(get_node_code(node_id) or "")
+        if current and current_len + length > threshold:
+            batches.append(current)
+            current = []
+            current_len = 0
+        current.append(node_id)
+        current_len += length
+
+    if current:
+        batches.append(current)
+
+    return batches
+
+
 def dispatch_explorers(state: MasterState):
-    """Reads the Manager's instructions and creates a list of 'Send' objects."""
+    """Reads the Manager's instructions and creates a list of 'Send' objects.
+
+    Nodes are batched per (community, source_file) so that multiple small nodes
+    sharing a file are analyzed in a single explorer dispatch, as long as their
+    combined code size stays under EXPLORER_BATCH_CHAR_THRESHOLD characters.
+    """
 
     G = build_networkx_graph(settings.graph)
     commands: list[Send] = []
+    skipped_nodes = 0
+    batched_batches = 0
+    single_batches = 0
 
     for task in state["expert_tasks"]:
         task = task if isinstance(task, dict) else task.model_dump()
         clean_id = task.get("target_community", "").lower().replace("community ", "").strip()
         community_nodes = [n for n, attr in G.nodes(data=True) if str(attr.get("community")) == clean_id]
+
+        # Group eligible nodes by source_file (the batching key within this task).
+        files: dict[str, list[str]] = defaultdict(list)
 
         # Filter out skeleton nodes, but keep functions, classes, and non-code files
         for node_id in community_nodes:
@@ -163,16 +205,36 @@ def dispatch_explorers(state: MasterState):
             if source_file.name in ["requirements.txt", "packages.json"]:
                 continue
 
-            payload = ExplorerState(
-                node_id=node_id,
-                role=task.get("agent_role", ""),
-                task_description=task.get("task_description", "")
-            )
-            logging.info(f"Dispatching explorer {task.get('agent_role', '')} on node {node_id}.")
+            # Drop inert nodes (pure types, empty skeletons, flat constants) to save LLM budget
+            if not is_node_worth_scanning(node_id):
+                skipped_nodes += 1
+                logging.debug(f"Skipping inert node {node_id} (no executable signals).")
+                continue
 
-            commands.append(Send("explorer_agent", payload))
+            files[node_data.get("source_file", "")].append(node_id)
 
-    logging.info(f"Dispatching {len(commands)} explorers.")
+        # Pack each file's nodes into batches whose combined code size stays under the threshold.
+        for file_path, file_nodes in files.items():
+            for batch in _pack_node_batches(file_nodes, EXPLORER_BATCH_CHAR_THRESHOLD):
+                payload = ExplorerState(
+                    node_ids=batch,
+                    role=task.get("agent_role", ""),
+                    task_description=task.get("task_description", "")
+                )
+                if len(batch) > 1:
+                    batched_batches += 1
+                else:
+                    single_batches += 1
+                logging.debug(
+                    f"Dispatching explorer {task.get('agent_role', '')} on batch "
+                    f"{batch} (from {file_path})."
+                )
+                commands.append(Send("explorer_agent", payload))
+
+    logging.info(
+        f"Dispatching {len(commands)} explorers ({batched_batches} multi-node batches, "
+        f"{single_batches} single-node), skipped {skipped_nodes} inert nodes."
+    )
     return commands
 
 
@@ -184,9 +246,15 @@ def dispatch_all_tasks(state: MasterState):
 
 
 def expert_explorer_node(state: ExplorerState) -> dict:
-    node_id = state.get("node_id")
+    node_ids = state.get("node_ids", [])
     role_name = state.get("role")
 
+    if len(node_ids) == 1:
+        return _explore_single(node_ids[0], role_name)
+    return _explore_batch(node_ids, role_name)
+
+
+def _explore_single(node_id: str, role_name: str) -> dict:
     # Check cache
     cache_file = settings.cache_dir / "notes" / f"{node_id}-{role_name}.json"
     cached_note = cache(cache_file, "read")
@@ -196,11 +264,9 @@ def expert_explorer_node(state: ExplorerState) -> dict:
     # LLM invocation
     source_code = get_node_code(node_id)
 
-    # parser = PydanticOutputParser(pydantic_object=AnalysisNote)
     sys_msg = SystemMessage(content=(
         f"{EXPERT_AGENTS[role_name]['prompt']}\n\n"
         f"{EXPERT_AGENTS['explorer_prompt']}\n\n"
-        # f"{parser.get_format_instructions()}"
     ))
 
     graph_data = get_cached_graph_data(settings.graph)
@@ -253,6 +319,95 @@ def expert_explorer_node(state: ExplorerState) -> dict:
 
     return {
         "notes": [dict_note],
+        "vulnerabilities": extracted_vulns
+    }
+
+
+def _explore_batch(node_ids: list[str], role_name: str) -> dict:
+    # Deterministic cache key: sorted node ids joined by '__'
+    batch_key = "__".join(sorted(node_ids))
+    cache_file = settings.cache_dir / "notes" / f"batch-{batch_key}-{role_name}.json"
+    cached_note = cache(cache_file, "read")
+    if cached_note:
+        return cached_note
+
+    graph_data = get_cached_graph_data(settings.graph)
+
+    sys_msg = SystemMessage(content=(
+        f"{EXPERT_AGENTS[role_name]['prompt']}\n\n"
+        f"{EXPERT_AGENTS['explorer_prompt']}\n\n"
+        "You are analyzing MULTIPLE nodes in a single dispatch. "
+        "Analyze each node independently and produce exactly one note per node."
+    ))
+
+    # Build a prompt that lists each node with its id, label, and code.
+    sections = []
+    for node_id in node_ids:
+        target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), {})
+        source_code = get_node_code(node_id)
+        label = target_node.get("label", node_id)
+        if target_node.get("source_file", "").endswith(target_node.get("label", "")):
+            sections.append(
+                f"### Node '{node_id}' ({label}) — entire file skeleton\n"
+                f"```python\n{source_code}\n```"
+            )
+        else:
+            sections.append(
+                f"### Node '{node_id}' ({label})\n"
+                f"Analyze the specific logic inside '{label}'. "
+                f"The rest of the file is provided solely as context; "
+                f"do NOT look for vulnerabilities outside of '{label}'.\n"
+                f"```python\n{source_code}\n```"
+            )
+
+    user_prompt = (
+        "Analyze each of the following nodes independently. "
+        "For every node, produce a separate analysis note tagged with the matching node_id.\n\n"
+        + "\n\n".join(sections)
+    )
+    human_msg = HumanMessage(content=user_prompt)
+
+    explorer_llm = fast_llm.with_structured_output(BatchedAnalysisResult, method="json_schema", strict=True)
+    result = explorer_llm.invoke([sys_msg, human_msg])
+
+    result = result if isinstance(result, dict) else result.model_dump()
+    raw_notes = result.get("notes", [])
+
+    notes = []
+    extracted_vulns = []
+
+    for note in raw_notes:
+        dict_note = note if isinstance(note, dict) else note.model_dump()
+        node_id = dict_note.get("node_id")
+        if not node_id:
+            continue
+
+        # Drop assumptions about the node under analysis
+        valid_assumptions = []
+        for assumption in dict_note.get("assumptions_to_verify", []):
+            if node_id == resolve_node_id(assumption.get("module"), assumption.get("symbol")):
+                continue # Drop it
+
+            valid_assumptions.append(assumption)
+        dict_note["assumptions_to_verify"] = valid_assumptions
+
+        # Extract and remove the list from dict_note
+        raw_hypotheses = dict_note.pop("vulnerability_hypothesis", [])
+        for hyp in raw_hypotheses:
+            extracted_vulns.append({
+                "node_id": node_id,
+                "cwe_id": hyp.get("cwe_id", "OTHER_UNCATEGORIZED"),
+                "description": hyp.get("description", ""),
+                "status": "hypothesis"
+            })
+
+        notes.append(dict_note)
+
+    # Save to cache
+    cache(cache_file, "write", {"notes": notes, "vulnerabilities": extracted_vulns})
+
+    return {
+        "notes": notes,
         "vulnerabilities": extracted_vulns
     }
 
