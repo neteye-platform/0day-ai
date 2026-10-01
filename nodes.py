@@ -349,6 +349,16 @@ def dispatch_explorers(state: MasterState):
         skipped_nodes,
     )
 
+    # The aggregate_demands join barrier requires explorer_agent to fire even
+    # when nothing was dispatchable; emit a no-op task otherwise.
+    if not commands:
+        commands.append(Send("explorer_agent", ExplorerState(
+            node_ids=[],
+            role="explorer",
+            task_description="",
+            progress_id="",
+        )))
+
     return commands
 
 
@@ -414,6 +424,11 @@ def _log_agent_completion(progress_id: str, agent_name: str, detail: str) -> Non
 def expert_explorer_node(state: ExplorerState) -> dict:
     node_ids = state.get("node_ids", [])
     role_name = state.get("role")
+
+    if not node_ids:
+        # No-op task (empty dispatches): fires the aggregate_demands join
+        # barrier without any LLM call.
+        return {}
 
     if len(node_ids) == 1:
         result = _explore_single(node_ids[0], role_name)
@@ -609,6 +624,13 @@ def dispatch_cve_analyzers(state: MasterState):
         )
         commands.append(Send("cve_analyzer", payload))
 
+    # The aggregate_demands join barrier requires the cve_analyzer chain to
+    # fire even with zero SCA findings; emit a no-op task otherwise. The no-op
+    # flows through threat_intel_gate -> no-op threat_intel so the barrier sees
+    # a write from threat_intel too.
+    if not commands:
+        commands.append(Send("cve_analyzer", CVEAnalyzerState(cve={}, progress_id="")))
+
     logging.info(
         "Starting CVE analyzer scan: 0/%d complete, %d remaining.",
         len(commands),
@@ -651,6 +673,11 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     cve = state.get("cve", {})
     package_name = cve.get("package") or "unknown"
     cve_id = cve.get("id", "UNKNOWN-CVE")
+    if not cve:
+        # No-op task (empty dispatches): fires the cve_analyzer -> threat_intel_gate
+        # chain so the aggregate_demands join barrier sees a write from
+        # threat_intel even when there are no SCA findings.
+        return {}
     # Up to 3 distinct descriptions of the same CVE (deduplicated by the
     # preprocessor); fall back to the single `details` field for legacy records.
     descriptions = cve.get("descriptions")
@@ -750,11 +777,24 @@ def _analysis_needs_threat_intel(cve: dict, analysis: dict | None) -> bool:
     return False
 
 
+def _noop_threat_intel_send() -> list[Send]:
+    """A single stateless Send that fires the aggregate_demands join barrier
+    when there is nothing to enrich (no TAVILY key, or no CVEs meet the
+    criteria). `threat_intel_node` returns immediately for an empty `cve`,
+    so this costs no API calls."""
+    return [Send("threat_intel", ThreatIntelState(cve={}, prior_analysis=None, progress_id=""))]
+
+
 def dispatch_threat_intel(state: MasterState):
-    """Dispatch only CVEs whose mechanics need external threat intelligence."""
+    """Dispatch only CVEs whose mechanics need external threat intelligence.
+
+    Always returns at least one `Send` to `threat_intel`: the join barrier into
+    `aggregate_demands` requires `threat_intel` to run exactly once even when
+    there is nothing to enrich, so the empty case emits a no-op task instead of
+    routing `aggregate_demands` directly."""
     if not os.environ.get("TAVILY_API_KEY"):
         logging.warning("Threat Intel disabled: TAVILY_API_KEY is not configured.")
-        return "aggregate_demands"
+        return _noop_threat_intel_send()
 
     analyzed = {}
     for record in state.get("cve_demands", []):
@@ -774,7 +814,7 @@ def dispatch_threat_intel(state: MasterState):
 
     if not candidates:
         logging.info("Threat Intel: no CVEs met the enrichment criteria.")
-        return "aggregate_demands"
+        return _noop_threat_intel_send()
 
     progress_id = _start_agent_progress(len(candidates))
     logging.info("Starting Threat Intel scan: 0/%d complete, %d remaining.", len(candidates), len(candidates))
@@ -859,6 +899,10 @@ def _threat_intel_node(state: ThreatIntelState) -> dict:
 
 
 def threat_intel_node(state: ThreatIntelState) -> dict:
+    if not state.get("cve"):
+        # No-op task: fires the aggregate_demands join barrier so it runs once
+        # even when there is nothing to enrich. No external calls.
+        return {}
     result = _threat_intel_node(state)
     cve = state.get("cve", {})
     _log_agent_completion(
@@ -1144,9 +1188,10 @@ def filter_cve_demands_by_keywords(cves: list[dict]) -> list[dict]:
     A record is kept if ANY of its keywords appears as an exact, case-sensitive
     substring in ANY code file. Records with an empty or missing keyword list
     are kept unchanged (fail-open — protects stale caches generated before the
-    ``required_keywords`` field existed). Applies to BOTH fix categories, so a
-    dropped record never produces a contract-verifier demand nor an
-    upgrade-only reviewer hypothesis.
+    ``required_keywords`` field existed). Intended for `application_mitigation`
+    records only: `aggregate_demands_node` exempts `upgrade_only` records, whose
+    hypotheses live in a synthetic `dependency:<package>` node and must not be
+    dropped on the basis of app-source keywords.
     """
     if not cves:
         return cves
@@ -1222,8 +1267,23 @@ def aggregate_demands_node(state: MasterState):
         logging.info(f"Loaded graph data: {len(callers_map)} caller entries, {len(node_imports_map)} import entries.")
         notes = state.get("notes", [])
         cves = _dedupe_enriched_cve_demands(state.get("cve_demands", []))
-        cves = filter_cve_demands_by_keywords(cves)
-        logging.info(f"Processing {len(notes)} notes and {len(cves)} CVE demands.")
+
+        # Upgrade-only records are exempt from the keyword pre-filter: their
+        # hypotheses are anchored to synthetic `dependency:<package>` nodes and
+        # route directly to the framework/dependency reviewer, which adjudicates
+        # exposure via container artifacts/config — not app-source substrings.
+        # Import-site keywords (e.g. build-tool internals like 'pip install')
+        # rarely appear in application code, so filtering them out would silently
+        # drop every upgrade-only hypothesis.
+        upgrade_only = [r for r in cves if r.get("fix_category") == "upgrade_only"]
+        cves = filter_cve_demands_by_keywords(
+            [r for r in cves if r.get("fix_category") != "upgrade_only"]
+        )
+        cves = upgrade_only + cves
+        logging.info(
+            f"Processing {len(notes)} notes and {len(cves)} CVE demands "
+            f"({len(upgrade_only)} upgrade-only exempted from the keyword pre-filter)."
+        )
 
         # Process Explorer Notes
         updated_notes = _route_explorer_notes(notes, graph_data, callers_map, grouped_demands)
@@ -1238,7 +1298,9 @@ def aggregate_demands_node(state: MasterState):
 
         return {
             "grouped_demands": dict(grouped_demands),
-            "notes": updated_notes,
+            # `notes` is an operator.add-reduced channel: returning `updated_notes`
+            # would re-append the very notes this node just consumed.
+            "notes": [],
             "vulnerabilities": cve_hypotheses,
         }
     finally:

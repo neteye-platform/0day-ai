@@ -126,14 +126,17 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_conditional_edges("manager", dispatch_explorers, ["explorer_agent"])
     workflow.add_conditional_edges("preprocessor", dispatch_cve_analyzers, ["cve_analyzer"])
 
-    workflow.add_edge("explorer_agent", "aggregate_demands")
     workflow.add_edge("cve_analyzer", "threat_intel_gate")
+    # AND-join barrier: aggregate_demands only fires once both the explorer
+    # branch and the CVE/threat-intel branch have written. A naive set of
+    # separate edges would trigger it on the FIRST writer (both write to the
+    # same EphemeralValue trigger channel), running it twice with partial input.
     workflow.add_conditional_edges(
         "threat_intel_gate",
         dispatch_threat_intel,
-        ["threat_intel", "aggregate_demands"],
+        ["threat_intel"],
     )
-    workflow.add_edge("threat_intel", "aggregate_demands")
+    workflow.add_edge(["explorer_agent", "threat_intel"], "aggregate_demands")
 
     workflow.add_conditional_edges("aggregate_demands", dispatch_verifiers, ["contract_verifier", "synchronization", END])
     workflow.add_edge("contract_verifier", "synchronization")
