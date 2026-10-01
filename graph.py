@@ -98,7 +98,8 @@ def compile_validator():
         {
             "validator_tools": "validator_tools",
             "ask_validator_for_tool": "ask_validator_for_tool",
-            "validator_fallback": "validator_fallback"
+            "validator_fallback": "validator_fallback",
+            "__end__": END
         }
     )
     validator_workflow.add_conditional_edges(

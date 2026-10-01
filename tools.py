@@ -14,7 +14,7 @@ import re
 import networkx as nx
 
 from schemas import EvaluationToolInput, ValidationToolInput, AskForContextInput, IntegrationAuditInput, VulnerabilityDetailsInput, cwes
-from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer, cache_validator, cache_integration_auditor, reviewer_cache_key, is_path_excluded
+from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer, cache_validator, cache_integration_auditor, reviewer_cache_key, is_feedback_review, is_path_excluded
 from languages import MANIFEST_NAMES
 import settings
 import browser_tools
@@ -423,8 +423,12 @@ def submit_evaluation(
         tool_call_id=tool_call_id
     )
 
-    # Save to cache so subsequent runs skip the tool-calling loop
-    cache_reviewer(reviewer_cache_key(report, state.get("node_id", "Unknown")), report, updated_vuln)
+    # Save to cache so subsequent runs skip the tool-calling loop. Feedback
+    # re-reviews are exempt (mirrors ReviewerAgent.pre_agent): a round-N report is
+    # byte-identical across checkpoint replays, so caching it would collapse every
+    # genuine re-answer into this verdict.
+    if not is_feedback_review(report):
+        cache_reviewer(reviewer_cache_key(report, state.get("node_id", "Unknown")), report, updated_vuln)
 
     return Command(
         update={

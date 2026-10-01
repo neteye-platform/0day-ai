@@ -23,7 +23,7 @@ import browser_tools
 import attacker_tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState, IntegrationAuditorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, INTEGRATION_AUDITOR_AGENT, EDGE_TRAVERSAL_AGENT, REPORTER_AGENT, ReporterOutput, cwes, EdgeTraversalOutput
-from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, is_path_excluded, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, scan_codebase_for_keywords, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, cache_validator, cache_integration_auditor, cache_reporter, reviewer_cache_key, cvss_v3_base_score, cvss_severity_label
+from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, is_path_excluded, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, scan_codebase_for_keywords, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, cache_validator, cache_integration_auditor, cache_reporter, reviewer_cache_key, is_feedback_review, cvss_v3_base_score, cvss_severity_label
 from boundary_edges import build_boundary_edges, cluster_boundary_edges, render_batch_prompt, boundary_batch_fingerprint, summarize_boundary_edges
 from tool_loop import CompactionConfig, ToolLoopAgent
 from dedup import Embeddings, cluster_vulnerabilities, deduplicate_demands
@@ -1983,14 +1983,19 @@ class ReviewerAgent(ToolLoopAgent):
     def pre_agent(self, state):
         if not state.get("messages"):
             report = state.get("expert_report", {})
-            cached_data = cache_reviewer(reviewer_cache_key(report, state.get("node_id", "Unknown")), report)
-            if cached_data:
-                logging.info("Reviewer cache hit.")
-                return Command(
-                    update={
-                        "vulnerabilities": [cached_data]
-                    }
-                )
+            # Feedback re-reviews are never served from cache: the same round-N
+            # flagged record is re-dispatched verbatim on every replay (checkpoint
+            # resume), so a content-hash cache would collapse each genuine
+            # re-answer into the earlier verdict without an LLM turn.
+            if not is_feedback_review(report):
+                cached_data = cache_reviewer(reviewer_cache_key(report, state.get("node_id", "Unknown")), report)
+                if cached_data:
+                    logging.info("Reviewer cache hit.")
+                    return Command(
+                        update={
+                            "vulnerabilities": [cached_data]
+                        }
+                    )
         return None
 
     def first_turn(self, state, llm_with_tools) -> dict:
@@ -2071,7 +2076,11 @@ class ReviewerAgent(ToolLoopAgent):
             f"without a submit_evaluation verdict (loop budget exceeded)."
         )
 
-        cache_reviewer(reviewer_cache_key(report, state.get("node_id", "Unknown")), report, updated_vuln)
+        # Feedback re-reviews are never cached (see pre_agent): writing one here
+        # would let a later replay of the same round-N request collapse into this
+        # verdict instead of genuinely re-answering the Validator.
+        if not is_feedback_review(report):
+            cache_reviewer(reviewer_cache_key(report, state.get("node_id", "Unknown")), report, updated_vuln)
 
         return Command(
             update={
