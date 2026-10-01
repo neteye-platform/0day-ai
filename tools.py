@@ -16,6 +16,7 @@ from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationT
 from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer
 from languages import MANIFEST_NAMES
 import settings
+import browser_tools
 
 
 @tool
@@ -582,6 +583,10 @@ def mark_validation_complete(
     # Inject the Validator's findings
     updated_vuln["poc_payload"] = kwargs.get("poc_payload")
     updated_vuln["execution_logs"] = kwargs.get("execution_logs")
+
+    # Close this validator's headless-browser sessions (per-agent, never
+    # touching other concurrently running validators' sessions).
+    browser_tools.manager.close_agent_sessions(state.get("agent_id"))
 
     tool_msg = ToolMessage(
         content="Validation complete. Ending validation phase.",

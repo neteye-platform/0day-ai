@@ -59,6 +59,10 @@ class ValidatorState(TypedDict):
     sandbox_url: Optional[str]     # The endpoint/IP of the sandbox
     container_name: Optional[str]  # The running sandbox container
     cookies: dict
+    # Unique per-validator id (uuid) used to namespace browser session ids, so
+    # concurrent validators sharing the single web browser never collide even
+    # if their LLM picks identical session labels.
+    agent_id: Optional[str]
     # Number of LLM invocations in the tool loop (same role as ReviewerState.iterations).
     iterations: Annotated[int, operator.add]
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]

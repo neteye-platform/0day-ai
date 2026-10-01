@@ -20,6 +20,7 @@ import uuid
 from languages import SYMBOL_QUERIES
 import settings
 import tools
+import browser_tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
 from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer
@@ -1727,7 +1728,8 @@ def dispatch_validators(state: MasterState):
             messages=[],
             iterations=0,
             vulnerabilities=[],
-            cookies={}
+            cookies={},
+            agent_id=uuid.uuid4().hex,
         )
         commands.append(Send("validator_agent", payload))
 
@@ -1752,6 +1754,11 @@ class ValidatorAgent(ToolLoopAgent):
             tools.send_http_request,
             # tools.list_files,
             # tools.read_sandbox_file,
+            browser_tools.browser_navigate,
+            browser_tools.browser_click,
+            browser_tools.browser_fill,
+            browser_tools.browser_evaluate,
+            browser_tools.browser_console,
             tools.mark_validation_complete
         ])
 
@@ -1786,14 +1793,21 @@ class ValidatorAgent(ToolLoopAgent):
     def session_state(self, state) -> dict:
         # Update cookies from the recent history (scans the raw, pre-compaction
         # history so compacted cookie-bearing responses are not missed).
+        # Both send_http_request (plain {name: value} artifact) and the browser
+        # tools (nested {"session_id", "cookies"} artifact) carry cookie jars,
+        # which lets the two channels stay in sync across the same validators.
         current_cookies = dict(state.get("cookies", {}))
         for msg in reversed(state["messages"]):
             if getattr(msg, "type", "") == "ai":
                 break
-            if getattr(msg, "type", "") == "tool" and getattr(msg, "name", "") == "send_http_request":
-                if hasattr(msg, "artifact") and msg.artifact:
-                    # Merge the new cookies into the current state
+            if getattr(msg, "type", "") == "tool" and hasattr(msg, "artifact") and msg.artifact:
+                name = getattr(msg, "name", "")
+                if name == "send_http_request":
                     current_cookies.update(msg.artifact)
+                elif name in browser_tools.BROWSER_TOOL_NAMES and isinstance(msg.artifact, dict):
+                    jar = msg.artifact.get("cookies") or {}
+                    if isinstance(jar, dict):
+                        current_cookies.update(jar)
         return {"cookies": current_cookies}
 
     def tool_batch_done(self, state) -> bool:
@@ -1815,6 +1829,10 @@ class ValidatorAgent(ToolLoopAgent):
         updated_vuln["execution_logs"] = (
             f"{existing_logs}\n{timeout_note}" if existing_logs else timeout_note
         )
+
+        # Close any headless-browser sessions this validator opened (same
+        # per-agent cleanup the terminal tool performs).
+        browser_tools.manager.close_agent_sessions(state.get("agent_id"))
 
         return Command(
             update={

@@ -16,6 +16,7 @@ from langgraph.types import RetryPolicy
 
 import settings
 import tools
+import browser_tools
 from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
 from reachability import reachability_filter_node
 from state import MasterState, ReviewerState, ValidatorState
@@ -80,6 +81,11 @@ def compile_validator():
         tools.send_http_request,
         tools.list_files,
         tools.read_sandbox_file,
+        browser_tools.browser_navigate,
+        browser_tools.browser_click,
+        browser_tools.browser_fill,
+        browser_tools.browser_evaluate,
+        browser_tools.browser_console,
         tools.mark_validation_complete
     ]))
     validator_workflow.add_edge(START, "validator_agent")
