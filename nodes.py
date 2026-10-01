@@ -451,7 +451,7 @@ def dispatch_cve_analyzers(state: MasterState):
 def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     """LLM node that extracts security assumptions from a single CVE description."""
     cve = state.get("cve", {})
-    package_name = ", ".join(cve.get("packages", []))
+    package_name = cve.get("package") or "unknown"
     cve_id = cve.get("id", "UNKNOWN-CVE")
     details = cve.get("details")
     if not details or len(details) == 0:
@@ -931,7 +931,7 @@ def reviewer_agent_node(state: ReviewerState) -> dict | Command:
         )
 
         if node_id:
-            target_node_source = get_node_code(node_id)
+            target_node_source = get_node_code(node_id, reviewer_mode=True)
             formatted_vuln += (
                 f"--- TARGET NODE SOURCE CODE ---\n"
                 f"```\n"

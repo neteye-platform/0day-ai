@@ -37,7 +37,7 @@ def read_source_code(node_id: str, reason_for_reading: str, current_state: str, 
                 if tc.get("name") == "read_source_code" and tc.get("args", {}).get("node_id") == node_id:
                     return f"System Notice: You have already read the source code for '{node_id}' in a previous step. The code is static and it will not change."
 
-    node_code = get_node_code(node_id)
+    node_code = get_node_code(node_id, reviewer_mode=True)
 
     if not node_code:
         return "Error: Could not extract code block."
