@@ -20,7 +20,7 @@ import settings
 import tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, VerifierState, ReviewerState, ValidatorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches
+from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches
 
 # fast_llm = ChatOllama(model="gemma4:cloud", temperature=0.2, reasoning=False, num_ctx=32768)
 # smart_llm = ChatOllama(model="gemma4:cloud", temperature=0.6, reasoning=False, num_ctx=32768)
@@ -419,7 +419,7 @@ def expert_explorer_node(state: ExplorerState) -> dict:
 
 def _explore_single(node_id: str, role_name: str) -> dict:
     # Check cache
-    cache_file = settings.cache_dir / "notes" / f"{node_id}-{role_name}.json"
+    cache_file = settings.cache_dir / "notes" / safe_cache_filename(f"{node_id}-{role_name}.json")
     cached_note = cache(cache_file, "read")
     if cached_note:
         return cached_note
@@ -494,7 +494,7 @@ def _explore_single(node_id: str, role_name: str) -> dict:
 def _explore_batch(node_ids: list[str], role_name: str) -> dict:
     # Deterministic cache key: sorted node ids joined by '__'
     batch_key = "__".join(sorted(node_ids))
-    cache_file = settings.cache_dir / "notes" / f"batch-{batch_key}-{role_name}.json"
+    cache_file = settings.cache_dir / "notes" / safe_cache_filename(f"batch-{batch_key}-{role_name}.json")
     cached_note = cache(cache_file, "read")
     if cached_note:
         return cached_note
