@@ -496,15 +496,6 @@ def _explore_single(node_id: str, role_name: str) -> dict:
     dict_note = note if isinstance(note, dict) else note.model_dump()
     dict_note["node_id"] = node_id
 
-    # Drop assumptions about the node under analysis
-    valid_assumptions = []
-    for assumption in dict_note.get("assumptions_to_verify", []):
-        if node_id == resolve_node_id(assumption.get("module"), assumption.get("symbol")):
-            continue # Drop it
-
-        valid_assumptions.append(assumption)
-    dict_note["assumptions_to_verify"] = valid_assumptions
-
     extracted_vulns = []
 
     # Extract hypotheses from the real 'vulns' key (kept in dict_note for later consumers)
@@ -590,15 +581,6 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
         node_id = dict_note.get("node_id")
         if not node_id:
             continue
-
-        # Drop assumptions about the node under analysis
-        valid_assumptions = []
-        for assumption in dict_note.get("assumptions_to_verify", []):
-            if node_id == resolve_node_id(assumption.get("module"), assumption.get("symbol")):
-                continue # Drop it
-
-            valid_assumptions.append(assumption)
-        dict_note["assumptions_to_verify"] = valid_assumptions
 
         # Extract hypotheses from the real 'vulns' key (kept in dict_note for later consumers)
         raw_hypotheses = dict_note.get("vulns", [])
@@ -1070,6 +1052,9 @@ def _route_downstream(demand: dict, current_node_id: str, graph_data: dict, grou
         module, symbol = clean_target, "unknown"
 
     if target_node_id := resolve_node_id(module, symbol):
+        if target_node_id == current_node_id:
+            # Drop assumptions about the node under analysis
+            return
         grouped_demands[target_node_id].append({
             "source": current_node_id,
             "type": "explorer_downstream_assumption",
