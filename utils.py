@@ -535,13 +535,97 @@ def find_container_builds(app_path: Path) -> list[tuple[str, Path]]:
     return [("dockerfile", d) for d in dockerfiles]
 
 
+def _image_exists(image: str) -> bool:
+    """True if a local docker image with the given tag exists."""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def _build_definition_hash(kind: str, path: Path) -> str:
+    digest = hashlib.md5()
+    digest.update(path.read_bytes())
+    if kind == "compose":
+        # Fold in any Dockerfiles under the compose directory so edits to the
+        # build context bust the reuse check too.
+        for candidate in sorted(p for p in path.parent.rglob("Dockerfile*") if p.is_file()):
+            if not _is_build_ignored(candidate):
+                digest.update(candidate.read_bytes())
+    return digest.hexdigest()
+
+
+def _build_hash_file(path: Path) -> Path:
+    return settings.cache_dir / "container_builds" / f"{_slugify_image(str(path))}.hash"
+
+
+def _build_definition_unchanged(kind: str, path: Path) -> bool:
+    try:
+        digest = _build_definition_hash(kind, path)
+    except OSError:
+        return False
+    stamp = _build_hash_file(path)
+    if not stamp.exists():
+        return False
+    try:
+        return stamp.read_text().strip() == digest
+    except OSError:
+        return False
+
+
+def _record_build_hash(kind: str, path: Path) -> None:
+    try:
+        stamp = _build_hash_file(path)
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(_build_definition_hash(kind, path))
+    except OSError:
+        pass
+
+
+def _compose_images(path: Path) -> list[str]:
+    """Derive the image names a compose file builds without building."""
+    result = subprocess.run(
+        ["docker", "compose", "-f", str(path), "config", "--images"],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        logging.error(f"docker compose config failed: {result.stderr}")
+        return []
+    images = [img.strip() for img in result.stdout.splitlines() if img.strip()]
+    if not images:
+        logging.error("docker compose config returned no images.")
+    # Compose emits build-only services (and unqualified `image:` refs)
+    # without a tag (e.g. "<project>-<service>"); osv-scanner rejects
+    # untagged references, so normalize them to :latest.
+    return [img if ":" in img else f"{img}:latest" for img in images]
+
+
 def build_images(kind: str, path: Path, tag: str) -> list[str]:
     """Build the container image(s) described by a compose file or Dockerfile.
 
     Returns the built image tag(s). On failure logs the error and returns [].
+    Unless ``settings.force_rebuild`` is set, images whose build definition
+    content is unchanged since the last recorded build are reused as-is (the
+    caller still scans/extracts artifacts from them).
     """
     try:
         if kind == "compose":
+            images = _compose_images(path)
+            if (
+                not settings.force_rebuild
+                and images
+                and all(_image_exists(img) for img in images)
+                and _build_definition_unchanged(kind, path)
+            ):
+                logging.info(f"Reusing existing compose image(s) {images} (build definition unchanged).")
+                return images
+
             build = subprocess.run(
                 ["docker", "compose", "-f", str(path), "build"],
                 capture_output=True,
@@ -550,24 +634,18 @@ def build_images(kind: str, path: Path, tag: str) -> list[str]:
             if build.returncode != 0:
                 logging.error(f"docker compose build failed: {build.stderr}")
                 return []
-            result = subprocess.run(
-                ["docker", "compose", "-f", str(path), "config", "--images"],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode != 0:
-                logging.error(f"docker compose config failed: {result.stderr}")
-                return []
-            images = [img.strip() for img in result.stdout.splitlines() if img.strip()]
-            if not images:
-                logging.error("docker compose config returned no images.")
-            # Compose emits build-only services (and unqualified `image:` refs)
-            # without a tag (e.g. "<project>-<service>"); osv-scanner rejects
-            # untagged references, so normalize them to :latest.
-            images = [img if ":" in img else f"{img}:latest" for img in images]
-            return images
+            _record_build_hash(kind, path)
+            return _compose_images(path)
 
         # Single Dockerfile build
+        if (
+            not settings.force_rebuild
+            and _image_exists(tag)
+            and _build_definition_unchanged(kind, path)
+        ):
+            logging.info(f"Reusing existing image {tag} (build definition unchanged).")
+            return [tag]
+
         build = subprocess.run(
             ["docker", "build", "-t", tag, "-f", str(path), str(path.parent)],
             capture_output=True,
@@ -576,6 +654,7 @@ def build_images(kind: str, path: Path, tag: str) -> list[str]:
         if build.returncode != 0:
             logging.error(f"docker build failed: {build.stderr}")
             return []
+        _record_build_hash(kind, path)
         return [tag]
 
     except FileNotFoundError:
