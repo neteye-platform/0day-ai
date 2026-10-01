@@ -17,15 +17,66 @@ from functools import lru_cache
 from languages import LANGUAGE_MAP, AST_GRAMMAR_MAP, SYMBOL_QUERIES, MANIFEST_NAMES
 
 
+def _is_manifest_node(node: dict) -> bool:
+    """True if a graph node belongs to a dependency manifest/lockfile.
+
+    Such files are already handled by the SCA layer (osv-scanner), so the LLM
+    stages (manager, explorers, reviewers, verifiers) should never spend budget
+    re-analyzing them. Matches on the node's ``source_file`` basename against
+    ``MANIFEST_NAMES``.
+    """
+    source_file = node.get("source_file")
+    if not source_file:
+        return False
+    return Path(source_file).name in MANIFEST_NAMES
+
+
+def _strip_links_to_dropped(graph_data: dict, dropped_ids: set) -> list:
+    """Return links whose source AND target both survive the graph filter."""
+    links = []
+    for edge in graph_data.get("links", []):
+        if edge.get("source") in dropped_ids or edge.get("target") in dropped_ids:
+            continue
+        links.append(edge)
+    return links
+
+
 @lru_cache(maxsize=1)
 def get_cached_graph_data(graph_path: Path):
-    """Caches the graph JSON in memory to prevent disk I/O bottlenecks."""
+    """Caches the graph JSON in memory to prevent disk I/O bottlenecks.
+
+    Dependency manifest/lockfile nodes (``MANIFEST_NAMES``) are dropped from the
+    returned graph entirely: they are already handled by the SCA layer, and the
+    LLM stages must not see them (they could mislead the manager, explorers, or
+    the reviewer). Their incident links are stripped too.
+    """
     try:
         with open(graph_path, "r") as f:
-            return json.load(f)
+            graph_data = json.load(f)
     except FileNotFoundError:
         logging.error(f"'{graph_path}' not found.")
         return {}
+
+    if not graph_data.get("nodes"):
+        return graph_data
+
+    dropped_ids = {
+        node.get("id")
+        for node in graph_data.get("nodes", [])
+        if node.get("id") and _is_manifest_node(node)
+    }
+    if not dropped_ids:
+        return graph_data
+
+    filtered = {
+        "nodes": [
+            node for node in graph_data.get("nodes", [])
+            if node.get("id") not in dropped_ids
+        ],
+        "links": [],
+    }
+    filtered["links"] = _strip_links_to_dropped(graph_data, dropped_ids)
+    return filtered
 
 
 def load_code_corpus() -> dict[str, str]:
@@ -283,9 +334,8 @@ def compact_tool_history(messages: list[AnyMessage], safe_window: int = 4, thres
 
 
 def resolve_node_id(module, symbol):
-    with open(settings.graph, "r") as f:
-        graph_data = json.load(f)
-        nodes_list = graph_data.get("nodes", [])
+    graph_data = get_cached_graph_data(settings.graph)
+    nodes_list = graph_data.get("nodes", [])
 
     # Sanitize Inputs
     # Handle cases where the LLM returns None, empty string, or "global"

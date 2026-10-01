@@ -19,7 +19,7 @@ LANGUAGE_MAP = {
 MANIFEST_NAMES = {
     # Python / Conda
     "requirements.txt", "requirements.in", "Pipfile", "Pipfile.lock",
-    "poetry.lock", "pyproject.toml", "setup.py", "setup.cfg",
+    "poetry.lock", "pyproject.toml",
     "environment.yml", "conda.yaml", "conda-lock.yml",
     # Node / JavaScript
     "package.json", "packages.json", "package-lock.json", "npm-shrinkwrap.json",

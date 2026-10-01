@@ -14,7 +14,8 @@ from docker.errors import NotFound, APIError
 import re
 
 from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationToolInput
-from utils import build_networkx_graph, cache, get_cached_symbol_index, get_node_code
+from utils import build_networkx_graph, cache, get_cached_graph_data, get_cached_symbol_index, get_node_code
+from languages import MANIFEST_NAMES
 import settings
 
 
@@ -283,15 +284,14 @@ def search_codebase(keyword: str, current_state: str, state: Annotated[dict, Inj
     """
     app_dir = Path(settings.app_path)
 
-    # Load the graph to map physical files to Node IDs
-    with open(settings.graph, "r") as f:
-        graph_data = json.load(f)
-        # Create a lookup dictionary: {"src/main.py": "node_123"}
-        file_to_node = {
-            n.get("source_file"): n.get("id")
-            for n in graph_data.get("nodes", [])
-            if n.get("source_file")
-        }
+    # Load the graph (manifest/dependency nodes already stripped centrally) to
+    # map physical files to Node IDs: {"src/main.py": "node_123"}
+    graph_data = get_cached_graph_data(settings.graph)
+    file_to_node = {
+        n.get("source_file"): n.get("id")
+        for n in graph_data.get("nodes", [])
+        if n.get("source_file")
+    }
 
     results = []
     match_count = 0
@@ -300,7 +300,10 @@ def search_codebase(keyword: str, current_state: str, state: Annotated[dict, Inj
 
     # Recursively search all files
     for file_path in app_dir.rglob("*"):
-        # Ignore hidden directories (like .git), pycache, and common heavy folders
+        # Ignore dependency manifest/lockfiles (handled by the SCA layer) plus
+        # hidden directories (like .git), pycache, and common heavy folders.
+        if file_path.is_file() and file_path.name in MANIFEST_NAMES:
+            continue
         if any((part.startswith('.') and not part.startswith('..')) or \
             part in ['venv', '__pycache__', 'node_modules', 'graphify-out'] for part in file_path.parts) or \
             not file_path.is_file():
