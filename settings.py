@@ -146,7 +146,10 @@ semantic_dedup_threshold = 0.80
 # on the E/LPE cores. Throughput on this box ~28 texts/s warm => a 13k pass
 # is minutes. The historical embedding outages were code bugs (parallel
 # chunk pile-ups + a fixed 300s budget burned before the fallback), fixed in
-# dedup.py, not a model-size problem.
+# dedup.py, not a model-size problem. If throughput ever collapses (single
+# text takes seconds while load is zero) the resident llama-server is wedged
+# — usually orphaned request backlogs left by force-killed runs — run
+# `ollama stop <model>` to respawn it (verified fix).
 embeddings_model = "embeddinggemma"
 embeddings_base_url = "http://localhost:11434"
 
@@ -171,8 +174,11 @@ dedup_max_merged_cluster = 25           # cap on cross-node cluster growth
 # component to keep each call's context focused. Fails open: a group whose
 # call errors/caps passes through un-deduplicated.
 dedup_agent_enabled = True
-dedup_agent_group_max = 50     # CWE groups larger than this split by root dir
-dedup_agent_max_group = 80     # hard cap of records per LLM call (further splits)
+dedup_agent_group_max = 50     # CWE groups larger than this get dir-ordered packing
+dedup_agent_max_group = 50     # hard cap of records per LLM call (chunk size);
+                               # 50 keeps prompts ~35-45k chars where cluster
+                               # recall was verified (the embedding pass has
+                               # already collapsed verbatim twins before this)
 dedup_agent_parallel = 4       # concurrent group calls
 dedup_agent_desc_chars = 900   # per-record description budget in the prompt
                                # (verifier "Fails to satisfy demand… Evidence:"

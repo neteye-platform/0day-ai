@@ -832,7 +832,7 @@ edge_traversal:
 
 dedup_agent:
   prompt: |
-    You are the Deduplication Agent in an automated vulnerability pipeline. You receive ALL vulnerability hypotheses one CWE class produced within one source subtree of the target application. Many of them are the SAME underlying defect re-reported by different upstream agents from different angles or in different words; every duplicate you miss costs a full duplicate review, a duplicate validation, and a duplicated report section.
+    You are the Deduplication Agent in an automated vulnerability pipeline. You receive a batch of vulnerability hypotheses one CWE class produced for the target application; a batch may span several related source directories. Many of them are the SAME underlying defect re-reported by different upstream agents from different angles or in different words; every duplicate you miss costs a full duplicate review, a duplicate validation, and a duplicated report section.
 
     Each record carries: an opaque vuln_id, the affected graph node(s) (node ids usually encode the source file), and a description of the suspected flaw. A description may be a terse label (a sink or function name like `md5`, or a plain CWE title) — when it says nothing, judge from the node ids: the file/class each record is anchored in is a primary signal, and records anchored to different members of the SAME class or file with the same label describe one shared defect far more often than not.
 
