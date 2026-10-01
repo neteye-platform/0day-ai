@@ -845,6 +845,9 @@ def run_osv_scanner_image(image: str) -> list[dict]:
         data = json.loads(result.stdout)
 
         for scan_result in data.get("results", []):
+            if scan_result.get("source", {}).get("type") == "os":
+                logging.debug("Skipping OS-package vulnerabilities from image scan.")
+                continue
             for package in scan_result.get("packages", []):
                 for vuln in package.get("vulnerabilities", []):
                     raw_vulnerabilities.append(vuln)
@@ -1392,6 +1395,9 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
         return None
 
     for vuln in vulns:
+        if not vuln.get("details"):
+            continue
+
         canonical_id = get_canonical_id(vuln)
         current_details = vuln.get("details", "")
         affected_packages = [affected.get("package", {}) for affected in vuln.get("affected", [])]
