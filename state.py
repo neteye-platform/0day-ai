@@ -93,6 +93,9 @@ class ValidatorState(TypedDict):
     # (each variant still flows through the vulnerabilities channel as its own
     # record — sharing only coalesces the validation runs, never the findings).
     validation_variants: Optional[list[dict]]
+    # Ledger id from dispatch_validators; the base router advances it on every
+    # terminal route so the run log tracks validator fan-out (turns included).
+    progress_id: str
     # Number of LLM invocations in the tool loop (same role as ReviewerState.iterations).
     iterations: Annotated[int, operator.add]
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
