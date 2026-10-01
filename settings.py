@@ -21,6 +21,19 @@ simple_agents_concurrency = 1
 reviewer_max_iterations = 10
 validator_max_iterations = 15
 
+# Reviewer context compaction (opencode-style). When the estimated token count
+# of the reviewer's message history reaches model_context_window minus
+# context_reserved, the middle of the conversation is collapsed into a prior
+# LLM-generated summary and the most recent verbatim tail is preserved. Token
+# estimates use the ~4 chars/token heuristic (utils.estimate_message_tokens).
+reviewer_model_context_window = 128000
+reviewer_context_reserved = 20000
+# Number of most-recent AI+tool interaction turns kept verbatim after compaction.
+reviewer_compaction_tail_turns = 2
+# Do not compact unless the compressible middle is worth at least this many
+# estimated tokens (avoids thrashing on tiny histories).
+reviewer_compaction_min_compressible_tokens = 8000
+
 
 graph = app_path / "graphify-out" / "graph.json"
 cache_dir = app_path / ".cache"
