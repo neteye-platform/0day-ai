@@ -103,6 +103,8 @@ class VulnerabilityRecord(BaseModel):
     @classmethod
     def validate_cwe(cls, value: str) -> str:
         # Clean up LLM formatting quirks (whitespace, lowercase)
+        if not value or not str(value).strip():
+            return "OTHER_UNCATEGORIZED"
         value = value.strip().upper()
         # Safely fallback if the LLM hallucinates an invalid CWE
         if value not in cwes:
@@ -150,6 +152,15 @@ class CVEDemand(BaseModel):
     import_namespace: str = Field(
         description="The actual module name used in the source code to import this package (e.g., if the package is 'beautifulsoup4', the import is 'bs4')."
     )
+    target_layer: Literal["global_configuration", "local_instantiation", "any"] = Field(
+        default="any",
+        description=(
+            "CRITICAL ARCHITECTURAL CLASSIFICATION:\n"
+            "- 'global_configuration': Use this for CVEs that require upgrading a package version, configuring application-wide settings (like Flask SECRET_KEY, SECRET_KEY_FALLBACKS, or global security middleware/headers). These must NEVER be assigned to local route handlers or business logic functions.\n"
+            "- 'local_instantiation': Use this ONLY for CVEs that require a local, per-object code fix (e.g., configuring a specific flag on an object like `HTMLExporter.embed_images=False`, or using a local parameterized query).\n"
+            "- 'any': Use only if the mitigation can exist anywhere."
+        )
+    )
 
 class VulnerabilityEvaluation(BaseModel):
     # report_id: str = Field(description="The unique identifier or title of the vulnerability report.")
@@ -193,12 +204,6 @@ class Hypothesis(BaseModel):
     component: str = Field(description="The exact parameter, state transition, or function call that is flawed.")
 
 class AnalysisNote(BaseModel):
-    """
-    Analysis note for the snippet.
-
-    CRITICAL SCHEMA RULE: If any list field (sources, sinks, upstream, downstream, vulns)
-    would be empty, omit the key entirely from the JSON output instead of returning [].
-    """
     sources: list[str] | None = Field(default=None, description="External data entering this snippet.")
     sinks: list[str] | None = Field(default=None, description="Dangerous operations performed with data.")
     upstream: list[UpstreamDemand] | None = Field(default=None)
@@ -219,7 +224,7 @@ class BatchedAnalysisNote(AnalysisNote):
 
 class BatchedAnalysisResult(BaseModel):
     notes: list[BatchedAnalysisNote] = Field(
-        description="One analysis note per node analyzed in this batch."
+        description="List of analysis notes. MUST contain one note per input node."
     )
 
 class DemandEvaluation(BaseModel):

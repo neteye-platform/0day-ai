@@ -3,16 +3,13 @@ import json
 import re
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
-from langchain_core.output_parsers import PydanticOutputParser
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.types import Command, Send
 from langgraph.graph import END
 from typing import Any
 from collections import defaultdict
-import networkx as nx
 import hashlib
 import logging
-from json_repair import repair_json
 
 from languages import SYMBOL_QUERIES
 import settings
@@ -21,14 +18,15 @@ from state import MasterState, ExplorerState, CVEAnalyzerState, VerifierState, R
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEDemand, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
 from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context
 
-# llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
+# fast_llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
+# smart_llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
 # Maximum combined code size (in chars) for a batched explorer dispatch.
 EXPLORER_BATCH_CHAR_THRESHOLD = 7500
 
 model = "deepseek-v4-flash"
 fast_llm = ChatOpenAI(base_url="http://localhost:11434/v1", model=model, stream_usage=True, temperature=0.0, max_retries=5, max_tokens=4096, reasoning_effort="none") # Used for explorer and cve_analyzer
-smart_llm = ChatOpenAI(base_url="http://localhost:11434/v1", model=model, stream_usage=True, temperature=0.0, max_retries=5, max_tokens=4096, reasoning_effort="none") # Used for explorer and cve_analyzer
-# smart_llm = ChatOpenAI(base_url="http://localhost:11434/v1", model=model, stream_usage=True, temperature=0.3, max_retries=5, max_tokens=8192, reasoning_effort="none")
+smart_llm = ChatOpenAI(base_url="http://localhost:11434/v1", model=model, stream_usage=True, temperature=0.3, max_retries=5, max_tokens=8192, reasoning_effort="none")
+# smart_llm = ChatOpenAI(base_url="http://localhost:11434/v1", model=model, stream_usage=True, temperature=0.0, max_retries=5, max_tokens=4096, reasoning_effort="none") # Used for explorer and cve_analyzer
 
 # ==========================================
 # Preprocessor
@@ -217,9 +215,14 @@ def dispatch_explorers(state: MasterState):
 
             files[node_data.get("source_file", "")].append(node_id)
 
-        # Pack each file's nodes into batches whose combined code size stays under the threshold.
+        # Pack each file's nodes into batches whose combined code size stays under the threshold,
+        # unless batching is disabled, in which case every node is its own dispatch.
         for file_path, file_nodes in files.items():
-            for batch in _pack_node_batches(file_nodes, EXPLORER_BATCH_CHAR_THRESHOLD):
+            if settings.explorer_batching_enabled:
+                batches = _pack_node_batches(file_nodes, EXPLORER_BATCH_CHAR_THRESHOLD)
+            else:
+                batches = [[node_id] for node_id in file_nodes]
+            for batch in batches:
                 payload = ExplorerState(
                     node_ids=batch,
                     role=task.get("agent_role", ""),
@@ -313,13 +316,13 @@ def _explore_single(node_id: str, role_name: str) -> dict:
 
     extracted_vulns = []
 
-    # Extract and remove the list from dict_note
-    raw_hypotheses = dict_note.pop("vulnerability_hypothesis", [])
+    # Extract hypotheses from the real 'vulns' key (kept in dict_note for later consumers)
+    raw_hypotheses = dict_note.get("vulns", [])
     for hyp in raw_hypotheses:
         extracted_vulns.append({
             "node_id": node_id,
-            "cwe_id": hyp.get("cwe_id", "OTHER_UNCATEGORIZED"), 
-            "description": hyp.get("description", ""),
+            "cwe_id": hyp.get("cwe", "OTHER_UNCATEGORIZED"),
+            "description": hyp.get("component", ""),
             "status": "hypothesis"
         })
 
@@ -405,13 +408,13 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
             valid_assumptions.append(assumption)
         dict_note["assumptions_to_verify"] = valid_assumptions
 
-        # Extract and remove the list from dict_note
-        raw_hypotheses = dict_note.pop("vulnerability_hypothesis", [])
+        # Extract hypotheses from the real 'vulns' key (kept in dict_note for later consumers)
+        raw_hypotheses = dict_note.get("vulns", [])
         for hyp in raw_hypotheses:
             extracted_vulns.append({
                 "node_id": node_id,
-                "cwe_id": hyp.get("cwe_id", "OTHER_UNCATEGORIZED"),
-                "description": hyp.get("description", ""),
+                "cwe_id": hyp.get("cwe", "OTHER_UNCATEGORIZED"),
+                "description": hyp.get("component", ""),
                 "status": "hypothesis"
             })
 
@@ -518,9 +521,199 @@ def build_import_map(graph_data: dict):
     return node_imports_map
 
 
+# File stems (basename without extension) whose whole-file skeleton represents an
+# application entry point / bootstrap. Language-agnostic: matches app.py, main.js,
+# server.go, __init__.py, index.tsx, factory.php, etc.
+_CONFIG_ENTRY_STEMS = {
+    "__init__", "app", "main", "index", "server",
+    "application", "config", "bootstrap", "factory",
+}
+
+# Rule 1: app/factory builder functions or classes (e.g. create_app, init_app,
+# make_application). Tokens are underscore-atomic and word-bounded.
+_APP_BUILDER_RE = re.compile(
+    r"\b(create|make|build|new|init|setup)_?(app|application|factory)\b|"
+    r"register_(blueprint|route|middleware)",
+    re.IGNORECASE,
+)
+
+# Rule 3: highly specific architectural role labels only. "app"/"index" are
+# deliberately excluded (reserved for the Rule 2 file-stem check). Matches
+# whole-word snake_case and CamelCase ("AppConfig") via word boundaries.
+_CONFIG_ROLE_RE = re.compile(
+    r"\b(middleware|server|bootstrap)\b|appconfig\b",
+    re.IGNORECASE,
+)
+
+
+def is_config_layer_node(node: dict) -> bool:
+    """True if the node represents an application factory, __init__ module, or
+    middleware/bootstrap configuration layer. Language- and framework-agnostic."""
+    label = node.get("label") or ""
+    source_file = Path(node.get("source_file") or "")
+
+    # Rule 1: app/factory builder function or class (e.g. create_app, init_app)
+    if _APP_BUILDER_RE.search(label):
+        return True
+
+    # Rule 3: architectural-role labels only (Middleware/Server/Bootstrap/AppConfig)
+    if _CONFIG_ROLE_RE.search(label):
+        return True
+
+    # Rule 2: entry file stem ONLY when this node is the whole-file skeleton itself.
+    # This prevents routing global demands to every helper inside main.py/app.py.
+    if label == source_file.name and source_file.stem.lower() in _CONFIG_ENTRY_STEMS:
+        return True
+
+    return False
+
+
+def _note_demands(dict_note: dict) -> list[dict]:
+    """Normalize an AnalysisNote into a flat list of unified demand dicts.
+
+    The explorer emits `upstream`/`downstream` (schema keys), each entry shaped
+    ``{"target": str, "description": str}``. Returns
+    ``{"direction": ..., "target": ..., "description": ...}`` dicts.
+    """
+    current_node_id = dict_note.get("node_id")
+    demands: list[dict] = []
+
+    for direction in ("upstream", "downstream"):
+        for entry in dict_note.get(direction, []) or []:
+            if not isinstance(entry, dict):
+                logging.warning(f"[{current_node_id}] NOTE DEMAND SKIP: malformed {direction} entry (not a dict): {entry!r}")
+                continue
+            demands.append({
+                "direction": direction,
+                "target": entry.get("target", ""),
+                "description": entry.get("description"),
+            })
+
+    return demands
+
+
+def _route_downstream(demand: dict, current_node_id: str, graph_data: dict, grouped_demands: defaultdict) -> None:
+    """Route a downstream demand to its resolved target node (callee)."""
+    target_str = demand.get("target", "")
+    desc = demand.get("description")
+
+    # STRIP LLM HALLUCINATIONS: Remove backticks, parentheses, and arguments
+    clean_target = re.sub(r'\(.*?\)', '', target_str).replace('`', '').strip()
+
+    # Handle correct `::` format, OR fallback to `module.symbol` dot notation
+    if "::" in clean_target:
+        module, symbol = clean_target.split("::", 1)
+    elif "." in clean_target:
+        module, symbol = clean_target.rsplit(".", 1)
+    else:
+        module, symbol = clean_target, "unknown"
+
+    if target_node_id := resolve_node_id(module, symbol):
+        grouped_demands[target_node_id].append({
+            "source": current_node_id,
+            "type": "explorer_downstream_assumption",
+            "description": desc
+        })
+    else:
+        logging.warning(f"[{current_node_id}] DOWNSTREAM DROP: Could not resolve '{module}' / '{symbol}' (Original: {target_str})")
+
+
+def _route_upstream(demand: dict, current_node_id: str, callers_map: dict, grouped_demands: defaultdict) -> None:
+    """Route an upstream demand to every caller of the current node."""
+    target_str = demand.get("target", "")
+    desc = demand.get("description")
+
+    callers = callers_map.get(current_node_id, [])
+    if callers:
+        for caller_id in callers:
+            grouped_demands[caller_id].append({
+                "source": current_node_id,
+                "type": "explorer_upstream_assumption",
+                "description": desc,
+                "parameter_name": target_str
+            })
+    else:
+        logging.warning(f"[{current_node_id}] UPSTREAM DROP: No callers found in graph for this node.")
+
+
+def _route_explorer_notes(notes: list, graph_data: dict, callers_map: dict, grouped_demands: defaultdict) -> list[dict]:
+    """Process explorer notes into grouped demands. Returns the updated notes."""
+    updated_notes = []
+
+    for note in notes:
+        dict_note = note if isinstance(note, dict) else note.model_dump()
+        current_node_id = dict_note.get("node_id")
+
+        for demand in _note_demands(dict_note):
+            direction = demand.get("direction")
+            if direction == "downstream":
+                _route_downstream(demand, current_node_id, graph_data, grouped_demands)
+            elif direction == "upstream":
+                _route_upstream(demand, current_node_id, callers_map, grouped_demands)
+            else:
+                logging.warning(f"[{current_node_id}] UNKNOWN DIRECTION: '{direction}'. Demand dropped.")
+
+        updated_notes.append(dict_note)
+
+    return updated_notes
+
+
+def _cve_candidates(target_layer: str, node_by_id: dict, node_imports_map: dict) -> list:
+    if target_layer == "global_configuration":
+        return [
+            nid for nid, nd in node_by_id.items()
+            if is_config_layer_node(nd) and nid in node_imports_map
+        ]
+    return list(node_imports_map.keys())
+
+
+def _cve_matches(nid: str, target_import: str, target_layer: str, node_imports_map: dict) -> bool:
+    imports = node_imports_map[nid]
+    if target_import not in imports:
+        return False
+    # local_instantiation requires strict AST usage of the namespace;
+    # global_configuration and any route on the import alone.
+    if target_layer == "local_instantiation":
+        return uses_namespace_in_ast(nid, target_import)
+    return True
+
+
+def _process_cve_demands(cves: list, node_imports_map: dict, graph_data: dict, grouped_demands: defaultdict) -> None:
+    """Route CVE demands to nodes that import the affected namespace."""
+    node_by_id = {n["id"]: n for n in graph_data.get("nodes", [])}
+
+    for demand in cves:
+        target_import = demand.get("import_namespace", "")
+        source_cve = demand.get("source_cve", "unknown")
+
+        combined_desc = (
+            f"Security Context: {demand.get('security_assumption')} | "
+            f"Trigger: {demand.get('trigger_condition')}"
+        )
+
+        # Route per target_layer. Default to "any" so older cache entries that
+        # predate target_layer keep their previous (broad) routing behavior.
+        target_layer = demand.get("target_layer", "any")
+
+        matched_any = False
+        for node_id in _cve_candidates(target_layer, node_by_id, node_imports_map):
+            if _cve_matches(node_id, target_import, target_layer, node_imports_map):
+                grouped_demands[node_id].append({
+                    "source": source_cve,
+                    "type": "cve_assumption",
+                    "description": combined_desc,
+                    "target_layer": target_layer,
+                })
+                matched_any = True
+            else:
+                logging.info(f"[{node_id}] CVE SKIP: '{target_import}' not routed for layer='{target_layer}'.")
+
+        if not matched_any:
+            logging.warning(f"[CVE DROP] {source_cve} for '{target_import}' (layer='{target_layer}') matched 0 nodes in the graph.")
+
+
 def aggregate_demands_node(state: MasterState):
     grouped_demands = defaultdict(list)
-    updated_notes = []
 
     graph_data = get_cached_graph_data(settings.graph)
     callers_map = build_caller_map(graph_data)
@@ -532,101 +725,10 @@ def aggregate_demands_node(state: MasterState):
     logging.info(f"Processing {len(notes)} notes and {len(cves)} CVE demands.")
 
     # Process Explorer Notes
-    for note in notes:
-        dict_note = note if isinstance(note, dict) else note.model_dump()
-        current_node_id = dict_note.get("node_id")
-        demands = dict_note.setdefault("demands", [])
-
-        has_source = any(
-            isinstance(iface, str) and (iface.upper().startswith("[SOURCE]") or iface.lower().startswith("source"))
-            for iface in dict_note.get("business_interfaces", [])
-        )
-
-        # Convert localized vulnerabilities into upstream demands
-        if not has_source and dict_note.get("vulnerability_hypotheses"):
-            vulns = dict_note.pop("vulnerability_hypotheses")
-            logging.info(f"[{current_node_id}] Treated as internal sink. Converting {len(vulns)} vulnerabilities into upstream demands.")
-            
-            for vuln in vulns:
-                demands.append({
-                    "direction": "upstream",
-                    "target": "context (auto-converted internal sink)",
-                    "description": f"Must prevent {vuln.get('cwe_id')} at {vuln.get('vulnerable_component')}"
-                })
-            dict_note["vulnerability_hypotheses"] = []
-
-        # Process the unified SecurityDemand objects
-        for demand in demands:
-            direction = demand.get("direction")
-            target_str = demand.get("target", "")
-            desc = demand.get("description")
-
-            if direction == "downstream":
-                # STRIP LLM HALLUCINATIONS: Remove backticks, parentheses, and arguments
-                clean_target = re.sub(r'\(.*?\)', '', target_str).replace('`', '').strip()
-
-                # Handle correct `::` format, OR fallback to `module.symbol` dot notation
-                if "::" in clean_target:
-                    module, symbol = clean_target.split("::", 1)
-                elif "." in clean_target:
-                    module, symbol = clean_target.rsplit(".", 1)
-                else:
-                    module, symbol = clean_target, "unknown"
-
-                if target_node_id := resolve_node_id(module, symbol):
-                    grouped_demands[target_node_id].append({
-                        "source": current_node_id,
-                        "type": "explorer_downstream_assumption",
-                        "description": desc
-                    })
-                else:
-                    logging.warning(f"[{current_node_id}] DOWNSTREAM DROP: Could not resolve '{module}' / '{symbol}' (Original: {target_str})")
-
-            elif direction == "upstream":
-                # DEBUG: Check if incoming edges are missing
-                callers = callers_map.get(current_node_id, [])
-                if callers:
-                    for caller_id in callers:
-                        grouped_demands[caller_id].append({
-                            "source": current_node_id,
-                            "type": "explorer_upstream_assumption",
-                            "description": desc,
-                            "parameter_name": target_str
-                        })
-                else:
-                    logging.warning(f"[{current_node_id}] UPSTREAM DROP: No callers found in graph for this node.")
-                    
-            else:
-                logging.warning(f"[{current_node_id}] UNKNOWN DIRECTION: '{direction}'. Demand dropped.")
-
-        updated_notes.append(dict_note)
+    updated_notes = _route_explorer_notes(notes, graph_data, callers_map, grouped_demands)
 
     # Process CVE Demands
-    for demand in cves:
-        target_import = demand.get("import_namespace", "")
-        source_cve = demand.get("source_cve", "unknown")
-
-        combined_desc = (
-            f"Security Context: {demand.get('security_assumption')} | "
-            f"Trigger: {demand.get('trigger_condition')}"
-        )
-
-        matched_any = False
-        for node_id, imports in node_imports_map.items():
-            if target_import in imports:
-                # DEBUG: Check if AST strict matching is rejecting the import
-                if uses_namespace_in_ast(node_id, target_import):
-                    grouped_demands[node_id].append({
-                        "source": source_cve,
-                        "type": "cve_assumption",
-                        "description": combined_desc
-                    })
-                    matched_any = True
-                else:
-                    logging.info(f"[{node_id}] CVE SKIP: '{target_import}' found in imports but uses_namespace_in_ast() returned False.")
-
-        if not matched_any:
-            logging.warning(f"[CVE DROP] {source_cve} for '{target_import}' matched 0 nodes in the graph.")
+    _process_cve_demands(cves, node_imports_map, graph_data, grouped_demands)
 
     # Log the accurate total by summing the lengths of the lists
     total_demands = sum(len(d) for d in grouped_demands.values())

@@ -177,7 +177,6 @@ expert_agents:
     ```
 
     Expected Output:
-    ```json
     {
       "sources": [
         "req.body"
@@ -197,7 +196,6 @@ expert_agents:
       ],
       "vulns": []
     }
-    ```
 
     Input Snippet:
     ```python
@@ -212,7 +210,6 @@ expert_agents:
     ```
 
     Expected Output:
-    ```json
     {
       "sources": [],
       "sinks": [
@@ -232,7 +229,6 @@ expert_agents:
         }
       ]
     }
-    ```
   WebSurfaceAuditor:
     prompt: You are an expert in HTTP abstractions, routing, middleware gates, and input contexts.
   LogicFlowAuditor:
@@ -255,6 +251,9 @@ cve_analyzer:
     - If the vulnerability detonates immediately upon calling the vulnerable function, state "Immediate execution upon calling [Function]".
     - If the CVE description is vague and lacks technical details about the execution sink, DO NOT hallucinate or guess based on outside knowledge. Leave the trigger_condition empty.
 
+    CRITICAL RULE 3: Enforcing Explicit Proof for Defaults
+    If the CVE states that a vulnerability exists in a library's default behavior, configuration, or preprocessor, the demand MUST say that the absence of explicit mitigation is a failure.
+
     Example Input 1 (Direct Function Vulnerability):
     In PyYAML before 5.1, the yaml.load() API allows execution of arbitrary Python commands, resulting in remote code execution if untrusted data is parsed.
 
@@ -262,7 +261,8 @@ cve_analyzer:
     {
       "security_assumption": "The application must not use yaml.load() to parse untrusted data; it must use yaml.safe_load() instead.",
       "trigger_condition": "Immediate execution upon calling yaml.load() with untrusted data.",
-      "import_namespace": "yaml"
+      "import_namespace": "yaml",
+      "target_layer": "local_instantiation"
     }
 
     Example Input 2 (Internal Class / Configuration Vulnerability):
@@ -272,13 +272,36 @@ cve_analyzer:
     {
       "security_assumption": "The application must explicitly mitigate XXE by initializing the XML parser with the `resolve_entities=False` configuration before parsing untrusted XML data.",
       "trigger_condition": "Immediate execution upon parsing the untrusted XML string with the vulnerable parser instance.",
-      "import_namespace": "lxml"
+      "import_namespace": "lxml",
+      "target_layer": "local_instantiation"
+    }
+
+    Example 3 (Default Library Behavior / Implicit States - Java XXE):
+    In the Java standard library, the default configuration for `javax.xml.parsers.DocumentBuilderFactory` allows the resolution of XML External Entities (XXE). If an application parses untrusted XML data without altering this default state, it is vulnerable to local file disclosure and SSRF. Workaround: The caller must explicitly call `setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)` on the factory instance.
+
+    Example Output 3:
+    {
+      "security_assumption": "The application must explicitly mitigate XXE by setting the 'disallow-doctype-decl' feature (or equivalent) to true on the DocumentBuilderFactory instance. Because the factory resolves external entities by default, if explicit code disabling DOCTYPEs or entity resolution is not visibly present in the local target node, this assumption MUST be marked as FAILED.",
+      "trigger_condition": "Immediate execution upon calling the 'parse()' method on the untrusted XML input.",
+      "import_namespace": "javax.xml.parsers",
+      "target_layer": "local_instantiation"
+    }
+
+    Example Input 4 (PHP Framework - Global Configuration):
+    In Laravel, if `app.debug` is left enabled in production, uncaught exceptions display detailed error pages containing sensitive environment variables and database credentials. Workaround: Ensure `APP_DEBUG` is explicitly set to false in the global configuration files.
+
+    Example Output 4:
+    {
+      "security_assumption": "The application must disable debug mode by setting 'app.debug' to false in the global configuration to prevent sensitive information disclosure.",
+      "trigger_condition": "Immediate execution upon encountering an application exception while debug mode is enabled.",
+      "import_namespace": "config",
+      "target_layer": "global_configuration"
     }
 contract_verifier_agent:
   prompt: |
     You are a strict security contract verifier. Your ONLY job is to evaluate if the provided source code successfully fulfills specific security demands required by upstream callers or dependencies. Do not look for other vulnerabilities. Evaluate the logic in the code and set the `status` field in your JSON output strictly to MET, FAILED, DELEGATED, or OUT_OF_SCOPE. If the demand describes a responsibility that clearly belongs to a different layer of the application (e.g., expecting a database helper to handle HTTP cookies, or a basic auth decorator to handle key rotation), set the status to OUT_OF_SCOPE.
 
-    Assume Framework Integrity: Do not generate vulnerability hypotheses about the inherent security of standard framework objects. Only generate hypotheses about how the developer explicitly manipulates data in the visible code.
+    Assume Framework Integrity: Do not generate vulnerability hypotheses about the inherent security of standard framework objects UNLESS a specific demand dictates that a secure configuration or flag is required for that object. Only generate hypotheses about how the developer explicitly manipulates data in the visible code.
 
     CRITICAL EVALUATION RULES:
     1. Trust Omitted Helpers (The Delegation Rule): In our architecture, EVERY helper function is strictly evaluated by another dedicated agent. If the snippet explicitly passes untrusted data to a dedicated validation or sanitization function before reaching the sink, you MUST set the status to DELEGATED.
@@ -287,6 +310,94 @@ contract_verifier_agent:
     2. No Privilege Substitutions: Do not accept access control (authentication, admin checks, feature flags) as a substitute for data-level mitigation. Restricting access to a vulnerable function does not fix the underlying vulnerability.
     3. No Fragile Mitigations: Do not set status to MET if the mitigation relies on easily bypassed methods, such as custom regular expressions, blacklisting (e.g., blocking ../), or naive string replacement.
     4. Standard of Proof: To set status to MET, the visible code must either use standard, secure-by-default mechanisms (e.g., parameterized queries, strict allow-lists, or established cryptographic libraries) OR explicitly delegate the data to a helper function. If the code attempts validation itself but does so weakly, set status to FAILED.
+    5. Wrong Architectural Layer: If the demand requires a global framework configuration (e.g., setting global Cache-Control headers, or configuring Flask SECRET_KEY_FALLBACKS) and the snippet is merely a localized route or helper that happens to touch the session, set status to OUT_OF_SCOPE. Global mitigations do not belong in local route logic.
+
+    EXAMPLE 1
+    Code Snippet:
+    ```python
+    import yaml
+    def parse_config(user_input):
+        return yaml.load(user_input)
+    ```
+    Demand: [ID: demand1] The application must not use yaml.load() to parse untrusted data; it must use yaml.safe_load() instead.
+
+    Expected Output:
+    {
+      "evaluations": [
+        {
+          "demand_id": "demand1",
+          "status": "FAILED",
+          "reasoning": "The code explicitly calls yaml.load() on `user_input` in plain sight on line 3, which violates the demand.",
+          "cwe_id": "CWE-502"
+        }
+      ]
+    }
+
+    EXAMPLE 2: DELEGATED (Omitted Helper)
+    Code Snippet:
+    ```javascript
+    function processPayment(req, res) {
+        const validatedBody = schemaValidator(req.body);
+        db.query(`INSERT INTO payments (amount) VALUES (${validatedBody.amount})`);
+    }
+    ```
+    Demand: [ID: demand2] The request body must be schema-validated by middleware before reaching this route to ensure 'amount' and 'currency' exist.
+
+    Expected Output:
+    {
+      "evaluations": [
+        {
+          "demand_id": "demand2",
+          "status": "DELEGATED",
+          "reasoning": "The untrusted data `req.body` is passed to the custom helper `schemaValidator()` before hitting the SQL query on line 3. The implementation of `schemaValidator` is omitted, so it is delegated to a peer agent.",
+          "cwe_id": null
+        }
+      ]
+    }
+
+    EXAMPLE 3: MET (Standard Secure Mechanism)
+    Code Snippet:
+    ```python
+    def get_user(user_id):
+        cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+        return cursor.fetchone()
+    ```
+    Demand: [ID: demand3] The database query must be protected against SQL injection using parameterized queries.
+
+    Expected Output:
+    {
+      "evaluations": [
+        {
+          "demand_id": "demand3",
+          "status": "MET",
+          "reasoning": "The code uses a standard parameterized query `(%s, (user_id,))` on line 2, which securely neutralizes the SQL injection threat.",
+          "cwe_id": null
+        }
+      ]
+    }
+
+    EXAMPLE 4: OUT_OF_SCOPE (Wrong Architectural Layer)
+    Code Snippet:
+    ```python
+    @app.route('/dashboard')
+    def dashboard():
+        user_id = session.get("user_id")
+        return render_template("dash.html")
+    ```
+    Demand: [ID: demand4] The application must explicitly set a Cache-Control: private header on responses accessing the session to prevent caching.
+
+    Expected Output:
+    {
+      "evaluations": [
+        {
+        "demand_id": "demand4",
+        "status": "OUT_OF_SCOPE",
+        "reasoning": "The snippet is a localized route that reads the session, but setting global Cache-Control headers for session management is an architectural framework concern. It is out of scope for this individual route handler.",
+        "cwe_id": null
+        }
+      ]
+    }
+
 reviewer_agent:
   prompt: |
     You are the Reviewer Agent in an automated vulnerability discovery pipeline. Your goal is to filter out false positives by attempting to build a concrete, undeniable exploit path for hypothesized vulnerabilities.
