@@ -698,6 +698,10 @@ def is_feedback_review(report: Optional[dict]) -> bool:
 # Merge ladder: higher rank wins on vuln_id collision. "chained" ranks above
 # "confirmed" (auditor proved the record joins a multi-step exploit) but below
 # "exploitable" (a validator PoC outranks the auditor's static chain proof).
+# "insufficient_context" ranks above "chained": the Validator's ask must DISPLACE
+# the auditor's intermediate "chained" status (a tie used to discard the ask AND
+# its bumped review_round, so the record stayed "chained" forever and
+# route_integration_audit re-dispatched it on every wave — a livelock).
 # "unchainable" is a terminal auditor verdict that stays in the report, like
 # "false_positive".
 _STATUS_PRIORITY = {
@@ -705,11 +709,11 @@ _STATUS_PRIORITY = {
     "review_error": 1,
     "confirmed": 2,
     "chained": 3,
-    "insufficient_context": 3,
-    "exploitable": 4,
-    "false_positive": 5,
-    "unchainable": 5,
-    "proven": 5,
+    "insufficient_context": 4,
+    "exploitable": 5,
+    "false_positive": 6,
+    "unchainable": 6,
+    "proven": 6,
 }
 
 

@@ -28,9 +28,17 @@ def dispatch_integration_audits(state: MasterState):
     (utils.boundary_deferred): a server-side boundary shift may only pay off
     chained with proven peers, so the CVSS gate does not cancel its audit."""
     all_vulns = as_dicts(state.get("vulnerabilities", []))
-    gated, pending = [], []
+    gated, pending, audited_once = [], [], []
     for v in all_vulns:
         if v.get("status") != "confirmed":
+            continue
+        if v.get("integration_audit_reasoning"):
+            # Every audit outcome stamps reasoning on the record (submit, the
+            # revoked boundary-unchainable note, the zero-peer resolution and
+            # the timeout fallback). A CONFIRMED record carrying it was already
+            # audited this scan — re-pending it would ping-pong the same
+            # verdict (revoke -> re-audit -> revoke) on every validator wave.
+            audited_once.append(v)
             continue
         strategy = v.get("validation_strategy") or "direct_to_validator"
         if strategy not in ("direct_to_validator", "requires_integration"):
@@ -55,6 +63,11 @@ def dispatch_integration_audits(state: MasterState):
             f"{v.get('vuln_id')} CVSS estimate {v.get('cvss_vector')} below gate "
             f"threshold {settings.validator_min_cvss} — integration audit skipped, "
             f"will be reported unvalidated."
+        )
+    for v in audited_once:
+        logging.info(
+            f"{v.get('vuln_id')} already audited for chaining this scan — not "
+            f"re-audited; staying 'confirmed' with its banked audit verdict."
         )
     proven = [v for v in all_vulns if v.get("status") == "exploitable"]
     logging.info(
