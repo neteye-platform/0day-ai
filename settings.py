@@ -21,7 +21,8 @@ graph = app_path / "graphify-out" / "graph.json"
 cache_dir = app_path / ".cache"
 
 # None = all
-communities_to_analyze = None # [32, 33, 54, 61]
+communities_to_analyze = None
+#communities_to_analyze = [3, 104] # [32, 33, 54, 61]
 
 # Path patterns (relative to app root) skipped before analysis and blocked from
 # reviewer file reads; globs and bare dir names supported.
@@ -33,15 +34,15 @@ scan_exclude_defaults = True
 # ========================== Model / LLM settings ==========================
 
 llm_base_url = "http://localhost:11434/v1"
-llm_model = "deepseek-v4-flash"
+llm_model = "qwen3-8-flash-next"
 llm_api_key = os.environ.get("OPENAI_API_KEY")
 # llm_base_url = "http://localhost:11434/v1"
-# llm_model = "nemotron-3-ultra:cloud"
+# llm_model = "nemotron-3-super:cloud"
 # llm_api_key = "ollama"
 
 # Single context-window size shared by the reviewer, validator, and integration
 # auditor (their compaction hard caps derive from it).
-model_context_window = 131072
+model_context_window = 250112
 
 # Single fixed output budget for EVERY LLM call in the pipeline — fast
 # structured JSON (explorer, CVE analyzer, threat-intel, contract verifier),
@@ -52,7 +53,7 @@ llm_max_completion_tokens = 16384
 
 # =============================== Agents ==================================
 
-agents_concurrency = 4
+agents_concurrency = 1
 
 # Reviewer/validator loop caps: if the terminal tool isn't called within this many
 # LLM rounds, the loop ends via the fallback node instead of hitting the recursion
@@ -133,11 +134,18 @@ browser_idle_timeout_sec = 600
 
 # Kali attacker container (run_command/write_attacker_file/read_attacker_file),
 # started lazily on the default bridge network; the sandbox is reachable at the
-# bridge gateway so all validator tools share one target URL. Fails open.
+# bridge gateway so all validator tools share one target URL. Each validator
+# gets its OWN container (named "<attacker_container_name>-<agent_id>") whose
+# "/work" is a bind mount of that validator's host directory under the cache,
+# so PoC files never leak between validators nor accumulate across runs. Fails
+# open.
 attacker_enabled = True
+# Shared, hash-cached image (built once, used by every validator container).
 attacker_image_tag = "vulnscan-kali-attacker:latest"
+# Container-name PREFIX; the per-validator container is "<name>-<agent_id>".
 attacker_container_name = "vulnscan-kali-attacker"
-# Confined working tree for validator shell activity.
+# Container mount point for the per-validator host dir
+# (<cache_dir>/validator/<agent_id>).
 attacker_workdir = "/work"
 # Per-command cap; image build has its own generous timeout.
 attacker_command_timeout = 60
