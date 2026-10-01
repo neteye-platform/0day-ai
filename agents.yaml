@@ -129,6 +129,12 @@ expert_agents:
     3. DOWNSTREAM ASSUMPTIONS (Demands on the Callee): When this snippet calls an external/unseen function, what MUST that function do securely? Leave empty if there are no security-related downstream assumptions.
     4. LOCAL VULNERABILITY HYPOTHESES (Visible Dangers): Create a `vulnerability_hypothesis` ONLY if a flaw is explicitly visible in the current snippet (e.g., raw SQL formatting, plaintext secrets).
 
+    NOISE REDUCTION RULES (STRICTLY ENFORCED):
+    1. WRAPPERS VS. ENTRY POINTS: If a snippet receives data via function parameters and passes it to a sink, DO NOT flag a vulnerability. Instead, create an `upstream` demand for the caller. A `vulnerability_hypothesis` MUST ONLY be created if the ingestion of untrusted data (e.g., fetching an HTTP parameter, reading an external file) AND the dangerous sink are BOTH explicitly visible in the same snippet.
+    2. PARAMETERIZED SINKS: Do not flag sinks that use structurally safe, parameterized data passing (e.g., passing OS commands as an array/list of arguments, using bound variables in SQL). Only flag explicit dangerous patterns, such as string concatenation, interpolation, or explicitly enabling unsafe execution flags (e.g., shell mode).
+    3. THIRD-PARTY LIBRARIES: Do not attempt to guess or hallucinate zero-days or known CVEs inside third-party dependencies. Assume imported libraries function securely unless the snippet explicitly implements an insecure configuration (e.g., disabling TLS verification, disabling CSRF protections). 
+    4. TYPE & FRAMEWORK SAFETY: Do not flag path traversals, overflows, or injections on data that is strongly typed (e.g., standard UUIDs, integers) or defined by internal framework constants, unless you explicitly see the snippet unsafely casting untrusted strings into those types.
+
     ALLOWED CWE LIST
     You must classify vulnerabilities using ONLY the following CWEs. If none fit, use "OTHER_UNCATEGORIZED":
     - CWE-119: Improper Restriction of Operations within the Bounds of a Memory Buffer
@@ -181,7 +187,6 @@ expert_agents:
       "sources": [
         "req.body"
       ],
-      "sinks": [],
       "upstream": [
         {
           "target": "req",
@@ -193,8 +198,7 @@ expert_agents:
           "target": "paymentService::processPayment",
           "description": "Must enforce authorization checks to ensure the current session is allowed to process a payment."
         }
-      ],
-      "vulns": []
+      ]
     }
 
     Input Snippet:
@@ -211,17 +215,9 @@ expert_agents:
 
     Expected Output:
     {
-      "sources": [],
       "sinks": [
         "open()"
       ],
-      "upstream": [
-        {
-          "target": "filename",
-          "description": "Must be strictly sanitized to reject directory traversal sequences (e.g., '../') and null bytes."
-        }
-      ],
-      "downstream": [],
       "vulns": [
         {
           "cwe": "CWE-22",
