@@ -21,7 +21,7 @@ class MasterState(TypedDict):
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
 
     # Per-vulnerability reporter outputs (one dict per reportable record,
-    # assembled into report.md by report_assembler_node). Append-reduced since
+    # assembled into the report dir by report_assembler_node). Append-reduced since
     # the reporter fan-out writes them concurrently.
     reporter_findings: Annotated[list[dict], operator.add]
 

@@ -200,6 +200,7 @@ class VulnerabilityRecord(BaseModel):
 
     # Validator additions
     poc_payload: Optional[str] = None
+    poc_script: Optional[str] = None
     execution_logs: Optional[str] = None
 
     # Integration Auditor additions
@@ -624,6 +625,15 @@ class EvaluationToolInput(BaseModel):
 class ValidationToolInput(BaseModel):
     is_confirmed: bool = Field(description="True if the exploit successfully triggered in the sandbox.")
     poc_payload: Optional[str] = Field(description="The exact payload, script, or HTTP request that triggered the vulnerability.")
+    poc_script: Optional[str] = Field(
+        default=None,
+        description=(
+            "When the proof is a script you wrote with write_attacker_file: path of "
+            "that complete, runnable PoC script RELATIVE TO YOUR WORKDIR (e.g. "
+            "'main.py' or 'pocs/exploit.py'). The final report ships this script to "
+            "the human reader. Leave unset for pure single-request proofs."
+        )
+    )
     execution_logs: str = Field(description="Relevant logs or output from the sandbox confirming the exploit.")
 
 

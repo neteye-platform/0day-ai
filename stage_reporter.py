@@ -1,12 +1,16 @@
-"""Reporter stage: single-shot per-vulnerability findings + final report.md assembly."""
+"""Reporter stage: single-shot per-vulnerability findings + final timestamped
+report directory (report.pdf + bundled poc/ scripts) assembly."""
 
 import logging
+import re
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Send
+from markdown_it import MarkdownIt
+from weasyprint import HTML
 
 import settings
 from llms import smart_llm
@@ -188,14 +192,30 @@ def _build_pipeline_statistics(state: MasterState) -> str:
     return "\n".join(lines)
 
 
+def _step_block(index: int, step: str) -> list[str]:
+    """One numbered step as markdown lines. A step embedding a fenced code
+    block is indented so the fence nests INSIDE the numbered list item
+    (CommonMark needs the 3-space content indent) instead of terminating it."""
+    text = strip_step_numbering(step)
+    lines = text.splitlines()
+    if not lines or "```" not in text:
+        return [f"{index}. {text}"]
+    out = [f"{index}. {lines[0]}"]
+    out += ["   " + line if line else "" for line in lines[1:]]
+    return out
+
+
 def _render_report_markdown(
     records: list[dict],
     findings_by_id: dict[str, dict],
     statistics: str | None = None,
+    poc_files: dict[str, str] | None = None,
 ) -> str:
-    """Assemble report.md from the reporter findings (summary + rewritten
-    steps). Raw description/reviewer_reasoning/poc_payload/execution_logs are
-    deliberately NOT written out — the reporter distilled them."""
+    """Assemble the report markdown (summary + rewritten steps) that
+    _write_report renders to PDF. poc_files maps vuln_id -> the PoC script
+    filename _copy_poc_scripts delivered into <report_dir>/poc/. Raw
+    description/reviewer_reasoning/poc_payload/execution_logs are deliberately
+    NOT written out — the reporter distilled them."""
     rows = []
     for record in records:
         finding = findings_by_id.get(record.get("vuln_id")) or {}
@@ -254,13 +274,17 @@ def _render_report_markdown(
             lines.append(f"**Source CVE:** {record['source_cve']}")
         if record.get("confidence_score") is not None:
             lines.append(f"**Audit confidence:** {record['confidence_score']}/10")
+        poc_file = (poc_files or {}).get(record.get("vuln_id"))
+        if poc_file:
+            lines.append(f"**PoC script:** `poc/{poc_file}`")
 
         summary = finding.get("summary") or record.get("description") or "_none_"
         steps = finding.get("reproduction_steps") or record.get("reproduction_steps") or []
         lines += ["", "#### Summary", "", str(summary).rstrip()]
         lines += ["", "#### Reproduction steps", ""]
         if steps:
-            lines += [f"{j}. {strip_step_numbering(s)}" for j, s in enumerate(steps, 1)]
+            for j, step in enumerate(steps, 1):
+                lines += _step_block(j, step)
         else:
             lines.append("_No reproduction steps available._")
         lines += ["", "#### Worst-case impact", ""]
@@ -297,18 +321,58 @@ def _render_empty_report(statistics: str | None = None) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _write_report(path: Path, text: str) -> None:
+_MD = MarkdownIt("commonmark").enable("table")
+
+_PDF_CSS = """
+@page { size: A4; margin: 18mm 16mm;
+        @bottom-center { content: counter(page) " / " counter(pages);
+                         font-size: 8pt; color: #888; } }
+body { font-family: "DejaVu Sans", sans-serif; font-size: 9.5pt;
+       line-height: 1.45; color: #1a1a1a; }
+h1 { font-size: 17pt; margin-bottom: 2mm; }
+h2 { font-size: 13pt; color: #0f3b5c; border-bottom: 1px solid #d0d7de;
+     padding-bottom: 1mm; margin-top: 6mm; }
+h3 { font-size: 11.5pt; margin-top: 5mm; }
+h4 { font-size: 10pt; margin-top: 4mm; color: #333; }
+p, li { orphans: 2; widows: 2; }
+code { font-family: "DejaVu Sans Mono", monospace; font-size: 8.6pt;
+       background: #f2f4f6; padding: 0 1px; }
+pre { background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 3px;
+      padding: 2mm; white-space: pre-wrap; word-wrap: break-word; }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; width: 100%; margin: 2mm 0; }
+th, td { border: 1px solid #c9d1d9; padding: 1mm 2mm; text-align: left; }
+th { background: #eef2f5; }
+blockquote { color: #555; border-left: 3px solid #d0d7de; margin-left: 0;
+             padding-left: 3mm; }
+"""
+
+
+def _markdown_to_pdf(markdown_text: str) -> bytes:
+    html_body = _MD.render(markdown_text)
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"<style>{_PDF_CSS}</style></head><body>{html_body}</body></html>"
+    )
+    return HTML(string=html).write_pdf()
+
+
+def _write_report(path: Path, markdown_text: str) -> None:
+    """Render the assembled markdown to PDF and write it; fail-open like every
+    other reporter I/O path (a render error logs, never crashes the pipeline)."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-        logging.info(f"Reporter: wrote {path} ({len(text)} chars).")
-    except OSError as exc:
+        pdf_bytes = _markdown_to_pdf(markdown_text)
+        path.write_bytes(pdf_bytes)
+        logging.info(f"Reporter: wrote {path} ({len(pdf_bytes)} bytes).")
+    except Exception as exc:
         logging.error(f"Reporter: failed to write {path}: {exc}")
 
 
 def dispatch_reporters(state: MasterState):
     """Fan out ONE reporter task per reportable record. Routes straight to the
-    assembler when nothing is reportable (report.md still gets statistics)."""
+    assembler when nothing is reportable (the statistics-only report dir is
+    still written)."""
     records = [
         record
         for record in as_dicts(state.get("vulnerabilities", []))
@@ -362,10 +426,56 @@ def reporter_node(state: ReporterState) -> dict:
     return {"reporter_findings": [finding]}
 
 
+def _copy_poc_scripts(records: list[dict], report_dir: Path) -> dict[str, str]:
+    """Bundle every reportable record's PoC script into <report_dir>/poc/ so the
+    human reader can run it next to the PDF.
+
+    Prefers the script bytes the validator staged under
+    .cache/poc_scripts/<vuln_id>/<rel>; a record that declares poc_script whose
+    staged file is missing gets its script rebuilt from the record's own
+    poc_payload text. Fails open per record. Returns vuln_id -> delivered
+    filename (rendered into the report as poc/<filename>)."""
+    files: dict[str, str] = {}
+    poc_dir = report_dir / "poc"
+    for record in records:
+        rel = str(record.get("poc_script") or "").strip().lstrip("/")
+        vuln_id = str(record.get("vuln_id") or "unknown")
+        if not rel or ".." in Path(rel).parts:
+            continue
+        data: bytes | None = None
+        try:
+            staged = settings.cache_dir / "poc_scripts" / vuln_id / rel
+            if staged.is_file():
+                data = staged.read_bytes()
+        except OSError:
+            data = None
+        if not data and record.get("poc_payload"):
+            data = (str(record["poc_payload"]).rstrip() + "\n").encode()
+        if not data:
+            logging.info(f"Reporter: no PoC script to bundle for {vuln_id}.")
+            continue
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", vuln_id).strip("_")
+        suffix = Path(rel).suffix or ".txt"
+        name, counter = f"{slug}{suffix}", 2
+        while name in files.values():
+            name = f"{slug}_{counter}{suffix}"
+            counter += 1
+        try:
+            poc_dir.mkdir(parents=True, exist_ok=True)
+            (poc_dir / name).write_bytes(data)
+        except OSError as exc:
+            logging.warning(f"Reporter: could not bundle PoC script for {vuln_id}: {exc}")
+            continue
+        files[vuln_id] = name
+    return files
+
+
 def report_assembler_node(state: MasterState) -> dict:
-    """Terminal barrier node: writes <target_app>/report.md once, severity-ranked,
-    with deterministic CVSS scores and the statistics section. Returns {}."""
-    report_path = settings.app_path / "report.md"
+    """Terminal barrier node: writes a FRESH timestamped report directory
+    (<target_app>/report_<YYYY-MM-DD_HHMMSS>/report.pdf + poc/ scripts),
+    severity-ranked, with deterministic CVSS scores and the statistics
+    section. Returns {}."""
+    report_dir = settings.app_path / f"report_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
     statistics = _build_pipeline_statistics(state)
 
     findings_by_id = {}
@@ -380,9 +490,10 @@ def report_assembler_node(state: MasterState) -> dict:
             records.append(record)
 
     if not records:
-        _write_report(report_path, _render_empty_report(statistics))
+        _write_report(report_dir / "report.pdf", _render_empty_report(statistics))
         return {}
 
-    markdown = _render_report_markdown(records, findings_by_id, statistics)
-    _write_report(report_path, markdown)
+    poc_files = _copy_poc_scripts(records, report_dir)
+    markdown = _render_report_markdown(records, findings_by_id, statistics, poc_files)
+    _write_report(report_dir / "report.pdf", markdown)
     return {}

@@ -252,7 +252,8 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("integration_audit_dispatch", lambda state: {})
     # Reporter phase: the terminal barrier fans out ONE single-shot reporter per
     # reportable vulnerability; each writes a finding, then report_assembler
-    # renders them into report.md (under the target app dir).
+    # renders them into the timestamped report dir (report.pdf + poc/, under the
+    # target app dir).
     workflow.add_node("reporter_dispatch", lambda state: {})
     workflow.add_node("reporter", reporter_node)
     workflow.add_node("report_assembler", report_assembler_node)
@@ -287,7 +288,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     # synchronously on this chain, no extra fan-out/join) -> reviewer dispatch.
     workflow.add_edge("synchronization", "edge_traversal")
     # Reporter dispatch is the single sink: every early/terminal exit routes
-    # there so report.md is written exactly once, even with zero hypotheses.
+    # there so the report dir is created exactly once, even with zero hypotheses.
     workflow.add_conditional_edges("edge_traversal", dispatch_reviewers, ["reviewer_agent", "reporter_dispatch"])
     # workflow.add_edge("reviewer_agent", "reviewer_sync")
     # Evaluate dispatch from the barrier (never mid-superstep) so it reads the
@@ -320,7 +321,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     )
     # Stage 2b: fan the audited records to the auditor (or advance to reporter
     # dispatch when none remain — covers the no-direct-tasks / post-chain drain
-    # cases, so report.md is always written).
+    # cases, so the report dir is always written).
     workflow.add_conditional_edges(
         "integration_audit_dispatch",
         dispatch_integration_audits,

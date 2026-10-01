@@ -833,12 +833,39 @@ def propagate_validation_update(state: dict, updated_vuln: dict) -> list[dict]:
         clone = dict(member)
         clone["status"] = updated_vuln.get("status")
         clone["poc_payload"] = updated_vuln.get("poc_payload")
+        clone["poc_script"] = updated_vuln.get("poc_script")
         clone["execution_logs"] = updated_vuln.get("execution_logs")
         if updated_vuln.get("status") == "insufficient_context":
             clone["review_round"] = (member.get("review_round") or 0) + 1
             clone["open_questions"] = list(updated_vuln.get("open_questions") or [])
         updates.append(clone)
     return updates
+
+
+def _stage_poc_script(script_path, record: dict, state: dict) -> str | None:
+    """Copy the validator's PoC script out of its (still-running) attacker
+    container into ``<cache_dir>/poc_scripts/<vuln_id>/<rel>`` so the reporter
+    can ship the runnable script alongside the PDF. Returns the workdir-relative
+    path to keep on the record, or None when there is nothing to ship."""
+    rel = str(script_path or "").strip().lstrip("/")
+    vuln_id = str(record.get("vuln_id") or "")
+    if not rel or not vuln_id or ".." in Path(rel).parts:
+        return None
+    data = attacker_tools.read_attacker_file_bytes(rel, state)
+    if not data:
+        logging.warning(
+            f"Validator: PoC script '{rel}' not found for {vuln_id}; "
+            "the report will fall back to the poc_payload text."
+        )
+        return None
+    dest = settings.cache_dir / "poc_scripts" / vuln_id / rel
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+    except OSError as exc:
+        logging.warning(f"Validator: failed to stage PoC script for {vuln_id}: {exc}")
+        return None
+    return rel
 
 
 @tool(args_schema=ValidationToolInput)
@@ -867,6 +894,16 @@ def mark_validation_complete(
     # Inject the Validator's findings
     updated_vuln["poc_payload"] = kwargs.get("poc_payload")
     updated_vuln["execution_logs"] = kwargs.get("execution_logs")
+
+    # Ship the verified exploit script to the report: read it back from the
+    # attacker workdir BEFORE the container is torn down below and stage the
+    # bytes under .cache/poc_scripts/ (read-then-stage keeps the cached
+    # verdict self-sufficient across runs).
+    updated_vuln["poc_script"] = (
+        _stage_poc_script(kwargs.get("poc_script"), report, state)
+        if kwargs.get("is_confirmed")
+        else None
+    )
 
     # Save to cache so subsequent runs skip the tool-calling loop.
     cache_validator(report, state.get("peer_payloads"), updated_vuln)
@@ -921,6 +958,7 @@ def ask_for_context(
     updated_vuln["open_questions"] = list(kwargs.get("open_questions") or [])
     updated_vuln["execution_logs"] = kwargs.get("reasoning")
     updated_vuln["poc_payload"] = None
+    updated_vuln["poc_script"] = None
 
     # Save to cache so subsequent runs skip the tool-calling loop (the cached
     # insufficient_context record keeps review_round bumped, so a repeat of the
