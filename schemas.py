@@ -661,7 +661,7 @@ class EvaluationToolInput(BaseModel):
         default=None,
         description=(
             "REQUIRED when is_exploitable is false: the defense blocking exploitation, cited "
-            "to file + function. A defense must HALT the flow — log/warn-only checks are not "
+            "to file + function. A defense must HALT the flow: log/warn-only checks are not "
             "defenses. Name every user-controllable field reaching the sink and its guard; "
             "if the list cannot be complete, use is_exploitable=true + `reservations`."
         ),
@@ -701,6 +701,14 @@ class EvaluationToolInput(BaseModel):
                 "with 'direct_to_validator' and the open points in `reservations`."
             )
         return self
+
+    @field_validator("reproduction_steps", mode="before")
+    @classmethod
+    def coerce_steps_to_list(cls, v):
+        if isinstance(v, str):
+            # Split the string by newlines, strip whitespace, and drop empty lines
+            return [step.strip() for step in v.split("\n") if step.strip()]
+        return v
 
 class ValidationToolInput(BaseModel):
     is_confirmed: bool = Field(description="True if the exploit successfully triggered in the sandbox.")

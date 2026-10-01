@@ -313,14 +313,17 @@ class ValidatorAgent(ToolLoopAgent):
     def first_turn(self, state, llm_with_tools) -> dict:
         # System prompt composed from the capabilities this run actually grants
         # (attacker shell only when enabled; insufficient-context hatch only on
-        # the first pass, mirroring bind_tools).
+        # the first pass, mirroring bind_tools; patched-target contract only
+        # when the record carries an applied patch).
+        report = state['report_to_test']
         sys_prompt = VALIDATOR_AGENT["prompt"]
         if settings.attacker_enabled:
             sys_prompt += "\n\n" + VALIDATOR_AGENT.get("attacker_tools", "")
         if _is_first_pass(state):
             sys_prompt += "\n\n" + VALIDATOR_AGENT.get("insufficient_context", "")
+        if report.get("patch_diff"):
+            sys_prompt += "\n\n" + VALIDATOR_AGENT.get("patched_target", "")
         sys_msg = SystemMessage(content=sys_prompt)
-        report = state['report_to_test']
         affected = [n for n in (report.get("affected_nodes") or []) if n]
         affected_str = affected_nodes_label(report, report.get('node_id', 'Unknown'))
         steps_str = steps_block(report.get('reproduction_steps') or [])
@@ -359,7 +362,8 @@ class ValidatorAgent(ToolLoopAgent):
             )
         # Patched records: the fix lives in PROPOSED PATCH; the sandbox either
         # already runs it or does not (SANDBOX SYNC decides what a replay proves).
-        # Two-step contract per validator prompt rule 7.
+        # Two-step contract per the `validator_agent.patched_target` section
+        # (attached to the system prompt above under this same condition).
         if report.get("patch_diff"):
             patch_files = ", ".join(report.get("patched_files") or []) or "_none_"
             sync_note = (
@@ -374,7 +378,8 @@ class ValidatorAgent(ToolLoopAgent):
                 f"Files touched: {patch_files}\n"
                 f"Unified diff:\n```\n{report['patch_diff']}\n```\n"
                 f"--- SANDBOX SYNC ---\n{sync_note}\n"
-                f"Adjudicate per the PATCHED TARGET rule: replay the reproduction "
+                f"Adjudicate per the PATCHED TARGET section of your instructions: "
+                f"replay the reproduction "
                 f"steps above; if the sandbox contains the patch, an exploit that "
                 f"still fires means the fix FAILED, and an exploit that stays dead "
                 f"still requires the legitimate-flow smoke test before any false "
