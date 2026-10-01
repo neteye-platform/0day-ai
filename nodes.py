@@ -2459,7 +2459,16 @@ class ValidatorAgent(ToolLoopAgent):
         return {"cookies": current_cookies}
 
     def tool_batch_done(self, state) -> bool:
-        terminal_names = self._terminal_names()
+        # `ask_for_context` is terminal only on passes where it is actually
+        # bound (mirrors the bind_tools/first_turn gating); on the final pass
+        # it must not end the loop without a verdict.
+        first_pass = (
+            state.get("report_to_test", {}).get("review_round") or 0
+        ) < settings.validator_feedback_max_rounds
+        terminal_names = [
+            n for n in self._terminal_names()
+            if n != "ask_for_context" or first_pass
+        ]
         for msg in reversed(state["messages"]):
             if getattr(msg, "type", "") != "tool":
                 break

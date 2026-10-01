@@ -87,6 +87,7 @@ def compile_validator():
         attacker_tools.run_command,
         attacker_tools.write_attacker_file,
         attacker_tools.read_attacker_file,
+        tools.ask_for_context,
         tools.mark_validation_complete
     ]))
     validator_workflow.add_edge(START, "validator_agent")
