@@ -235,63 +235,54 @@ expert_agents:
     prompt: You are an expert in container security, server configurations, and supply chain risks.
 cve_analyzer:
   prompt: |
-    You are an expert security analyst for a Software Composition Analysis (SCA) pipeline. Your task is to read a CVE description and extract a specific security assumption (demand), the trigger condition (execution sink), and the standard 'import_namespace' for the vulnerable package.
+    You are an expert security analyst for a Software Composition Analysis (SCA) pipeline. Your task is to read a CVE description and extract a specific security assumption (demand), trigger condition, and routing metadata.
 
     CRITICAL RULE 1: Actionable Caller Demands
-    When generating demands from a CVE description, do not dictate what the vulnerable library's internal code should do. Instead, formulate the demand strictly as a requirement for the **application developer** (the caller).
+    Formulate the demand strictly as a requirement for the **application developer** (the caller). State exactly what configuration, sanitization, or alternative functions the visible application code must implement. 
     State exactly what configuration flags, pre-processing, sanitization, or alternative functions the visible application code must implement to mitigate the vulnerability before calling the library. Focus heavily on the "Workarounds" section if provided. The demand must be verifiable by looking ONLY at the application's source code.
 
-    CRITICAL RULE 2: Explicit Trigger Conditions (No Guessing)
-    Many CVEs describe a library parsing or returning malicious payloads, but the exploit only triggers if the application actively passes that payload to a dangerous sink. You MUST identify the specific trigger condition required for the exploit to execute ONLY IF it is explicitly stated or strongly implied by the CVE text.
-    - If the CVE explains the required data flow (e.g., "if the returned object is written to disk"), document that secondary action.
-    - If the vulnerability detonates immediately upon calling the vulnerable function, state "Immediate execution upon calling [Function]".
-    - If the CVE description is vague and lacks technical details about the execution sink, DO NOT hallucinate or guess based on outside knowledge. Leave the trigger_condition empty.
+    CRITICAL RULE 2: Explicit Trigger Conditions
+    Identify the specific data flow required for the exploit to execute (e.g., "Immediate execution upon calling [Function]" or "Execution when the parsed object is written to disk"). If the CVE is vague, DO NOT guess—leave it empty.
 
     CRITICAL RULE 3: Enforcing Explicit Proof for Defaults
     If the CVE states that a vulnerability exists in a library's default behavior, configuration, or preprocessor, the demand MUST say that the absence of explicit mitigation is a failure.
 
-    Example Input 1 (Direct Function Vulnerability):
-    In PyYAML before 5.1, the yaml.load() API allows execution of arbitrary Python commands, resulting in remote code execution if untrusted data is parsed.
+    CRITICAL RULE 4: Strict Routing Metadata
+    You MUST accurately fill out the routing fields so the demand reaches the correct agent:
+    - `import_namespace`: The exact string used in import statements (e.g., "yaml").
+    - `target_layer`: Use `local_instantiation` for ANY library configuration or method call within standard application logic (even if the mitigation uses global-looking syntax like Jupyter's `c.Config`). Use `global_configuration` ONLY for true framework-wide deployment files (e.g., `.env`, Laravel config files).
 
-    Example Output 1:
+    Example 1 (Direct Function & Default State):
+    In PyYAML before 5.1, the yaml.load() API allows execution of arbitrary Python commands by default.
+    Output 1:
     {
-      "security_assumption": "The application must not use yaml.load() to parse untrusted data; it must use yaml.safe_load() instead.",
+      "security_assumption": "The application must not use yaml.load() to parse untrusted data; it must use yaml.safe_load() instead. Because yaml.load is vulnerable by default, the absence of safe_load MUST be marked as FAILED.",
       "trigger_condition": "Immediate execution upon calling yaml.load() with untrusted data.",
       "import_namespace": "yaml",
-      "target_layer": "local_instantiation"
+      "target_layer": "local_instantiation",
+      "package": "PyYAML"
     }
 
-    Example Input 2 (Internal Class / Configuration Vulnerability):
-    In lxml before version 4.6.0, the default XML parser resolves external entities, leading to XML External Entity (XXE) vulnerabilities if untrusted data is parsed. Workaround: Initialize the XMLParser with the `resolve_entities=False` argument.
-
-    Example Output 2:
+    Example 2 (Configuration-Heavy Local Library):
+    In FasterXML jackson-databind before 2.10.0, deserializing untrusted data with polymorphic typing enabled can lead to remote code execution. Workaround: Ensure `ObjectMapper.enableDefaultTyping()` is not called, or explicitly use `BasicPolymorphicTypeValidator` when configuring the `ObjectMapper` instance.
+    Output 2:
     {
-      "security_assumption": "The application must explicitly mitigate XXE by initializing the XML parser with the `resolve_entities=False` configuration before parsing untrusted XML data.",
-      "trigger_condition": "Immediate execution upon parsing the untrusted XML string with the vulnerable parser instance.",
-      "import_namespace": "lxml",
-      "target_layer": "local_instantiation"
+      "security_assumption": "The application must not call 'enableDefaultTyping()' on the ObjectMapper instance, or it must explicitly configure a strict 'PolymorphicTypeValidator' before deserialization.",
+      "trigger_condition": "Immediate execution upon calling 'readValue()' on untrusted JSON.",
+      "import_namespace": "com.fasterxml.jackson.databind",
+      "target_layer": "local_instantiation",
+      "package": "jackson-databind"
     }
 
-    Example 3 (Default Library Behavior / Implicit States - Java XXE):
-    In the Java standard library, the default configuration for `javax.xml.parsers.DocumentBuilderFactory` allows the resolution of XML External Entities (XXE). If an application parses untrusted XML data without altering this default state, it is vulnerable to local file disclosure and SSRF. Workaround: The caller must explicitly call `setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)` on the factory instance.
-
-    Example Output 3:
+    Example 3 (True Global Configuration):
+    In Laravel, if `app.debug` is enabled in production, exceptions display sensitive credentials. 
+    Output 3:
     {
-      "security_assumption": "The application must explicitly mitigate XXE by setting the 'disallow-doctype-decl' feature (or equivalent) to true on the DocumentBuilderFactory instance. Because the factory resolves external entities by default, if explicit code disabling DOCTYPEs or entity resolution is not visibly present in the local target node, this assumption MUST be marked as FAILED.",
-      "trigger_condition": "Immediate execution upon calling the 'parse()' method on the untrusted XML input.",
-      "import_namespace": "javax.xml.parsers",
-      "target_layer": "local_instantiation"
-    }
-
-    Example Input 4 (PHP Framework - Global Configuration):
-    In Laravel, if `app.debug` is left enabled in production, uncaught exceptions display detailed error pages containing sensitive environment variables and database credentials. Workaround: Ensure `APP_DEBUG` is explicitly set to false in the global configuration files.
-
-    Example Output 4:
-    {
-      "security_assumption": "The application must disable debug mode by setting 'app.debug' to false in the global configuration to prevent sensitive information disclosure.",
+      "security_assumption": "The application must disable debug mode by setting 'app.debug' to false in the global configuration.",
       "trigger_condition": "Immediate execution upon encountering an application exception while debug mode is enabled.",
       "import_namespace": "config",
-      "target_layer": "global_configuration"
+      "target_layer": "global_configuration",
+      "package": "laravel/framework"
     }
 contract_verifier_agent:
   prompt: |
@@ -307,6 +298,7 @@ contract_verifier_agent:
     3. No Fragile Mitigations: Do not set status to MET if the mitigation relies on easily bypassed methods, such as custom regular expressions, blacklisting (e.g., blocking ../), or naive string replacement.
     4. Standard of Proof: To set status to MET, the visible code must either use standard, secure-by-default mechanisms (e.g., parameterized queries, strict allow-lists, or established cryptographic libraries) OR explicitly delegate the data to a helper function. If the code attempts validation itself but does so weakly, set status to FAILED.
     5. Wrong Architectural Layer: If the demand requires a global framework configuration (e.g., setting global Cache-Control headers, or configuring Flask SECRET_KEY_FALLBACKS) and the snippet is merely a localized route or helper that happens to touch the session, set status to OUT_OF_SCOPE. Global mitigations do not belong in local route logic.
+    6. Context / Component Mismatch: If a demand explicitly targets a specific technology, library, protocol, or configuration mechanism, but the visible code snippet does not utilize that component (e.g., it uses a different library for the same task, or handles data in a completely unrelated way), you MUST set the status to OUT_OF_SCOPE. Do not mark a snippet as FAILED for lacking a mitigation to a vulnerability in a component it does not even use.
 
     EXAMPLE 1
     Code Snippet:
