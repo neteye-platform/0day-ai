@@ -412,8 +412,9 @@ def submit_evaluation(
     # Mutate a copy of the single report
     updated_vuln = dict(report)
     updated_vuln["status"] = "confirmed" if kwargs.get("is_exploitable") else "false_positive"
-    updated_vuln["confidence_score"] = kwargs.get("confidence_score")
     updated_vuln["reviewer_reasoning"] = kwargs.get("reasoning")
+    updated_vuln["mitigation"] = kwargs.get("mitigation")
+    updated_vuln["reservations"] = kwargs.get("reservations") or None
     updated_vuln["reproduction_steps"] = kwargs.get("reproduction_steps", [])
     updated_vuln["validation_strategy"] = kwargs.get("validation_strategy")
 

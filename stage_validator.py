@@ -306,6 +306,20 @@ class ValidatorAgent(ToolLoopAgent):
             f"--- REPRODUCTION STEPS (from Reviewer, follow in order) ---\n"
             f"{steps_str}"
         )
+        # "Confirmed with reservations": the reviewer believed the finding real but
+        # could not statically settle these specific points. The sandbox is the
+        # adjudicator — mirror how PROVEN CHAIN COMPONENTS is rendered.
+        reservations = report.get("reservations") or []
+        if reservations:
+            res_str = "\n".join(f"  {i}. {r}" for i, r in enumerate(reservations, 1))
+            formatted_report += (
+                f"\n\n--- REVIEWER RESERVATIONS (resolve every item) ---\n"
+                f"Points the Reviewer could not verify from source alone. Prove or refute "
+                f"each in the sandbox and log the outcome with evidence in "
+                f"execution_logs; an exploit failing exactly on a reservation is "
+                f"false-positive evidence.\n"
+                f"{res_str}"
+            )
         # Chained records carry the proven poc_payloads of the peers they chain
         # with, so the final exploit reuses real proven primitives.
         peer_payloads = state.get("peer_payloads") or []
@@ -349,6 +363,11 @@ class ValidatorAgent(ToolLoopAgent):
                     f"Description: {v.get('description', 'None')}\n"
                     f"--- REPRODUCTION STEPS (from Reviewer, follow in order) ---\n"
                     f"{vsteps_str}"
+                    + (
+                        "\n--- REVIEWER RESERVATIONS (resolve for this variant too) ---\n"
+                        + "\n".join(f"  {i}. {r}" for i, r in enumerate(v["reservations"], 1))
+                        if v.get("reservations") else ""
+                    )
                 )
             formatted_report += (
                 f"\n\n--- EQUIVALENT VARIANTS OF THE SAME PATTERN "

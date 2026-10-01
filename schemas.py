@@ -164,6 +164,20 @@ class VulnerabilityRecord(BaseModel):
 
     # Reviewer additions
     reviewer_reasoning: Optional[str] = None
+    mitigation: Optional[str] = Field(
+        default=None,
+        description=(
+            "Reviewer's cited blocking defense for a `false_positive` record "
+            "(file/function; per-field for enumerated filters)."
+        ),
+    )
+    reservations: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "'Confirmed with reservations': the reviewer's unresolved points, which the "
+            "Validator must prove or refute in the sandbox."
+        ),
+    )
     reproduction_steps: Optional[list[str]] = Field(
         default=None,
         description=(
@@ -549,6 +563,25 @@ class EvaluationToolInput(BaseModel):
         description="Detailed description of how the security measures can be bypassed or how the application logic can be abused to exploit the vulnerability."
         # description="True if the node contains a defect, unsafe configuration, lacks mitigation, or if the implemented safeguards can be bypassed, regardless of external reachability."
     )
+    mitigation: Optional[str] = Field(
+        default=None,
+        description=(
+            "REQUIRED when is_exploitable is false: the defense that blocks exploitation, "
+            "cited to file + function. For filter/whitelist/parameterization defenses, name "
+            "each user-controllable field reaching the sink and its guard; if that list "
+            "cannot be complete, use is_exploitable=true + 'direct_to_validator' with "
+            "`reservations` instead."
+        ),
+    )
+    reservations: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Points you could not settle statically (unaudited fields, assumptions only a "
+            "live exploit can confirm). Submit with is_exploitable=true + "
+            "'direct_to_validator' to mark the finding 'confirmed with reservations'; the "
+            "Validator must prove or refute each one in the sandbox."
+        ),
+    )
     is_exploitable: bool = Field(
         description="True if there is a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by application mitigations."
     )
@@ -579,6 +612,12 @@ class EvaluationToolInput(BaseModel):
                 "validation_strategy is required when is_exploitable is true. "
                 "Pick one of 'direct_to_validator', 'requires_integration', 'static_finding_only'. "
                 "Leave it unset only for false positives."
+            )
+        if not self.is_exploitable and not (self.mitigation or "").strip():
+            raise ValueError(
+                "mitigation is required for false positives: cite the concrete defense "
+                "blocking the exploit in code. If you cannot, submit is_exploitable=true "
+                "with 'direct_to_validator' and the open points in `reservations`."
             )
         return self
 

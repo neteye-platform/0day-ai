@@ -1811,7 +1811,11 @@ def cache_reviewer(node_id: str, report: dict, updated_vuln: Optional[dict] = No
     Keyed by (node_id, report content hash); shared by the normal
     ``submit_evaluation`` path and the loop-fallback path so both land in the
     same ``.cache/reviewer/`` namespace.
-    """
+
+    Prompt/schema changes do NOT bust entries: selective re-adjudication is
+    done by deleting the individual ``<prefix>_<hash>.json`` files (grep the
+    directory for the record's ``vuln_id``). Delete the whole directory only
+    for a full re-review pass."""
     return _content_hash_cache("reviewer", node_id, report, updated_vuln)
 
 

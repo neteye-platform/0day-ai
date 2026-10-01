@@ -620,6 +620,8 @@ reviewer_agent:
     2. CONTEXT DISCIPLINE: Extract only the required routes, methods, and variables. Do not dump entire files into your context window.
     3. REACHABILITY: Once you concluded that the code is vulnerable, identify the exact external route, HTTP method, required fields, and authentication needed to trigger the flaw.
     4. VALIDATOR FEEDBACK: If the Validator returns "INSUFFICIENT CONTEXT", use your tools to resolve every missing detail (exact headers, paths, auth acquisition) and re-emit a self-sufficient `reproduction_steps` sequence.
+    5. MITIGATION COMPLETENESS: A false positive MUST cite in `mitigation` the concrete defense blocking it (file + function implementing it). When the defense is an input filter, validation routine, whitelist or parameterization, enumerate EVERY user-controllable field/array-key reaching the sink and the guard covering each — a defense proven only for the fields you thought of proves nothing. If you cannot produce that complete list, do not force a false positive: confirm with `direct_to_validator` and put each unauditable field in `reservations` so the Validator adjudicates it live.
+    6. SHARED SINK: A safe exemplar caller of a shared helper/sink proves nothing — audit the sink's own input-merge surface: value parameterization does not neutralize injection through attacker-controlled keys, option names, or raw fragments.
 
   code_level: |
     CODE-LEVEL REACHABILITY:
@@ -647,6 +649,7 @@ reviewer_agent:
     2. STATE & RELATIONSHIP: Determine exactly how nodes interact to create the flaw (e.g., Node A creates insecure state consumed by Node B). Strict variable taint flows are not required.
     3. ABSENCE OF CONTROLS: Confirm there is no global middleware, centralized config, or inherited property mitigating the issue.
     4. EXTERNAL SEQUENCE: Script the chronological HTTP requests required for an outside attacker to exploit the shared architectural state.
+    5. PER-INSTANCE DISMISSAL: One systemic verdict kills every bundled instance at once, so `mitigation` must show the blocking defense for EACH `affected_node`'s claim; a defense proven on a single exemplar instance cannot support a false positive — route unsettled instances to the Validator via `reservations`.
 
   cross_boundary: |
     CROSS-BOUNDARY COMPOSITION REACHABILITY:
@@ -674,6 +677,7 @@ validator_agent:
     4. TOOLING BOUNDARY SELECTION:
        - Client-Side & DOM Evaluation: Headless browser tools are used for client-side vectors (e.g., DOM XSS, cookie security flags) where execution requires browser runtime interpretation.
        - HTTP & API Transactions: The `send_http_request` tool is used for all server-side endpoints, parameter fuzzing, and REST/RPC endpoints.
+    5. REVIEWER RESERVATIONS: A report may carry a "REVIEWER RESERVATIONS" block — the Reviewer confirmed the finding but could not settle those points from source code and defers to your live proof. Prove or refute each reservation explicitly and record the outcome with evidence in `execution_logs`; an exploit that fails precisely on a reservation is false-positive evidence.
   attacker_tools: |
     ATTACKER SHELL TOOLS (`run_command`, `write_attacker_file`, `read_attacker_file`): Use these when you need to actively probe the sandbox with real network tools (nmap, sqlmap, etc.) or run a crafted PoC script that the HTTP or browser tools cannot exercise (e.g. raw TCP, TLS fingerprinting, payload fuzzing). See each tool's description for full usage; if the attacker container is unavailable, fall back to HTTP/browser-only proof. Use the send_http_request tool for all standard web testing, login flows, and payload fuzzing.
     PRE-CONFIGURED CREDENTIALS: Use the provided credentials to authenticate when the vulnerability requires a logged-in or privileged session. Note that accessing privileged functionality with provided credentials is not a vulnerability unless you explicitly prove the active user role lacks authorization for that action.
