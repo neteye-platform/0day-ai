@@ -1,5 +1,3 @@
 .env
 __pycache__/
-apps/
-agent_logs/
-
+.langchain_cache.db

@@ -77,17 +77,17 @@ def serialize_for_json(obj):
             if k not in ["usage_metadata", "response_metadata"]
         }
 
-    # elif isinstance(obj, list):
-    #     # Filter out hidden system messages
-    #     parsed_list = [serialize_for_json(item) for item in obj]
-    #     return [item for item in parsed_list if item != "[SYSTEM PROMPT HIDDEN]"]
+    elif isinstance(obj, list):
+        # Filter out hidden system messages
+        parsed_list = [serialize_for_json(item) for item in obj]
+        return parsed_list
+        return [item for item in parsed_list if item != "[SYSTEM PROMPT HIDDEN]"]
 
     elif hasattr(obj, "model_dump"):
         # Unpack Pydantic models
         return serialize_for_json(obj.model_dump())
 
     elif hasattr(obj, "content") and hasattr(obj, "type"):
-        # --- LANGCHAIN MESSAGE SHAPING ---
         if obj.type == "system":
             return "[SYSTEM PROMPT HIDDEN]"
 
