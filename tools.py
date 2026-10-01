@@ -7,6 +7,7 @@ from pathlib import Path
 import logging
 import threading
 from bs4 import BeautifulSoup
+from fnmatch import fnmatch
 from langgraph.prebuilt import InjectedState
 from langchain_core.tools import tool, InjectedToolCallId
 from langgraph.types import Command
@@ -1198,19 +1199,54 @@ def _compile_pattern(keyword: str, is_regex: bool) -> re.Pattern:
 
 
 @tool
-def search_codebase(keyword: str, state: Annotated[dict, InjectedState], regex: bool = True) -> str:
+def search_codebase(
+    query: str,
+    state: Annotated[dict, InjectedState],
+    file_pattern: Optional[str] = None,
+    match_whole_word: bool = True,
+    is_regex: bool = False
+) -> str:
     """
     Searches the entire application codebase for a specific string or regular expression. 
     Use this to find where specific libraries, functions, variables, or class instantiations are used. 
 
+    WARNING: Output is strictly truncated to 20 lines. Searching bare identifier 
+    names or common terms (e.g., 'getItem', 'data', 'handle') produces massive noise 
+    and truncates useful results. Narrow your query by including contextual code 
+    syntax (such as brackets, assignment operators, or declaration keywords) or 
+    by restricting `file_pattern`.
+
     Args:
-        keyword (str): The string or pattern to search in the codebase.
-        regex (bool): Set to True if the keyword parameter is a regular expression, False otherwise (default = True). When True you can search multiple keywords at once with an alternation regex like 'auth|login|token'.
+        query (str): The string or pattern to search in the codebase.
+        file_pattern (str, optional): Glob to restrict files (e.g., '*.php', 'src/api/*'). Matched against the app-relative path and the plain file name.
+        match_whole_word (bool): Match distinct words only. Defaults to True.
+        is_regex (bool): Set to True if the query parameter is a regular expression, False for a literal string (default = False). When True you can search multiple keywords at once with an alternation regex like 'auth|login|token'.
 
     Returns:
         str: List of nodes with a match and the matched line of code.
     """
     app_dir = Path(settings.app_path)
+
+    # Repeat-call memo (mirrors read_source_code): an identical search earlier
+    # in this conversation already put its results in the history; re-injecting
+    # the same up-to-20-match blob only burns context.
+    # [:-1] skips the in-flight AIMessage that triggered this very call (it is
+    # already the last message in the injected state) — without it every call
+    # matches itself. Mirrors read_source_code.
+    for msg in state.get("messages", [])[:-1]:
+        msg = msg if isinstance(msg, dict) else msg.model_dump()
+        if msg.get("type") == "ai":
+            for tc in msg.get("tool_calls", []):
+                if tc.get("name") != "search_codebase":
+                    continue
+                a = tc.get("args", {})
+                if (a.get("query") == query
+                        and (a.get("file_pattern") or None) == (file_pattern or None)
+                        and a.get("match_whole_word", True) == match_whole_word
+                        and a.get("is_regex", False) == is_regex):
+                    return ("System Notice: You already ran this exact search_codebase call "
+                            "in a previous step; its results are in your history above. Change "
+                            "the query, add a file_pattern, or conclude with your final tool.")
 
     # Load the graph (manifest/dependency nodes already stripped centrally) to
     # map physical files to Node IDs: {"src/main.py": "node_123"}
@@ -1224,7 +1260,11 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState], regex: 
     results = []
     match_count = 0
     MAX_MATCHES = 20 # prevent context window overflow
-    query = _compile_pattern(keyword, regex)
+    pattern = _compile_pattern(query, is_regex)
+    # Whole-word boundaries only make sense when both ends of the raw query are
+    # word chars; skipping them keeps '$foo' and 'foo(' style queries searchable.
+    if match_whole_word and query and re.match(r"\w", query) and re.search(r"\w$", query):
+        pattern = re.compile(rf"(?<!\w)(?:{pattern.pattern})(?!\w)")
 
     # Recursively search all files
     for file_path in app_dir.rglob("*"):
@@ -1244,12 +1284,15 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState], regex: 
             rel = str(file_path)
         if is_path_excluded(rel):
             continue
+        # Optional glob restriction (app-relative path or bare file name).
+        if file_pattern and not (fnmatch(rel, file_pattern) or fnmatch(file_path.name, file_pattern)):
+            continue
 
         try:
-            # Read lines and search for the keyword
+            # Read lines and search for the query
             with open(file_path, "r", encoding="utf-8") as f:
                 for line_num, line in enumerate(f, 1):
-                    match = re.search(query, line)
+                    match = pattern.search(line)
                     if match:
                         relative_path = str(file_path.relative_to(app_dir))
                         # Match the file back to its Node ID so the agent can read it
@@ -1263,7 +1306,11 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState], regex: 
 
                         # Stop if we hit the limit
                         if match_count >= MAX_MATCHES:
-                            results.append(f"... [Truncated: found more than {MAX_MATCHES} matches] ...")
+                            results.append(
+                                f"... [Truncated: found more than {MAX_MATCHES} matches. "
+                                f"This query is too broad — narrow it or restrict files "
+                                f"with file_pattern instead of re-issuing the same search.] ..."
+                            )
                             return "\n".join(results)
 
         except UnicodeDecodeError:
@@ -1271,7 +1318,7 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState], regex: 
             continue
 
     if not results:
-        return f"No matches found for '{keyword}'."
+        return f"No matches found for '{query}'."
 
     return "\n".join(results)
 

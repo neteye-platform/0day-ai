@@ -51,7 +51,8 @@ from stage_validator import (
     validator_router,
 )
 from stage_verifier import contract_verifier_node, dispatch_verifiers
-from tool_loop import SequentialToolNode
+from run_stats import gen_run_id, langsmith_detached_node
+from tool_loop import SequentialToolNode, concise_tool_error
 from credential_finder import credential_finder_node
 from state import MasterState, ReviewerState, ValidatorState, IntegrationAuditorState
 from schemas import ReviewerOutput, ValidatorOutput
@@ -72,7 +73,7 @@ def compile_reviewer():
         tools.find_in_container,
         tools.read_container_artifact,
         tools.submit_evaluation
-    ]))
+    ], handle_tool_errors=concise_tool_error))
     reviewer_workflow.add_edge(START, "reviewer_agent")
     reviewer_workflow.add_conditional_edges(
         "reviewer_agent",
@@ -117,7 +118,7 @@ def compile_validator():
         attacker_tools.read_attacker_file,
         tools.ask_for_context,
         tools.mark_validation_complete
-    ]))
+    ], handle_tool_errors=concise_tool_error))
     validator_workflow.add_edge(START, "validator_agent")
     validator_workflow.add_conditional_edges(
         "validator_agent",
@@ -155,7 +156,7 @@ def compile_integration_auditor():
         tools.get_node_connections,
         tools.get_path,
         tools.submit_integration_audit
-    ]))
+    ], handle_tool_errors=concise_tool_error))
     integration_auditor_workflow.add_edge(START, "integration_auditor_agent")
     integration_auditor_workflow.add_conditional_edges(
         "integration_auditor_agent",
@@ -219,9 +220,11 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("contract_verifier", contract_verifier_node)
     workflow.add_node("edge_traversal", edge_traversal_node)
     # Subgraphs own their per-message retries; disable wholesale replay retry from set_node_defaults.
-    workflow.add_node("reviewer_agent", compiled_reviewer_agent, retry_policy=RetryPolicy(max_attempts=1))
-    workflow.add_node("validator_agent", compiled_validator_agent, retry_policy=RetryPolicy(max_attempts=1))
-    workflow.add_node("integration_auditor", compiled_integration_auditor, retry_policy=RetryPolicy(max_attempts=1))
+    # langsmith_detached_node is identity when trace splitting is off; when on, each dispatch
+    # runs the subgraph as its own root trace in the agent's dedicated LangSmith project.
+    workflow.add_node("reviewer_agent", langsmith_detached_node(compiled_reviewer_agent, "reviewer"), retry_policy=RetryPolicy(max_attempts=1))
+    workflow.add_node("validator_agent", langsmith_detached_node(compiled_validator_agent, "validator"), retry_policy=RetryPolicy(max_attempts=1))
+    workflow.add_node("integration_auditor", langsmith_detached_node(compiled_integration_auditor, "integration_auditor"), retry_policy=RetryPolicy(max_attempts=1))
     # Barrier for the contract-verifier fan-out: edge_traversal runs once after every verifier task has written.
     workflow.add_node("synchronization", lambda state: {})
     # Barrier so dispatch_validators sees the fully-merged record set, not a mid-superstep snapshot.
@@ -327,7 +330,9 @@ if __name__ == "__main__":
         datetime.now().astimezone().isoformat(timespec="seconds"),
     )
 
+    run_id = gen_run_id()
     initial_state = MasterState(
+        pipeline_run_id=run_id,
         known_vulns=[],
         expert_tasks=[],
         sandbox_url=None,
@@ -342,15 +347,28 @@ if __name__ == "__main__":
 
     Path("states").mkdir(parents=True, exist_ok=True)
 
-    config = {"configurable": {"thread_id": "scan-1"}}
+    # Stamp the entry config so this run's ROOT trace correlates with the
+    # project-split subagent traces (run_stats.langsmith_detached_node).
+    config = {
+        "configurable": {"thread_id": "scan-1"},
+        "metadata": {"pipeline_run_id": run_id, "target": settings.app_path.name},
+        "tags": ["pipeline"],
+    }
     done_flag = Path("states/scan-complete.flag")
 
     with SqliteSaver.from_conn_string("states/pipeline_checkpoints.sqlite") as checkpointer:
         app = build_graph(checkpointer=checkpointer)
         try:
-            if app.get_state(config).values and not done_flag.exists():
+            prior = app.get_state(config).values
+            if prior and not done_flag.exists():
                 logging.info("Resuming previously interrupted run from checkpoint.")
-                final_state = app.invoke(None, config)
+                run_id = prior.get("pipeline_run_id") or run_id
+                config["metadata"]["pipeline_run_id"] = run_id
+                # Resume passes the id IN as a partial state update: a
+                # pre-change checkpoint never ran bootstrap with the field, and
+                # bootstrap will not re-run now, so without this the subagent
+                # dispatches would read None while the root trace claims an id.
+                final_state = app.invoke({"pipeline_run_id": run_id}, config)
             else:
                 final_state = app.invoke(initial_state, config)
 

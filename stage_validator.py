@@ -44,6 +44,7 @@ def _validation_group_key(record: dict):
 
 def _validator_payload(state: MasterState, seed: dict, variants: list[dict] | None) -> ValidatorState:
     return ValidatorState(
+        pipeline_run_id=state.get("pipeline_run_id"),
         report_to_test=seed,
         validation_variants=variants,
         sandbox_url=state.get("sandbox_url"),
@@ -160,7 +161,10 @@ def route_validator_feedback(state: MasterState):
 
     commands = []
     for record in flagged:
-        commands.append(Send("reviewer_agent", build_reviewer_payload(record, progress_id)))
+        commands.append(Send(
+            "reviewer_agent",
+            build_reviewer_payload(record, progress_id, state.get("pipeline_run_id")),
+        ))
 
     logging.info(
         f"Validator requested more context for {len(commands)} vulnerability(ies); "

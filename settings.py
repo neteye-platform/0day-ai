@@ -33,7 +33,7 @@ container_demands_scope_to_members = True
 
 # None = all
 # communities_to_analyze = None
-communities_to_analyze = [5]
+communities_to_analyze = [0, 1, 2, 3, 5, 9, 12, 54, 77, 115, 150, 158, 205, 403]
 
 # Path patterns (relative to app root) skipped before analysis and blocked from
 # reviewer file reads; globs and bare dir names supported.
@@ -64,7 +64,7 @@ llm_max_completion_tokens = 16384
 
 # =============================== Agents ==================================
 
-agents_concurrency = 2
+agents_concurrency = 4
 
 # Reviewer/validator loop caps: if the terminal tool isn't called within this many
 # LLM rounds, the loop ends via the fallback node instead of hitting the recursion
@@ -137,7 +137,7 @@ demand_dedup_enabled = True
 # a monotone tail — the [0.80, 0.86) band is dominated by related-but-distinct
 # contract checks, while true paraphrases cluster above 0.90.
 demand_dedup_threshold = 0.86
-embeddings_timeout = 60
+embeddings_timeout = 180
 # On expiry the embedding pass raises and dedup fails open to exact-identity
 # merging; partial work is already on disk, so repeated runs resume.
 embeddings_fallback_budget_sec = 300
@@ -240,6 +240,27 @@ threat_intel_enabled = False
 
 # Always rebuild the container image even if Dockerfile/compose is unchanged.
 force_rebuild = False
+
+## ---- LangSmith trace splitting ----
+
+# Tracing itself stays purely env-driven (LANGSMITH_TRACING / LANGSMITH_API_KEY
+# in .env); these settings only control HOW traces are split. When enabled, the
+# three tool-loop subagents (reviewer, validator, integration auditor) run with
+# their own LangSmith project, so their runs navigate as separate traces instead
+# of bloating the single giant pipeline trace (25k-run-per-trace cap). Every
+# run is tagged `agent:<name>` and carries `pipeline_run_id` metadata for
+# cross-project correlation with the main trace. No effect unless tracing is
+# actually active; fails open (plain env-level tracing) on any langsmith issue.
+langsmith_tracing = os.environ.get("LANGSMITH_TRACING", "").lower() in ("true", "1", "yes")
+# "default" is LangSmith's fallback project when LANGSMITH_PROJECT is unset —
+# keeping them aligned preserves the root-project == "-reviewer" prefix invariant.
+langsmith_project = os.environ.get("LANGSMITH_PROJECT") or "default"
+langsmith_split_subagents = True
+langsmith_split_projects = {
+    "reviewer": f"{langsmith_project}-reviewer",
+    "validator": f"{langsmith_project}-validator",
+    "integration_auditor": f"{langsmith_project}-integration-auditor",
+}
 
 # osv-scanner results are cached under <cache_dir>/osv keyed by target identity
 # (container image content id / repo path) and reused while younger than this

@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import settings
-from run_stats import _reset_pipeline_stats
+from run_stats import _reset_pipeline_stats, gen_run_id
 from state import MasterState
 from utils import (
     run_osv_scanner,
@@ -27,13 +27,20 @@ def bootstrap_node(state: MasterState) -> dict[str, Any]:
     """Ensure the knowledge graph exists before the parallel branches start."""
     _reset_pipeline_stats()  # fresh ledger per pipeline invocation
     clear_warning_state()    # ... and fresh once-per-run warning dedup
+    # Correlation id shared by the main trace and the project-split subagent
+    # traces (see run_stats.langsmith_detached_node); reused on checkpoint
+    # resume and on the round-2 reviewer/validator re-dispatch. `python
+    # graph.py` also passes one in via the invoke config so the ROOT trace
+    # carries it; under `langgraph dev` the entry config is platform-owned
+    # and the main trace lacks it — the subagent traces still correlate.
+    run_id = state.get("pipeline_run_id") or gen_run_id()
     if not settings.graph.exists():
         logging.info(f"Graph {settings.graph} not found. Running graphify extract...")
         subprocess.run(
             ["graphify", "extract", str(settings.app_path), "--code-only"],
             check=True,
         )
-    return {}
+    return {"pipeline_run_id": run_id}
 
 
 def _write_symbol_index() -> None:
