@@ -73,7 +73,7 @@ def compile_reviewer():
 
 
 def compile_validator():
-    validator_workflow = StateGraph(ValidatorState)
+    validator_workflow = StateGraph(ValidatorState, output_schema=ValidatorOutput)
     # Same scoped-retry rationale as the reviewer agent node.
     validator_workflow.add_node("validator_agent", validator_agent_node, retry_policy=RETRY)
     validator_workflow.add_node("ask_validator_for_tool", ask_validator_for_tool)
@@ -182,6 +182,10 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("integration_auditor", compiled_integration_auditor, retry_policy=RetryPolicy(max_attempts=1))
     workflow.add_node("synchronization", synchronization_node)
     workflow.add_node("reachability_filter", reachability_filter_node)
+    # Barrier after the reviewer superstep, so dispatch_validators sees the fully
+    # merged record set (not a partial mid-superstep snapshot, which previously
+    # sent the auditor an empty `confirmed_vulns` peer list).
+    workflow.add_node("validator_dispatch_gate", lambda state: {})
     # workflow.add_node("reviewer_sync", synchronization_node)
 
     workflow.add_edge(START, "bootstrap")
@@ -208,7 +212,10 @@ def build_graph(checkpointer=None, interrupt_before=None):
     # workflow.add_edge("synchronization", "reachability_filter")
     workflow.add_conditional_edges("synchronization", dispatch_reviewers, ["reviewer_agent", END])
     # workflow.add_edge("reviewer_agent", "reviewer_sync")
-    workflow.add_conditional_edges("reviewer_agent", dispatch_validators, ["validator_agent", "integration_auditor", END])
+    # Evaluate dispatch from the barrier (never mid-superstep) so it reads the
+    # fully-merged confirmed set before emitting validator/auditor Sends.
+    workflow.add_edge("reviewer_agent", "validator_dispatch_gate")
+    workflow.add_conditional_edges("validator_dispatch_gate", dispatch_validators, ["validator_agent", "integration_auditor", END])
     # Chained records from the integration auditor go to the Validator for PoC
     # construction; unchainable (and non-chained) records are terminal.
     workflow.add_conditional_edges("integration_auditor", route_integration_audit, ["validator_agent", END])

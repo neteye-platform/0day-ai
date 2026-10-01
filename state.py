@@ -10,8 +10,8 @@ class MasterState(TypedDict):
     known_vulns: list[dict]
     expert_tasks: list[ExpertTask]
 
-    # Container runtime data, populated by the preprocessor after it starts the
-    # built image in the background. None when no sandbox could be started.
+    # Set only by the preprocessor; validator output is constrained to
+    # `vulnerabilities` by compile_validator's output_schema.
     sandbox_url: Optional[str]
     container_name: Optional[str]
 
