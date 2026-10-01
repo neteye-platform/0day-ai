@@ -2526,9 +2526,14 @@ class ValidatorAgent(ToolLoopAgent):
             n for n in self._terminal_names()
             if n != "ask_for_context" or first_pass
         ]
+        # Failed (status='error') tool messages never count as a verdict: e.g. a
+        # mark_validation_complete whose arguments failed schema validation must
+        # bounce back to the validator LLM so it can fix them and retry.
         for msg in reversed(state["messages"]):
             if getattr(msg, "type", "") != "tool":
                 break
+            if getattr(msg, "status", "") == "error":
+                continue
             if getattr(msg, "name", "") in terminal_names:
                 return True
         return False

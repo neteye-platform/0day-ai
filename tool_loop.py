@@ -304,11 +304,17 @@ class ToolLoopAgent:
         return False
 
     def tool_batch_done(self, state) -> bool:
-        """True when the latest contiguous tool batch contains a terminal tool."""
+        """True when the latest contiguous tool batch contains a successful
+        terminal tool call. Failed (``status='error'``) tool messages — e.g. a
+        ``submit_evaluation`` whose arguments failed schema validation — do NOT
+        count as a verdict: they must bounce back to the agent LLM so it can
+        correct its arguments and retry."""
         terminal_names = self._terminal_names()
         for msg in reversed(state["messages"]):
             if msg.type != "tool":
                 break
+            if getattr(msg, "status", "") == "error":
+                continue
             if getattr(msg, "name", "") in terminal_names:
                 return True
         return False
