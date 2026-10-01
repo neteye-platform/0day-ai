@@ -45,7 +45,7 @@ def _render_reporter_prompt(record: dict) -> str:
     if record.get("source_cve"):
         lines.append(f"Source CVE: {record['source_cve']}")
     if record.get("confidence_score") is not None:
-        lines.append(f"Reviewer confidence: {record['confidence_score']}/10")
+        lines.append(f"Confidence: {record['confidence_score']}/10")
     lines += ["", "Description:", str(record.get("description") or "_none_")]
     if record.get("reviewer_reasoning"):
         lines += ["", "Reviewer reasoning:", str(record["reviewer_reasoning"]).rstrip()]
@@ -239,7 +239,7 @@ def _render_report_markdown(
         if record.get("source_cve"):
             lines.append(f"**Source CVE:** {record['source_cve']}")
         if record.get("confidence_score") is not None:
-            lines.append(f"**Reviewer confidence:** {record['confidence_score']}/10")
+            lines.append(f"**Audit confidence:** {record['confidence_score']}/10")
 
         summary = finding.get("summary") or record.get("description") or "_none_"
         steps = finding.get("reproduction_steps") or record.get("reproduction_steps") or []
