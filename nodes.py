@@ -980,9 +980,20 @@ def threat_intel_node(state: ThreatIntelState) -> dict:
 # ==========================================
 
 def build_caller_map(graph_data: dict):
+    """Map each node to the source nodes of its incoming ``calls`` edges.
+
+    Only genuine call edges qualify. Structural relations (``method`` /
+    ``contains`` / ``inherits`` / ``mixes_in`` / ``implements`` / ``imports`` /
+    ``references``) do not carry parameter contracts: routing explorer upstream
+    demands through them delivers a callee's contracts to its class/file node,
+    whose sibling method bodies are pruned by ``get_node_code`` ("Body omitted
+    ... evaluated by a peer agent"), leaving the call sites invisible — the
+    verifier could only guess there.
+    """
     callers_map = defaultdict(list)
     for edge in graph_data.get("links", []):
-        callers_map[edge.get("target")].append(edge.get("source"))
+        if edge.get("relation") == "calls":
+            callers_map[edge.get("target")].append(edge.get("source"))
     return callers_map
 
 
@@ -1102,7 +1113,10 @@ def _route_upstream(demand: dict, current_node_id: str, callers_map: dict, group
                 "parameter_name": target_str
             })
     else:
-        logging.warning(f"[{current_node_id}] UPSTREAM DROP: No callers found in graph for this node.")
+        # Expected for methods with no in-graph caller (private helpers,
+        # entrypoints); with the calls-only caller map this fires for every
+        # never-called method, so it must not be a warning.
+        logging.debug(f"[{current_node_id}] UPSTREAM DROP: No callers found in graph for this node.")
 
 
 def _route_explorer_notes(notes: list, graph_data: dict, callers_map: dict, grouped_demands: defaultdict) -> list[dict]:
