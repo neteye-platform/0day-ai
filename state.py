@@ -2,7 +2,7 @@ import operator
 from pathlib import Path
 from typing import TypedDict, Any, Annotated, Optional
 from langgraph.graph.message import add_messages
-from schemas import AnalysisNote, ExpertTask, ValidationResult, VulnerabilityEvaluation, VulnerabilityRecord
+from schemas import AnalysisNote, ExpertTask, VulnerabilityRecord
 from utils import merge_vulnerabilities
 
 
@@ -13,7 +13,6 @@ class MasterState(TypedDict):
     # Set only by the preprocessor; validator output is constrained to
     # `vulnerabilities` by compile_validator's output_schema.
     sandbox_url: Optional[str]
-    container_name: Optional[str]
 
     notes: Annotated[list[AnalysisNote], operator.add]
     cve_demands: Annotated[list[dict], operator.add]
@@ -57,7 +56,6 @@ class ReviewerState(TypedDict):
 class ValidatorState(TypedDict):
     report_to_test: dict # The specific vulnerability to validate
     sandbox_url: Optional[str]     # The endpoint/IP of the sandbox
-    container_name: Optional[str]  # The running sandbox container
     cookies: dict
     # Unique per-validator id (uuid) used to namespace browser session ids, so
     # concurrent validators sharing the single web browser never collide even

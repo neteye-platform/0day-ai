@@ -1,13 +1,11 @@
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Literal, Optional
-import json
 import yaml
 import re
 
 
 with open("agents.yaml", "r") as f:
     data = yaml.safe_load(f)
-    TOOLS = data.get("tools")
     MANAGER_AGENT = data.get("manager_agent")
     EXPERT_AGENTS = data.get("expert_agents")
     CVE_ANALYZER_AGENT = data.get("cve_analyzer")
@@ -437,16 +435,6 @@ class ValidatorOutput(BaseModel):
     # input fields (sandbox_url etc.) back to MasterState — concurrent writes to
     # those scalars raised "Can receive only one value per step" at checkpoint time.
     vulnerabilities: list[VulnerabilityRecord]
-
-class ValidationResult(BaseModel):
-    # report_id: str = Field(description="The ID/title of the vulnerability being tested.")
-    is_confirmed: bool = Field(description="True if the exploit successfully triggered in the sandbox.")
-    poc_payload: Optional[str] = Field(description="The exact payload or HTTP request that triggered the vulnerability. If you developed a PoC script in the attacker container using the ATTACKER SHELL TOOLS, provide the path of the script relative to /work.")
-    execution_logs: str = Field(description="Relevant logs or output from the sandbox confirming the exploit.")
-
-class PackageCheck(BaseModel):
-    name: str = Field(description="The name of the package")
-    version: str = Field(description="The exact version string")
 
 class UpstreamDemand(BaseModel):
     target: str = Field(description="Exact parameter name (e.g., 'query', 'user_id').")
