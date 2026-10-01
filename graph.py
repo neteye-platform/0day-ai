@@ -18,7 +18,7 @@ import settings
 import tools
 import browser_tools
 import attacker_tools
-from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, integration_auditor_node, integration_auditor_router, integration_auditor_fallback_node, ask_integration_auditor_for_tool, route_integration_audit, route_validator_feedback, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
+from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, dispatch_integration_audits, integration_auditor_node, integration_auditor_router, integration_auditor_fallback_node, ask_integration_auditor_for_tool, route_integration_audit, route_validator_feedback, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
 from state import MasterState, ReviewerState, ValidatorState, IntegrationAuditorState
 from schemas import ReviewerOutput, ValidatorOutput
 
@@ -185,6 +185,11 @@ def build_graph(checkpointer=None, interrupt_before=None):
     # merged record set (not a partial mid-superstep snapshot, which previously
     # sent the auditor an empty `confirmed_vulns` peer list).
     workflow.add_node("validator_dispatch_gate", lambda state: {})
+    # Runs strictly AFTER the validator superstep: a barrier node whose
+    # conditional edges fan the deferred `requires_integration` records to the
+    # auditor once their `direct_to_validator` peers carry proven poc_payloads
+    # (dispatch_integration_audits is the conditional path function).
+    workflow.add_node("integration_audit_dispatch", lambda state: {})
     # workflow.add_node("reviewer_sync", synchronization_node)
 
     workflow.add_edge(START, "bootstrap")
@@ -213,11 +218,40 @@ def build_graph(checkpointer=None, interrupt_before=None):
     # Evaluate dispatch from the barrier (never mid-superstep) so it reads the
     # fully-merged confirmed set before emitting validator/auditor Sends.
     workflow.add_edge("reviewer_agent", "validator_dispatch_gate")
-    workflow.add_conditional_edges("validator_dispatch_gate", dispatch_validators, ["validator_agent", "integration_auditor", END])
-    # Chained records from the integration auditor go to the Validator for PoC
-    # construction; unchainable (and non-chained) records are terminal.
+    # Stage 1: prove every direct_to_validator record. requires_integration records
+    # are DEFERRED by dispatch_validators — the auditor must run only AFTER these
+    # are proven so its chain candidates carry real validator poc_payloads.
+    workflow.add_conditional_edges(
+        "validator_dispatch_gate",
+        dispatch_validators,
+        {
+            "validator_agent": "validator_agent",
+            "integration_audit_dispatch": "integration_audit_dispatch",
+            "__end__": END,
+        },
+    )
+    # Stage 2: from the validator (once its whole superstep finished) either bounce
+    # insufficient_context records back to the Reviewer OR, when no feedback is
+    # pending, advance into the integration-audit phase.
+    workflow.add_conditional_edges(
+        "validator_agent",
+        route_validator_feedback,
+        {
+            "reviewer_agent": "reviewer_agent",
+            "integration_audit_dispatch": "integration_audit_dispatch",
+            "__end__": END,
+        },
+    )
+    # Stage 2b: fan the audited records to the auditor (or END when none remain —
+    # covers the no-direct-tasks / post-chain drain cases).
+    workflow.add_conditional_edges(
+        "integration_audit_dispatch",
+        dispatch_integration_audits,
+        ["integration_auditor", END],
+    )
+    # Stage 3: chained records go to the Validator with the peers' proven
+    # poc_payloads injected (see route_integration_audit); unchainable are terminal.
     workflow.add_conditional_edges("integration_auditor", route_integration_audit, ["validator_agent", END])
-    workflow.add_conditional_edges("validator_agent", route_validator_feedback, ["reviewer_agent", END])
 
     app = workflow.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)
     app = app.with_config({"max_concurrency": settings.agents_concurrency})

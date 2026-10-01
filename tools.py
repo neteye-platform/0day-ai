@@ -714,6 +714,22 @@ def _format_vulnerability_markdown(record: dict) -> str:
     else:
         lines.append("_none_")
 
+    if record.get("poc_payload") or record.get("execution_logs"):
+        lines += [
+            "",
+            "### Proven Validator Payload",
+        ]
+        if record.get("poc_payload"):
+            lines += ["```", str(record["poc_payload"]).rstrip(), "```"]
+        else:
+            lines.append("_no payload_")
+        if record.get("execution_logs"):
+            lines += [
+                "",
+                "Execution logs:",
+                str(record["execution_logs"]).rstrip(),
+            ]
+
     return "\n".join(lines)
 
 
