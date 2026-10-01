@@ -19,7 +19,7 @@ from stage_patcher import patchable_records
 from state import MasterState, ValidatorState
 from stage_reviewer import build_reviewer_payload
 from tool_loop import CompactionConfig, ToolLoopAgent
-from utils import cache_validator, get_node_code
+from utils import cache_validator, cvss_gate_blocks, get_node_code
 
 
 _BARE_IDENT_RE = re.compile(r"^[\w$]+$")
@@ -106,6 +106,18 @@ def dispatch_validators(state: MasterState):
             logging.info(
                 f"{evaluation.get('vuln_id')} requires_integration — deferred to "
                 f"the integration audit phase (after direct validation)."
+            )
+            continue
+        if cvss_gate_blocks(
+            {**evaluation, "validation_strategy": strategy}, settings.validator_min_cvss
+        ):
+            # Reviewer's CVSS estimate below settings.validator_min_cvss: the
+            # sandbox is never spent on it; the record stays 'confirmed' and the
+            # reporter ships it unvalidated (same predicate, state-derived row).
+            logging.info(
+                f"{evaluation.get('vuln_id')} CVSS estimate {evaluation.get('cvss_vector')} "
+                f"below gate threshold {settings.validator_min_cvss} — validation skipped, "
+                f"will be reported unvalidated."
             )
             continue
         direct.append(evaluation)

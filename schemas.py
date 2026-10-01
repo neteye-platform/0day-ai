@@ -207,6 +207,16 @@ class VulnerabilityRecord(BaseModel):
         ),
     )
 
+    cvss_vector: Optional[str] = Field(
+        default=None,
+        description=(
+            "Reviewer's CVSS v3.1 base-vector estimate for the adjudicated finding "
+            "(set on exploitable verdicts). The pipeline recomputes the numeric score "
+            "from it; a confirmed record estimated below settings.validator_min_cvss "
+            "is not dispatched to the Validator/Auditor and is reported unvalidated."
+        ),
+    )
+
     # Validator additions
     poc_payload: Optional[str] = None
     poc_script: Optional[str] = None
@@ -623,6 +633,27 @@ class VerifierOutput(BaseModel):
 # Tools
 # ==========================================
 
+# Shared CVSS v3.1 base-metric primer, reused by every schema that makes the
+# model emit a vector (the reviewer's pre-validation estimate and the
+# reporter's final assessment) so the definitions can never diverge.
+CVSS_V31_BASE_HELP = (
+    "A complete CVSS v3.1 BASE vector string, e.g. 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'. "
+    "Pick the metrics honestly from the evidence, using these definitions:\n"
+    "AV  Attack Vector: N(network) / A(adjacent) / L(local) / P(physical)\n"
+    "AC  Attack Complexity: L(low) / H(high)\n"
+    "PR  Privileges Required: N(none) / L(low) / H(high)\n"
+    "UI  User Interaction: N(none) / R(required)\n"
+    "S   Scope: U(unchanged) / C(changed)\n"
+    "C,I,A  Confidentiality / Integrity / Availability impact: H(high) / L(low) / N(none)\n"
+)
+CVSS_V31_BASE_EXAMPLES = (
+    "Choose metrics that match the proven reproduction: a finding triggered over HTTP by an "
+    "unauthenticated attacker is AV:N/AC:L/PR:N/UI:N/S:U; a client-side XSS requires UI:R; an "
+    "admin-only route is PR:H; a compromise that moves past the vulnerable component into adjacent "
+    "assets (e.g. sandbox escape, RCE that reaches the host) is S:C. "
+    "The pipeline recomputes the numeric base score from this vector."
+)
+
 class EvaluationToolInput(BaseModel):
     reasoning: str = Field(
         description="Brief technical explanation for the decision."
@@ -665,6 +696,18 @@ class EvaluationToolInput(BaseModel):
     is_exploitable: bool = Field(
         description="True if there is a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by application mitigations."
     )
+    cvss_vector: Optional[str] = Field(
+        default=None,
+        description=(
+            "REQUIRED when is_exploitable is true; never set for false positives. "
+            "Your honest CVSS severity estimate of the adjudicated flaw, judged from the "
+            "flow you traced (not a number you wish it were).\n"
+            + CVSS_V31_BASE_HELP +
+            "The pipeline recomputes the numeric base score from this vector and it decides "
+            "whether a live Validator is spent on the finding, so an inflated vector wastes "
+            "sandbox time and a deflated one hides the finding's true risk."
+        )
+    )
     mitigation: Optional[str] = Field(
         default=None,
         description=(
@@ -702,6 +745,18 @@ class EvaluationToolInput(BaseModel):
                 "Pick one of 'direct_to_validator', 'requires_integration', 'static_finding_only'. "
                 "Leave it unset only for false positives."
             )
+        if self.is_exploitable and not (self.cvss_vector or "").strip():
+            raise ValueError(
+                "cvss_vector is required when is_exploitable is true: a complete CVSS v3.x "
+                "base vector (e.g. 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H') honestly "
+                "estimating the adjudicated flaw. False positives carry no severity estimate."
+            )
+        if not self.is_exploitable and (self.cvss_vector or "").strip():
+            raise ValueError(
+                "cvss_vector must stay unset for false positives: a blocked flow has no "
+                "severity estimate. If the flow is not actually blocked, submit "
+                "is_exploitable=true with your vector instead."
+            )
         if not self.is_exploitable and not (self.mitigation or "").strip():
             raise ValueError(
                 "mitigation is required for false positives: cite the concrete defense "
@@ -709,6 +764,27 @@ class EvaluationToolInput(BaseModel):
                 "with 'direct_to_validator' and the open points in `reservations`."
             )
         return self
+
+    @field_validator("cvss_vector", mode="before")
+    @classmethod
+    def _validate_cvss_vector(cls, v):
+        """Strict for the reviewer: the numeric score gates Validator dispatch, so the
+        vector must be fully parseable, not just CVSS-prefixed."""
+        if v is None or not isinstance(v, str):
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        # Lazy import: utils imports schemas at module level (merge_vulnerabilities).
+        from utils import cvss_v3_base_score
+        if not v.startswith("CVSS:3.") or cvss_v3_base_score(v) is None:
+            raise ValueError(
+                "cvss_vector must be a complete CVSS v3.x base vector: start with "
+                "'CVSS:3.' and carry all eight base metrics AV/AC/PR/UI/S/C/I/A, e.g. "
+                "'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'. The pipeline scores it "
+                "deterministically; a partial or malformed vector is rejected."
+            )
+        return v
 
     @field_validator("reproduction_steps", mode="before")
     @classmethod
@@ -914,21 +990,7 @@ class ReporterFinding(BaseModel):
         description="As short as possible: the finding in one or two direct sentences, distilled from the record's description and reviewer reasoning. Nothing beyond what a reader needs to grasp it."
     )
     cvss_vector: str = Field(
-        description=(
-            "A complete CVSS v3.1 BASE vector string, e.g. 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'. "
-            "Pick the metrics honestly from the evidence, using these definitions:\n"
-            "AV  Attack Vector: N(network) / A(adjacent) / L(local) / P(physical)\n"
-            "AC  Attack Complexity: L(low) / H(high)\n"
-            "PR  Privileges Required: N(none) / L(low) / H(high)\n"
-            "UI  User Interaction: N(none) / R(required)\n"
-            "S   Scope: U(unchanged) / C(changed)\n"
-            "C,I,A  Confidentiality / Integrity / Availability impact: H(high) / L(low) / N(none)\n"
-            "Choose metrics that match the proven reproduction: a finding triggered over HTTP by an "
-            "unauthenticated attacker is AV:N/AC:L/PR:N/UI:N/S:U; a client-side XSS requires UI:R; an "
-            "admin-only route is PR:H; a compromise that moves past the vulnerable component into adjacent "
-            "assets (e.g. sandbox escape, RCE that reaches the host) is S:C. "
-            "The pipeline recomputes the numeric base score from this vector."
-        )
+        description=CVSS_V31_BASE_HELP + CVSS_V31_BASE_EXAMPLES
     )
     severity: Literal["Critical", "High", "Medium", "Low", "None"] = Field(
         description="Qualitative severity matching the CVSS v3 score ranges (Critical >= 9.0, High >= 7.0, Medium >= 4.0, Low >= 0.1, None = 0.0). Overridden by the pipeline if it disagrees with the vector's computed score."
