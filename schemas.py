@@ -78,6 +78,14 @@ CWE_KEYS = Literal[
 ]
 
 
+# A canonical systemic signature must be a short pattern label. Verbose
+# signatures are node-specific phrasing (an explorer ignoring the pattern_label
+# rule), never a stable cross-node identity — so anything longer falls back to
+# CWE-level grouping instead of producing per-node-unique keys.
+SIGNATURE_MAX_WORDS = 6
+SIGNATURE_MAX_CHARS = 60
+
+
 def _normalize_signature(value) -> str:
     """Canonicalize free text into a stable grouping token (lowercase, quotes
     stripped, non-alphanumerics collapsed to '_')."""
@@ -97,8 +105,10 @@ def canonical_signature(
     """Deterministic identity for grouping systemic findings across nodes.
 
     Falls through the record's most-identity-bearing fields in order of
-    stability: the verifier's demand id, the CVE's usage pattern, and finally
-    the free-text description (the explorer's `component` label)."""
+    stability: the explorer's enforced `pattern_label` (carried as
+    `vulnerable_component`), the verifier's demand id, the CVE's usage pattern,
+    and finally the free-text description. Returns "" when no candidate yields
+    a short enough canonical label (the caller then groups at CWE level)."""
     for candidate in (
         vulnerable_component,
         demand_id if demand_id and demand_id != "unknown_anchor" else None,
@@ -106,9 +116,13 @@ def canonical_signature(
         description,
     ):
         sig = _normalize_signature(candidate)
-        if sig:
-            return sig
-    return "general"
+        if not sig:
+            continue
+        # Cap: verbose free text is node-specific phrasing, not a shared label.
+        if sig.count("_") + 1 > SIGNATURE_MAX_WORDS or len(sig) > SIGNATURE_MAX_CHARS:
+            return ""
+        return sig
+    return ""
 
 
 class VulnerabilityRecord(BaseModel):
@@ -230,8 +244,10 @@ class VulnerabilityRecord(BaseModel):
                     description=self.description,
                 )
                 # Node-independent: identical patterns from different nodes
-                # share one vuln_id, so merge_vulnerabilities groups them.
-                self.vuln_id = f"systemic:{self.cwe_id}:{sig}"
+                # share one vuln_id, so merge_vulnerabilities groups them. An
+                # empty signature (no short canonical label available) degrades
+                # to CWE-level grouping instead of a per-node-unique key.
+                self.vuln_id = f"systemic:{self.cwe_id}:{sig}" if sig else f"systemic:{self.cwe_id}"
             return self
 
         if not self.vuln_id:
@@ -403,6 +419,18 @@ class DownstreamDemand(BaseModel):
 class Hypothesis(BaseModel):
     cwe: CWE_KEYS = Field(description="The matching CWE ID from the provided list.")
     component: str = Field(description="The exact parameter, state transition, or function call that is flawed.")
+    pattern_label: Optional[str] = Field(
+        default=None,
+        description=(
+            "REQUIRED when cwe is a systemic/architectural class (CWE-327, CWE-319, "
+            "CWE-306, CWE-200, CWE-352, CWE-384, CWE-840): a SHORT canonical name of "
+            "at most six lowercase words identifying the insecure pattern, e.g. "
+            "'plaintext password storage', 'no csrf token validation', 'weak tls ciphers'. "
+            "Use the EXACT SAME label for every occurrence of the same pattern, so findings "
+            "from different nodes can be grouped into a single review. Leave null for "
+            "localized defects."
+        ),
+    )
 
 class AnalysisNote(BaseModel):
     sources: list[str] | None = Field(default=None, description="External data entering this snippet.")

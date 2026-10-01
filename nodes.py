@@ -504,6 +504,7 @@ def _explore_single(node_id: str, role_name: str) -> dict:
             "affected_nodes": [node_id],
             "cwe_id": hyp.get("cwe", "OTHER_UNCATEGORIZED"),
             "description": hyp.get("component", ""),
+            "vulnerable_component": hyp.get("pattern_label") or None,
             "status": "hypothesis"
         })
 
@@ -596,6 +597,7 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
                 "affected_nodes": [node_id],
                 "cwe_id": hyp.get("cwe", "OTHER_UNCATEGORIZED"),
                 "description": hyp.get("component", ""),
+                "vulnerable_component": hyp.get("pattern_label") or None,
                 "status": "hypothesis"
             })
 
