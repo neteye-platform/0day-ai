@@ -64,64 +64,135 @@ def extract_subgraph(G: nx.DiGraph, target_communities: list) -> nx.DiGraph:
     return subgraph
 
 
-def serialize_and_truncate(obj, max_length=400):
+def serialize_for_json(obj):
     """
-    Recursively parses objects and shortens long strings for clean terminal logging.
-    Ensures anything a node outputs is JSON serializable for pretty-printing.
+    Recursively parses objects to create a clean, JSON structure.
+    Strips heavy LangChain metadata but preserves full content and tool IDs.
     """
     if isinstance(obj, dict):
-        return {k: serialize_and_truncate(v, max_length) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [serialize_and_truncate(item, max_length) for item in obj]
-    elif isinstance(obj, str):
-        # Truncate giant source code dumps or massive summaries
-        return obj if len(obj) <= max_length else obj[:max_length] + \
-            f" ... [TRUNCATED (showing {max_length}/{len(obj)} bytes)]"
+        # Strip out noisy metadata
+        return {
+            k: serialize_for_json(v)
+            for k, v in obj.items()
+            if k not in ["usage_metadata", "response_metadata"]
+        }
+
+    # elif isinstance(obj, list):
+    #     # Filter out hidden system messages
+    #     parsed_list = [serialize_for_json(item) for item in obj]
+    #     return [item for item in parsed_list if item != "[SYSTEM PROMPT HIDDEN]"]
+
     elif hasattr(obj, "model_dump"):
-        # Beautifully unpack Pydantic models (like your ExpertTask)
-        return serialize_and_truncate(obj.model_dump(), max_length)
-    elif hasattr(obj, "content"):
-        # Extract meaningful data from Langchain AIMessage/ToolMessage objects
-        rep = {"content": obj.content}
+        # Unpack Pydantic models
+        return serialize_for_json(obj.model_dump())
+
+    elif hasattr(obj, "content") and hasattr(obj, "type"):
+        # --- LANGCHAIN MESSAGE SHAPING ---
+        if obj.type == "system":
+            return "[SYSTEM PROMPT HIDDEN]"
+
+        # Structure the message exactly how you requested
+        msg_data = {"type": obj.type}
+
+        if obj.content:
+            msg_data["content"] = obj.content
+
+        # If the AI calls a tool, include the call details and ID
         if hasattr(obj, "tool_calls") and obj.tool_calls:
-            rep["tool_calls"] = obj.tool_calls
-        return serialize_and_truncate(rep, max_length)
-    elif type(obj) in (int, float, bool, type(None)):
+            msg_data["tool_calls"] = obj.tool_calls
+
+        # If this is a tool responding, include its name and the ID it's answering
+        if obj.type == "tool":
+            if hasattr(obj, "name"):
+                msg_data["tool_name"] = obj.name
+            if hasattr(obj, "tool_call_id"):
+                msg_data["responds_to_id"] = obj.tool_call_id
+
+        return msg_data
+
+    elif type(obj) in (int, float, bool, type(None), str):
         return obj
     else:
         return str(obj)
 
+def run_stream(app, inputs, config=None, output_file="trace.json"):
+    print(f"\n[System] Running Multi-Agent Analysis. Assembling state to {output_file}...")
 
-def run_stream(app, inputs, config=None, vv=False):
-    print("\n\033[95m[System]\033[0m Initializing Multi-Agent Analysis...\n")
+    assembled_states = {}
+    raw_main_state = {}
 
-    # We still need to manually accumulate the reports to return to main.py
-    accumulated_state = {"vulnerability_reports": []}
+    for event in app.stream(inputs, stream_mode="values", subgraphs=True, config=config):
+        namespace, state = event
 
-    for event in app.stream(inputs, stream_mode="updates", subgraphs=True, config=config):
+        # Format the namespace so it's readable in the JSON
+        # The root graph has an empty namespace tuple ()
+        if not namespace:
+            graph_name = "Main_Graph"
+            raw_main_state = state
+        else:
+            # Subgraphs/Agents have namespaces like ('manager', 'expert', 'b3f1...')
+            graph_name = ' -> '.join(namespace)
 
-        namespace, chunk = event
+        if hasattr(state.get("task"), "agent_role"):
+            graph_name = graph_name[:17] + f" ({state.get("task").agent_role})"
 
-        for node_name, state_update in chunk.items():
-            if vv and node_name == "execute_tools":
-                continue
+        # Overwrite the key with the most recent full state.
+        assembled_states[graph_name] = serialize_for_json(state)
 
-            # 1. Print the Node Header
-            print(f"\n" + "-"*60)
-            print(f"\033[94m[NODE EXECUTED: {node_name}]\033[0m")
-            print("-" * 60)
+        # --- TERMINAL PROGRESS INDICATOR ---
+        if "messages" in state and state["messages"]:
+            last_msg = state["messages"][-1]
+            msg_type = getattr(last_msg, "type", "unknown")
 
-            # 2. Parse, truncate, and dynamically format the output
-            clean_data = serialize_and_truncate(state_update)
-            formatted_json = json.dumps(clean_data, indent=2)
+            # Extract content safely, even if it's nested
+            content = getattr(last_msg, "content", "")
+            if isinstance(content, list):
+                content = str(content)
 
-            # 3. Print the Output to terminal
-            print(f"\033[96m-> State Update (Output):\033[0m")
-            print(f"\033[90m{formatted_json}\033[0m")
+            # Create a clean, single-line snippet
+            snippet = (content[:100] + "...") if len(content) > 100 else content
+            snippet = snippet.replace('\n', ' ').strip()
 
-            # 4. Track vulnerability reports for the final output in main.py
-            if "vulnerability_reports" in state_update and not namespace:
-                accumulated_state["vulnerability_reports"].extend(state_update["vulnerability_reports"])
+            if msg_type == "ai":
+                # 1. Print the AI's thought process (Chain of Thought)
+                if snippet:
+                    print(f"[{graph_name}] \033[96m🧠 AI: {snippet}\033[0m")
 
-    print("\n\033[95m[System]\033[0m Execution Finished.")
-    return accumulated_state
+                # 2. Print the Tool Call (if it decided to act)
+                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                    tool_strings = []
+                    for tc in last_msg.tool_calls:
+                        name = tc.get("name", "unknown")
+                        args = tc.get("args", {})
+                        if name == "SubmitReport":
+                            args_str = [a.get("vulnerability_type", "") for a in args.get("findings", [])]
+                        else:
+                            args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
+                        tool_strings.append(f"{name}({args_str})")
+
+                    print(f"[{graph_name}] \033[93m🛠️  Calling tool: {' | '.join(tool_strings)}\033[0m")
+
+            elif msg_type == "tool":
+                print(f"[{graph_name}] \033[92m✅ Tool executed: {getattr(last_msg, 'name', 'unknown')}\033[0m")
+
+            elif msg_type == "human":
+                print(f"[{graph_name}] \033[94m👤 Human: {snippet}\033[0m")
+
+            else:
+                print(f"[{graph_name}] \033[90m⚙️  {msg_type.capitalize()} message\033[0m")
+
+        else:
+            # Tell us exactly WHICH state keys were updated in the background
+            state_keys = ", ".join([k for k in state.keys() if k != "messages"])
+            print(f"[{graph_name}] \033[90mState updated: [{state_keys}]\033[0m")
+        # -----------------------------------
+
+    # Dump the cohesive final states to a JSON file
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(assembled_states, f, indent=2)
+
+    print("[System] Execution Finished.")
+
+    # Extract the vulnerability reports from the main graph to return
+    main_state = assembled_states.get("Main_Graph", {})
+    return {"vulnerability_reports": raw_main_state.get("vulnerability_reports", [])}

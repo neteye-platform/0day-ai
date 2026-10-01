@@ -354,12 +354,7 @@ if __name__ == "__main__":
     )
 
     try:
-        if "-v" in sys.argv:
-            final_state = run_stream(app, initial_state)
-        elif "-vv" in sys.argv:
-            final_state = run_stream(app, initial_state, vv=True)
-        else:
-            final_state = app.invoke(initial_state)
+        final_state = run_stream(app, initial_state)
 
         # Print the aggregated findings
         print("\n\n" + "="*60)
