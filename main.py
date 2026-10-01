@@ -15,13 +15,13 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 import tools
 from utils import build_networkx_graph, run_stream
-from state import MasterState, ExpertState, ValidatorState
+from state import MasterState, ExpertState, ReviewerState, ValidatorState
 from schemas import VALIDATOR_AGENT, ExpertTask, VulnerabilityEvaluation, VulnerabilityReport, ManagerOutput, ReviewerOutput, ValidationResult, EXPERT_AGENTS, REVIEWER_AGENT, TOOLS
 
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# Nodes
+# Preprocessor
 # ==========================================
 
 def preprocessor_node(state: MasterState) -> Dict[str, Any]:
@@ -83,17 +83,20 @@ def preprocessor_node(state: MasterState) -> Dict[str, Any]:
         "communities_map": communities_map
     }
 
+# ==========================================
+# Manager
+# ==========================================
 
 def manager_agent_node(state: MasterState) -> Dict[str, Any]:
     """The Manager LLM reads the programmatic summary and dispatches tasks."""
     logger.debug("Entering manager_agent_node. Invoking Lead Security Architect LLM.")
 
-    # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
-    llm = ChatOpenAI(
-        base_url="http://localhost:11434/v1",
-        model="glm-5-2-3-bit",
-        temperature=0
-    )
+    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    # llm = ChatOpenAI(
+    #     base_url="http://localhost:11434/v1",
+    #     model="glm-5-2-3-bit",
+    #     temperature=0
+    # )
     parser = PydanticOutputParser(pydantic_object=ManagerOutput)
 
     roles_docs = "\n".join([
@@ -116,8 +119,11 @@ def manager_agent_node(state: MasterState) -> Dict[str, Any]:
     response = parser.invoke(response_msg)
 
     logger.debug(f"Manager created {len(response.tasks)} expert tasks.")
-    return {"expert_tasks": response.tasks, "messages": response_msg}
+    return {"expert_tasks": response.tasks, "manager_message": response_msg}
 
+# ==========================================
+# Expert agents
+# ==========================================
 
 def expert_agent_node(state: ExpertState) -> dict:
     role_name = state["task"].agent_role
@@ -127,12 +133,12 @@ def expert_agent_node(state: ExpertState) -> dict:
         logger.debug(f"No subgraph nodes assigned to {role_name}. Bypassing execution.")
         return {"vulnerability_reports": []}
 
-    # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
-    llm = ChatOpenAI(
-        base_url="http://localhost:11434/v1",
-        model="glm-5-2-3-bit",
-        temperature=0
-    )
+    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    # llm = ChatOpenAI(
+    #     base_url="http://localhost:11434/v1",
+    #     model="glm-5-2-3-bit",
+    #     temperature=0
+    # )
 
     agent_tools = [tools.submit_report]
     tool_names = EXPERT_AGENTS[role_name].get("tools", [])
@@ -258,42 +264,28 @@ def dispatch_experts(state: MasterState):
 
     return commands
 
+# ==========================================
+# Reviewer agent
+# ==========================================
 
-def reviewer_node(state: MasterState):
-    """Review the vulnerability reports and keep only what is actually relevant"""
+def dispatch_reviewers(state: MasterState):
+    """Groups reports and dispatches parallel reviewer threads using the Send API."""
     logger.debug("Entering reviewer_node.")
 
     reports = state.get("vulnerability_reports", [])
     if not reports:
         logger.debug("No reports to review. Skipping.")
-        return {"filtered_reports": []}
+        return END
 
     # Group the reports by vulnerability and sink_node
     grouped_reports = defaultdict(list)
     for report in reports:
-        # Use .get() in case a dictionary is malformed
         vuln = report.get("vulnerability", "Unknown")
         sink = report.get("sink_node", "Unknown")
         grouped_reports[(vuln, sink)].append(report)
 
-    logger.debug(f"Consolidated {len(reports)} raw reports into {len(grouped_reports)} unique groups.")
-
-    # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
-    llm = ChatOpenAI(
-        base_url="http://localhost:11434/v1",
-        model="glm-5-2-3-bit",
-        temperature=0
-    )
-    parser = PydanticOutputParser(pydantic_object=VulnerabilityEvaluation)
-
-    sys_msg = SystemMessage(content=(
-        f"{REVIEWER_AGENT.get('prompt')}\n\n"
-        f"{parser.get_format_instructions()}"
-    ))
-
-    valid_reports = []
+    commands = []
     for (vuln, sink), group in grouped_reports.items():
-
         # Format the group into a single, clean string for the LLM
         formatted_group_text = f"Vulnerability: {vuln}\nSink Node: {sink}\n\nInstances found:\n"
         for idx, item in enumerate(group, 1):
@@ -306,17 +298,69 @@ def reviewer_node(state: MasterState):
                 f"  Trace Nodes: {trace_str}\n"
             )
 
+        report_id = f"{vuln} @ {sink}"
+        sys_msg = SystemMessage(content=REVIEWER_AGENT.get('prompt'))
         human_msg = HumanMessage(content=f"Vulnerability report to evaluate:\n{formatted_group_text}")
 
-        response_msg = llm.invoke([sys_msg, human_msg])
-        response = parser.invoke(response_msg)
+        payload = ReviewerState(
+            report_id=report_id,
+            messages=[sys_msg, human_msg]
+        )
+        commands.append(Send("reviewer_agent", payload))
 
-        if response.is_exploitable:
-            valid_reports.append(response)
+    return commands
 
-    logger.debug(f"Reviewer kept {len(valid_reports)} out of {len(reports)} reports.")
-    return {"filtered_reports": valid_reports}
 
+def reviewer_agent_node(state: ReviewerState) -> dict:
+    """Review the vulnerability reports and keep only what is actually relevant"""
+    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    # llm = ChatOpenAI(
+    #     base_url="http://localhost:11434/v1",
+    #     model="glm-5-2-3-bit",
+    #     temperature=0
+    # )
+
+    llm_with_tools = llm.bind_tools([tools.read_source_code, tools.submit_evaluation])
+
+    response = llm_with_tools.invoke(state["messages"])
+    return {"messages": [response]}
+
+
+def reviewer_router(state: ReviewerState) -> str:
+    """Routes based on the tool called by the reviewer LLM."""
+    last_message = state["messages"][-1]
+
+    if last_message.tool_calls:
+        for tc in last_message.tool_calls:
+            if tc["name"] == "submit_evaluation":
+                return "save_evaluation"
+        return "reviewer_tools"
+
+    # If the LLM just talks without using tools, we force it back to the agent to try again
+    return "reviewer_agent"
+
+
+def save_evaluation_node(state: ReviewerState) -> dict:
+    """Intercepts submit_evaluation and passes the result back to MasterState."""
+    last_message = state["messages"][-1]
+
+    for tool_call in last_message.tool_calls:
+        if tool_call["name"] == "submit_evaluation":
+            # Extract arguments and return them to be appended to MasterState's filtered_reports
+            # We construct the VulnerabilityEvaluation pydantic model schema manually here
+            evaluation_result = {
+                "report_id": state.get("report_id", "Unknown"),
+                "is_exploitable": tool_call["args"].get("is_exploitable", False),
+                "confidence_score": tool_call["args"].get("confidence_score", 0),
+                "reasoning": tool_call["args"].get("reasoning", "")
+            }
+            return {"filtered_reports": [evaluation_result]}
+
+    return {"filtered_reports": []}
+
+# ==========================================
+# Validator agent
+# ==========================================
 
 def dispatch_validators(state: MasterState):
     """Creates a parallel validation thread for each vulnerability that survived the reviewer."""
@@ -325,13 +369,14 @@ def dispatch_validators(state: MasterState):
     commands = []
     # Loop over the Pydantic models generated by the reviewer
     for evaluation in state.get("filtered_reports", []):
+        if evaluation.get("is_exploitable"):
 
-        payload = ValidatorState(
-            report_to_test=evaluation.dict(),
-            sandbox_url=settings.sandbox_url,
-            messages=[]
-        )
-        commands.append(Send("validator_agent", payload))
+            payload = ValidatorState(
+                report_to_test=evaluation,
+                sandbox_url=settings.sandbox_url,
+                messages=[]
+            )
+            commands.append(Send("validator_agent", payload))
 
     if not commands:
          # If nothing to validate, skip straight to the end
@@ -343,20 +388,18 @@ def dispatch_validators(state: MasterState):
 def validator_agent_node(state: ValidatorState) -> dict:
     logger.debug(f"Entering validator_agent for report: {state['report_to_test'].get('report_id')}")
 
-    llm = ChatOpenAI(
-        base_url="http://localhost:11434/v1",
-        model="glm-5-2-3-bit",
-        temperature=0.2
-    )
+    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    # llm = ChatOpenAI(
+    #     base_url="http://localhost:11434/v1",
+    #     model="glm-5-2-3-bit",
+    #     temperature=0.2
+    # )
 
     validator_tools = [tools.send_http_request, tools.mark_validation_complete]
     llm_with_tools = llm.bind_tools(validator_tools, tool_choice="any")
 
     if not state.get("messages"):
-        sys_msg = SystemMessage(content=(
-            f"{VALIDATOR_AGENT.get('prompt')}\n"
-        ))
-
+        sys_msg = SystemMessage(content=VALIDATOR_AGENT.get('prompt'))
         human_msg = HumanMessage(content=(
             f"Target Sandbox: {state['sandbox_url']}\n\n"
             f"Vulnerability to Prove:\n{state['report_to_test']}\n"
@@ -416,6 +459,17 @@ def build_graph(checkpointer=None, interrupt_before=None):
     expert_workflow.add_edge("nag_agent", "expert")
     compiled_expert_agent = expert_workflow.compile()
 
+    # --- Reviewer Sub-Graph ---
+    reviewer_workflow = StateGraph(ReviewerState)
+    reviewer_workflow.add_node("reviewer_agent", reviewer_agent_node)
+    reviewer_workflow.add_node("reviewer_tools", ToolNode([tools.read_source_code]))
+    reviewer_workflow.add_node("save_evaluation", save_evaluation_node)
+    reviewer_workflow.add_edge(START, "reviewer_agent")
+    reviewer_workflow.add_conditional_edges("reviewer_agent", reviewer_router)
+    reviewer_workflow.add_edge("reviewer_tools", "reviewer_agent")
+    reviewer_workflow.add_edge("save_evaluation", END)
+    compiled_reviewer_agent = reviewer_workflow.compile()
+
     # Validator Sub-Graph
     validator_workflow = StateGraph(ValidatorState)
     validator_workflow.add_node("validator_agent", validator_agent_node)
@@ -431,14 +485,14 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("preprocessor", preprocessor_node)
     workflow.add_node("manager", manager_agent_node)
     workflow.add_node("expert_agent", compiled_expert_agent)
-    workflow.add_node("reviewer", reviewer_node)
-    workflow.add_node("validator", compiled_validator_agent)
+    workflow.add_node("reviewer_agent", compiled_reviewer_agent)
+    workflow.add_node("validator_agent", compiled_validator_agent)
     workflow.add_edge(START, "preprocessor")
     workflow.add_edge("preprocessor", "manager")
     workflow.add_conditional_edges("manager", dispatch_experts, ["expert_agent"])
-    workflow.add_edge("expert_agent", "reviewer")
-    workflow.add_conditional_edges("reviewer", dispatch_validators, ["validator", END])
-    workflow.add_edge("validator", END)
+    workflow.add_conditional_edges("expert_agent", dispatch_reviewers, ["reviewer_agent", END])
+    workflow.add_conditional_edges("reviewer_agent", dispatch_validators, ["validator_agent", END])
+    workflow.add_edge("validator_agent", END)
     app = workflow.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)
 
     return app
