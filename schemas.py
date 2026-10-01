@@ -130,7 +130,7 @@ class VulnerabilityRecord(BaseModel):
     vuln_id: Optional[str] = None
 
     # Lifecycle tracking
-    status: Literal["hypothesis", "unreachable", "confirmed", "exploitable", "false_positive", "review_error", "insufficient_context", "chained", "unchainable"] = "hypothesis"
+    status: Literal["hypothesis", "confirmed", "exploitable", "false_positive", "review_error", "insufficient_context", "chained", "unchainable"] = "hypothesis"
 
     # Core details (from Explorer/Verifier). Systemic records accumulate every
     # affected graph node here; localized records carry exactly one.

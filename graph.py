@@ -19,7 +19,6 @@ import tools
 import browser_tools
 import attacker_tools
 from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, integration_auditor_node, integration_auditor_router, integration_auditor_fallback_node, ask_integration_auditor_for_tool, route_integration_audit, route_validator_feedback, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
-from reachability import reachability_filter_node
 from state import MasterState, ReviewerState, ValidatorState, IntegrationAuditorState
 from schemas import ReviewerOutput, ValidatorOutput
 
@@ -182,7 +181,6 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("validator_agent", compiled_validator_agent, retry_policy=RetryPolicy(max_attempts=1))
     workflow.add_node("integration_auditor", compiled_integration_auditor, retry_policy=RetryPolicy(max_attempts=1))
     workflow.add_node("synchronization", synchronization_node)
-    workflow.add_node("reachability_filter", reachability_filter_node)
     # Barrier after the reviewer superstep, so dispatch_validators sees the fully
     # merged record set (not a partial mid-superstep snapshot, which previously
     # sent the auditor an empty `confirmed_vulns` peer list).
@@ -210,7 +208,6 @@ def build_graph(checkpointer=None, interrupt_before=None):
 
     workflow.add_conditional_edges("aggregate_demands", dispatch_verifiers, ["contract_verifier", "synchronization", END])
     workflow.add_edge("contract_verifier", "synchronization")
-    # workflow.add_edge("synchronization", "reachability_filter")
     workflow.add_conditional_edges("synchronization", dispatch_reviewers, ["reviewer_agent", END])
     # workflow.add_edge("reviewer_agent", "reviewer_sync")
     # Evaluate dispatch from the barrier (never mid-superstep) so it reads the
