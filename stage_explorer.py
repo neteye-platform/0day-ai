@@ -198,14 +198,15 @@ def expert_explorer_node(state: ExplorerState) -> dict:
         return {}
 
     if len(node_ids) == 1:
-        result = _explore_single(node_ids[0], role_name)
+        result, cache_hit = _explore_single(node_ids[0], role_name)
     else:
-        result = _explore_batch(node_ids, role_name)
+        result, cache_hit = _explore_batch(node_ids, role_name)
 
     _log_agent_completion(
         state.get("progress_id", ""),
         "Explorer",
-        f"role={state.get('role', 'unknown')}, nodes={', '.join(state.get('node_ids', []))}",
+        f"role={state.get('role', 'unknown')}, nodes={', '.join(state.get('node_ids', []))}, "
+        f"{'HIT' if cache_hit else 'MISS'}",
     )
     return result
 
@@ -217,11 +218,11 @@ def _explorer_system_message(role_name: str, batch: bool = False) -> SystemMessa
     return SystemMessage(content="\n\n".join(parts))
 
 
-def _explore_single(node_id: str, role_name: str) -> dict:
+def _explore_single(node_id: str, role_name: str) -> tuple[dict, bool]:
     cache_file = settings.cache_dir / "notes" / safe_cache_filename(f"{node_id}-{role_name}.json")
     cached_note = cache(cache_file, "read")
     if cached_note:
-        return cached_note
+        return cached_note, True
 
     source_code = get_node_code(node_id)
 
@@ -242,7 +243,7 @@ def _explore_single(node_id: str, role_name: str) -> dict:
             "compaction, a 400 is deterministic."
         )
         _record_stat("explorer_nodes_skipped_oversized")
-        return {"notes": [], "vulnerabilities": []}
+        return {"notes": [], "vulnerabilities": []}, False
 
     if target_node.get("source_file", "").endswith(target_node.get("label", "")):
         user_prompt = (
@@ -268,7 +269,7 @@ def _explore_single(node_id: str, role_name: str) -> dict:
     if note is None:
         # Output cap exhausted: empty note, left uncached so a later run re-attempts.
         _record_stat("explorer_nodes_skipped_output_cap")
-        return {"notes": [], "vulnerabilities": []}
+        return {"notes": [], "vulnerabilities": []}, False
 
     dict_note = note if isinstance(note, dict) else note.model_dump()
     dict_note["node_id"] = node_id
@@ -281,16 +282,16 @@ def _explore_single(node_id: str, role_name: str) -> dict:
     return {
         "notes": [dict_note],
         "vulnerabilities": extracted_vulns
-    }
+    }, False
 
 
-def _explore_batch(node_ids: list[str], role_name: str) -> dict:
+def _explore_batch(node_ids: list[str], role_name: str) -> tuple[dict, bool]:
     # Deterministic cache key: sorted node ids joined by '__'
     batch_key = "__".join(sorted(node_ids))
     cache_file = settings.cache_dir / "notes" / safe_cache_filename(f"batch-{batch_key}-{role_name}.json")
     cached_note = cache(cache_file, "read")
     if cached_note:
-        return cached_note
+        return cached_note, True
 
     graph_data = get_cached_graph_data(settings.graph)
 
@@ -336,7 +337,7 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
     if oversized:
         _record_stat("explorer_nodes_skipped_oversized", oversized)
     if not sections:
-        return {"notes": [], "vulnerabilities": []}
+        return {"notes": [], "vulnerabilities": []}, False
 
     user_prompt = (
         "Analyze each of the following nodes independently. "
@@ -352,7 +353,7 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
     if result is None:
         # Output cap exhausted for the batch; uncached so a later run re-attempts.
         _record_stat("explorer_nodes_skipped_output_cap", len(node_ids))
-        return {"notes": [], "vulnerabilities": []}
+        return {"notes": [], "vulnerabilities": []}, False
 
     result = result if isinstance(result, dict) else result.model_dump()
     raw_notes = result.get("notes", [])
@@ -374,4 +375,4 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
     return {
         "notes": notes,
         "vulnerabilities": extracted_vulns
-    }
+    }, False
