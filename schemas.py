@@ -176,74 +176,40 @@ class PackageCheck(BaseModel):
     name: str = Field(description="The name of the package")
     version: str = Field(description="The exact version string")
 
-class DownstreamSecurityAssumption(BaseModel):
+class SecurityDemand(BaseModel):
+    direction: Literal["upstream", "downstream"] = Field(
+        description="'upstream' (caller must fulfill) or 'downstream' (callee must fulfill)."
+    )
+    target: str = Field(
+        description=(
+            "STRICT FORMATTING REQUIRED for programmatic parsing. "
+            "If direction is 'downstream': Format as 'module::symbol' (e.g., 'app.auth::get_jobs' or 'self::validate'). "
+            "If direction is 'upstream': Format as the exact parameter name (e.g., 'query', 'user_id', or 'context')."
+        )
+    )
     description: str = Field(
-        ...,
-        description="The exact security contract this node expects the target to fulfill."
-    )
-    module: str = Field(
-        ...,
-        description="The module the downstream symbol is imported from (e.g., 'utils', 'app.auth'). Use 'self' if the symbol is defined in the same file."
-    )
-    symbol:str = Field(
-        ...,
-        description="The specific function called (e.g., 'get_jobs'). NEVER put the current node's own name here."
-    )
-
-class UpstreamSecurityAssumption(BaseModel):
-    description: str = Field(
-        ...,
-        description="The exact security contract this node expects its caller to fulfill (e.g., 'Caller must pass a parameterized SQL query')."
-    )
-    parameter_name: str = Field(
-        ...,
-        description="The specific function argument or input parameter this assumption applies to (e.g., 'query' or 'file_path'). Use 'context' if it applies to global state (e.g., 'g.user')."
+        description="The exact security contract."
     )
 
 class VulnerabilityHypothesis(BaseModel):
-    cwe_id: str = Field(
-        ...,
-        description=(
-            "The exact CWE ID. Mapping:\n"
-            "\n".join([f"{k}: {v}" for k, v in cwes.items()])
-        ),
-        json_schema_extra={"enum": list(cwes.keys())}
+    cwe_id: str = Field(..., json_schema_extra={"enum": list(cwes.keys())})
+    vulnerable_component: str = Field(
+        description="The exact parameter, state transition, or function call that is flawed."
     )
-    description: str = Field(..., description="A strictly factual, summary of the vulnerability.", max_length=250)
-    vulnerable_component: str = Field(..., description="The specific parameter, function call, or state transition that is flawed (e.g., 'req.query.id').")
-
-    @field_validator('description', mode='before')
-    @classmethod
-    def truncate_description(cls, v: str) -> str:
-        # If the LLM generates a string longer than 150 chars, truncate it safely
-        if isinstance(v, str) and len(v) > 150:
-            return v[:247] + "..."
-        return v
-
-class BusinessInterface(BaseModel):
-    interface_type: Literal["source", "sink"] = Field(..., description="Strictly 'source' (untrusted data enters) or 'sink' (sensitive state changes).")
-    description: str = Field(..., description="What the interface does (e.g., 'Kafka consumer for order events', 'Upgrades user role'). Ignore standard HTTP/DB flows; focus on business logic boundaries.")
 
 class AnalysisNote(BaseModel):
-    role_in_system: str = Field(
-        ..., 
-        description="One sentence summarizing what this node does and its security context."
+    #role_in_system: str = Field(..., description="One sentence summarizing the node's purpose.")
+    business_interfaces: list[str] = Field(
+        default_factory=list, 
+        description="List of boundaries. Prefix with [SOURCE] or [SINK] (e.g., '[SOURCE] Kafka consumer'). Leave empty if standard flow."
     )
-    business_interfaces: list[BusinessInterface] = Field(
-        default_factory=list,
-        description="High-level architectural entry and exit points (sources and sinks)."
-    )
-    upstream_assumptions: list[UpstreamSecurityAssumption] = Field(
-        default_factory=list,
-        description="Security requirements that the UPSTREAM CALLER of this node must fulfill before invoking it (e.g., 'Caller must sanitize the file path' or 'Caller must verify authorization')."
-    )
-    downstream_assumptions: list[DownstreamSecurityAssumption] = Field(
-        default_factory=list,
-        description="Security requirements that this node expects its DOWNSTREAM CALLEES to fulfill (e.g., 'The called database function must use parameterized queries')."
+    demands: list[SecurityDemand] = Field(
+        default_factory=list, 
+        description="Upstream and downstream security assumptions."
     )
     vulnerability_hypotheses: list[VulnerabilityHypothesis] = Field(
         default_factory=list,
-        description="Suspected localized vulnerabilities visible in this exact code snippet. Flag anything that looks objectively dangerous (e.g., raw SQL string formatting, plaintext secrets)."
+        description="Flag localized vulnerabilities visible in this snippet."
     )
 
 class DemandEvaluation(BaseModel):
