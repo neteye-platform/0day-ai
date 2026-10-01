@@ -129,3 +129,6 @@ class ValidationResult(BaseModel):
     poc_payload: Optional[str] = Field(description="The exact payload, script, or HTTP request that triggered the vulnerability.")
     execution_logs: str = Field(description="Relevant logs or output from the sandbox confirming the exploit.")
 
+class PackageCheck(BaseModel):
+    name: str = Field(description="The name of the package")
+    version: str = Field(description="The exact version string")

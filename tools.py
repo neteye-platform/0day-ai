@@ -12,9 +12,11 @@ from langgraph.prebuilt import InjectedState
 from langchain_core.tools import tool, InjectedToolCallId
 from langgraph.types import Command
 
-from schemas import EvaluationToolInput, ValidationToolInput, VulnerabilityReport
-from utils import build_networkx_graph
+from schemas import EvaluationToolInput, ValidationToolInput, VulnerabilityReport, PackageCheck
+from utils import build_networkx_graph, enforce_note_taking
 import settings
+
+GUARDRAIL_MESSAGES = 8
 
 LANGUAGE_MAP = {
     ".py": tree_sitter.Language(tree_sitter_python.language()),
@@ -43,7 +45,7 @@ AST_GRAMMAR_MAP = {
 }
 
 @tool
-def read_source_code(node_id: str, reason_for_reading: str) -> str:
+def read_source_code(node_id: str, reason_for_reading: str, state: Annotated[dict, InjectedState]) -> str:
     """
     Fetches the source code for a given Node ID.
 
@@ -51,6 +53,10 @@ def read_source_code(node_id: str, reason_for_reading: str) -> str:
         node_id: The exact ID of the node to read (e.g., 'src_main_query_db').
         reason_for_reading: Explain exactly why you need to read THIS specific node next, and how you expect it to connect to your current knowledge.
     """
+    rejection = enforce_note_taking(state.get("messages", []))
+    if rejection:
+        return rejection
+
     try:
         with open(settings.graph, "r") as f:
             graph_data = json.load(f)
@@ -178,37 +184,33 @@ def read_source_code(node_id: str, reason_for_reading: str) -> str:
 
 
 @tool
-def check_package_vulnerability(package_name: str, version: str) -> list:
+def check_package_vulnerability(packages: list[PackageCheck]) -> list:
     """
     Use this tool immediately whenever you parse a dependency manifest (like
     package.json or requirements.txt) to check for known vulnerabilities.
     """
-    query = {
-        "package": {
-            "name": package_name,
-        },
-        "version": version
-    }
-    response = requests.post("https://api.osv.dev/v1/query", json=query)
-    data = json.loads(response.text)
-    vulns = data.get("vulns")
-
-    if not vulns:
-        return []
-
     output = []
-    for vuln in vulns:
-        details = vuln.get("details")
-        if not details:
-            continue
-        output.append({
-            "id": vuln.get("id"),
-            "aliases": vuln.get("aliases"),
-            "details": vuln.get("details"),
-            "severity": [s.get("score") for s in vuln.get("severity", [])]
-        })
+    for pkg in packages:
+        query = {"package": {"name": pkg.name}, "version": pkg.version}
+        response = requests.post("https://api.osv.dev/v1/query", json=query)
+        data = json.loads(response.text)
+        vulns = data.get("vulns", [])
 
-    return output
+        if not vulns:
+            output.append(f"[OK] {pkg.name}@{pkg.version}: No vulnerabilities found.")
+            continue
+
+        pkg_out = f"\n\n{pkg.name}\n"
+        for vuln in vulns:
+            details = vuln.get("details")
+            if not details:
+                continue
+            pkg_out += f"  ID: {vuln.get('id', 'Unknown')}"
+            pkg_out += f"  Aliases: {', '.join(vuln.get('aliases', []))}"
+            pkg_out += f"  Details: {vuln.get('details', '')}"
+            pkg_out += f"  Severity: {', '.join([s.get('score') for s in vuln.get('severity', [])])}"
+
+        return output
 
 
 @tool
@@ -217,20 +219,20 @@ def take_notes(
     tool_call_id: Annotated[str, InjectedToolCallId]
 ) -> Command:
     """
-    Saves crucial information (variables, logic flows, hardcoded secrets) to your persistent memory.
+    Saves notes (variables, logic flows, hardcoded secrets) to your persistent memory.
 
     BEST PRACTICES FOR NOTES:
-    - Keep it concise and use markdown.
+    - Keep it concise and use markdown. Do NOT write raw tools outputs, write a summary or the most relevant parts.
     - Always include the context (e.g., file name, node ID, or endpoint).
-    - Example: "Node src_main_py: Found SQL injection sink, where `query` is concatenated."
-    - Example: "Login endpoint /api/auth requires CSRF token: `X-CSRF-TOKEN`."
+    - Record both positive findings (e.g., "Found SQL injection in main.py") 
+      AND negative findings (e.g., "Checked auth.py, no issues found", "Search returned no results").
     """
     return Command(
         update={
             "notes": [note],
             "messages": [
                 ToolMessage(
-                    content="Note successfully saved to your persistent memory.",
+                    content="Note updated successfully.",
                     tool_call_id=tool_call_id
                 )
             ]
@@ -295,10 +297,10 @@ def send_http_request(
     method: str,
     endpoint: str,
     headers: dict,
+    state: Annotated[dict, InjectedState],
     body: str = "",
     reset_session: bool = False,
-    extract_mode: str = "clean_html",
-    state: Annotated[dict, InjectedState] = None
+    extract_mode: str = "clean_html"
 ) -> tuple[str, dict]:
     """
     Sends an HTTP request to the sandboxed application. Use this for testing web endpoints.
@@ -313,6 +315,11 @@ def send_http_request(
     - 'raw': Returns the untouched body (use cautiously, may truncate).
     - ANY CUSTOM TAG: Enter any HTML tag (e.g., 'form', 'a', 'script', 'input', 'iframe') to extract only those elements.
     """
+
+    rejection = enforce_note_taking(state.get("messages", []))
+    if rejection:
+        return rejection, {}
+
     if not endpoint.startswith(settings.sandbox_url):
         return f"You can only make requests to the sandbox application at {settings.sandbox_url}", {}
 
@@ -403,11 +410,16 @@ def mark_validation_complete(
 
 
 @tool
-def search_codebase(keyword: str) -> str:
+def search_codebase(keyword: str, state: Annotated[dict, InjectedState]) -> str:
     """
     Searches the entire application codebase for a specific string. Use this
     to find where specific libraries, functions, or variables are used.
     """
+
+    rejection = enforce_note_taking(state.get("messages", []))
+    if rejection:
+        return rejection
+
     app_dir = Path(settings.app_path)
 
     # Load the graph to map physical files to Node IDs

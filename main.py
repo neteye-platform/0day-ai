@@ -2,28 +2,26 @@ import os
 import settings
 import logging
 import argparse
-from typing import List, Dict, Any
+from typing import Any
 from collections import defaultdict
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_core.output_parsers import PydanticOutputParser
-from langgraph.types import Command, Send
+from langgraph.types import Send
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 
 import tools
-from utils import build_networkx_graph, run_stream
+from utils import build_networkx_graph, run_stream, compact_tool_history
 from state import MasterState, ExpertState, ReviewerState, ValidatorState
 from schemas import ManagerOutput, EXPERT_AGENTS, REVIEWER_AGENT, VALIDATOR_AGENT, TOOLS
-
-MAX_MESSAGES = 4
 
 # ==========================================
 # Preprocessor
 # ==========================================
 
-def preprocessor_node(state: MasterState) -> Dict[str, Any]:
+def preprocessor_node(state: MasterState) -> dict[str, Any]:
     """Reads graph.json, builds a NetworkX graph, and summarizes it for the manager node."""
 
     G = build_networkx_graph(state["graph_path"])
@@ -84,16 +82,28 @@ def preprocessor_node(state: MasterState) -> Dict[str, Any]:
 # Manager
 # ==========================================
 
-def manager_agent_node(state: MasterState) -> Dict[str, Any]:
+def manager_agent_node(state: MasterState) -> dict[str, Any]:
     """The Manager LLM reads the programmatic summary and dispatches tasks."""
 
-    llm = ChatOllama(model="qwen3.6:35b", temperature=0, format="json")
+    # from schemas import ExpertTask
+    # return {"expert_tasks": [ExpertTask(
+    #         agent_role="InfraConfigAuditor",
+    #         target_communities=[
+    #             "8",
+    #             "2"
+    #         ],
+    #         task_description="Audit the Docker Compose configuration in Community 8 for security best practices (e.g., non-root users, exposed ports). Review Community 2's requirements to ensure no vulnerable or outdated dependencies are present that could compromise the container environment."
+    #     )
+    # ]}
+
+    llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
     # llm = ChatOpenAI(
     #     base_url="http://localhost:11434/v1",
     #     model="glm-5-2",
     #     temperature=0
     # )
-    structured_llm = llm.with_structured_output(ManagerOutput)
+
+    parser = PydanticOutputParser(pydantic_object=ManagerOutput)
 
     roles_docs = ""
     for role, config in EXPERT_AGENTS.items():
@@ -108,12 +118,14 @@ def manager_agent_node(state: MasterState) -> Dict[str, Any]:
         "CRITICAL INSTRUCTIONS:\n"
         "- You must populate the 'target_communities' array for every task with the exact Community IDs (as strings, e.g., '0', '1') provided in the topology summary. Never leave the 'target_communities' array empty.\n"
         "- Do not assign more than 3 communities to a single task. If a complex logic flow spans, for example, 7 communities, break it down into overlapping tasks (e.g., Task 1: Comm 6,7,8. Task 2: Comm 8,9,10). This prevents context overload."
+        f"{parser.get_format_instructions()}"
     ))
     human_msg = HumanMessage(content=f"Here is the app topology:\n{state.get('app_summary')}")
 
-    response = structured_llm.invoke([sys_msg, human_msg])
+    response_msg = llm.invoke([sys_msg, human_msg])
+    response = parser.invoke(response_msg)
 
-    return {"expert_tasks": response.tasks, "manager_message": response}
+    return {"expert_tasks": response.tasks, "manager_message": response_msg}
 
 # ==========================================
 # Expert agents
@@ -125,7 +137,7 @@ def expert_agent_node(state: ExpertState) -> dict:
     if not state.get("subgraph_nodes"):
         return {"vulnerability_reports": []}
 
-    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
     # llm = ChatOpenAI(
     #     base_url="http://localhost:11434/v1",
     #     model="glm-5-2",
@@ -138,7 +150,7 @@ def expert_agent_node(state: ExpertState) -> dict:
         if hasattr(tools, name):
             agent_tools.append(getattr(tools, name))
 
-    llm_with_tools = llm.bind_tools(agent_tools, tool_choice="any")
+    llm_with_tools = llm.bind_tools(agent_tools)
 
     if not state.get("messages"):
         sys_msg = SystemMessage(content=(
@@ -154,20 +166,20 @@ def expert_agent_node(state: ExpertState) -> dict:
         response = llm_with_tools.invoke(messages)
         messages = [sys_msg, human_msg, response]
     else:
+        compacted_messages = compact_tool_history(state["messages"], safe_window=6)
+
         dynamic_msgs = []
         if state.get("notes"):
             notes_str = "\n".join([f"- {n}" for n in state["notes"]])
             saved_notes = f"\n\n### Persistent Scratchpad\n{notes_str}\n"
             dynamic_msgs.append(HumanMessage(content=saved_notes))
 
-        history = state["messages"][2:]
-        rolling_history = history[-MAX_MESSAGES:]
-        sys_msg = state["messages"][0]
-        human_msg = state["messages"][1]
-        messages = [sys_msg, human_msg] + dynamic_msgs + rolling_history
+        sys_msg = compacted_messages[0]
+        human_msg = compacted_messages[1]
+        messages = [sys_msg, human_msg] + dynamic_msgs + compacted_messages[2:]
 
         response = llm_with_tools.invoke(messages)
-        messages = [response]
+        return {"messages": compacted_messages[2:] + [response]}
 
     return {"messages": messages}
 
@@ -185,19 +197,20 @@ def expert_agent_router(state: ExpertState):
         return "tools"
 
     # The LLM failed to call a tool
+    return "ask_expert_for_tool"
+
+def ask_expert_for_tool(state: ExpertState):
+    """Fallback node to force the LLM to use a tool."""
     message = HumanMessage(
         content=f"You did not invoke any tools. You must either use `{'`, `'.join(TOOLS.keys())}` to proceed."
     )
-    return Command(
-        goto="expert",
-        update={"messages": [message]}
-    )
+    return {"messages": [message]}
 
 
 def dispatch_experts(state: MasterState):
     """Reads the Manager's instructions and creates a list of 'Send' objects."""
 
-    commands: List[Send] = []
+    commands: list[Send] = []
     for task in state["expert_tasks"]:
         nodes_for_task = []
         for comm_id in task.target_communities:
@@ -262,7 +275,7 @@ def dispatch_reviewers(state: MasterState):
 
 def reviewer_agent_node(state: ReviewerState) -> dict:
     """Review the vulnerability reports and keep only what is actually relevant"""
-    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
     # llm = ChatOpenAI(
     #     base_url="http://localhost:11434/v1",
     #     model="glm-5-2",
@@ -275,23 +288,24 @@ def reviewer_agent_node(state: ReviewerState) -> dict:
         tools.get_node_connections,
         tools.submit_evaluation,
         tools.take_notes
-    ], tool_choice="any")
+    ])
 
-    sys_msg = state["messages"][0]
-    human_msg = state["messages"][1]
+    # Use a slightly larger safe_window for the reviewer
+    # so it can compare a search result with a file read
+    compacted_messages = compact_tool_history(state["messages"], safe_window=8)
+
+    sys_msg = compacted_messages[0]
+    human_msg = compacted_messages[1]
     dynamic_msgs = []
     if state.get("notes"):
         notes_str = "\n".join([f"- {n}" for n in state["notes"]])
         saved_notes = f"\n\n### Persistent Scratchpad\n{notes_str}\n"
         dynamic_msgs.append(HumanMessage(content=saved_notes))
 
-    history = state["messages"][2:]
-    rolling_history = history[-MAX_MESSAGES:]
-
-    messages_to_pass = [sys_msg, human_msg] + dynamic_msgs + rolling_history
+    messages_to_pass = [sys_msg, human_msg] + dynamic_msgs + compacted_messages[2:]
 
     response = llm_with_tools.invoke(messages_to_pass)
-    return {"messages": [response]}
+    return {"messages": compacted_messages[2:] + [response]}
 
 
 def reviewer_router(state: ReviewerState):
@@ -302,11 +316,13 @@ def reviewer_router(state: ReviewerState):
         return "reviewer_tools"
 
     # The LLM failed to call a tool
+    return "ask_reviewer_for_tool"
+
+
+def ask_reviewer_for_tool(state: ReviewerState):
+    """Fallback node to force the LLM to use a tool."""
     message = HumanMessage(content=f"You did not invoke any tools. You must use a tool to proceed.")
-    return Command(
-        goto="reviewer_agent",
-        update={"messages": [message]}
-    )
+    return {"messages": [message]}
 
 # ==========================================
 # Validator agent
@@ -335,7 +351,7 @@ def dispatch_validators(state: MasterState):
 
 
 def validator_agent_node(state: ValidatorState) -> dict:
-    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
     # llm = ChatOpenAI(
     #     base_url="http://localhost:11434/v1",
     #     model="glm-5-2",
@@ -346,7 +362,7 @@ def validator_agent_node(state: ValidatorState) -> dict:
         tools.send_http_request,
         tools.mark_validation_complete,
         tools.take_notes
-    ], tool_choice="any")
+    ])
     current_cookies = state.get("cookies", {})
 
     if not state.get("messages"):
@@ -368,37 +384,35 @@ def validator_agent_node(state: ValidatorState) -> dict:
                     # Merge the new cookies into the current state
                     current_cookies.update(msg.artifact)
 
-        sys_msg = state["messages"][0]
-        human_msg = state["messages"][1]
+        compacted_messages = compact_tool_history(state["messages"], safe_window=6)
+        sys_msg = compacted_messages[0]
+        human_msg = compacted_messages[1]
 
         dynamic_msgs = []
         if state.get("notes"):
             notes_str = "\n".join([f"- {n}" for n in state["notes"]])
             saved_notes = f"\n\n### Persistent Scratchpad\n{notes_str}\n"
             dynamic_msgs.append(HumanMessage(content=saved_notes))
-        history = state["messages"][2:]
-        rolling_history = history[-MAX_MESSAGES:]
 
-        messages_to_pass = [sys_msg, human_msg] + dynamic_msgs + rolling_history
+        messages_to_pass = [sys_msg, human_msg] + dynamic_msgs + compacted_messages[2:]
 
         response = llm_with_tools.invoke(messages_to_pass)
-        return {"messages": [response], "cookies": current_cookies}
+        return {"messages": compacted_messages[2:] + [response], "cookies": current_cookies}
 
 
 def validator_router(state: ValidatorState):
     last_message = state["messages"][-1]
     if last_message.tool_calls:
-        for tc in last_message.tool_calls:
-            if tc["name"] == "mark_validation_complete":
-                return "save_validation"
         return "validator_tools"
 
     # The LLM failed to call a tool
+    return "ask_validator_for_tool"
+
+
+def ask_validator_for_tool(state: ValidatorState):
+    """Fallback node to force the LLM to use a tool."""
     message = HumanMessage(content=f"You did not invoke any tools. You must use a tool to proceed.")
-    return Command(
-        goto="validator_agent",
-        update={"messages": [message]}
-    )
+    return {"messages": [message]}
 
 # ==========================================
 # Build and Compile the Graph
@@ -409,6 +423,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     # Expert Sub-Graph
     expert_workflow = StateGraph(ExpertState)
     expert_workflow.add_node("expert", expert_agent_node)
+    expert_workflow.add_node("ask_expert_for_tool", ask_expert_for_tool)
     expert_workflow.add_node("tools", ToolNode([
         tools.submit_report,
         tools.read_source_code,
@@ -418,11 +433,13 @@ def build_graph(checkpointer=None, interrupt_before=None):
     expert_workflow.add_edge(START, "expert")
     expert_workflow.add_conditional_edges("expert", expert_agent_router)
     expert_workflow.add_edge("tools", "expert")
+    expert_workflow.add_edge("ask_expert_for_tool", "expert")
     compiled_expert_agent = expert_workflow.compile()
 
     # Reviewer Sub-Graph
     reviewer_workflow = StateGraph(ReviewerState)
     reviewer_workflow.add_node("reviewer_agent", reviewer_agent_node)
+    reviewer_workflow.add_node("ask_reviewer_for_tool", ask_reviewer_for_tool)
     reviewer_workflow.add_node("reviewer_tools", ToolNode([
         tools.read_source_code,
         tools.get_node_connections,
@@ -433,11 +450,13 @@ def build_graph(checkpointer=None, interrupt_before=None):
     reviewer_workflow.add_edge(START, "reviewer_agent")
     reviewer_workflow.add_conditional_edges("reviewer_agent", reviewer_router)
     reviewer_workflow.add_edge("reviewer_tools", "reviewer_agent")
+    reviewer_workflow.add_edge("ask_reviewer_for_tool", "reviewer_agent")
     compiled_reviewer_agent = reviewer_workflow.compile()
 
     # Validator Sub-Graph
     validator_workflow = StateGraph(ValidatorState)
     validator_workflow.add_node("validator_agent", validator_agent_node)
+    validator_workflow.add_node("ask_validator_for_tool", ask_validator_for_tool)
     validator_workflow.add_node("validator_tools", ToolNode([
         tools.send_http_request,
         tools.mark_validation_complete,
@@ -446,6 +465,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     validator_workflow.add_edge(START, "validator_agent")
     validator_workflow.add_conditional_edges("validator_agent", validator_router)
     validator_workflow.add_edge("validator_tools", "validator_agent")
+    validator_workflow.add_edge("ask_validator_for_tool", "validator_agent")
     compiled_validator_agent = validator_workflow.compile()
 
     # Master Graph
@@ -461,6 +481,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_conditional_edges("expert_agent", dispatch_reviewers, ["reviewer_agent", END])
     workflow.add_conditional_edges("reviewer_agent", dispatch_validators, ["validator_agent", END])
     workflow.add_edge("validator_agent", END)
+
     app = workflow.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)
 
     return app
@@ -491,7 +512,7 @@ if __name__ == "__main__":
         messages=[]
     )
     config = {
-        "max_concurrency": 3 # Limits parallel Send() executions to 3 at a time!
+        "max_concurrency": 3
     }
 
     try:

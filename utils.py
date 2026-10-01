@@ -1,7 +1,7 @@
 import networkx as nx
 import json
-import logging
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from typing import Optional
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AnyMessage
 
 
 def build_networkx_graph(graph_path: str) -> nx.DiGraph:
@@ -115,6 +115,7 @@ def serialize_for_json(obj):
     else:
         return str(obj)
 
+
 def run_stream(app, inputs, config=None, output_file="trace.json"):
     print(f"\n[System] Running Multi-Agent Analysis. Assembling state to {output_file}...")
 
@@ -151,7 +152,7 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
         # 1. Catch Subgraph Agents (they still use the 'messages' array)
         if namespace and "messages" in state and state["messages"]:
             last_msg = state["messages"][-1]
-            
+
         # 2. Catch the Manager (runs on Main Graph, uses 'manager_message' key)
         elif not namespace and "manager_message" in state and state["manager_message"]:
             last_msg = state["manager_message"]
@@ -194,7 +195,7 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
 
                 # Print the AI's thought process (Chain of Thought)
                 if snippet:
-                    print(f"[{graph_name}] \033[96m🧠 AI: {snippet}\033[0m")
+                    print(f"[{graph_name}] \033[96m🧠 AI: {snippet}\033[0m", flush=True)
 
                 # Print the Tool Call (if it decided to act)
                 if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
@@ -205,22 +206,23 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
                         args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
                         tool_strings.append(f"{name}({args_str})")
 
-                    print(f"[{graph_name}] \033[93m🛠️  Calling tool: {' | '.join(tool_strings)}\033[0m")
+                    print(f"[{graph_name}] \033[93m🛠️  Calling tool: {' | '.join(tool_strings)}\033[0m", flush=True)
 
             elif msg_type == "tool":
-                print(f"[{graph_name}] \033[92m✅ Tool executed: {getattr(last_msg, 'name', 'unknown')}\033[0m")
+                tool_name = getattr(last_msg, 'name', 'unknown')
+                print(f"[{graph_name}] \033[92m✅ Tool executed: {tool_name} | Output: {snippet[:50]}\033[0m", flush=True)
 
             elif msg_type == "human":
-                print(f"[{graph_name}] \033[94m👤 Human: {snippet}\033[0m")
+                print(f"[{graph_name}] \033[94m👤 Human: {snippet}\033[0m", flush=True)
 
             else:
-                print(f"[{graph_name}] \033[90m⚙️  {msg_type.capitalize()} message\033[0m")
+                print(f"[{graph_name}] \033[90m⚙️  {msg_type.capitalize()} message\033[0m", flush=True)
 
         else:
             # Tell us exactly WHICH state keys were updated in the background
             state_keys = ", ".join([k for k in state.keys() if k not in ["messages", "manager_message"]])
             if state_keys:
-                print(f"[{graph_name}] \033[90mState updated: [{state_keys}]\033[0m")
+                print(f"[{graph_name}] \033[90mState updated: [{state_keys}]\033[0m", flush=True)
         # -----------------------------------
 
     # Dump the cohesive final states to a JSON file
@@ -228,7 +230,7 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
         json.dump(assembled_states, f, indent=2)
 
     print("[System] Execution Finished.")
-    
+
     # --- Print Token Usage Summary ---
     print("\n" + "="*50)
     print("📊 \033[1mToken Usage Summary by Agent\033[0m")
@@ -248,3 +250,80 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
 
     main_state = assembled_states.get("Main_Graph", {})
     return {"vulnerability_reports": raw_main_state.get("vulnerability_reports", [])}
+
+
+# Tools that takes a lot of context
+heavy_tools = ["read_source_code", "send_http_request", "search_codebase"]
+
+def compact_tool_history(messages: list[AnyMessage], safe_window: int = 10, threshold: int = 300) -> list[AnyMessage]:
+    """
+    Compresses heavy tool outputs in the message history to save context space,
+    while preserving the structural timeline of the conversation.
+    """
+    compacted_messages = []
+
+    for i, msg in enumerate(messages):
+        # Check if the message is older than the safe window AND is a ToolMessage
+        if i < len(messages) - safe_window and isinstance(msg, ToolMessage):
+            content_str = str(getattr(msg, "content", ""))
+
+            if msg.name in heavy_tools and len(str(msg.content)) > threshold:
+                # Create a crushed version with the exact SAME ID to overwrite it in state
+                crushed_msg = ToolMessage(
+                    content="[SYSTEM OVERRIDE: Raw data removed to conserve memory. Please refer to your notes for details.]",
+                    name=msg.name,
+                    tool_call_id=msg.tool_call_id,
+                    id=msg.id  # This tells LangGraph to replace the old message
+                )
+                compacted_messages.append(crushed_msg)
+                continue
+
+            # Crush redundant rejection to save tokens
+            if content_str.startswith("SYSTEM REJECTION:"):
+                crushed_msg = ToolMessage(
+                    content="REJECTED",
+                    name=msg.name,
+                    tool_call_id=msg.tool_call_id,
+                    id=msg.id # Overwrites the original in LangGraph state
+                )
+                compacted_messages.append(crushed_msg)
+                continue
+
+        # If it doesn't meet the criteria, keep the original message
+        compacted_messages.append(msg)
+
+    return compacted_messages
+
+
+def enforce_note_taking(messages: list[AnyMessage], max_consecutive: int = 4) -> Optional[str]:
+    """
+    Scans recent history to ensure the agent took a note after successfully using a heavy tool.
+    Returns a rejection string if the rule is violated, otherwise returns None.
+    """
+    consecutive_count = 0
+
+    scan_window = max(8, max_consecutive * 3)
+
+    # Scan the recent tool messages in the history
+    for msg in reversed(messages[-scan_window:]):
+        if getattr(msg, "type", "") == "tool":
+
+            # The agent took a note recently
+            if msg.name == "take_notes":
+                return None
+
+            elif msg.name in heavy_tools:
+                content_str = str(getattr(msg, "content", ""))
+
+                # Check if it was a successful data extraction
+                if not content_str.startswith("Error:") and (len(content_str) > 100 or "[SYSTEM OVERRIDE" in content_str):
+                    consecutive_count += 1
+
+                    if consecutive_count >= max_consecutive:
+                        return (
+                            f"SYSTEM REJECTION: Access Denied. You have used heavy tools {consecutive_count} times in a row "
+                            "without documenting your findings. You MUST use the `take_notes` tool to summarize "
+                            "your current context before you are allowed to execute another heavy action."
+                        )
+
+    return None
