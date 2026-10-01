@@ -678,7 +678,6 @@ def _llm_normalize(candidates: list[dict]) -> Optional[list[dict]]:
     try:
         from langchain_openai import ChatOpenAI
         from langchain_core.messages import SystemMessage, HumanMessage
-        from llm_debug import build_debug_http_client
         from schemas import CREDENTIAL_FINDER_AGENT, CredentialList
 
         sys_msg = SystemMessage(content=CREDENTIAL_FINDER_AGENT.get("prompt", ""))
@@ -695,7 +694,6 @@ def _llm_normalize(candidates: list[dict]) -> Optional[list[dict]]:
             temperature=0.2,
             max_completion_tokens=settings.llm_max_completion_tokens,
             reasoning_effort="none",
-            http_client=build_debug_http_client(),
         )
         structured = llm.with_structured_output(CredentialList, method="json_schema", strict=True)
         result = structured.invoke([sys_msg, human_msg])
