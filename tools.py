@@ -891,29 +891,34 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState], regex: 
 
 
 @tool
-def get_node_connections(node_id: str) -> str:
+def get_node_connections(node_ids: list[str]) -> str:
     """
-    Returns the neighbors of a node in the application graph.
-    Use this to identify which functions call the current node (callers)
-    or which functions/files the current node calls (callees).
+    Returns the neighbors of one or more nodes in the application graph.
+    Use this to identify which functions call the current nodes (callers)
+    or which functions/files the current nodes call (callees).
 
     Args:
-        node_id (str): The identifier of the node in the graph.
+        node_ids (list[str]): The identifiers of the nodes to inspect in the graph.
     """
     try:
         G = build_networkx_graph(settings.graph)
 
-        if node_id not in G:
-            return f"Node ID '{node_id}' not found in the graph structure."
+        blocks = []
+        for node_id in node_ids:
+            if node_id not in G:
+                blocks.append(f"Node ID '{node_id}' not found in the graph structure.")
+                continue
 
-        successors = list(G.successors(node_id))
-        predecessors = list(G.predecessors(node_id))
+            successors = list(G.successors(node_id))
+            predecessors = list(G.predecessors(node_id))
 
-        return (
-            f"Node: {node_id}\n"
-            f"Called by (Predecessors): {predecessors}\n"
-            f"Calls (Successors): {successors}"
-        )
+            blocks.append(
+                f"Node: {node_id}\n"
+                f"Called by (Predecessors): {predecessors}\n"
+                f"Calls (Successors): {successors}"
+            )
+
+        return "\n\n".join(blocks)
     except Exception as e:
         return f"Error traversing graph: {str(e)}"
 

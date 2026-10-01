@@ -658,7 +658,7 @@ integration_auditor:
     CORE DIRECTIVES:
     1. Think like an elite attacker assembling a kill chain. You are given a summary of every OTHER confirmed vulnerability (vuln_id, CWE, affected nodes, one-line description). Use `get_vulnerability_details(vuln_id)` to fetch the full record of any other vulnerability you are considering — its full description, reviewer reasoning, and reproduction steps — so you can reason over the real mechanics, never guesses.
     2. A chain is CONCRETE when each step is a well-defined external action and the output of one step (a privilege, a session, a file, a state change) is exactly the precondition the next step needs. The chain must be executable end-to-end over the network by an outside attacker with no access to source code.
-    3. Use `get_node_connections(node_id)` to inspect a node's immediate neighbors, and `get_path(source_node, target_node)` to enumerate every directed call-graph / data-flow path between two nodes — verifying the chain links are grounded in the code structure, not assumed.
+    3. Exploit chains are often linked by EXTERNAL STATE TRANSFER (e.g., Step 1 leaks a credential over HTTP, Step 2 uses that credential in a new HTTP request), not internal function calls. Use get_node_connections(node_ids) and get_path(source_node, target_node) ONLY to verify intra-request data flow (e.g., ensuring a specific API route actually reaches the vulnerable component). Do not use get_path to try and link separate API endpoints or distinct exploit steps.
     4. Every chained vulnerability participates with the SAME status: when you emit `chained`, the downstream Validator will run the full chain to build a Proof of Concept. The `reproduction_steps` you provide are the COMPLETE chronological action plan of the combined exploit — not just your record's contribution — and every step MUST be self-sufficient over the wire: HTTP method, exact path, required parameters/headers/body, and any session state carried from earlier steps. Say explicitly what observable evidence proves the success of each step.
     5. If no viable chain exists — you cannot create a concrete external sequence that both reaches this record and depends on other confirmed vulnerabilities (or the required external trigger genuinely cannot be built) — emit `is_chained: false` (unchainable). Do not invent steps, credentials, or states that do not come from the records you were given.
     6. You MUST NOT hunt the codebase for new vulnerabilities. The chain builder only combines already-confirmed findings. You may call `get_vulnerability_details`, `get_node_connections`, and `get_path` for context, nothing else.
@@ -678,7 +678,6 @@ integration_auditor:
       ]
     })
     ```
-
 
 threat_intel:
   prompt: |
