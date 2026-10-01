@@ -174,11 +174,13 @@ def dispatch_explorers(state: MasterState):
 
 
 def _extract_hypotheses(node_id: str, raw_hypotheses: list) -> list[dict]:
-    """Turn an explorer note's `vulns` entries into standard hypotheses."""
+    """Turn an explorer note's `vulns` entries into standard hypotheses.
+    Notes cached before the hypothesis carried a `description` fall back to
+    the bare `component` label (the old promoted-to-description behavior)."""
     return [{
         "affected_nodes": [node_id],
         "cwe_id": hyp.get("cwe", "OTHER_UNCATEGORIZED"),
-        "description": hyp.get("component", ""),
+        "description": hyp.get("description") or hyp.get("component", ""),
         "vulnerable_component": hyp.get("pattern_label") or None,
         "status": "hypothesis",
     } for hyp in raw_hypotheses]

@@ -23,6 +23,7 @@ import attacker_tools
 import patch_tools
 from stage_aggregate import aggregate_demands_node
 from stage_cve import cve_analyzer_node, dispatch_cve_analyzers
+from stage_dedup import dedup_agent_node
 from stage_edge_traversal import edge_traversal_node
 from stage_explorer import dispatch_explorers, expert_explorer_node
 from stage_integration_auditor import (
@@ -287,6 +288,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("threat_intel", threat_intel_node)
     workflow.add_node("aggregate_demands", aggregate_demands_node)
     workflow.add_node("contract_verifier", contract_verifier_node)
+    workflow.add_node("dedup_agent", dedup_agent_node)
     workflow.add_node("edge_traversal", edge_traversal_node)
     # Subgraphs own their per-message retries; disable wholesale replay retry from set_node_defaults.
     # The wrapper always starts with the cooperative-stop check (raise_if_stopping);
@@ -335,7 +337,8 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_conditional_edges("aggregate_demands", dispatch_verifiers, ["contract_verifier", "synchronization", END])
     workflow.add_edge("contract_verifier", "synchronization")
     workflow.add_edge("synchronization", "edge_traversal")
-    workflow.add_conditional_edges("edge_traversal", dispatch_reviewers, ["reviewer_agent", "reporter_dispatch"])
+    workflow.add_edge("edge_traversal", "dedup_agent")
+    workflow.add_conditional_edges("dedup_agent", dispatch_reviewers, ["reviewer_agent", "reporter_dispatch"])
     workflow.add_edge("reviewer_agent", "validator_dispatch_gate")
     # Stage 1: prove direct_to_validator records; requires_integration records are DEFERRED so the auditor only sees proven poc_payloads.
     workflow.add_conditional_edges(

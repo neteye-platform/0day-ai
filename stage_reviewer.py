@@ -17,6 +17,7 @@ from run_stats import (
     get_embedder,
 )
 from schemas import REVIEWER_AGENT
+from stage_dedup import apply_agent_clusters
 from state import MasterState, ReviewerState
 from tool_loop import CompactionConfig, ToolLoopAgent
 from utils import (
@@ -142,6 +143,19 @@ def dispatch_reviewers(state: MasterState):
         max_merged_cluster=settings.dedup_max_merged_cluster,
         disk_cache_dir=settings.cache_dir / "hypothesis_embeddings",
     )
+
+    # LLM dedup layer (the dedup_agent node ran before this dispatch): apply
+    # its equivalence classes exactly like the embedding merges above — one
+    # canonical per cluster (affected_nodes unioned), duplicates never Sent.
+    hypotheses, agent_merged = apply_agent_clusters(
+        hypotheses, state.get("hypothesis_clusters")
+    )
+    if agent_merged:
+        _record_stat("hypotheses_merged_by_agent", agent_merged)
+        logging.info(
+            "Dedup agent merged away %d duplicate hypothesis record(s) before reviewer dispatch.",
+            agent_merged,
+        )
 
     progress_id = _start_agent_progress(len(hypotheses))
     logging.info(

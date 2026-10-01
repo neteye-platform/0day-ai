@@ -15,6 +15,7 @@ with open("agents.yaml", "r") as f:
     VALIDATOR_AGENT = data.get("validator_agent")
     INTEGRATION_AUDITOR_AGENT = data.get("integration_auditor")
     EDGE_TRAVERSAL_AGENT = data.get("edge_traversal")
+    DEDUP_AGENT = data.get("dedup_agent")
     REPORTER_AGENT = data.get("reporter_agent")
     CREDENTIAL_FINDER_AGENT = data.get("credential_finder")
     PATCHER_AGENT = data.get("patcher_agent")
@@ -533,6 +534,13 @@ class DownstreamDemand(BaseModel):
 class Hypothesis(BaseModel):
     cwe: CWE_KEYS = Field(description="The matching CWE ID.")
     component: str = Field(description="The vulnerable parameter, logic check, or missing control.")
+    description: str = Field(
+        description=(
+            "One or two sentences: which untrusted input reaches which exact "
+            "sink call or omitted control, and the missing guard. A bare "
+            "parameter, function, or CWE name is invalid."
+        )
+    )
     pattern_label: Optional[str] = Field(
         default=None,
         description=(
@@ -862,6 +870,35 @@ class EdgeTraversalOutput(BaseModel):
     assertions: list[EdgeInvariantAssertion] = Field(
         default_factory=list,
         description="Edge invariant assertions: flags confirming when an upstream boundary's validation satisfies a downstream node's entry demands, pruning unnecessary false-positive evaluations. Emit one per edge you explicitly verified as safe."
+    )
+
+
+class DedupCluster(BaseModel):
+    reason: str = Field(
+        description=(
+            "One short sentence naming the shared sink or root cause that "
+            "justifies the merge (file/function or the shared vulnerable call)."
+        ),
+    )
+    member_vuln_ids: list[str] = Field(
+        min_length=2,
+        description=(
+            "Two or more vuln_ids from THIS group that describe the SAME "
+            "underlying defect (same sink at the same code location reached by "
+            "the same kind of untrusted input, or one shared root cause fixed "
+            "by one change at one place). Copy the vuln_id strings VERBATIM."
+        ),
+    )
+
+
+class DedupAgentOutput(BaseModel):
+    clusters: list[DedupCluster] = Field(
+        default_factory=list,
+        description=(
+            "Equivalence classes of true duplicate hypotheses in this group. "
+            "Clusters must be DISJOINT (one vuln_id in at most one cluster). "
+            "Empty when every record is a distinct defect."
+        ),
     )
 
 
