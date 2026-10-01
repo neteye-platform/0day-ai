@@ -13,7 +13,7 @@ import credential_finder
 import settings
 import tools
 from llms import fast_llm, validator_llm
-from run_stats import _record_stat, _start_agent_progress, affected_nodes_label, as_dicts, steps_block
+from run_stats import _record_stat, _start_agent_progress, affected_nodes_label, as_dicts, record_llm_usage, steps_block
 from schemas import VALIDATOR_AGENT
 from stage_patcher import patchable_records
 from state import MasterState, ValidatorState
@@ -471,7 +471,11 @@ class ValidatorAgent(ToolLoopAgent):
         ))
         messages = [sys_msg, human_msg]
         response = llm_with_tools.invoke(messages)
-        return {"messages": [sys_msg, human_msg, response], "iterations": 1}
+        return {
+            "messages": [sys_msg, human_msg, response],
+            "iterations": 1,
+            "token_spent": record_llm_usage(self.name, response),
+        }
 
     def session_state(self, state) -> dict:
         # Merge cookie jars from tool artifacts into ValidatorState.cookies.
@@ -528,7 +532,12 @@ class ValidatorAgent(ToolLoopAgent):
         updated_vuln = with_timeout_note(state.get("report_to_test", {}))
 
         # Save to cache so subsequent runs skip the (doomed) tool-calling loop.
-        cache_validator(dict(state.get("report_to_test", {})), state.get("peer_payloads"), updated_vuln)
+        cache_validator(
+            dict(state.get("report_to_test", {})),
+            state.get("peer_payloads"),
+            updated_vuln,
+            state.get("token_spent"),
+        )
 
         # Batched variants stay unproven too: give each its own timeout note
         # (status untouched, same as the seed's).

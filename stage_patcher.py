@@ -26,6 +26,7 @@ from run_stats import (
     _start_agent_progress,
     affected_nodes_label,
     as_dicts,
+    record_llm_usage,
     steps_block,
 )
 from schemas import PATCHER_AGENT
@@ -314,7 +315,11 @@ class PatcherAgent(ToolLoopAgent):
         ))
         messages = [sys_msg, human_msg]
         response = llm_with_tools.invoke(messages)
-        return {"messages": [sys_msg, human_msg, response], "iterations": 1}
+        return {
+            "messages": [sys_msg, human_msg, response],
+            "iterations": 1,
+            "token_spent": record_llm_usage(self.name, response),
+        }
 
     def fallback(self, state) -> Command:
         """Iteration cap crossed without submit_patch: record the failed attempt
@@ -329,7 +334,7 @@ class PatcherAgent(ToolLoopAgent):
         # burning another doomed loop (files this run may have half-edited are
         # NOT reverted — the reviewer re-read and the validator smoke test
         # adjudicate them; the status stays exploitable either way).
-        cache_patcher(dict(report), updated)
+        cache_patcher(dict(report), updated, state.get("token_spent"))
 
         logging.info(
             f"Patcher on {updated.get('vuln_id', 'Unknown')} ended after "

@@ -13,8 +13,8 @@ from markdown_it import MarkdownIt
 from weasyprint import HTML
 
 import settings
-from llms import smart_llm
-from run_stats import _record_stat, _snapshot_pipeline_stats, as_dict, as_dicts, raise_if_stopping, strip_step_numbering
+from llms import invoke_tracked, smart_llm
+from run_stats import _record_stat, _snapshot_pipeline_stats, as_dict, as_dicts, raise_if_stopping, snapshot_token_totals, strip_step_numbering
 from schemas import REPORTER_AGENT, ReporterFinding, cwes
 from state import MasterState, ReporterState
 from utils import cache_reporter, cvss_severity_label, cvss_v3_base_score
@@ -219,6 +219,63 @@ def _build_pipeline_statistics(state: MasterState) -> str:
         f"| Insufficient context | {status_counts.get('insufficient_context', 0)} |",
         f"| Hypothesis (never reviewed) | {status_counts.get('hypothesis', 0)} |",
     ]
+    return "\n".join(lines)
+
+
+# Ledger agent keys -> report labels. Unknown keys render prettified as-is.
+_TOKEN_AGENT_LABELS = {
+    "explorer": "Expert explorer",
+    "cve_analyzer": "CVE analyzer",
+    "threat_intel": "Threat intel",
+    "credential_finder": "Credential finder",
+    "contract_verifier": "Contract verifier",
+    "edge_traversal": "Edge traversal",
+    "dedup_agent": "LLM dedup agent",
+    "reviewer": "Reviewer",
+    "validator": "Validator",
+    "integration_auditor": "Integration auditor",
+    "patcher": "Patcher",
+    "reporter": "Reporter",
+}
+
+
+def _build_token_usage() -> str:
+    """Deterministic Token Usage section: per-agent LLM input/output token
+    totals for the run, from the run_stats token ledger. The ledger merges
+    this process's live spend with the usage persisted in cache entries that
+    HIT (a cached verdict carries the tokens its original run spent), so the
+    section reflects the full work behind this report regardless of how much
+    was recomputed today. Values are never derived from LLM output."""
+    totals = snapshot_token_totals()
+    lines = [
+        "## Token Usage",
+        "",
+        "_LLM tokens attributed to each pipeline agent for this report, "
+        "including token counts persisted with reused (cached) verdicts._",
+        "",
+        "| Agent | LLM calls | Input tokens | Output tokens | Total tokens |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    grand_calls = grand_in = grand_out = 0
+    ranked = sorted(
+        totals.items(),
+        key=lambda kv: -(kv[1].get("input_tokens", 0) + kv[1].get("output_tokens", 0)),
+    )
+    for agent, usage in ranked:
+        calls = usage.get("calls", 0)
+        tin = usage.get("input_tokens", 0)
+        tout = usage.get("output_tokens", 0)
+        grand_calls += calls
+        grand_in += tin
+        grand_out += tout
+        label = _TOKEN_AGENT_LABELS.get(agent, agent.replace("_", " ").capitalize())
+        lines.append(
+            f"| {label} | {calls:,} | {tin:,} | {tout:,} | {tin + tout:,} |"
+        )
+    lines.append(
+        f"| **Total** | **{grand_calls:,}** | **{grand_in:,}** | "
+        f"**{grand_out:,}** | **{grand_in + grand_out:,}** |"
+    )
     return "\n".join(lines)
 
 
@@ -512,8 +569,9 @@ def reporter_node(state: ReporterState) -> dict:
         reporter_llm = smart_llm.with_structured_output(
             ReporterFinding, method="json_schema", strict=True
         )
+        usage = None
         try:
-            result = reporter_llm.invoke([sys_msg, human_msg])
+            result, usage = invoke_tracked(reporter_llm, [sys_msg, human_msg], "reporter")
             finding = result if isinstance(result, dict) else result.model_dump()
         except Exception as exc:
             # Fail open: keep the record's own evidence, losing no finding.
@@ -527,7 +585,7 @@ def reporter_node(state: ReporterState) -> dict:
                 "worst_case_scenario": "",
                 "remediation": "",
             }
-        cache_reporter(report, finding)
+        cache_reporter(report, finding, usage)
 
     finding["vuln_id"] = vuln_id
     return {"reporter_findings": [finding]}
@@ -609,7 +667,7 @@ def report_assembler_node(state: MasterState) -> dict:
     severity-ranked, with deterministic CVSS scores and the statistics
     section. Returns {}."""
     report_dir = settings.app_path / f"report_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
-    statistics = _build_pipeline_statistics(state)
+    statistics = _build_pipeline_statistics(state) + "\n\n" + _build_token_usage()
 
     findings_by_id = {}
     for finding in state.get("reporter_findings", []) or []:

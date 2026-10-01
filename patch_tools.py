@@ -293,7 +293,7 @@ def submit_patch(
     # Store the verdict so a replay of the same record short-circuits BEFORE
     # the loop: the files on disk are already patched, so re-running the edits
     # is neither needed nor safe.
-    cache_patcher(dict(report), updated)
+    cache_patcher(dict(report), updated, state.get("token_spent"))
 
     logging.info(
         f"Patcher: submitted fix for {report.get('vuln_id', 'Unknown')} "

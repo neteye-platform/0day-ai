@@ -505,7 +505,12 @@ def submit_evaluation(
     # byte-identical across checkpoint replays, so caching it would collapse every
     # genuine re-answer into this verdict.
     if not is_feedback_review(report):
-        cache_reviewer(reviewer_cache_key(report, state.get("node_id", "Unknown")), report, updated_vuln)
+        cache_reviewer(
+            reviewer_cache_key(report, state.get("node_id", "Unknown")),
+            report,
+            updated_vuln,
+            state.get("token_spent"),
+        )
 
     return Command(
         update={
@@ -996,7 +1001,7 @@ def mark_validation_complete(
     )
 
     # Save to cache so subsequent runs skip the tool-calling loop.
-    cache_validator(report, state.get("peer_payloads"), updated_vuln)
+    cache_validator(report, state.get("peer_payloads"), updated_vuln, state.get("token_spent"))
 
     # Close this validator's headless-browser sessions and remove its dedicated
     # attacker container (per-agent, never touching other concurrently running
@@ -1053,7 +1058,7 @@ def ask_for_context(
     # Save to cache so subsequent runs skip the tool-calling loop (the cached
     # insufficient_context record keeps review_round bumped, so a repeat of the
     # same round-0 report re-triggers the reviewer feedback loop exactly).
-    cache_validator(report, state.get("peer_payloads"), updated_vuln)
+    cache_validator(report, state.get("peer_payloads"), updated_vuln, state.get("token_spent"))
 
     # Close this validator's headless-browser sessions and remove its dedicated
     # attacker container (per-agent, never touching other concurrently running
@@ -1187,7 +1192,9 @@ def submit_integration_audit(
     )
 
     # Save to cache so subsequent runs skip the tool-calling loop.
-    cache_integration_auditor(report, state.get("confirmed_vulns"), updated_vuln)
+    cache_integration_auditor(
+        report, state.get("confirmed_vulns"), updated_vuln, state.get("token_spent")
+    )
 
     return Command(
         update={

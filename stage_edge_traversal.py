@@ -7,7 +7,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 import settings
 from llms import fast_llm, invoke_structured_capped
-from run_stats import _record_stat, as_dict, raise_if_stopping
+from run_stats import _record_stat, as_dict, raise_if_stopping, take_cached_usage
 from schemas import EDGE_TRAVERSAL_AGENT, EdgeTraversalOutput
 from state import MasterState
 from boundary_edges import (
@@ -89,6 +89,7 @@ def _run_edge_traversal_batch(batch: list[dict], idx: int, total: int) -> list[d
     cache_file = settings.cache_dir / "edge_traversal" / safe_cache_filename(f"{digest}.json")
     cached = cache(cache_file, "read")
     if cached:
+        take_cached_usage("edge_traversal", cached)
         logging.debug("Edge Traversal cache hit for batch %d/%d.", idx, total)
         return (cached.get("hypotheses") or []) if isinstance(cached, dict) else []
 
@@ -97,8 +98,8 @@ def _run_edge_traversal_batch(batch: list[dict], idx: int, total: int) -> list[d
     human_msg = HumanMessage(content=prompt)
 
     structured_llm = fast_llm.with_structured_output(EdgeTraversalOutput, method="json_schema", strict=True)
-    output = invoke_structured_capped(
-        structured_llm, [sys_msg, human_msg], f"Edge Traversal batch {idx}/{total}"
+    output, usage = invoke_structured_capped(
+        structured_llm, [sys_msg, human_msg], f"Edge Traversal batch {idx}/{total}", "edge_traversal"
     )
     if output is None:
         # Uncached on purpose: the next run re-attempts this batch.
@@ -119,7 +120,7 @@ def _run_edge_traversal_batch(batch: list[dict], idx: int, total: int) -> list[d
         )
 
     hypotheses = [_edge_traversal_finding_to_record(f) for f in (output.get("findings") or [])]
-    cache(cache_file, "write", {"hypotheses": hypotheses})
+    cache(cache_file, "write", {"hypotheses": hypotheses, "token_usage": usage})
     logging.info(
         "Edge Traversal batch %d/%d: %d hypothesis(es).",
         idx,

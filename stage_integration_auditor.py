@@ -8,7 +8,7 @@ from langgraph.types import Command, Send
 
 import tools
 from llms import fast_llm, smart_llm
-from run_stats import _record_stat, _start_agent_progress, affected_nodes_label, as_dicts, steps_block
+from run_stats import _record_stat, _start_agent_progress, affected_nodes_label, as_dicts, record_llm_usage, steps_block
 from schemas import INTEGRATION_AUDITOR_AGENT
 from state import IntegrationAuditorState, MasterState, ValidatorState
 from tool_loop import CompactionConfig, ToolLoopAgent
@@ -191,8 +191,9 @@ class IntegrationAuditorAgent(ToolLoopAgent):
             record = append_note(report, "integration_audit_reasoning", note)
             record["status"] = "unchainable"
             # Cache so a repeat of the same report short-circuits in the base
-            # pre_agent cache hook instead of re-running this branch.
-            cache_integration_auditor(report, [], record)
+            # pre_agent cache hook instead of re-running this branch. Zero LLM
+            # spend (deterministic resolution), so no token usage to record.
+            cache_integration_auditor(report, [], record, state.get("token_spent"))
             return Command(update={"vulnerabilities": [record]})
 
         # strip_numbering: our counter must never double-number the reviewer's steps.
@@ -208,7 +209,11 @@ class IntegrationAuditorAgent(ToolLoopAgent):
         ))
 
         response = llm_with_tools.invoke([sys_msg, human_msg])
-        return {"messages": [sys_msg, human_msg, response], "iterations": 1}
+        return {
+            "messages": [sys_msg, human_msg, response],
+            "iterations": 1,
+            "token_spent": record_llm_usage(self.name, response),
+        }
 
     def fallback(self, state) -> Command:
         """Resolve an iteration-capped audit: keeps the record 'confirmed'
@@ -225,6 +230,7 @@ class IntegrationAuditorAgent(ToolLoopAgent):
             dict(state.get("report_to_test", {})),
             state.get("confirmed_vulns"),
             updated_vuln,
+            state.get("token_spent"),
         )
         return Command(update={"vulnerabilities": [updated_vuln]})
 

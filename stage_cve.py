@@ -5,7 +5,7 @@ from langgraph.types import Send
 
 import settings
 from llms import fast_llm, invoke_structured_capped
-from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping
+from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping, take_cached_usage
 from schemas import CVE_ANALYZER_AGENT, CVEAnalysis
 from state import CVEAnalyzerState, MasterState
 from utils import cache
@@ -133,6 +133,7 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     cache_file = settings.cache_dir / "cve_analyzer" / f"{cve_id}.json"
     cached_demand = cache(cache_file, "read")
     if cached_demand:
+        take_cached_usage("cve_analyzer", cached_demand)
         return {"cve_demands": [_backfill_osv_cwe_ids(cached_demand, cve)]}
 
     sys_msg = SystemMessage(content=CVE_ANALYZER_AGENT["prompt"] + "\n\n")
@@ -157,8 +158,8 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     ))
 
     cve_analyzer_llm = fast_llm.with_structured_output(CVEAnalysis, method="json_schema", strict=True)
-    analysis = invoke_structured_capped(
-        cve_analyzer_llm, [sys_msg, human_msg], f"CVE analyzer {cve_id}"
+    analysis, usage = invoke_structured_capped(
+        cve_analyzer_llm, [sys_msg, human_msg], f"CVE analyzer {cve_id}", "cve_analyzer"
     )
     if analysis is None:
         # Fail open: no demands for this CVE; uncached so a re-run retries it.
@@ -171,7 +172,10 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     if dict_analysis is None:
         return {"cve_demands": []}
 
-    cache(cache_file, "write", dict_analysis)
+    # token_usage rides ONLY the cache payload, never the channel record:
+    # demand content keys the verifier's cache, so polluting it would make
+    # cached-vs-fresh runs disagree on downstream hashes.
+    cache(cache_file, "write", {**dict_analysis, "token_usage": usage})
 
     return {
         "cve_demands": [dict_analysis]
