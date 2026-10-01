@@ -60,8 +60,8 @@ BOUNDARY_CATEGORY_ORDER = ("infra", "async_messaging", "network_ipc", "in_proces
 
 # Relations that denote real coupling across an AST edge (as opposed to purely
 # structural relations like contains/method/inherits). `imports` is also
-# included: in PHP monoliths (e.g. GLPI's ajax/front entrypoints importing
-# `src/*` services) the cross-community import from an unauthenticated
+# included: in PHP monoliths (front-controller / AJAX entrypoint scripts
+# reaching into a shared `src/` class layer) the cross-community import from an unauthenticated
 # entrypoint into a privileged service is exactly the composition surface the
 # Edge Traversal agent must reason about (see boundary_edges.md). Low-signal
 # import/reference targets (exceptions, loggers, utilities, pure types) are
@@ -595,8 +595,8 @@ def _synthesis_fingerprint(note_map: dict) -> str:
     meaningful in sync with graph.json (regenerated together by graphify), and
     this matches the pipeline-wide "source is immutable while its graph is
     current" cache assumption. A digest match replays byte-identical edges for
-    a given graph; delete the cache directory to force fresh synthesis after
-    editing target sources without re-extracting the graph.
+    a given graph; hand-edited target sources stay invisible to the cache
+    until the graph is re-extracted.
     """
     payload: dict = {
         "app_path": str(settings.app_path),

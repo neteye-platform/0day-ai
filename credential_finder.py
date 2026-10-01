@@ -78,10 +78,10 @@ _DEFINE = re.compile(
     (?P<q>['"])(?P<val>(?:(?!\2).){1,200})\2
     """
 )
-# Seed code `password_hash('glpi', PASSWORD_DEFAULT)` -> the literal is the
+# Seed code `password_hash('admin', PASSWORD_DEFAULT)` -> the literal is the
 # plaintext default password.
 _PASSWORD_HASH = re.compile(r"""password_hash\s*\(\s*['"](?P<val>[^'"]{1,100})['"]""", re.I)
-# `'name' => 'glpi'` (or login/username) literals, used to recover the account
+# `'name' => 'admin'` (or login/username) literals, used to recover the account
 # name sitting near a password_hash call.
 _NAME_ASSIGN = re.compile(r"""['"](?:name|login|username)['"]\s*=>\s*['"]([^'"]+)['"]""", re.I)
 
@@ -142,8 +142,8 @@ def _is_placeholder(value: str) -> bool:
 
 
 def _namespace(key: str) -> str:
-    """Strip a trailing user/secret suffix so ``GLPI_DB_USER`` and
-    ``GLPI_DB_PASSWORD`` collapse to the same namespace ``GLPI_DB``."""
+    """Strip a trailing user/secret suffix so ``APP_DB_USER`` and
+    ``APP_DB_PASSWORD`` collapse to the same namespace ``APP_DB``."""
     upper = key.upper()
     for suffix in _SECRET_SUFFIXES + _USER_SUFFIXES:
         if upper.endswith(suffix) and len(upper) > len(suffix):

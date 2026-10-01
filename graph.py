@@ -490,7 +490,7 @@ if __name__ == "__main__":
             if snapshot.next:
                 # Resume needs a None/Command input: a plain dict is treated as
                 # a NEW run and restarts from bootstrap. The Command UPDATE
-                # patches pipeline_run_id for pre-change checkpoints while the
+                # patches pipeline_run_id into the resumed state while the
                 # pending tasks keep running (task writes already committed are
                 # durable and never re-executed).
                 run_id = snapshot.values.get("pipeline_run_id") or run_id

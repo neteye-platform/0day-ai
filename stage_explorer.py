@@ -175,8 +175,8 @@ def dispatch_explorers(state: MasterState):
 
 def _extract_hypotheses(node_id: str, raw_hypotheses: list) -> list[dict]:
     """Turn an explorer note's `vulns` entries into standard hypotheses.
-    Notes cached before the hypothesis carried a `description` fall back to
-    the bare `component` label (the old promoted-to-description behavior)."""
+    Notes cached from an older schema whose hypotheses carry no `description`
+    fall back to the bare `component` label."""
     return [{
         "affected_nodes": [node_id],
         "cwe_id": hyp.get("cwe", "OTHER_UNCATEGORIZED"),

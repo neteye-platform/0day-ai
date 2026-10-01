@@ -1051,7 +1051,7 @@ class CredentialRecord(BaseModel):
     service: str = Field(
         description=(
             "Short label identifying what this credential grants access to "
-            "(e.g. 'GLPI administrator login', 'MySQL root', 'GLPI application "
+            "(e.g. 'MyApp administrator login', 'MySQL root', 'MyApp application "
             "database user'). Prefer the application/service name over the env "
             "key alone."
         )
@@ -1061,7 +1061,7 @@ class CredentialRecord(BaseModel):
     )
     username: Optional[str] = Field(
         default=None,
-        description="The username/account identifier when one is known (e.g. 'glpi', 'root'). Leave unset for bare secrets without a principal."
+        description="The username/account identifier when one is known (e.g. 'admin', 'root'). Leave unset for bare secrets without a principal."
     )
     secret: str = Field(
         description="The credential value: the plaintext password, token, API key, or secret."

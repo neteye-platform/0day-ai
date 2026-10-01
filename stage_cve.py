@@ -129,7 +129,7 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
         logging.warning(f"{cve_id}: no descriptions provided")
         return {"cve_demands": []}
 
-    # Cached by CVE id only; delete .cache/cve_analyzer/ to re-classify.
+    # Cache keyed by CVE id only (no content hash).
     cache_file = settings.cache_dir / "cve_analyzer" / f"{cve_id}.json"
     cached_demand = cache(cache_file, "read")
     if cached_demand:

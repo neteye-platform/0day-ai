@@ -104,7 +104,7 @@ def _threat_intel_node(state: ThreatIntelState) -> dict:
     prior = state.get("prior_analysis")
     cve_id = cve.get("id", "UNKNOWN-CVE")
     package_name = cve.get("package") or "unknown"
-    # Cached by CVE id only; delete .cache/threat_intel/ to re-enrich.
+    # Cache keyed by CVE id only (no content hash).
     cache_file = settings.cache_dir / "threat_intel" / f"{cve_id}.json"
     cached = cache(cache_file, "read")
     if cached:

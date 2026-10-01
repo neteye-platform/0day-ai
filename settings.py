@@ -15,7 +15,8 @@ if _missing:
 
 # ============================ Target settings ============================
 
-app_path = Path("../apps/glpi")
+# Target repository to scan (lives OUTSIDE this repo). Edit this to switch targets.
+app_path = Path("../apps/target-app")
 
 graph = app_path / "graphify-out" / "graph.json"
 cache_dir = app_path / ".cache"
@@ -31,16 +32,15 @@ repair_call_edges = True
 # repair_call_edges (falls back to the plain broadcast without it).
 container_demands_scope_to_members = True
 
-# None = all
+# None = all; a list of ints restricts the scan to those graphify communities.
 communities_to_analyze = None
-# communities_to_analyze = [60]
 
 # Path patterns (relative to app root) skipped before analysis and blocked from
 # reviewer file reads; globs and bare dir names supported.
-scan_exclude_paths = ["install/mysql/", "*.sql"]   # e.g. ["tests/", "docs/api/*", "**/migrations/*"]
-# SQL dumps/seeds (GLPI's install/mysql/*-empty.sql is ~400 KB) are unanalyzable
-# (no tree-sitter grammar) and were blowing the explorer's unmanaged prompt past
-# the model window; excluded by default.
+scan_exclude_paths = ["*.sql"]   # e.g. ["install/mysql/", "tests/", "docs/api/*", "**/migrations/*"]
+# SQL dumps/seeds (e.g. an app's *-empty.sql installer files can be hundreds of KB)
+# are unanalyzable (no tree-sitter grammar) and were blowing the explorer's
+# unmanaged prompt past the model window; excluded by default.
 # Auto-exclude well-known dependency/test/doc paths even when the list is empty.
 scan_exclude_defaults = True
 
@@ -134,8 +134,7 @@ validator_feedback_max_rounds = 1
 # (submitted via submit_evaluation) computes below this base score is never sent to
 # the Validator/Integration Auditor — it stays 'confirmed' and is reported without
 # dynamic proof. Findings with a missing/unparseable estimate ALWAYS validate
-# (fail-open, so verdicts cached before the reviewer shipped vectors behave as
-# before). 0 (or negative) disables the gate entirely.
+# (fail-open). 0 (or negative) disables the gate entirely.
 validator_min_cvss = 7.0
 
 ## ---- Patcher agent ----
@@ -177,9 +176,9 @@ hard_reserved = 8192
 ## ---- Contract verifier ----
 
 # Max demands per structured contract-verifier call: output scales with demand
-# count, so batches stay well under llm_max_completion_tokens. 15 keeps a
-# degenerate rambling batch (~400 out-tokens/demand) far from the 16k cap; the
-# call sites also salvage a capped batch via llms.invoke_structured_capped.
+# count, so batches stay well under llm_max_completion_tokens. 15 keeps even a
+# degenerate rambling batch far from the 16k cap; the call sites also salvage a
+# capped batch via llms.invoke_structured_capped.
 verifier_max_demands_per_call = 15
 
 ## ---- Deduplication ----
@@ -189,24 +188,17 @@ verifier_max_demands_per_call = 15
 # records; fails open to no dedup if Ollama is unreachable.
 semantic_dedup_enabled = True
 semantic_dedup_threshold = 0.80
-# Plain official model (ollama pull). N.B. the local embeddinggemma2 alias
-# (OLLAMA create: FROM embeddinggemma + num_thread 16, byte-identical GGUF
-# blob, identical vectors) is ~2.5x SLOWER here, not faster: clean interleaved
-# benches on 150 demand-length texts measured 5.4s (plain) vs 13s (alias) —
-# pinning 16 threads on this 4P+8E+4LPE hybrid makes every batch barrier wait
-# on the E/LPE cores. Throughput on this box ~28 texts/s warm => a 13k pass
-# is minutes. The historical embedding outages were code bugs (parallel
-# chunk pile-ups + a fixed 300s budget burned before the fallback), fixed in
-# dedup.py, not a model-size problem. If throughput ever collapses (single
-# text takes seconds while load is zero) the resident llama-server is wedged
-# — usually orphaned request backlogs left by force-killed runs — run
-# `ollama stop <model>` to respawn it (verified fix).
+# Plain official model (ollama pull). Keep-alive/prewarm/timeout tuning below
+# matters more than model size here. If throughput ever collapses (single text
+# takes seconds while load is zero) the resident llama-server is wedged —
+# usually orphaned request backlogs left by force-killed runs — run
+# `ollama stop <model>` to respawn it.
 embeddings_model = "embeddinggemma"
 embeddings_base_url = "http://localhost:11434"
 
 # Cross-node merging of code-level hypotheses (same defect reported from
-# different caller nodes). Thresholds measured on the GLPI run's embeddings:
-# hub-utility hypotheses anchor on bare parameter names ($str, $itemtype) whose
+# different caller nodes). Thresholds calibrated on representative scans:
+# hub-utility hypotheses anchor on bare parameter names ($str, $id) whose
 # token identity is meaningless (cosine ~0.6 between different defects), while
 # genuine paraphrased duplicates sit at cosine >= 0.93 even with low component
 # overlap. At 0.85 + jaccard alone, degenerate anchors coalesce hundreds of
@@ -228,23 +220,22 @@ dedup_max_merged_cluster = 25           # cap on cross-node cluster growth
 dedup_agent_enabled = True
 dedup_agent_group_max = 50     # CWE groups larger than this get dir-ordered packing
 dedup_agent_max_group = 50     # hard cap of records per LLM call (chunk size);
-                               # 50 keeps prompts ~35-45k chars where cluster
-                               # recall was verified (the embedding pass has
-                               # already collapsed verbatim twins before this)
+                               # 50 was picked for prompt-size focus (the
+                               # embedding pass has already collapsed verbatim
+                               # twins before this)
 dedup_agent_parallel = 4       # concurrent group calls
 dedup_agent_desc_chars = 900   # per-record description budget in the prompt
                                # (verifier "Fails to satisfy demand… Evidence:"
-                               # texts run p90 ~1 KB; cutting mid-Evidence would
-                               # hide the discriminating sink call)
+                               # texts often run ~1 KB; cutting mid-Evidence
+                               # would hide the discriminating sink call)
 
 # Demand dedup (contract-verifier input): collapse paraphrases of one requirement
 # per target node (exact identity, then embedding similarity). cve_assumption
 # demands never merge; fails open to exact-only merging.
 demand_dedup_enabled = True
-# 0.86, not the hypothesis 0.80: the global pairwise-cosine histogram of the
-# cached demand vectors shows 99.95% of DISTINCT demand pairs below 0.815 with
-# a monotone tail — the [0.80, 0.86) band is dominated by related-but-distinct
-# contract checks, while true paraphrases cluster above 0.90.
+# 0.86, not the hypothesis 0.80: offline cosine histograms over demand vectors
+# show distinct pairs dominated by the [0.80, 0.86) band (related-but-distinct
+# contract checks), while true paraphrases cluster above 0.90.
 demand_dedup_threshold = 0.86
 embeddings_timeout = 180
 # Texts per /api/embed request. Failed chunks subdivide (halved down to 1)
@@ -252,21 +243,22 @@ embeddings_timeout = 180
 # fail-open.
 embeddings_batch_size = 200
 # Serial by design: one llama.cpp server queues concurrent requests anyway,
-# and >1 concurrent cold loads/contexts on the same box caused the pile-up
-# timeouts (4 parallel chunks each holding a model copy).
+# and each concurrent request can materialize its own model copy, which caused
+# pile-up timeouts with >1 worker.
 embeddings_parallel_chunks = 1
 # One-shot cold-load allowance: the model load normally happens INSIDE the
 # first request, so a healthy-but-cold server can burn the whole
 # embeddings_timeout before serving a byte. Prewarm absorbs that with a
 # dedicated long timeout, only when uncached texts actually exist.
 embeddings_prewarm_timeout = 600
-# Pinned across the dedup passes (hours apart: demands then hypotheses);
-# the model is small, and without this every pass re-pays the cold load.
+# Pinned across the dedup passes (demands then hypotheses run far apart within
+# one scan); the model is small, and without this every pass re-pays the cold
+# load.
 embeddings_keep_alive = "6h"
 # Progress watchdog: the pass aborts only after this many seconds with ZERO
-# newly embedded texts (a healthy pass can never stall longer than one
-# request timeout), replacing the old fixed total budget that was incompatible
-# with 13k-text lists. 0 disables the watchdog entirely.
+# newly embedded texts (a healthy pass can never stall longer than one request
+# timeout), instead of a fixed total budget that long lists would outlive.
+# 0 disables the watchdog entirely.
 embeddings_stall_budget_sec = 540
 
 # Confirmed records sharing (cwe, vulnerable_component) exactly are validated by
