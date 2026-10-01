@@ -442,6 +442,25 @@ def reviewer_cache_key(report: Optional[dict], default: str = "Unknown") -> str:
     return "+".join(affected) if affected else default
 
 
+def is_feedback_review(report: Optional[dict]) -> bool:
+    """True when the report is a Validator->Reviewer feedback re-review rather
+    than a first-pass hypothesis review.
+
+    `ask_for_context` bumps `review_round` and fills `open_questions`, and
+    `route_validator_feedback` re-dispatches exactly those flagged records to the
+    reviewer. Feedback re-reviews must NEVER be served from (or written to) the
+    reviewer cache: their whole purpose is to genuinely re-answer the Validator's
+    questions and emit self-sufficient reproduction steps for re-validation.
+    Round-0 hypothesis reviews are pure/idempotent analyses whose caching is
+    safe, but a round-N feedback report is byte-identical across every replay of
+    the same dispatch (e.g. resuming a checkpoint inside the feedback cycle), so
+    a content-hash cache would silently collapse each replay into the earlier
+    verdict with zero LLM turns — the reviewer appears to "not run again"."""
+    if not report:
+        return False
+    return (report.get("review_round") or 0) > 0 or bool(report.get("open_questions"))
+
+
 def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dict]:
     vuln_map = {}
 
