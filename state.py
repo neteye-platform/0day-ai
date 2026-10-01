@@ -57,6 +57,11 @@ class ValidatorState(TypedDict):
     report_to_test: dict # The specific vulnerability to validate
     sandbox_url: Optional[str]     # The endpoint/IP of the sandbox
     cookies: dict
+    # Proven results (vuln_id / cwe_id / description / poc_payload / execution_logs)
+    # of the OTHER validated vulnerabilities a `chained` record depends on, sent
+    # only by route_integration_audit. Rendered into the validator's first turn so
+    # the final PoC can reuse the peers' proven payloads.
+    peer_payloads: Optional[list[dict]]
     # Unique per-validator id (uuid) used to namespace browser session ids, so
     # concurrent validators sharing the single web browser never collide even
     # if their LLM picks identical session labels.
