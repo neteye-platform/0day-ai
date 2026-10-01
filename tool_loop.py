@@ -29,9 +29,10 @@ from utils import estimate_message_tokens
 class CompactionConfig:
     """Settings-backed compaction budget for one tool-loop agent.
 
-    Reads ``settings.<prefix>_model_context_window`` and friends live (on every
-    call) so runtime overrides stay effective, exactly as the original nodes
-    read their ``settings.reviewer_*`` / ``settings.validator_*`` values.
+    Reads ``settings.model_context_window`` (one general setting) and
+    ``settings.<prefix>_*`` friends live (on every call) so runtime overrides
+    stay effective, exactly as the original nodes read their
+    ``settings.reviewer_*`` / ``settings.validator_*`` values.
     """
 
     __slots__ = ("prefix",)
@@ -40,6 +41,10 @@ class CompactionConfig:
         self.prefix = prefix
 
     def _get(self, name: str) -> int:
+        # model_context_window is a single general setting shared by all agents;
+        # everything else is read per-prefix (e.g. settings.reviewer_context_reserved).
+        if name == "model_context_window":
+            return getattr(settings, "model_context_window")
         return getattr(settings, f"{self.prefix}_{name}")
 
     def threshold(self) -> int:
