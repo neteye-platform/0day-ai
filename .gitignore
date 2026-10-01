@@ -2,6 +2,7 @@
 __pycache__/
 testing_db*
 states/
+results.json
 trace.json
 graphify-out/
 .langgraph_api/

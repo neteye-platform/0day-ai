@@ -520,7 +520,7 @@ contract_verifier_agent:
         {
           "demand_id": "demand1",
           "status": "FAILED",
-          "reasoning": "The code explicitly calls yaml.load() on `user_input` in plain sight on line 3, which violates the demand.",
+          "evidence": "The code explicitly calls yaml.load() on `user_input` in plain sight on line 3, which violates the demand.",
           "cwe_id": "CWE-502"
         }
       ]
@@ -542,7 +542,7 @@ contract_verifier_agent:
         {
           "demand_id": "demand2",
           "status": "DELEGATED",
-          "reasoning": "The untrusted data `req.body` is passed to the custom helper `schemaValidator()` before hitting the SQL query on line 3. The implementation of `schemaValidator` is omitted, so it is delegated to a peer agent.",
+          "evidence": "The untrusted data `req.body` is passed to the custom helper `schemaValidator()` before hitting the SQL query on line 3. The implementation of `schemaValidator` is omitted, so it is delegated to a peer agent.",
           "cwe_id": null
         }
       ]
@@ -563,7 +563,7 @@ contract_verifier_agent:
         {
           "demand_id": "demand3",
           "status": "MET",
-          "reasoning": "The code uses a standard parameterized query `(%s, (user_id,))` on line 2, which securely neutralizes the SQL injection threat.",
+          "evidence": "The code uses a standard parameterized query `(%s, (user_id,))` on line 2, which securely neutralizes the SQL injection threat.",
           "cwe_id": null
         }
       ]
@@ -585,7 +585,7 @@ contract_verifier_agent:
         {
         "demand_id": "demand4",
         "status": "OUT_OF_SCOPE",
-        "reasoning": "The snippet is a localized route that reads the session, but setting global Cache-Control headers for session management is an architectural framework concern. It is out of scope for this individual route handler.",
+        "evidence": "The snippet is a localized route that reads the session, but setting global Cache-Control headers for session management is an architectural framework concern. It is out of scope for this individual route handler.",
         "cwe_id": null
         }
       ]
@@ -605,7 +605,7 @@ contract_verifier_agent:
         {
           "demand_id": "demand5",
           "status": "FAILED",
-          "reasoning": "The code initializes `fileUpload()` on line 2 without passing any configuration options. Because it does not explicitly disable the `parseNested` feature as required by the demand, the vulnerable default must be assumed active.",
+          "evidence": "The code initializes `fileUpload()` on line 2 without passing any configuration options. Because it does not explicitly disable the `parseNested` feature as required by the demand, the vulnerable default must be assumed active.",
           "cwe_id": "CWE-94"
         }
       ]
