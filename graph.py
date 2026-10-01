@@ -37,6 +37,7 @@ def compile_reviewer():
         tools.search_codebase,
         tools.get_definition,
         tools.list_container_artifacts,
+        tools.find_in_container,
         tools.read_container_artifact,
         tools.submit_evaluation
     ]))

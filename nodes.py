@@ -1457,6 +1457,7 @@ FRAMEWORK_DEPENDENCY_REVIEWER_TOOLS = [
     tools.get_node_connections,
     tools.search_codebase,
     tools.list_container_artifacts,
+    tools.find_in_container,
     tools.read_container_artifact,
     tools.submit_evaluation,
 ]
