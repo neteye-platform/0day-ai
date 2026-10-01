@@ -429,7 +429,11 @@ def submit_evaluation(
     tool_call_id: Annotated[str, InjectedToolCallId],
     **kwargs
 ) -> Command:
-    """Call this tool when you have finished reviewing the source code and made a final decision."""
+    """
+    TERMINAL ACTION: Call this tool IMMEDIATELY as soon as you have a working 
+    exploit (is_confirmed=True) OR have definitively exhausted the attack surface 
+    (is_confirmed=False). Do not over-explore unneeded code.
+    """
 
     report = state.get("expert_report", {})
 
@@ -947,8 +951,12 @@ def mark_validation_complete(
     **kwargs
 ) -> Command:
     """
-    Call this when you have definitively proven the vulnerability exists,
-    or exhausted all options and believe it to be a false positive.
+    TERMINAL ACTION: Call this tool IMMEDIATELY once you have a working exploit 
+    (is_confirmed=True) OR have definitively exhausted the attack surface (is_confirmed=False).
+
+    PREREQUISITE: If your proof requires a standalone script, you MUST call 
+    `write_attacker_file` to save it either before or IN THE EXACT SAME RESPONSE 
+    as calling this tool.
     """
     # Get the single vulnerability assigned to this Validator agent
     report = state.get("report_to_test", {})
@@ -1271,6 +1279,7 @@ def search_codebase(
     is_regex: bool = False
 ) -> str:
     """
+    [HIGH COST OPERATION - USE AS LAST RESORT]
     Searches the entire application codebase for a specific string or regular expression. 
     Use this to find where specific libraries, functions, variables, or class instantiations are used. 
 
@@ -1385,26 +1394,21 @@ def search_codebase(
                         if match_count >= MAX_MATCHES:
                             hit_limit = True
 
-                if hit_limit:
-                    # Sort and cap the directories to keep the prompt clean
-                    dirs_list = sorted(list(omitted_dirs))[:10]
-                    dirs_str = ", ".join(dirs_list)
-                    example_dir = dirs_list[0] if dirs_list else "src"
-
-                    results.append(
-                        f"... [Truncated: found more than {MAX_MATCHES} matches. "
-                        f"Additional matches exist in these directories: {dirs_str}. "
-                        f"Narrow your query or use file_pattern (e.g., file_pattern='{example_dir}/*') to explore them.] ..."
-                    )
-
-                if not results:
-                    return f"No matches found for '{query}'."
-
-                return "\n".join(results)
-
         except UnicodeDecodeError:
             # Safely skip binary files (images, compiled files, etc.)
             continue
+
+    if hit_limit:
+        # Sort and cap the directories to keep the prompt clean
+        dirs_list = sorted(list(omitted_dirs))[:10]
+        dirs_str = ", ".join(dirs_list)
+        example_dir = dirs_list[0] if dirs_list else "src"
+
+        results.append(
+            f"... [Truncated: found more than {MAX_MATCHES} matches. "
+            f"Additional matches exist in these directories: {dirs_str}. "
+            f"Narrow your query or use file_pattern (e.g., file_pattern='{example_dir}/*') to explore them.] ..."
+        )
 
     if not results:
         return f"No matches found for '{query}'."

@@ -226,11 +226,13 @@ class ReviewerAgent(ToolLoopAgent):
 
     def first_turn(self, state, llm_with_tools) -> dict:
         # System prompt = shared directives + the mode-specific reachability
-        # standard (mode names match agents.yaml keys); patch-verification
-        # re-reviews additionally get the dedicated PATCH RE-VERIFICATION
-        # section attached (agents.yaml `reviewer_agent.patch_verification`) —
-        # only when the record actually carries a pending patch, so first-pass
-        # prompts stay byte-identical.
+        # standard (mode names match agents.yaml keys); insufficient-context
+        # re-reviews additionally get the dedicated VALIDATOR FEEDBACK section
+        # (agents.yaml `reviewer_agent.validator_feedback`), and patch
+        # re-reviews the PATCH RE-VERIFICATION section
+        # (`reviewer_agent.patch_verification`) — both attached only when the
+        # record actually carries that state, so first-pass prompts stay
+        # byte-identical.
         mode = state.get("mode", "code_level")
         mode_prompt = REVIEWER_AGENT.get(mode, "")
         sys_prompt = REVIEWER_AGENT.get('prompt', '')
@@ -238,6 +240,9 @@ class ReviewerAgent(ToolLoopAgent):
             sys_prompt = f"{sys_prompt}\n\n{mode_prompt}"
 
         report = state.get("expert_report", {})
+        feedback_qs = report.get("open_questions") or []
+        if feedback_qs:
+            sys_prompt = f"{sys_prompt}\n\n{REVIEWER_AGENT.get('validator_feedback', '')}"
         if report.get("patch_state") == "applied":
             sys_prompt = f"{sys_prompt}\n\n{REVIEWER_AGENT.get('patch_verification', '')}"
         sys_msg = SystemMessage(content=sys_prompt)
@@ -257,7 +262,6 @@ class ReviewerAgent(ToolLoopAgent):
         if report.get("source_cve"):
             formatted_vuln += f"- Source CVE: {report.get('source_cve')}\n"
 
-        feedback_qs = report.get("open_questions") or []
         if feedback_qs:
             qs_str = "\n".join(f"  {i}. {q}" for i, q in enumerate(feedback_qs, 1))
             formatted_vuln += (
