@@ -33,7 +33,7 @@ from schemas import PATCHER_AGENT
 from stage_reviewer import build_reviewer_payload
 from state import MasterState, PatcherState
 from tool_loop import CompactionConfig, ToolLoopAgent
-from utils import cache_patcher, format_node_context, get_cached_graph_data, get_node_code, resync_sandbox
+from utils import cache_patcher, format_node_context, get_cached_graph_data, get_node_code, resync_sandbox, take_dispatch_claim
 
 # Record classes the patcher must never touch: dependency-anchored hypotheses
 # have their sink inside the vendor tree (first-party edit impossible), and a
@@ -139,7 +139,16 @@ def dispatch_patch_reviews(state: MasterState):
     """Send every freshly-patched record back to the Reviewer (cache-exempt
     re-review via is_feedback_review; the PATCH APPLIED block teaches the mode
     contract in the reviewer's first turn)."""
-    applied = _applied(state)
+    # One claim per (record, patch round): `dispatch_patch_reviews` and its
+    # reviewer edge re-fire while a PATCH APPLIED re-review is still in flight
+    # (the record keeps patch_state 'applied' until submit_evaluation flips it
+    # to 'reviewed'); a rejected round bump still re-dispatches.
+    applied = [
+        r for r in _applied(state)
+        if take_dispatch_claim(
+            r.get("vuln_id") or "", "patch_review", r.get("patch_round") or 0
+        )
+    ]
     if not applied:
         return "integration_audit_dispatch"
 

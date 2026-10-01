@@ -739,6 +739,18 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
         if not isinstance(update, dict):
             update = update.model_dump() if hasattr(update, "model_dump") else dict(update)
 
+        # --- OPERATOR RESET (one-shot scan-recovery escape hatch) ---
+        # A record whose verdict was banked against a broken/unreachable sandbox
+        # must be downgraded below a HIGHER-ranked stale status (exploitable ->
+        # confirmed), which the priority ladder alone can never express. An
+        # update tagged `_force_reset` replaces the stored record verbatim; the
+        # marker is popped here so it never rides on the persisted record.
+        if update.pop("_force_reset", False):
+            if not (reset_id := update.get("vuln_id")):
+                raise ValueError("_force_reset updates must carry an explicit vuln_id")
+            vuln_map[reset_id] = update
+            continue
+
         # If vuln_id wasn't pre-computed, instantiate the model to trigger the validator logic
         if not update.get("vuln_id"):
             record = VulnerabilityRecord(**update)
@@ -894,26 +906,84 @@ def clear_warning_state() -> None:
         _LOG_ONCE_SEEN.clear()
 
 
-_FEEDBACK_DISPATCHED: set[tuple[str, int]] = set()
+_DISPATCH_CLAIMED: set[tuple] = set()
+_DISPATCH_CLAIM_LOCK = threading.Lock()
+
+
+def take_dispatch_claim(*key_parts) -> bool:
+    """True the first time ``key_parts`` is claimed, False on every repeat.
+
+    Fan-out dispatchers select status-based (e.g. "every record still
+    ``confirmed``") and fire once per superstep of ANY sibling task, so while a
+    record's own agent run is still in flight its status is unchanged and every
+    later firing would re-dispatch it, burning a second full agent run (and, for
+    cache-exempt passes, real sandbox work) on the same record. The claim key
+    must embed exactly the fields a LEGITIMATE re-dispatch changes across the
+    record's lifecycle (review_round / patch_round / peer set), so dedup
+    suppresses only true duplicates."""
+    key = tuple(key_parts)
+    with _DISPATCH_CLAIM_LOCK:
+        if key in _DISPATCH_CLAIMED:
+            return False
+        _DISPATCH_CLAIMED.add(key)
+        return True
+
+
+def dispatch_claim_taken(*key_parts) -> bool:
+    """Read-only peek at ``take_dispatch_claim`` (no consumption). Dispatchers
+    that may abort AFTER selecting candidates (e.g. the dead-sandbox guard)
+    peek while selecting, then commit the claims only once the abort point has
+    passed, so an aborted dispatch never burns claims for records that never
+    went out."""
+    with _DISPATCH_CLAIM_LOCK:
+        return tuple(key_parts) in _DISPATCH_CLAIMED
 
 
 def take_feedback_dispatch(vuln_id: str, review_round: int) -> bool:
-    """True the first time a (vuln_id, review_round) pair is claimed, False on
-    every repeat. Dedups the validator->reviewer feedback re-review fan-out:
+    """One-claim gate for the validator->reviewer feedback re-review fan-out:
     ``route_validator_feedback`` fires after EVERY validator superstep while
     earlier re-reviews are still in flight (the record keeps its
     insufficient_context status until the re-answer lands), and every duplicate
     dispatch burns a full cache-exempt reviewer run."""
-    key = (vuln_id, review_round)
-    if key in _FEEDBACK_DISPATCHED:
-        return False
-    _FEEDBACK_DISPATCHED.add(key)
-    return True
+    return take_dispatch_claim(vuln_id, "feedback", review_round)
 
 
 def clear_feedback_dispatch_state() -> None:
-    """Reset the once-per-run feedback-dispatch dedup (called from bootstrap)."""
-    _FEEDBACK_DISPATCHED.clear()
+    """Reset the once-per-run dispatch claims (called from bootstrap, so a
+    resumed scan re-dispatches everything still pending)."""
+    with _DISPATCH_CLAIM_LOCK:
+        _DISPATCH_CLAIMED.clear()
+
+
+def sandbox_url_alive(sandbox_url: Optional[str], timeout: float = 5.0) -> bool:
+    """False only when the sandbox URL is configured but answers no HTTP at all
+    (refused/timeout — the crash-loop signature). Any HTTP status counts as
+    alive: the port serving means the app stack is up (maintenance/error pages
+    are legitimate validator targets). Fails OPEN for an unset URL — a
+    no-container scan legitimately runs without a sandbox."""
+    if not sandbox_url:
+        return True
+    try:
+        requests.get(sandbox_url, timeout=timeout, allow_redirects=True)
+        return True
+    except requests.RequestException:
+        return False
+
+
+def ensure_sandbox_reachable(sandbox_url: Optional[str], phase: str) -> None:
+    """Abort the scan loudly when a sandbox-consuming phase is about to fan out
+    agents against a dead sandbox instead of burning LLM tokens (and caching
+    garbage verdicts) on runs that can only observe an unreachable target.
+    Raises (not returns) on purpose: the checkpointed run stays resumable and
+    the pending records keep their pre-dispatch status for a retry after the
+    sandbox is fixed."""
+    if sandbox_url_alive(sandbox_url):
+        return
+    raise RuntimeError(
+        f"SANDBOX UNREACHABLE at {sandbox_url!r} — aborting the {phase} fan-out "
+        f"(records stay pending). Repair the sandbox container, then rerun "
+        f"`python graph.py` to resume this scan."
+    )
 
 
 def build_container_members(graph_data: dict) -> dict[str, dict[str, str]]:
