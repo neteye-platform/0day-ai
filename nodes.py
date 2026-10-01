@@ -27,8 +27,6 @@ from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis
 from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer
 from tool_loop import CompactionConfig, ToolLoopAgent
 
-# Maximum combined code size (in chars) for a batched explorer dispatch.
-EXPLORER_BATCH_CHAR_THRESHOLD = 10000
 
 _agent_progress: dict[str, dict[str, int]] = {}
 _agent_progress_lock = threading.Lock()
@@ -280,7 +278,7 @@ def dispatch_explorers(state: MasterState):
 
     Nodes are batched per (community, source_file) so that multiple small nodes
     sharing a file are analyzed in a single explorer dispatch, as long as their
-    combined code size stays under EXPLORER_BATCH_CHAR_THRESHOLD characters.
+    combined code size stays under settings.explorer_batch_char_threshold characters.
     """
 
     G = build_networkx_graph(settings.graph)
@@ -320,7 +318,7 @@ def dispatch_explorers(state: MasterState):
         # unless batching is disabled, in which case every node is its own dispatch.
         for file_path, file_nodes in files.items():
             if settings.explorer_batching_enabled:
-                batches = _pack_node_batches(file_nodes, EXPLORER_BATCH_CHAR_THRESHOLD)
+                batches = _pack_node_batches(file_nodes, settings.explorer_batch_char_threshold)
             else:
                 batches = [[node_id] for node_id in file_nodes]
             for batch in batches:
@@ -531,8 +529,7 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
     sys_msg = SystemMessage(content=(
         f"{EXPERT_AGENTS[role_name]['prompt']}\n\n"
         f"{EXPERT_AGENTS['explorer_prompt']}\n\n"
-        "You are analyzing MULTIPLE nodes in a single dispatch. "
-        "Analyze each node independently and produce exactly one note per node."
+        f"{EXPERT_AGENTS['batch_prompt']}"
     ))
 
     # Build a prompt that lists each node with its id, label, and code.
@@ -547,6 +544,8 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
         if target_node.get("source_file", "").endswith(target_node.get("label", "")):
             sections.append(
                 f"### Node '{node_id}' ({label}) — entire file skeleton\n"
+                "Evaluate this module-level skeleton for global configuration issues. Omitted child functions "
+                "are evaluated separately; do not report vulnerabilities for them under this ID.\n"
                 f"{context_block}"
                 f"```python\n{source_code}\n```"
             )
@@ -555,8 +554,7 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
                 f"### Node '{node_id}' ({label})\n"
                 f"{context_block}"
                 f"Analyze the specific logic inside '{label}'. "
-                f"The rest of the file is provided solely as context; "
-                f"do NOT look for vulnerabilities outside of '{label}'.\n"
+                f"Report vulnerabilities affecting this specific node using ONLY the ID '{node_id}'.\n"
                 f"```python\n{source_code}\n```"
             )
 
