@@ -7,7 +7,7 @@ from langgraph.types import Send
 from tavily import TavilyClient
 
 import settings
-from llms import fast_llm, invoke_structured_capped
+from llms import get_llm, invoke_structured_capped
 from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping, take_cached_usage
 from schemas import THREAT_INTEL_AGENT, CVEAnalysis
 from stage_cve import _backfill_osv_cwe_ids, _finalize_cve_analysis, cve_descriptions, osv_enrichment_lines
@@ -136,7 +136,7 @@ def _threat_intel_node(state: ThreatIntelState) -> dict:
         f"--- WEB INTEL ---\n{_format_threat_intel_results(search_data)}"
     ))
     sys_msg = SystemMessage(content=THREAT_INTEL_AGENT.get("prompt", ""))
-    structured_llm = fast_llm.with_structured_output(CVEAnalysis, method="json_schema", strict=True)
+    structured_llm = get_llm("threat_intel").with_structured_output(CVEAnalysis, method="json_schema", strict=True)
     response, usage = invoke_structured_capped(
         structured_llm, [sys_msg, human_msg], f"Threat Intel {cve_id}", "threat_intel"
     )

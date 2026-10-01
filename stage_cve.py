@@ -4,7 +4,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Send
 
 import settings
-from llms import fast_llm, invoke_structured_capped
+from llms import get_llm, invoke_structured_capped
 from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping, take_cached_usage
 from schemas import CVE_ANALYZER_AGENT, CVEAnalysis
 from state import CVEAnalyzerState, MasterState
@@ -157,7 +157,7 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
         f"{enrichment}"
     ))
 
-    cve_analyzer_llm = fast_llm.with_structured_output(CVEAnalysis, method="json_schema", strict=True)
+    cve_analyzer_llm = get_llm("cve_analyzer").with_structured_output(CVEAnalysis, method="json_schema", strict=True)
     analysis, usage = invoke_structured_capped(
         cve_analyzer_llm, [sys_msg, human_msg], f"CVE analyzer {cve_id}", "cve_analyzer"
     )

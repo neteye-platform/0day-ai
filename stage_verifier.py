@@ -8,7 +8,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Send
 
 import settings
-from llms import fast_llm, invoke_structured_capped
+from llms import get_llm, invoke_structured_capped
 from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, add_usage, new_usage, raise_if_stopping, take_cached_usage
 from schemas import VERIFIER_AGENT, VerifierOutput, cwes
 from stage_cve import _normalize_cwe_ids
@@ -161,7 +161,7 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
     batch_starts = range(0, len(formatted_demands), batch_size)
 
     sys_msg = SystemMessage(content=VERIFIER_AGENT["prompt"])
-    structured_llm = fast_llm.with_structured_output(VerifierOutput, method="json_schema", strict=True)
+    structured_llm = get_llm("contract_verifier").with_structured_output(VerifierOutput, method="json_schema", strict=True)
 
     evaluations = []
     skipped_demands = 0

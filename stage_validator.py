@@ -12,7 +12,7 @@ import browser_tools
 import credential_finder
 import settings
 import tools
-from llms import fast_llm, validator_llm
+from llms import get_llm
 from run_stats import _record_stat, _start_agent_progress, affected_nodes_label, as_dicts, record_llm_usage, steps_block
 from schemas import VALIDATOR_AGENT
 from stage_patcher import patchable_records
@@ -313,7 +313,7 @@ class ValidatorAgent(ToolLoopAgent):
         # ask_for_context is bound ONLY on the first validation pass.
         if _is_first_pass(state):
             validator_tools.append(tools.ask_for_context)
-        return validator_llm.bind_tools(validator_tools)
+        return get_llm("validator").bind_tools(validator_tools)
 
     def cached_verdict(self, state):
         return cache_validator(
@@ -584,9 +584,10 @@ class ValidatorAgent(ToolLoopAgent):
 validator_agent = ValidatorAgent(
     name="validator",
     settings_prefix="validator",
-    compaction=CompactionConfig(),
+    compaction=CompactionConfig("validator"),
     summary_ledger=VALIDATOR_SUMMARY_LEDGER,
-    summary_llm=fast_llm,
+    summary_llm=get_llm("compaction"),
+    summarizer_compaction=CompactionConfig("compaction"),
 )
 
 # Module-level graph node callables (kept so graph.py's imports stay untouched).

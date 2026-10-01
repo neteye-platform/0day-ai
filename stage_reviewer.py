@@ -7,7 +7,7 @@ from langgraph.types import Command, Send
 
 import settings
 import tools
-from llms import fast_llm, reviewer_llm
+from llms import get_llm
 from run_stats import (
     _record_stat,
     _start_agent_progress,
@@ -210,7 +210,7 @@ class ReviewerAgent(ToolLoopAgent):
 
     def bind_tools(self, state):
         reviewer_tools = _MODE_TOOLS.get(state.get("mode", "code_level"), CODE_LEVEL_REVIEWER_TOOLS)
-        return reviewer_llm.bind_tools(
+        return get_llm("reviewer").bind_tools(
             reviewer_tools,
             parallel_tool_calls=True
         )
@@ -367,9 +367,10 @@ class ReviewerAgent(ToolLoopAgent):
 reviewer_agent = ReviewerAgent(
     name="reviewer",
     settings_prefix="reviewer",
-    compaction=CompactionConfig(),
+    compaction=CompactionConfig("reviewer"),
     summary_ledger=REVIEWER_SUMMARY_LEDGER,
-    summary_llm=fast_llm,
+    summary_llm=get_llm("compaction"),
+    summarizer_compaction=CompactionConfig("compaction"),
 )
 
 # Module-level graph node callables (kept so graph.py's imports stay untouched).

@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from langchain_core.messages import HumanMessage, SystemMessage
 
 import settings
-from llms import fast_llm, invoke_structured_capped
+from llms import get_llm, invoke_structured_capped
 from run_stats import _record_stat, as_dict, raise_if_stopping, take_cached_usage
 from schemas import EDGE_TRAVERSAL_AGENT, EdgeTraversalOutput
 from state import MasterState
@@ -97,7 +97,7 @@ def _run_edge_traversal_batch(batch: list[dict], idx: int, total: int) -> list[d
     sys_msg = SystemMessage(content=EDGE_TRAVERSAL_AGENT.get("prompt", ""))
     human_msg = HumanMessage(content=prompt)
 
-    structured_llm = fast_llm.with_structured_output(EdgeTraversalOutput, method="json_schema", strict=True)
+    structured_llm = get_llm("edge_traversal").with_structured_output(EdgeTraversalOutput, method="json_schema", strict=True)
     output, usage = invoke_structured_capped(
         structured_llm, [sys_msg, human_msg], f"Edge Traversal batch {idx}/{total}", "edge_traversal"
     )

@@ -3,7 +3,8 @@
 Finds pre-configured credentials in repo env/compose/Dockerfile definitions,
 application source/seed/SQL, and extracted container-image artifacts.
 Discovery is deterministic; with ``settings.credential_finder_use_llm`` one
-structured ``llms.fast_llm`` call normalizes the candidates, failing open to
+structured ``llms.get_llm("credential_finder")`` call normalizes the
+candidates, failing open to
 the raw list. Result goes to ``<target_app>/.cache/credentials.json`` for
 validator agents. Importing this module never touches docker or the network.
 """
@@ -19,7 +20,7 @@ import yaml
 
 import settings
 import utils
-from llms import fast_llm, invoke_tracked
+from llms import get_llm, invoke_tracked
 from utils import COMPOSE_FILENAMES, is_path_excluded, get_container_artifacts_root, safe_cache_filename
 
 logger = logging.getLogger(__name__)
@@ -658,7 +659,7 @@ def _llm_normalize(candidates: list[dict]) -> tuple[Optional[list[dict]], Option
             f"RAW CREDENTIAL CANDIDATES ({len(candidates)} total, up to "
             f"{_MAX_CANDIDATES_TO_LLM} shown):\n{_render_candidates(candidates)}"
         ))
-        structured = fast_llm.with_structured_output(CredentialList, method="json_schema", strict=True)
+        structured = get_llm("credential_finder").with_structured_output(CredentialList, method="json_schema", strict=True)
         result, usage = invoke_tracked(structured, [sys_msg, human_msg], "credential_finder")
         result = result if isinstance(result, dict) else result.model_dump()
         records = []

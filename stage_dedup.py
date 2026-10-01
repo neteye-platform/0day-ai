@@ -21,7 +21,8 @@ from dedup import cluster_vulnerabilities
 from langchain_core.messages import HumanMessage, SystemMessage
 
 import settings
-from llms import invoke_structured_capped, smart_llm
+import llms
+from llms import get_llm, invoke_structured_capped
 from run_stats import _record_stat, as_dict, as_dicts, get_embedder, raise_if_stopping, take_cached_usage
 from schemas import DEDUP_AGENT, DedupAgentOutput, cwes
 from state import MasterState
@@ -162,9 +163,13 @@ def _render_group_prompt(group: dict) -> str:
 
 def _group_fingerprint(group: dict) -> str:
     # The hashed triple mirrors EXACTLY what the prompt renders (ids, nodes,
-    # truncated description), plus the judging model's identity.
+    # truncated description), plus the judging model's identity — the DEDUP
+    # agent's effective registry config, not the global default, so switching
+    # its model/effort busts stale verdicts instead of silently reusing them.
+    judge_cfg = llms.get_config("dedup_agent")
     payload = {
-        "model": settings.llm_model,
+        "model": judge_cfg["model"],
+        "reasoning_effort": judge_cfg["reasoning_effort"],
         "cwe_id": group["cwe_id"],
         "bucket": group["bucket"],
         "records": [
@@ -190,7 +195,7 @@ def _run_group(group: dict, idx: int, total: int) -> list[dict]:
             return [cl for cl in (cached.get("clusters") or []) if isinstance(cl, dict)]
 
         known = {str(record.get("vuln_id")) for record in group["records"]}
-        structured_llm = smart_llm.with_structured_output(DedupAgentOutput, method="json_schema", strict=True)
+        structured_llm = get_llm("dedup_agent").with_structured_output(DedupAgentOutput, method="json_schema", strict=True)
         output, usage = invoke_structured_capped(
             structured_llm,
             [

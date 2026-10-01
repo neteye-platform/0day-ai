@@ -5,7 +5,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Send
 
 import settings
-from llms import fast_llm
+from llms import get_llm
 from llms import invoke_structured_capped
 from schemas import EXPERT_AGENTS, AnalysisNote, BatchedAnalysisResult
 from state import ExplorerState, MasterState
@@ -263,7 +263,7 @@ def _explore_single(node_id: str, role_name: str) -> tuple[dict, bool]:
         )
     human_msg = HumanMessage(content=user_prompt)
 
-    explorer_llm = fast_llm.with_structured_output(AnalysisNote, method="json_schema", strict=True)
+    explorer_llm = get_llm("explorer").with_structured_output(AnalysisNote, method="json_schema", strict=True)
     note, usage = invoke_structured_capped(
         explorer_llm, [sys_msg, human_msg], f"Explorer single-node {node_id}", "explorer"
     )
@@ -352,7 +352,7 @@ def _explore_batch(node_ids: list[str], role_name: str) -> tuple[dict, bool]:
     )
     human_msg = HumanMessage(content=user_prompt)
 
-    explorer_llm = fast_llm.with_structured_output(BatchedAnalysisResult, method="json_schema", strict=True)
+    explorer_llm = get_llm("explorer").with_structured_output(BatchedAnalysisResult, method="json_schema", strict=True)
     result, usage = invoke_structured_capped(
         explorer_llm, [sys_msg, human_msg], f"Explorer batch of {len(node_ids)} nodes", "explorer"
     )
