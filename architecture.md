@@ -1,5 +1,83 @@
 # System Architecture
 
+```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	bootstrap(bootstrap)
+	preprocessor(preprocessor)
+	credential_finder(credential_finder)
+	manager(manager)
+	explorer_agent(explorer_agent)
+	cve_analyzer(cve_analyzer)
+	threat_intel_gate(threat_intel_gate)
+	threat_intel(threat_intel)
+	aggregate_demands(aggregate_demands)
+	contract_verifier(contract_verifier)
+	dedup_agent(dedup_agent)
+	edge_traversal(edge_traversal)
+	reviewer_agent(reviewer_agent)
+	validator_agent(validator_agent)
+	patcher_agent(patcher_agent)
+	integration_auditor(integration_auditor)
+	synchronization(synchronization)
+	validator_dispatch_gate(validator_dispatch_gate)
+	integration_audit_dispatch(integration_audit_dispatch)
+	patch_dispatch(patch_dispatch)
+	sandbox_resync(sandbox_resync)
+	reporter_dispatch(reporter_dispatch)
+	reporter(reporter)
+	report_assembler(report_assembler)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> bootstrap;
+	aggregate_demands -.-> __end__;
+	aggregate_demands -.-> contract_verifier;
+	aggregate_demands -.-> synchronization;
+	bootstrap --> manager;
+	bootstrap --> preprocessor;
+	contract_verifier --> synchronization;
+	credential_finder -.-> cve_analyzer;
+	cve_analyzer --> threat_intel_gate;
+	dedup_agent -.-> reporter_dispatch;
+	dedup_agent -.-> reviewer_agent;
+	edge_traversal --> dedup_agent;
+	explorer_agent --> aggregate_demands;
+	integration_audit_dispatch -.-> integration_auditor;
+	integration_audit_dispatch -.-> reporter_dispatch;
+	integration_auditor -.-> reporter_dispatch;
+	integration_auditor -.-> validator_agent;
+	manager -.-> explorer_agent;
+	patch_dispatch -.-> integration_audit_dispatch;
+	patch_dispatch -.-> patcher_agent;
+	patcher_agent -.-> integration_audit_dispatch;
+	patcher_agent -.-> sandbox_resync;
+	preprocessor --> credential_finder;
+	reporter --> report_assembler;
+	reporter_dispatch -.-> report_assembler;
+	reporter_dispatch -.-> reporter;
+	reviewer_agent --> validator_dispatch_gate;
+	sandbox_resync -.-> integration_audit_dispatch;
+	sandbox_resync -.-> reviewer_agent;
+	synchronization --> edge_traversal;
+	threat_intel --> aggregate_demands;
+	threat_intel_gate -.-> threat_intel;
+	validator_agent -.-> integration_audit_dispatch;
+	validator_agent -.-> patch_dispatch;
+	validator_agent -. &nbsp;__end__&nbsp; .-> reporter_dispatch;
+	validator_agent -.-> reviewer_agent;
+	validator_dispatch_gate -.-> integration_audit_dispatch;
+	validator_dispatch_gate -. &nbsp;__end__&nbsp; .-> reporter_dispatch;
+	validator_dispatch_gate -.-> validator_agent;
+	report_assembler --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+```
+
 ## Pre-processing
 
 Creates the foundational context by parsing every file in the repository.
