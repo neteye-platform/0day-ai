@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Literal, Optional
 import json
 import yaml
+import re
 
 
 with open("agents.yaml", "r") as f:
@@ -137,6 +138,34 @@ class ExpertTask(BaseModel):
         description="Detailed instructions on what specific vulnerability classes, architectural risks, or cross-component interactions to investigate within this subgraph."
     )
 
+# Matches patterns like 15.0.5, v1.2, 19.0.0-rc.1. The bounds avoid corrupting
+# IPv4-like dotted numerics (e.g. 192.168.1.1 must survive untouched).
+_VERSION_PATTERN = r'(?<![\d.])\b(?:v|version\s*)?\d+\.\d+(?:\.\d+)?(?!\.\d)(?:-[a-zA-Z0-9.]+)?\b'
+
+# Matches full phrases the LLM likes to generate (e.g. "fixed in 15.0.5"),
+# optionally swallowing a trailing , or . so sentences stay clean.
+_PHRASE_PATTERN = r'(?i)(?:fixed\s+in|prior\s+to|before|upgrading\s+to)\s+(?:' + _VERSION_PATTERN + r'[.,]?)'
+
+
+def strip_version_numbers(text: str) -> str:
+    """Deterministically strip version numbers and fix-version phrases from
+    agent-facing text so downstream agents (e.g. the Reviewer) don't go down
+    the rabbit hole of checking package versions.
+
+    - Removes whole phrases like "fixed in 2.3.0" / "prior to 3.0.0" entirely.
+    - Redacts standalone versions (15.0.5, v1.2, 19.0.0-rc.1) with a token.
+    - Never corrupts IPv4-like dotted numerics (e.g. 192.168.1.1 stays intact).
+    - Preserves newlines (only horizontal whitespace is collapsed).
+    """
+    if not isinstance(text, str):
+        return text
+    cleaned = re.sub(_PHRASE_PATTERN, '', text)
+    cleaned = re.sub(_VERSION_PATTERN, '[VERSION_REDACTED]', cleaned)
+    cleaned = re.sub(r'[ \t]+', ' ', cleaned)
+    cleaned = '\n'.join(line.strip() for line in cleaned.split('\n'))
+    return cleaned.strip()
+
+
 class CVEHypothesis(BaseModel):
     cwe: CWE_KEYS = Field(description="The matching CWE ID from the provided list.")
     description: str = Field(
@@ -145,6 +174,14 @@ class CVEHypothesis(BaseModel):
     affected_component: str = Field(
         description="The concrete, greppable usage pattern the Reviewer should hunt for in application code (e.g., 'app.run(debug=True)', 'serve(app)', 'express-fileupload middleware'). For transitive dependencies, name the likely parent-framework usage (e.g., 'render_template implies Jinja2')."
     )
+    framework_exposure_mechanism: str = Field(
+        description="How the framework/library inherently exposes the flaw to the attacker. Frame it as framework behavior (e.g., 'The framework intercepts payloads on all routes', 'The middleware parses all multipart requests')."
+    )
+
+    @field_validator('description', 'framework_exposure_mechanism')
+    @classmethod
+    def _strip_versions(cls, v: str) -> str:
+        return strip_version_numbers(v)
 
 class CVEAnalysis(BaseModel):
     reasoning: str = Field(
@@ -180,12 +217,21 @@ class CVEAnalysis(BaseModel):
     )
     trigger_condition: Optional[str] = Field(
         default=None,
-        description="The explicit data flow, function call, or execution sink required for the vulnerability to trigger. If the CVE description does not explicitly state how the payload is executed, leave empty."
+        description="The explicit data flow, function call, OR network request required for the exploit. For code-level library flaws, specify the function call (e.g., 'calling yaml.load()'). For framework/middleware flaws, specify the exact HTTP request primitive. If vague, leave empty."
+    )
+    attacker_request_primitive: Optional[str] = Field(
+        default=None,
+        description="The exact theoretical request or input primitive an attacker uses (e.g., 'POST request with Next-Action header', 'crafted Transfer-Encoding header', 'multipart/form-data payload')."
     )
     hypothesis: Optional[CVEHypothesis] = Field(
         default=None,
         description="REQUIRED iff fix_category is 'upgrade_only'. The vulnerability hypothesis describing the dependency-internal flaw."
     )
+
+    @field_validator('security_assumption', 'trigger_condition')
+    @classmethod
+    def _strip_versions(cls, v: Optional[str]) -> Optional[str]:
+        return strip_version_numbers(v) if v else None
 
 class VulnerabilityEvaluation(BaseModel):
     # report_id: str = Field(description="The unique identifier or title of the vulnerability report.")
