@@ -12,7 +12,7 @@ import re
 import networkx as nx
 
 from schemas import EvaluationToolInput, ValidationToolInput, AskForContextInput, IntegrationAuditInput, VulnerabilityDetailsInput, cwes
-from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer, reviewer_cache_key, is_path_excluded
+from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer, cache_validator, cache_integration_auditor, reviewer_cache_key, is_path_excluded
 from languages import MANIFEST_NAMES
 import settings
 import browser_tools
@@ -611,6 +611,9 @@ def mark_validation_complete(
     updated_vuln["poc_payload"] = kwargs.get("poc_payload")
     updated_vuln["execution_logs"] = kwargs.get("execution_logs")
 
+    # Save to cache so subsequent runs skip the tool-calling loop.
+    cache_validator(report, state.get("peer_payloads"), updated_vuln)
+
     # Close this validator's headless-browser sessions (per-agent, never
     # touching other concurrently running validators' sessions).
     browser_tools.manager.close_agent_sessions(state.get("agent_id"))
@@ -659,6 +662,11 @@ def ask_for_context(
     updated_vuln["open_questions"] = list(kwargs.get("open_questions") or [])
     updated_vuln["execution_logs"] = kwargs.get("reasoning")
     updated_vuln["poc_payload"] = None
+
+    # Save to cache so subsequent runs skip the tool-calling loop (the cached
+    # insufficient_context record keeps review_round bumped, so a repeat of the
+    # same round-0 report re-triggers the reviewer feedback loop exactly).
+    cache_validator(report, state.get("peer_payloads"), updated_vuln)
 
     # Close this validator's headless-browser sessions (per-agent, never
     # touching other concurrently running validators' sessions).
@@ -788,6 +796,9 @@ def submit_integration_audit(
         name="submit_integration_audit",
         tool_call_id=tool_call_id
     )
+
+    # Save to cache so subsequent runs skip the tool-calling loop.
+    cache_integration_auditor(report, state.get("confirmed_vulns"), updated_vuln)
 
     return Command(
         update={

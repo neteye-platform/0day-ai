@@ -23,7 +23,7 @@ import browser_tools
 import attacker_tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState, IntegrationAuditorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, INTEGRATION_AUDITOR_AGENT, EDGE_TRAVERSAL_AGENT, cwes, EdgeTraversalOutput
-from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, is_path_excluded, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, scan_codebase_for_keywords, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, reviewer_cache_key
+from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, is_path_excluded, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, scan_codebase_for_keywords, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, cache_validator, cache_integration_auditor, reviewer_cache_key
 from boundary_edges import build_boundary_edges, cluster_boundary_edges, render_batch_prompt, boundary_batch_fingerprint, summarize_boundary_edges
 from tool_loop import CompactionConfig, ToolLoopAgent
 from dedup import Embeddings, cluster_vulnerabilities, deduplicate_demands
@@ -2254,21 +2254,30 @@ class IntegrationAuditorAgent(ToolLoopAgent):
             tools.submit_integration_audit,
         ])
 
+    def pre_agent(self, state):
+        if not state.get("messages"):
+            report = state.get("report_to_test", {})
+            cached_data = cache_integration_auditor(report, state.get("confirmed_vulns"))
+            if cached_data:
+                logging.info("Integration auditor cache hit.")
+                return Command(
+                    update={
+                        "vulnerabilities": [cached_data]
+                    }
+                )
+        return None
+
     def pre_router(self, state) -> bool:
-        """End the auditor loop immediately when `first_turn` already resolved the
-        record as `unchainable` (no other confirmed vulnerability exists to chain
-        with; a 'chained' verdict is impossible by construction). The router is
-        then never allowed to index the still-empty `messages` list. Invariant:
-        the subgraph's `vulnerabilities` channel only ever holds this one record
-        (init `[]`, `first_turn` writes exactly one), so the match-by-id scan is
-        safe and can never end a live with-peers loop."""
-        report_vid = state.get("report_to_test", {}).get("vuln_id")
-        if not report_vid:
-            return False
-        return any(
-            v.get("vuln_id") == report_vid and v.get("status") == "unchainable"
-            for v in state.get("vulnerabilities", [])
-        )
+        """End the auditor loop immediately when the record was already resolved
+        into `vulnerabilities` without any LLM turn — either a pre_agent cache
+        hit or `first_turn`'s deterministic no-peers `unchainable` resolution (no
+        other confirmed vulnerability exists to chain with; a 'chained' verdict is
+        impossible by construction). In both cases `messages` is still empty, so
+        the router is never allowed to index it. Invariant: the subgraph's
+        `vulnerabilities` channel only ever holds this one record (init `[]`,
+        cache hit / `first_turn` writes exactly one), so the guard can never end
+        a live with-peers loop."""
+        return not state.get("messages") and bool(state.get("vulnerabilities"))
 
     def first_turn(self, state, llm_with_tools) -> dict:
         sys_msg = SystemMessage(content=INTEGRATION_AUDITOR_AGENT.get("prompt", ""))
@@ -2338,6 +2347,9 @@ class IntegrationAuditorAgent(ToolLoopAgent):
                 f"{existing}\n{note}" if existing else note
             )
             record["status"] = "unchainable"
+            # Cache the deterministic resolution so a repeat of the same report
+            # short-circuits in pre_agent instead of re-doing this branch.
+            cache_integration_auditor(dict(report), [], record)
             return Command(update={"vulnerabilities": [record]})
 
         steps = report.get("reproduction_steps") or []
@@ -2376,6 +2388,11 @@ class IntegrationAuditorAgent(ToolLoopAgent):
         existing = updated_vuln.get("integration_audit_reasoning") or ""
         updated_vuln["integration_audit_reasoning"] = (
             f"{existing}\n{timeout_note}" if existing else timeout_note
+        )
+        cache_integration_auditor(
+            dict(state.get("report_to_test", {})),
+            state.get("confirmed_vulns"),
+            updated_vuln,
         )
         return Command(update={"vulnerabilities": [updated_vuln]})
 
@@ -2539,6 +2556,25 @@ class ValidatorAgent(ToolLoopAgent):
             validator_tools.append(tools.ask_for_context)
         return smart_llm.bind_tools(validator_tools)
 
+    def pre_agent(self, state):
+        if not state.get("messages"):
+            report = state.get("report_to_test", {})
+            cached_data = cache_validator(report, state.get("peer_payloads"))
+            if cached_data:
+                logging.info("Validator cache hit.")
+                return Command(
+                    update={
+                        "vulnerabilities": [cached_data]
+                    }
+                )
+        return None
+
+    def pre_router(self, state) -> bool:
+        # Cache-hit guard: the verdict was already written into `vulnerabilities`
+        # by pre_agent without any LLM turn, so end the loop before the router
+        # indexes the still-empty `messages`.
+        return not state.get("messages") and bool(state.get("vulnerabilities"))
+
     def first_turn(self, state, llm_with_tools) -> dict:
         # Compose the validator system prompt from the capabilities this run
         # actually grants: the attacker shell tools are only described when
@@ -2679,6 +2715,9 @@ class ValidatorAgent(ToolLoopAgent):
         updated_vuln["execution_logs"] = (
             f"{existing_logs}\n{timeout_note}" if existing_logs else timeout_note
         )
+
+        # Save to cache so subsequent runs skip the (doomed) tool-calling loop.
+        cache_validator(dict(state.get("report_to_test", {})), state.get("peer_payloads"), updated_vuln)
 
         # Close any headless-browser sessions this validator opened (same
         # per-agent cleanup the terminal tool performs).
