@@ -1,3 +1,4 @@
+import hashlib
 from typing import Annotated
 import json
 from langchain_core.messages import ToolMessage
@@ -10,20 +11,22 @@ from langchain_core.tools import tool, InjectedToolCallId
 from langgraph.types import Command
 import docker
 from docker.errors import NotFound, APIError
+import re
 
 from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationToolInput
-from utils import build_networkx_graph, get_node_code
+from utils import build_networkx_graph, cache, get_cached_symbol_index, get_node_code
 import settings
 
 
 @tool
-def read_source_code(node_id: str, reason_for_reading: str, state: Annotated[dict, InjectedState]) -> str:
+def read_source_code(node_id: str, reason_for_reading: str, current_state: str, state: Annotated[dict, InjectedState]) -> str:
     """
     Fetches the source code for a given Node ID.
 
     Args:
-        node_id: The exact ID of the node to read (e.g., 'src_main_query_db').
-        reason_for_reading: Explain exactly why you need to read THIS specific node next, and how you expect it to connect to your current knowledge.
+        node_id (str): The exact ID of the node to read (e.g., 'src_main_query_db').
+        reason_for_reading (str): Explain exactly why you need to read THIS specific node next, and how you expect it to connect to your current knowledge.
+        current_state (str): A detailed summary of the your current state and the outcome of your previous command.
     """
     messages = state.get("messages", [])
     for msg in messages[:-1]:
@@ -89,12 +92,11 @@ def submit_evaluation(
     """Call this tool when you have finished reviewing the source code and made a final decision."""
 
     report = state.get("expert_report", {})
-
-    new_status = "confirmed" if kwargs.get("is_exploitable") else "false_positive"
+    node_id = state.get("node_id", "Unknown")
 
     # Mutate a copy of the single report
     updated_vuln = dict(report)
-    updated_vuln["status"] = new_status
+    updated_vuln["status"] = "confirmed" if kwargs.get("is_exploitable") else "false_positive"
     updated_vuln["confidence_score"] = kwargs.get("confidence_score")
     updated_vuln["reviewer_reasoning"] = kwargs.get("reasoning")
     updated_vuln["entry_point_url"] = kwargs.get("entry_point_url")
@@ -107,6 +109,11 @@ def submit_evaluation(
         name="submit_evaluation",
         tool_call_id=tool_call_id
     )
+
+    # Save to cache so subsequent runs skip the tool-calling loop
+    report_hash = hashlib.md5(json.dumps(report, sort_keys=True).encode()).hexdigest()
+    cache_file = settings.cache_dir / "reviewer" / f"{node_id}_{report_hash}.json"
+    cache(cache_file, "write", updated_vuln)
 
     return Command(
         update={
@@ -252,10 +259,19 @@ def mark_validation_complete(
 
 
 @tool
-def search_codebase(keyword: str, state: Annotated[dict, InjectedState]) -> str:
+def search_codebase(keyword: str, current_state: str, state: Annotated[dict, InjectedState], thought: str, regex: bool = True) -> str:
     """
-    Searches the entire application codebase for a specific string. Use this
-    to find where specific libraries, functions, or variables are used.
+    Searches the entire application codebase for a specific string or regular expression. 
+    Use this to find where specific libraries, functions, variables, or class instantiations are used. 
+
+    Args:
+        keyword (str): The string or pattern to search in the codebase.
+        regex (bool): Set to True if the keyword parameter is a regular expression, False otherwise (default = True).
+        thought (str): Explain explicitly why you are running this search and what specific vulnerability path you are tracking.
+        current_state (str): A detailed summary of the your current state and the outcome of your previous command.
+
+    Returns:
+        str: List of nodes with a match and the matched line of code.
     """
     app_dir = Path(settings.app_path)
 
@@ -271,7 +287,8 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState]) -> str:
 
     results = []
     match_count = 0
-    MAX_MATCHES = 30 # prevent context window overflow
+    MAX_MATCHES = 20 # prevent context window overflow
+    query = re.compile(keyword) if regex else re.escape(keyword)
 
     # Recursively search all files
     for file_path in app_dir.rglob("*"):
@@ -285,7 +302,8 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState]) -> str:
             # Read lines and search for the keyword
             with open(file_path, "r", encoding="utf-8") as f:
                 for line_num, line in enumerate(f, 1):
-                    if keyword in line:
+                    match = re.search(query, line)
+                    if match:
                         relative_path = str(file_path.relative_to(app_dir))
                         # Match the file back to its Node ID so the agent can read it
                         node_id = file_to_node.get(relative_path, "Unknown (Not in Graph)")
@@ -312,11 +330,16 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState]) -> str:
 
 
 @tool
-def get_node_connections(node_id: str) -> str:
+def get_node_connections(node_id: str, thought: str, current_state: str) -> str:
     """
     Returns the neighbors of a node in the application graph.
     Use this to identify which functions call the current node (callers)
     or which functions/files the current node calls (callees).
+
+    Args:
+        node_id (str): The identifier of the node in the graph.
+        thought (str): Explain explicitly why examining the neighbors or data-flow edges of this node is necessary for your investigation.
+        current_state (str): A detailed summary of the your current state and the outcome of your previous command.
     """
     try:
         G = build_networkx_graph(settings.graph)
@@ -341,6 +364,9 @@ def get_node_connections(node_id: str) -> str:
 def list_files(path: str = ".") -> str:
     """
     Lists files and directories in the specified path within the sandbox container.
+    CRITICAL INSTRUCTION: Use this tool ONLY to verify the success of an exploit.
+    DO NOT use this tool for initial reconnaissance, to read the source code, 
+    or to understand the application structure. You already have all the context you need.
 
     Args:
         path (str): The directory path to inspect inside the container. Defaults to the current working directory.
@@ -376,6 +402,9 @@ def list_files(path: str = ".") -> str:
 def read_file(path: str) -> str:
     """
     Reads the content of a file from the sandbox container.
+    CRITICAL INSTRUCTION: Use this tool ONLY to verify the success of an exploit.
+    DO NOT use this tool for initial reconnaissance, to read the source code, 
+    or to understand the application structure. You already have all the context you need.
 
     Args:
         path: The absolute or relative path to the file inside the sandbox.
@@ -402,3 +431,77 @@ def read_file(path: str) -> str:
         return f"Error: Docker API issue occurred: {str(e)}"
     except Exception as e:
         return f"Error: An unexpected error occurred: {str(e)}"
+
+
+@tool
+def get_definition(symbol_name: str, thought: str, current_state: str) -> str:
+    """
+    Retrieves the exact source code for a specific function or class method.
+    If investigating a class method, format the input as ClassName::methodName.
+
+    Args:
+        symbol_name (str): The function or method name.
+        thought (str): Explain explicitly why you are looking up this symbol and how it helps verify your hypothesis.
+        current_state (str): A detailed summary of the your current state and the outcome of your previous command.
+    """
+    index_file_path = Path(settings.app_path) / ".ast_symbol_index.json"
+    symbol_index = get_cached_symbol_index(index_file_path)
+
+    if not symbol_index:
+        return "Error: The AST symbol index is empty or could not be loaded."
+
+    # Initial direct lookup
+    target = next((item for item in symbol_index if item["name"] == symbol_name), None)
+    resolution_trail = []
+
+    # Inheritance traversal (if direct lookup fails)
+    if not target and "::" in symbol_name:
+        current_class, method = symbol_name.split("::", 1)
+
+        while current_class:
+            # Find any method belonging to the current class to look up its parent
+            class_entry = next((item for item in symbol_index if item.get("class") == current_class), None)
+
+            if not class_entry or not class_entry.get("parent"):
+                break  # Reached the top of the chain, or class doesn't exist
+
+            parent_class = class_entry["parent"]
+            resolution_trail.append(parent_class)
+
+            # Check if the parent implements the target method
+            parent_symbol = f"{parent_class}::{method}"
+            target = next((item for item in symbol_index if item["name"] == parent_symbol), None)
+
+            if target:
+                break  # We found the inherited method
+
+            current_class = parent_class  # Move up to the next parent
+
+    # Final verification
+    if not target:
+        return f"Error: The definition for '{symbol_name}' could not be found, even after checking parent classes."
+
+    # Extract and Format
+    filepath = target["filepath"]
+    start_line = target["start_line"]
+    end_line = target["end_line"]
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        code = "".join(lines[start_line - 1 : end_line])
+
+        # Build the response string
+        header = f"File: {filepath}\nLines: {start_line}-{end_line}\n"
+
+        # Append the helpful note if we had to walk the inheritance tree
+        if resolution_trail:
+            original_class = symbol_name.split("::")[0]
+            chain = " -> ".join(resolution_trail)
+            header += f"\n> Note: Method resolved via inheritance: {original_class} -> {chain}\n"
+
+        return f"{header}\n{code}"
+
+    except Exception as e:
+        return f"Error reading file {filepath}: {str(e)}"
