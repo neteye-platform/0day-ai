@@ -125,8 +125,9 @@ expert_agents:
     1. BUSINESS INTERFACES (Sources & Sinks): You must strictly identify data crossing the boundary of this snippet.
        - Label as `source` if the snippet receives external data (e.g., HTTP parameters, uploaded files, CLI args).
        - Label as `sink` if the snippet performs a dangerous operation with data (e.g., database execution, file writing, subprocess spawning).
-    2. UPSTREAM ASSUMPTIONS (Demands on the Caller): For this specific snippet to execute safely, what MUST the upstream caller have done before invoking it? Leave empty if there are no security-related upstream assumptions.
-    3. DOWNSTREAM ASSUMPTIONS (Demands on the Callee): When this snippet calls an external/unseen function, what MUST that function do securely? Leave empty if there are no security-related downstream assumptions.
+    2. UPSTREAM ASSUMPTIONS (Data State Demands): For this specific snippet to execute safely, what MUST be true about the data entering it? Leave empty if there are no security-related upstream assumptions.
+    CRITICAL: Focus on the required state of the data, not where or who validates it. NEVER use phrases like "The caller must" or "Before invoking this function". Instead, use outcome-based phrasing (e.g., "The job_id must be validated against the active user session," "The file_path must be sanitized against traversal").
+    3. DOWNSTREAM ASSUMPTIONS (Demands on the Callee): When this snippet delegates business logic to an external/unseen function, what MUST that function do securely? Explicitly note that this snippet relies on the callee for safety (e.g., "This route delegates authorization; the callee 'delete_document' MUST enforce that the doc_id belongs to the active user session").
     4. LOCAL VULNERABILITY HYPOTHESES (Visible Dangers): Create a `vulnerability_hypothesis` ONLY if a flaw is explicitly visible in the current snippet (e.g., raw SQL formatting, plaintext secrets).
 
     NOISE REDUCTION RULES (STRICTLY ENFORCED):
@@ -204,8 +205,10 @@ expert_agents:
 
     Input Snippet:
     ```python
-    def read_user_config(filename: str) -> str:
-        # Read the requested configuration file from disk
+    @app.route('/download')
+    def download_config():
+        # Fetch directly from the HTTP request
+        filename = request.args.get('filename')
         config_path = "/var/app/configs/" + filename
 
         with open(config_path, 'r') as f:
@@ -216,13 +219,16 @@ expert_agents:
 
     Expected Output:
     {
+      "sources": [
+        "request.args.get('filename')"
+      ],
       "sinks": [
         "open()"
       ],
       "vulns": [
         {
           "cwe": "CWE-22",
-          "component": "The 'config_path' variable directly concatenates the 'filename' parameter into a file path, passing it unsanitized to the 'open()' sink, allowing path traversal."
+          "component": "The 'config_path' variable concatenates the untrusted 'filename' HTTP parameter directly into a file path and passes it unsanitized to the 'open()' sink, allowing path traversal."
         }
       ]
     }
@@ -399,13 +405,13 @@ contract_verifier_agent:
 
     CRITICAL EVALUATION RULES:
     1. Trust Omitted Helpers (The Delegation Rule): In our architecture, EVERY helper function is strictly evaluated by another dedicated agent. If the snippet explicitly passes untrusted data to a dedicated validation or sanitization function before reaching the sink, you MUST set the status to DELEGATED.
-      - IF untrusted data is passed into ANY custom internal function (e.g., `validate_...`, `check_...`, `get_...`) before reaching a sink, AND that function's body is omitted from the snippet, you MUST assume the peer agent perfectly secured it. Set status to DELEGATED.
+      - IF untrusted data is passed into ANY custom internal function (e.g., validate_..., get_...), you MUST assume that internal function securely handles authorization and validation internally. Set status to DELEGATED. Do not treat the internal function as an unprotected sink unless it is a standard framework/library sink.
       - IF untrusted data is passed DIRECTLY into a standard framework/library sink (e.g., `java.sql.Statement.execute`, `fs.readFile`, `subprocess.run`) WITHOUT touching any custom helper function first, it is considered RAW. This is an explicit failure. Set status to FAILED.
     2. No Privilege Substitutions: Do not accept access control (authentication, admin checks, feature flags) as a substitute for data-level mitigation. Restricting access to a vulnerable function does not fix the underlying vulnerability.
     3. No Fragile Mitigations: Do not set status to MET if the mitigation relies on easily bypassed methods, such as custom regular expressions, blacklisting (e.g., blocking ../), or naive string replacement.
     4. Standard of Proof: To set status to MET, the visible code must either use standard, secure-by-default mechanisms (e.g., parameterized queries, strict allow-lists, extracting basenames, or established cryptographic libraries) OR explicitly delegate the data to a helper function. If a valid mitigation is visibly present, you MUST immediately set the status to MET and stop evaluating. Do NOT speculate about hypothetical edge cases (e.g., "what if the string is too long?") once the core vulnerability is mitigated. If the code attempts validation itself but does so weakly (e.g. custom regex), set status to FAILED.
     5. Wrong Architectural Layer: If the demand requires a global framework configuration (e.g., setting global Cache-Control headers, or configuring Flask SECRET_KEY_FALLBACKS) and the snippet is merely a localized route or helper that happens to touch the session, set status to OUT_OF_SCOPE. Global mitigations do not belong in local route logic.
-    6. Context / Component Mismatch: If a demand explicitly targets a specific technology, library, protocol, or configuration mechanism, but the visible code snippet does not utilize that component (e.g., it uses a different library for the same task, or handles data in a completely unrelated way), you MUST set the status to OUT_OF_SCOPE. Do not mark a snippet as FAILED for lacking a mitigation to a vulnerability in a component it does not even use.
+    6. Context / Component Mismatch: If a demand explicitly targets a specific technology, library, protocol, or configuration mechanism, but the visible code snippet does not utilize that component (e.g., it uses a different library for the same task, or handles data in a completely unrelated way), you MUST set the status to OUT_OF_SCOPE. Do not mark a snippet as FAILED for lacking a mitigation to a vulnerability in a component it does not even use. EXCEPTION: If a demand warns about an insecure default or nested component within a library, and the visible code initializes a primary object/wrapper from that same library (e.g., an Exporter, Parser, or Client), you must assume the vulnerable sub-component is active under the hood unless explicitly disabled. Treat this as an implicit default failure (Example 5), not a Component Mismatch.
     7. Suggested CWE for Failed Demands: A demand may carry a `[SUGGESTED CWE: ...]` hint (these come from the authoritative osv-scanner classifications for the underlying CVE). When you mark a demand FAILED, prefer the suggested CWE for the `cwe_id` field: if it appears in the ALLOWED CWE LIST below, use it verbatim; otherwise map it to the closest allowed CWE that captures the same class of flaw (e.g. a suggestion like CWE-1333 regex denial-of-service maps to CWE-770). Never invent a CWE outside the ALLOWED list.
 
     ALLOWED CWE LIST
