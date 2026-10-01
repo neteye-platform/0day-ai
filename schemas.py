@@ -39,6 +39,7 @@ cwes = {
     "CWE-639": "Authorization Bypass Through User-Controlled Key (IDOR)",
     "CWE-306": "Missing Authentication for Critical Function",
     "CWE-287": "Improper Authentication",
+    "CWE-307": "Improper Restriction of Excessive Authentication Attempts",
     # --- STATE & SESSION (Web / API) ---
     "CWE-352": "Cross-Site Request Forgery (CSRF)",
     "CWE-384": "Session Fixation",
@@ -80,8 +81,8 @@ CWE_KEYS = Literal[
     "CWE-119", "CWE-416", "CWE-476", "CWE-190", "CWE-362", "CWE-89",
     "CWE-78", "CWE-79", "CWE-94", "CWE-918", "CWE-862", "CWE-863",
     "CWE-915", "CWE-639", "CWE-306", "CWE-352", "CWE-384", "CWE-200",
-    "CWE-319", "CWE-327", "CWE-502", "CWE-807", "CWE-287", "CWE-22",
-    "CWE-434", "CWE-770", "CWE-284",
+    "CWE-319", "CWE-327", "CWE-502", "CWE-807", "CWE-287", "CWE-307",
+    "CWE-22", "CWE-434", "CWE-770", "CWE-284",
     "CWE-20", "CWE-444", "CWE-840", "OTHER_UNCATEGORIZED"
 ]
 
@@ -451,35 +452,55 @@ class ValidatorOutput(BaseModel):
     vulnerabilities: list[VulnerabilityRecord]
 
 class UpstreamDemand(BaseModel):
-    target: str = Field(description="Exact parameter name (e.g., 'query', 'user_id').")
-    description: str = Field(description="The security contract.")
+    target: str = Field(description="Parameter or context variable requiring upstream restriction.")
+    description: str = Field(description="The security invariant required of the caller.")
 
 class DownstreamDemand(BaseModel):
-    target: str = Field(description="Format as 'module::symbol' (e.g., 'app.auth::get_jobs').")
-    description: str = Field(description="The security contract.")
+    target: str = Field(description="External symbol or route called (format: 'module::symbol').")
+    description: str = Field(description="The security requirement the callee must enforce.")
 
 class Hypothesis(BaseModel):
-    cwe: CWE_KEYS = Field(description="The matching CWE ID from the provided list.")
-    component: str = Field(description="The exact parameter, state transition, or function call that is flawed.")
+    cwe: CWE_KEYS = Field(description="The matching CWE ID.")
+    component: str = Field(description="The vulnerable parameter, logic check, or missing control.")
     pattern_label: Optional[str] = Field(
         default=None,
         description=(
-            "REQUIRED when cwe is a systemic/architectural class (CWE-327, CWE-319, "
-            "CWE-306, CWE-200, CWE-352, CWE-384, CWE-840, CWE-915): a SHORT canonical name of "
-            "at most six lowercase words identifying the insecure pattern, e.g. "
-            "'plaintext password storage', 'no csrf token validation', 'weak tls ciphers'. "
-            "Use the EXACT SAME label for every occurrence of the same pattern, so findings "
-            "from different nodes can be grouped into a single review. Leave null for "
-            "localized defects."
+            "Short canonical name (≤6 lowercase words) REQUIRED for architectural flaws: "
+            "CWE-306, CWE-307, CWE-319, CWE-327, CWE-352, CWE-384, CWE-840, CWE-915. "
+            "Leave null for localized injection defects."
         ),
     )
 
 class AnalysisNote(BaseModel):
-    sources: list[str] | None = Field(default=None, description="External data entering this snippet.")
-    sinks: list[str] | None = Field(default=None, description="Dangerous operations performed with data.")
-    upstream: list[UpstreamDemand] | None = Field(default=None)
-    downstream: list[DownstreamDemand] | None = Field(default=None)
-    vulns: list[Hypothesis] | None = Field(default=None)
+    sources: list[str] | None = Field(default=None, description="External untrusted data entering this snippet.")
+    sinks: list[str] | None = Field(default=None, description="Dangerous execution sinks, state changes, or auth checks.")
+    upstream: list[UpstreamDemand] | None = Field(
+        default=None,
+        description=(
+            "Populate ONLY if an attacker with full control over an input can achieve "
+            "an exploitable security impact (e.g., unauthorized access, injection, data tampering) "
+            "within this snippet unless the caller enforces an invariant. "
+            "Leave empty if malicious input cannot cause a security compromise here."
+        )
+    )
+    downstream: list[DownstreamDemand] | None = Field(
+        default=None,
+        description=(
+            "Populate ONLY when delegating sensitive operations (e.g. authentication, "
+            "token verification, access checks, or database persistence) where the callee "
+            "must enforce specific security guarantees to prevent a security bypass."
+        )
+    )
+    vulns: list[Hypothesis] | None = Field(
+        default=None,
+        description=(
+            "Populate ONLY if an exploitable flaw is self-contained within this snippet: "
+            "either untrusted data reaches an unmitigated execution sink, or a security-critical "
+            "operation (e.g. authentication, authorization, or sensitive state changes) "
+            "omits necessary constraints or rate limits. "
+            "Leave empty if safety depends on caller data validation."
+        )
+    )
 
     @model_validator(mode='after')
     def set_empty_lists(self) -> "AnalysisNote":

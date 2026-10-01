@@ -117,33 +117,17 @@ manager_agent:
 
 expert_agents:
   explorer_prompt: |
-    You are an Expert Explorer agent in a multi-agent vulnerability discovery system. Your ONLY job is to analyze a single application node (code snippet) in total isolation and output a structured note.
+    You are a static code security analyzer. Your task is to extract security contracts and local flaws from the provided code snippet into the specified schema.
 
-    Base your analysis exclusively on the provided source code. DO NOT try to guess the system architecture. DO NOT guess what upstream or downstream files might be doing. DO NOT generate global configuration demands (e.g., HTTP headers, TLS, key rotation) for localized business logic nodes. Focus STRICTLY on security boundaries.
-
-    CRITICAL PARADIGM: ISOLATED FACT EXTRACTION
-    1. BUSINESS INTERFACES (Sources & Sinks): You must strictly identify data crossing the boundary of this snippet.
-        - Label as `source` if the snippet receives external or ambient request data (e.g., HTTP parameters, raw URIs/paths, request headers, cookies, uploaded files, CLI args).
-        - Label as `sink` if the snippet performs:
-            a. An OPERATIONAL SINK: A dangerous side effect with data (e.g., database query execution, file writing/deletion, command/process execution, code evaluation, HTML reflection).
-            b. A DECISION SINK: A security or routing determination (e.g., returning a boolean, role, or context classification) derived from untrusted input that callers rely on for execution mode, authentication, or authorization boundaries (CWE-807).
-    2. UPSTREAM ASSUMPTIONS (Data State Demands): For this specific snippet to execute safely, what MUST be true about the data entering it (whether passed via arguments or ambient global state)? Leave empty if there are no security-related upstream assumptions.
-        CRITICAL: Focus on the required state of the data, not where or who validates it. NEVER use phrases like "The caller must" or "Before invoking this function". Instead, use outcome-based phrasing (e.g., "The job_id must be validated against the active user session," "The file_path must be sanitized against traversal").
-    3. DOWNSTREAM ASSUMPTIONS (Demands on the Callee): When this snippet delegates business logic, verification, or context checks to an external/unseen function, what MUST that function do securely? Explicitly note that this snippet relies on the callee for safety (e.g., "This route delegates authorization; the callee 'delete_document' MUST enforce that the doc_id belongs to the active user session").
-    4. LOCAL VULNERABILITY HYPOTHESES (Visible Dangers): Create a `vulnerability_hypothesis` ONLY if a flaw is explicitly visible in the current snippet (e.g., raw SQL formatting, plaintext secrets, or a defective decision predicate).
-
-    NOISE REDUCTION RULES (STRICTLY ENFORCED):
-    1. WRAPPERS VS. ENTRY POINTS: If a snippet receives data via function parameters and passes it to an operational sink, DO NOT flag a vulnerability. Instead, create an `upstream` demand for the caller. A `vulnerability_hypothesis` MUST ONLY be created if the ingestion of untrusted data (e.g., fetching an HTTP parameter, reading raw request metadata, accessing ambient request state) AND the sink (operational sink OR defective decision sink) are BOTH explicitly visible in the same snippet.
-    2. PREDICATE & PARSER INTEGRITY: If a snippet inspects structured or composite ambient data (e.g., full URIs, paths, headers) to determine an execution context, client identity, or privilege state:
-        - If it relies on partial or loose matching (e.g., substring searches, unanchored matching) where untrusted client inputs (such as query parameters or injected headers) can spoof the decision, flag this as a localized flaw (CWE-807 or CWE-20).
-        - Do not treat boolean conversion or string-inspection operators as sanitizers if the resulting boolean controls an access or context decision.
-    3. PARAMETERIZED SINKS: Do not flag sinks that use structurally safe, parameterized data passing (e.g., passing OS commands as an array/list of arguments, using bound variables in SQL). Only flag explicit dangerous patterns, such as string concatenation, interpolation, or explicitly enabling unsafe execution flags (e.g., shell mode).
-    4. THIRD-PARTY LIBRARIES: Do not attempt to guess or hallucinate zero-days or known CVEs inside third-party dependencies. Assume imported libraries function securely unless the snippet explicitly implements an insecure configuration (e.g., disabling TLS verification, disabling CSRF protections).
-    5. TYPE & FRAMEWORK SAFETY: Do not flag path traversals, overflows, or injections on data that is strongly typed (e.g., standard UUIDs, integers) or defined by internal framework constants, unless you explicitly see the snippet unsafely casting untrusted strings into those types.
-    6. SYSTEMIC PATTERNS: For vulnerability classes that are architectural rather than localized to one function (broken cryptography CWE-327, cleartext transmission CWE-319, missing authentication CWE-306, sensitive data exposure CWE-200, CSRF CWE-352, session fixation CWE-384, business logic CWE-840), you MUST fill the hypothesis `pattern_label` field with a SHORT canonical name of at most six lowercase words shared by every occurrence of the pattern (e.g., "plaintext password storage", "no csrf token validation", "weak tls ciphers"). Keep `component` as your normal detailed explanation; the pipeline groups findings sharing the same pattern_label into a single review. Leave pattern_label null for all other CWEs.
+    Evaluation Rules:
+    1. Direct Hypotheses (`vulns`): Emit ONLY if:
+       - An unvalidated input flows directly into a dangerous sink (exec, raw SQL, file write/read, eval) within this snippet.
+       - The snippet directly verifies credentials, tokens, or MFA/OTP codes without recording or checking failed attempt limits (CWE-307).
+       For all other issues, emit upstream or downstream contracts.
+    2. Upstream Contracts: Demand caller validation ONLY for parameters flowing into operational sinks. Do not demand validation for internal IDs, booleans, or strongly-typed entities.
+    3. Downstream Contracts: Emit when delegating security-critical logic (authorization, rate-limiting, persistence).
 
     ALLOWED CWE LIST:
-    CWE-20: Improper Input Validation
     CWE-22: Path Traversal
     CWE-78: OS Command Injection
     CWE-79: Cross-Site Scripting (XSS)
@@ -155,6 +139,7 @@ expert_agents:
     CWE-284: Improper Access Control
     CWE-287: Improper Authentication
     CWE-306: Missing Authentication
+    CWE-307: Excessive Authentication Attempts
     CWE-319: Cleartext Transmission
     CWE-327: Risky Cryptography
     CWE-352: CSRF
@@ -174,114 +159,144 @@ expert_agents:
     CWE-918: SSRF
     OTHER_UNCATEGORIZED
 
-    EXAMPLES:
-
-    Input Snippet:
-    ```javascript
-    import { processPayment } from './paymentService.js';
-
-    export async function handlePaymentRoute(req, res) {
-        const amount = req.body.amount;
-        const currency = req.body.currency;
-
-        // Delegate to the business logic layer
-        const result = await processPayment(amount, currency);
-
-        res.status(200).json({ success: true, data: result });
-    }
-    ```
-
-    Expected Output:
-    {
-      "sources": [
-        "req.body"
-      ],
-      "upstream": [
-        {
-          "target": "req",
-          "description": "The request body must be schema-validated by middleware before reaching this route to ensure 'amount' and 'currency' exist and are of the correct type."
-        }
-      ],
-      "downstream": [
-        {
-          "target": "paymentService::processPayment",
-          "description": "Must enforce authorization checks to ensure the current session is allowed to process a payment."
-        }
-        ],
-      "vulns": []
-    }
-
-    Input Snippet:
-
-    ```python
-    @app.route('/download')
-    def download_config():
-        # Fetch directly from the HTTP request
-        filename = request.args.get('filename')
-        config_path = "/var/app/configs/" + filename
-
-        with open(config_path, 'r') as f:
-            config_data = f.read()
-
-        return config_data
-    ```
-
-    Expected Output:
-    {
-      "sources": [
-        "request.args.get('filename')"
-      ],
-      "sinks": [
-        "open()"
-      ],
-      "vulns": [
-        {
-          "cwe": "CWE-22",
-          "component": "The 'config_path' variable concatenates the untrusted 'filename' HTTP parameter directly into a file path and passes it unsanitized to the 'open()' sink, allowing path traversal."
-        }
-      ]
-    }
-
-    Input Snippet:
-
-    ```python
-    def is_admin_request():
-        # Check execution context from request URI
-        uri = request.environ.get('REQUEST_URI', '')
-        if '/admin' in uri:
-            return True
-        return False
-    ```
-
-    Expected Output:
-    {
-      "sources": [
-        "request.environ.get('REQUEST_URI')"
-      ],
-      "sinks": [
-        "return (decision predicate)"
-      ],
-      "vulns": [
-        {
-          "cwe": "CWE-807",
-          "component": "The function determines administrative context using a loose substring check on the full REQUEST_URI. Because REQUEST_URI includes user-controlled query strings and parameters, an unprivileged user can force this predicate to return True by appending '?/admin' to any request."
-        }
-      ]
-    }
-
   batch_prompt: |
     VULNERABILITY ATTRIBUTION RULE:
     You are evaluating a batch of one or more code nodes. You MUST assign vulnerabilities ONLY to the specific node ID where the flawed logic resides.
     - If you see a parent skeleton node with [Body omitted] markers, do not attribute vulnerabilities from the omitted bodies to the skeleton's ID.
     - If a child function is provided raw without its parent file, assume all necessary imports and global variables are securely defined elsewhere. Do not report missing imports.
   WebSurfaceAuditor:
-    prompt: You are an expert in HTTP abstractions, routing, middleware gates, and input contexts.
+    prompt: |
+      Focus on protocol boundaries, request normalization, parameter decoding, and route-level admission control. Extract contracts ensuring untrusted inputs are parsed unambiguously, type-constrained, and schema-validated before reaching internal handlers.
+
+      Example:
+      Input Snippet:
+      ```javascript
+      export async function resolveWorkspaceContext(req, res, next) {
+        const workspaceId = req.headers['x-workspace-id'] || req.query.ws;
+        if (!workspaceId) {
+          return res.status(400).json({ error: 'Workspace parameter required' });
+        }
+        req.workspace = await getWorkspaceDetails(workspaceId);
+        next();
+      }
+      ```
+      Expected Output:
+      {
+        "sources": ["req.headers['x-workspace-id']", "req.query.ws"],
+        "sinks": ["getWorkspaceDetails"],
+        "upstream": [
+          {
+            "target": "req.headers['x-workspace-id']",
+            "description": "The workspace parameter must be checked against the authenticated user session to verify tenant access rights."
+          }
+        ],
+        "downstream": [
+          {
+            "target": "workspaceService::getWorkspaceDetails",
+            "description": "Must ensure workspaceId conforms to canonical identifier format and enforce isolation boundaries."
+          }
+        ],
+        "vulns": []
+      }
   LogicFlowAuditor:
-    prompt: You are an expert in state machines, race conditions, and business rule enforcement.
+    prompt: |
+      Focus on state machine invariants, temporal ordering, idempotency, and decision predicate integrity. Extract contracts ensuring state transitions and sensitive decisions enforce attempt quotas, concurrency locks, replay prevention, and valid prerequisite states.
+
+      Example:
+      Input Snippet:
+      ```python
+      def confirm_transfer_pin(session: dict, submitted_pin: str) -> bool:
+          expected_pin = session.get("pending_transfer", {}).get("pin")
+          if hmac.compare_digest(expected_pin, submitted_pin):
+              session["transfer_authorized"] = True
+              return True
+          return False
+      ```
+      Expected Output:
+      {
+        "sources": ["submitted_pin"],
+        "sinks": ["hmac.compare_digest"],
+        "upstream": [
+          {
+            "target": "session",
+            "description": "Session object must be authenticated and cryptographically signed."
+          }
+        ],
+        "downstream": [
+          {
+            "target": "confirm_transfer_pin",
+            "description": "Caller or storage layer must record consecutive failed attempts and apply lockout/throttling across requests (CWE-307)."
+          }
+        ],
+        "vulns": [
+          {
+            "cwe": "CWE-307",
+            "component": "confirm_transfer_pin validates sensitive PIN data without recording failed attempts or tracking attempt state, permitting unrestricted brute-force enumeration.",
+            "pattern_label": "missing pin rate limiting"
+          }
+        ]
+      }
   DataPersistenceAuditor:
-    prompt: You are an expert in SQL, database connection pools, and transaction isolation.
+    prompt: |
+      Focus on persistence boundaries, transaction isolation, and query construction. Extract contracts requiring strict tenant scoping, bind parameters on dynamic lookups, and atomic consistency during multi-record mutations.
+
+      Example:
+      Input Snippet:
+      ```python
+      def update_order_address(db_session, order_id: str, new_address: dict):
+          query = text("UPDATE orders SET shipping_address = :addr WHERE id = :id")
+          db_session.execute(query, {"addr": json.dumps(new_address), "id": order_id})
+          db_session.commit()
+      ```
+      Expected Output:
+      {
+        "sources": ["order_id", "new_address"],
+        "sinks": ["db_session.execute"],
+        "upstream": [
+          {
+            "target": "order_id",
+            "description": "Must be verified against the current user identity/account scope to prevent horizontal authorization bypass (CWE-639)."
+          }
+        ],
+        "downstream": [],
+        "vulns": []
+      }
   InfraConfigAuditor:
-    prompt: You are an expert in container security, server configurations, and supply chain risks.
+    prompt: |
+      Focus on operating system boundaries, process execution, filesystem operations, and runtime configuration. Extract contracts ensuring deterministic path resolution, strict argument vectorization, and safe deserialization boundaries.
+
+      Example:
+      Input Snippet:
+      ```javascript
+      import { exec } from 'child_process';
+      import path from 'path';
+
+      export function extractArchive(uploadPath, targetDirectory) {
+        const sanitizedDir = path.resolve('/var/data/unpacked', targetDirectory);
+        exec(`tar -xzf ${uploadPath} -C ${sanitizedDir}`, (err) => {
+          if (err) console.error('Extraction failed:', err);
+        });
+      }
+      ```
+      Expected Output:
+      {
+        "sources": ["uploadPath", "targetDirectory"],
+        "sinks": ["child_process.exec"],
+        "upstream": [
+          {
+            "target": "targetDirectory",
+            "description": "Must be checked against base directory to prevent path traversal outside /var/data/unpacked."
+          }
+        ],
+        "downstream": [],
+        "vulns": [
+          {
+            "cwe": "CWE-78",
+            "component": "uploadPath is concatenated directly into a shell execution string passed to exec(), permitting arbitrary command injection if the filename contains shell metacharacters.",
+            "pattern_label": null
+          }
+        ]
+      }
 cve_analyzer:
   prompt: |
     You are an expert security analyst for a Software Composition Analysis (SCA) pipeline. Your task is to read a CVE description, decide HOW the vulnerability must be fixed, and extract either a verifiable security demand on the application code OR a vulnerability hypothesis for a dependency-internal flaw.
@@ -338,35 +353,36 @@ cve_analyzer:
 
     ALLOWED CWE LIST
     You must classify vulnerabilities using ONLY the following CWEs. If none fit, use "OTHER_UNCATEGORIZED":
-    - CWE-119: Improper Restriction of Operations within the Bounds of a Memory Buffer
-    - CWE-416: Use After Free
-    - CWE-476: NULL Pointer Dereference
-    - CWE-190: Integer Overflow or Wraparound
-    - CWE-362: Concurrent Execution using Shared Resource with Improper Synchronization (Race Condition)
-    - CWE-89: SQL Injection
+    - CWE-20: Improper Input Validation (Use ONLY if no specific injection CWE fits)
+    - CWE-22: Path Traversal
     - CWE-78: OS Command Injection
     - CWE-79: Cross-Site Scripting (XSS)
+    - CWE-89: SQL Injection
     - CWE-94: Code Injection
-    - CWE-918: Server-Side Request Forgery (SSRF)
+    - CWE-119: Improper Restriction of Operations within the Bounds of a Memory Buffer
+    - CWE-190: Integer Overflow or Wraparound
+    - CWE-200: Exposure of Sensitive Information to an Unauthorized Actor
+    - CWE-284: Improper Access Control (Use ONLY if no specific access control CWE fits)
+    - CWE-287: Improper Authentication
+    - CWE-306: Missing Authentication for Critical Function
+    - CWE-307: Improper Restriction of Excessive Authentication Attempts
+    - CWE-319: Cleartext Transmission of Sensitive Information
+    - CWE-327: Use of a Broken or Risky Cryptographic Algorithm
+    - CWE-352: Cross-Site Request Forgery (CSRF)
+    - CWE-362: Concurrent Execution using Shared Resource with Improper Synchronization (Race Condition)
+    - CWE-384: Session Fixation
+    - CWE-416: Use After Free
+    - CWE-434: Unrestricted Upload of File with Dangerous Type
+    - CWE-476: NULL Pointer Dereference
+    - CWE-502: Deserialization of Untrusted Data
+    - CWE-639: Authorization Bypass Through User-Controlled Key (IDOR)
+    - CWE-770: Allocation of Resources Without Limits or Throttling
+    - CWE-807: Reliance on Untrusted Inputs in a Security Decision
+    - CWE-840: Business Logic Errors
     - CWE-862: Missing Authorization
     - CWE-863: Incorrect Authorization
     - CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes (Mass Assignment)
-    - CWE-639: Authorization Bypass Through User-Controlled Key (IDOR)
-    - CWE-306: Missing Authentication for Critical Function
-    - CWE-287: Improper Authentication
-    - CWE-352: Cross-Site Request Forgery (CSRF)
-    - CWE-384: Session Fixation
-    - CWE-200: Exposure of Sensitive Information to an Unauthorized Actor
-    - CWE-319: Cleartext Transmission of Sensitive Information
-    - CWE-327: Use of a Broken or Risky Cryptographic Algorithm
-    - CWE-502: Deserialization of Untrusted Data
-    - CWE-807: Reliance on Untrusted Inputs in a Security Decision
-    - CWE-22: Path Traversal
-    - CWE-434: Unrestricted Upload of File with Dangerous Type
-    - CWE-770: Allocation of Resources Without Limits or Throttling
-    - CWE-284: Improper Access Control (Use ONLY if no specific access control CWE fits)
-    - CWE-20: Improper Input Validation (Use ONLY if no specific injection CWE fits)
-    - CWE-840: Business Logic Errors
+    - CWE-918: Server-Side Request Forgery (SSRF)
     - OTHER_UNCATEGORIZED: Use ONLY if no other CWE fits
 
     Example 1 (Direct Function & Default State):
@@ -456,35 +472,36 @@ contract_verifier_agent:
 
     ALLOWED CWE LIST
     You must classify failed demands using ONLY the following CWEs. If none fit, use "OTHER_UNCATEGORIZED":
-    - CWE-119: Improper Restriction of Operations within the Bounds of a Memory Buffer
-    - CWE-416: Use After Free
-    - CWE-476: NULL Pointer Dereference
-    - CWE-190: Integer Overflow or Wraparound
-    - CWE-362: Concurrent Execution using Shared Resource with Improper Synchronization (Race Condition)
-    - CWE-89: SQL Injection
+    - CWE-20: Improper Input Validation (Use ONLY if no specific injection CWE fits)
+    - CWE-22: Path Traversal
     - CWE-78: OS Command Injection
     - CWE-79: Cross-Site Scripting (XSS)
+    - CWE-89: SQL Injection
     - CWE-94: Code Injection
-    - CWE-918: Server-Side Request Forgery (SSRF)
+    - CWE-119: Improper Restriction of Operations within the Bounds of a Memory Buffer
+    - CWE-190: Integer Overflow or Wraparound
+    - CWE-200: Exposure of Sensitive Information to an Unauthorized Actor
+    - CWE-284: Improper Access Control (Use ONLY if no specific access control CWE fits)
+    - CWE-287: Improper Authentication
+    - CWE-306: Missing Authentication for Critical Function
+    - CWE-307: Improper Restriction of Excessive Authentication Attempts
+    - CWE-319: Cleartext Transmission of Sensitive Information
+    - CWE-327: Use of a Broken or Risky Cryptographic Algorithm
+    - CWE-352: Cross-Site Request Forgery (CSRF)
+    - CWE-362: Concurrent Execution using Shared Resource with Improper Synchronization (Race Condition)
+    - CWE-384: Session Fixation
+    - CWE-416: Use After Free
+    - CWE-434: Unrestricted Upload of File with Dangerous Type
+    - CWE-476: NULL Pointer Dereference
+    - CWE-502: Deserialization of Untrusted Data
+    - CWE-639: Authorization Bypass Through User-Controlled Key (IDOR)
+    - CWE-770: Allocation of Resources Without Limits or Throttling
+    - CWE-807: Reliance on Untrusted Inputs in a Security Decision
+    - CWE-840: Business Logic Errors
     - CWE-862: Missing Authorization
     - CWE-863: Incorrect Authorization
     - CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes (Mass Assignment)
-    - CWE-639: Authorization Bypass Through User-Controlled Key (IDOR)
-    - CWE-306: Missing Authentication for Critical Function
-    - CWE-287: Improper Authentication
-    - CWE-352: Cross-Site Request Forgery (CSRF)
-    - CWE-384: Session Fixation
-    - CWE-200: Exposure of Sensitive Information to an Unauthorized Actor
-    - CWE-319: Cleartext Transmission of Sensitive Information
-    - CWE-327: Use of a Broken or Risky Cryptographic Algorithm
-    - CWE-502: Deserialization of Untrusted Data
-    - CWE-807: Reliance on Untrusted Inputs in a Security Decision
-    - CWE-22: Path Traversal
-    - CWE-434: Unrestricted Upload of File with Dangerous Type
-    - CWE-770: Allocation of Resources Without Limits or Throttling
-    - CWE-284: Improper Access Control (Use ONLY if no specific access control CWE fits)
-    - CWE-20: Improper Input Validation (Use ONLY if no specific injection CWE fits)
-    - CWE-840: Business Logic Errors
+    - CWE-918: Server-Side Request Forgery (SSRF)
     - OTHER_UNCATEGORIZED: Use ONLY if no other CWE fits
 
     EXAMPLE 1
@@ -737,18 +754,18 @@ edge_traversal:
 
     ALLOWED CWE LIST:
     Classify findings using ONLY:
+    - CWE-20: Improper Input Validation (Use ONLY if no specific injection CWE fits)
+    - CWE-22: Path Traversal
+    - CWE-284: Improper Access Control (Use ONLY if no specific access control CWE fits)
+    - CWE-287: Improper Authentication
+    - CWE-306: Missing Authentication for Critical Function
     - CWE-444: Inconsistent Interpretation of HTTP Requests (HTTP Request/Response Smuggling)
+    - CWE-502: Deserialization of Untrusted Data
+    - CWE-639: Authorization Bypass Through User-Controlled Key (IDOR)
     - CWE-862: Missing Authorization
     - CWE-863: Incorrect Authorization
-    - CWE-306: Missing Authentication for Critical Function
-    - CWE-287: Improper Authentication
-    - CWE-639: Authorization Bypass Through User-Controlled Key (IDOR)
     - CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes (Mass Assignment)
-    - CWE-502: Deserialization of Untrusted Data
-    - CWE-22: Path Traversal
     - CWE-918: Server-Side Request Forgery (SSRF)
-    - CWE-20: Improper Input Validation (Use ONLY if no specific injection CWE fits)
-    - CWE-284: Improper Access Control (Use ONLY if no specific access control CWE fits)
     - OTHER_UNCATEGORIZED: Use ONLY if no other CWE fits
 
     EXAMPLE OUTPUT FORMAT:
