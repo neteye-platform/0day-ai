@@ -19,6 +19,7 @@ def compile_reviewer():
     reviewer_workflow.add_node("ask_reviewer_for_tool", ask_reviewer_for_tool)
     reviewer_workflow.add_node("reviewer_tools", ToolNode([
         tools.read_source_code,
+        tools.read_file,
         tools.get_node_connections,
         tools.search_codebase,
         tools.get_definition,
@@ -55,7 +56,7 @@ def compile_validator():
     validator_workflow.add_node("validator_tools", ToolNode([
         tools.send_http_request,
         tools.list_files,
-        tools.read_file,
+        tools.read_sandbox_file,
         tools.mark_validation_complete
     ]))
     validator_workflow.add_edge(START, "validator_agent")

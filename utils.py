@@ -300,7 +300,7 @@ def extract_subgraph(G: nx.DiGraph, target_communities: list) -> nx.DiGraph:
 
 
 # Tools that takes a lot of context
-heavy_tools = ["read_source_code", "send_http_request", "search_codebase", "get_definition"]
+heavy_tools = ["read_source_code", "read_file", "send_http_request", "search_codebase", "get_definition"]
 
 def compact_tool_history(messages: list[AnyMessage], safe_window: int = 4, threshold: int = 300) -> list[AnyMessage]:
     """

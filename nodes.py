@@ -1067,6 +1067,7 @@ def reviewer_agent_node(state: ReviewerState) -> dict | Command:
 
     llm_with_tools = smart_llm.bind_tools([
             tools.read_source_code,
+            tools.read_file,
             tools.search_codebase,
             tools.get_node_connections,
             tools.get_definition,
@@ -1182,7 +1183,7 @@ def validator_agent_node(state: ValidatorState) -> dict:
     llm_with_tools = smart_llm.bind_tools([
         tools.send_http_request,
         # tools.list_files,
-        # tools.read_file,
+        # tools.read_sandbox_file,
         tools.mark_validation_complete
     ])
     current_cookies = state.get("cookies", {})
