@@ -49,16 +49,11 @@ base_llm = ChatOpenAI(
     model="deepseek-v4-flash",
     stream_usage=True,
     temperature=0.4,
-    max_retries=3,
     reasoning_effort="none"
 )
-
-# Helper function to avoid repeating the retry config everywhere
-def with_robust_retry(runnable):
-    return runnable.with_retry(
-        stop_after_attempt=5,
-        wait_exponential_jitter=True
-    )
+# NOTE: Retry is handled at the graph level via RetryPolicy on every node
+# (see graph.py build_graph -> set_node_defaults), so no per-call retry wrapper
+# is needed here. This avoids double retry layers on top of the openai client.
 
 fast_llm = base_llm.bind(temperature=0.2, max_tokens=4096)
 smart_llm = base_llm.bind(temperature=0.8, max_tokens=16384)
@@ -361,7 +356,6 @@ def _explore_single(node_id: str, role_name: str) -> dict:
     human_msg = HumanMessage(content=user_prompt)
 
     explorer_llm = fast_llm.with_structured_output(AnalysisNote, method="json_schema", strict=True)
-    explorer_llm = with_robust_retry(explorer_llm)
     note = explorer_llm.invoke([sys_msg, human_msg])
 
     dict_note = note if isinstance(note, dict) else note.model_dump()
@@ -447,7 +441,6 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
     human_msg = HumanMessage(content=user_prompt)
 
     explorer_llm = fast_llm.with_structured_output(BatchedAnalysisResult, method="json_schema", strict=True)
-    explorer_llm = with_robust_retry(explorer_llm)
     result = explorer_llm.invoke([sys_msg, human_msg])
 
     result = result if isinstance(result, dict) else result.model_dump()
@@ -553,7 +546,6 @@ def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     ))
 
     cve_analyzer_llm = fast_llm.with_structured_output(CVEAnalysis, method="json_schema", strict=True)
-    cve_analyzer_llm = with_robust_retry(cve_analyzer_llm)
     analysis = cve_analyzer_llm.invoke([sys_msg, human_msg])
 
     dict_analysis = analysis if isinstance(analysis, dict) else analysis.model_dump()
@@ -992,7 +984,6 @@ def contract_verifier_node(state: VerifierState) -> dict:
     human_msg = HumanMessage(content=f"```python\n{target_code}\n```\n\nSecurity Demands:\n{demands_string}")
 
     structured_llm = smart_llm.with_structured_output(VerifierOutput, method="json_schema", strict=True)
-    structured_llm = with_robust_retry(structured_llm)
     response = structured_llm.invoke([sys_msg, human_msg])
     response = response if isinstance(response, dict) else response.model_dump()
 
