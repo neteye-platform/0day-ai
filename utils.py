@@ -2572,6 +2572,25 @@ def cvss_gate_blocks(record: dict, threshold: float | None) -> bool:
     return score < threshold
 
 
+def boundary_deferred(record: dict, threshold: float | None) -> bool:
+    """True when a confirmed finding the CVSS gate holds back must reach the
+    Integration Auditor anyway because the Reviewer flagged a server-side
+    security-boundary shift (`changes_security_boundary`): the boundary shift
+    may only pay off chained with proven peers, so a below-gate estimate does
+    not cancel the auditor spend. A gate-PASSING record is never "deferred" —
+    it was dispatched on its own merit.
+
+    Doubles as the revoke predicate for `unchainable` verdicts: a record that
+    reached the auditor ONLY via this exception must fall back to 'confirmed'
+    (then reported unvalidated via the same gate predicate) instead of dying as
+    a terminal 'unchainable' — chaining is upside, never information loss. The
+    status probe keeps the check verdict-time safe ('chained'/'unchainable'
+    copies still evaluate against the gate)."""
+    probe = {**record, "status": "confirmed"}
+    probe["validation_strategy"] = probe.get("validation_strategy") or "direct_to_validator"
+    return bool(probe.get("changes_security_boundary")) and cvss_gate_blocks(probe, threshold)
+
+
 def deduplicate_cves(vulns: list[dict]) -> list[dict]:
     """
     Extracts unique vulnerabilities by canonical ID and keeps up to 3 distinct

@@ -15,7 +15,7 @@ import re
 import networkx as nx
 
 from schemas import EvaluationToolInput, ValidationToolInput, AskForContextInput, IntegrationAuditInput, VulnerabilityDetailsInput, cwes
-from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer, cache_validator, cache_integration_auditor, reviewer_cache_key, is_feedback_review, is_path_excluded
+from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer, cache_validator, cache_integration_auditor, reviewer_cache_key, is_feedback_review, is_path_excluded, boundary_deferred
 from languages import MANIFEST_NAMES
 import settings
 import browser_tools
@@ -491,6 +491,9 @@ def submit_evaluation(
     # verdicts, forced None on false positives. utils.cvss_gate_blocks recomputes
     # the numeric score from it to gate Validator/Auditor dispatch.
     updated_vuln["cvss_vector"] = (kwargs.get("cvss_vector") or "").strip() or None
+    # Below-gate records carrying this flag are deferred to the Integration
+    # Auditor instead of being gate-skipped outright (utils.boundary_deferred).
+    updated_vuln["changes_security_boundary"] = bool(kwargs.get("changes_security_boundary"))
 
     # Patch lifecycle: this verdict adjudicates the PATCHED code, so the re-check
     # is consumed — route_patch_reviews only re-dispatches "applied" records, and
@@ -1188,6 +1191,28 @@ def submit_integration_audit(
         # The auditor's reproduction_steps are the FULL combined chain plan the
         # downstream Validator executes to build the PoC.
         updated_vuln["reproduction_steps"] = kwargs.get("reproduction_steps", [])
+    elif boundary_deferred(report, settings.validator_min_cvss):
+        # The record reached the auditor ONLY via the CVSS-gate boundary
+        # exception, not as a genuine requires_integration finding: an absent
+        # chain must NOT strand it as terminal 'unchainable' (excluded from the
+        # report). Revert to 'confirmed' so the reporter ships it unvalidated
+        # via the same gate predicate — chaining was pure upside.
+        updated_vuln["status"] = "confirmed"
+        logging.info(
+            f"{updated_vuln.get('vuln_id')}: unchainable verdict revoked — "
+            f"below-gate security-boundary finding falls back to 'confirmed' "
+            f"(reported unvalidated)."
+        )
+        note = (
+            "[integration auditor] No exploit chain found. This finding is below the "
+            "CVSS gate but flagged as shifting a server-side security boundary, so "
+            "it was audited for chaining only; staying 'confirmed' — reported "
+            "unvalidated."
+        )
+        reasoning = updated_vuln.get("integration_audit_reasoning")
+        updated_vuln["integration_audit_reasoning"] = (
+            f"{reasoning}\n{note}" if reasoning else note
+        )
 
     tool_msg = ToolMessage(
         content="Integration audit submitted. Ending chaining review.",
