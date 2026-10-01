@@ -34,26 +34,39 @@ _agent_progress: dict[str, dict[str, int]] = {}
 _agent_progress_lock = threading.Lock()
 
 if settings.llm_provider == "openai":
-    base_llm = ChatOpenAI(
+    fast_llm = ChatOpenAI(
         base_url=settings.openai_base_url,
         model=settings.openai_model,
         stream_usage=True,
-        temperature=0.4,
+        temperature=0.2,
+        max_completion_tokens=4096,
+        reasoning_effort="none",
         http_client=build_debug_http_client(),
     )
-    fast_llm = base_llm.bind(temperature=0.2, max_completion_tokens=4096, reasoning_effort="none")
-    smart_llm = base_llm.bind(temperature=0.8, max_completion_tokens=16384, reasoning_effort="medium")
+    smart_llm = ChatOpenAI(
+        base_url=settings.openai_base_url,
+        model=settings.openai_model,
+        stream_usage=True,
+        temperature=0.8,
+        max_completion_tokens=16384,
+        reasoning_effort="medium",
+        http_client=build_debug_http_client(),
+    )
 elif settings.llm_provider == "ollama":
-    base_llm = ChatOllama(
+    fast_llm = ChatOllama(
         model=settings.ollama_model,
         base_url=settings.ollama_base_url,
-        temperature=0.4,
-        num_ctx=32768,
+        temperature=0.2,
+        num_predict=4096,
+        reasoning=False
     )
-    # num_predict is Ollama's max-tokens equivalent; the OpenAI-only
-    # max_completion_tokens / reasoning_effort kwargs are not passed here.
-    fast_llm = base_llm.bind(temperature=0.2, reasoning=False, num_predict=4096)
-    smart_llm = base_llm.bind(temperature=0.8, reasoning=True, num_predict=16384)
+    smart_llm = ChatOllama(
+        model=settings.ollama_model,
+        base_url=settings.ollama_base_url,
+        temperature=0.8,
+        num_predict=16384,
+        reasoning=True
+    )
 else:
     raise ValueError(
         f"Unknown llm_provider {settings.llm_provider!r}; expected 'openai' or 'ollama'."
