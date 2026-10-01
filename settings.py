@@ -13,274 +13,167 @@ if _missing:
     )
 
 
+# ============================ Target settings ============================
+
 app_path = Path("../apps/glpi-11.0.7-clean")
 
-# LLM provider.
-# "openai" = ChatOpenAI against the internal gateway (needs OPENAI_API_KEY).
-# "ollama" = ChatOpenAI against a local Ollama server's OpenAI-compatible /v1 API.
-llm_provider = "ollama"
-openai_base_url = "http://localhost:11434/v1"
-openai_model = "deepseek-v4-flash"
+graph = app_path / "graphify-out" / "graph.json"
+cache_dir = app_path / ".cache"
 
-# Output-token budget for each agent's LLM is derived from that agent's model
-# context window by OUTPUT_BUDGET_FRACTION (see the per-agent
-# `*_max_completion_tokens` lines; `smart_max_completion_tokens` is computed at
-# the bottom, next to the validator window it is based on). The OpenAI-compat
-# gateway rejects any request whose input + requested output exceed the model
-# window, so capping the requested output at a small fraction of the window
-# keeps input headroom wide. The compaction hard cap reserves the same budget
-# (tool_loop.CompactionConfig.hard_cap).
+# None = all
+communities_to_analyze = None # [32, 33, 54, 61]
+
+# Path patterns (relative to app root) skipped before analysis and blocked from
+# reviewer file reads; globs and bare dir names supported.
+scan_exclude_paths = []          # e.g. ["tests/", "docs/api/*", "**/migrations/*"]
+# Auto-exclude well-known dependency/test/doc paths even when the list is empty.
+scan_exclude_defaults = True
+
+
+# ========================== Model / LLM settings ==========================
+
+llm_base_url = "http://localhost:11434/v1"
+llm_model = "deepseek-v4-flash"
+llm_api_key = os.environ.get("OPENAI_API_KEY")
+# llm_base_url = "http://localhost:11434/v1"
+# llm_model = "nemotron-3-ultra:cloud"
+# llm_api_key = "ollama"
+
+# Single context-window size shared by the reviewer, validator, and integration
+# auditor (their output budgets and compaction hard caps derive from it).
+model_context_window = 131072
+
+# Requested output budget is a fraction of the model context window (keeps input
+# headroom wide under the gateway's max-context rejection).
 OUTPUT_BUDGET_FRACTION = 1 / 32
 
-# Hardcoded output-token cap for the fast LLM only (explorer, CVE analyzer,
-# threat-intel gate, contract verifier). Deliberately window-independent: these
-# agents make strict structured-output calls whose JSON must complete within the
-# cap, and a window-fraction budget would be far too large (e.g. ~130k for a 1M
-# window), wasting tokens on runaway/looping or hallucinating outputs. 16384 is
-# large enough for legitimate explorer/VerifierOutput JSON while still bounding
-# runaway generations.
+# Window-independent cap for the fast LLM (explorer, CVE analyzer, threat-intel,
+# contract verifier): their structured JSON must complete within this cap.
 fast_max_completion_tokens = 16384
 
-ollama_model = "qwen36"
-ollama_base_url = "http://localhost:11434"
+# smart_llm backs both the validator and the integration auditor, so they share
+# this output budget.
+smart_max_completion_tokens = int(model_context_window * OUTPUT_BUDGET_FRACTION)
 
-# Unified LLM endpoint consumed by nodes.py: both providers build the same
-# langchain_openai.ChatOpenAI instances, so the provider difference is fully
-# resolved here. "openai" uses the gateway key from the environment; "ollama"
-# ignores auth but ChatOpenAI requires a non-None api_key (dummy value).
-if llm_provider == "openai":
-    llm_base_url = openai_base_url
-    llm_model = openai_model
-    llm_api_key = os.environ.get("OPENAI_API_KEY")
-elif llm_provider == "ollama":
-    llm_base_url = ollama_base_url.rstrip("/") + "/v1"
-    llm_model = ollama_model
-    llm_api_key = "ollama"
-else:
-    raise ValueError(
-        f"Unknown llm_provider {llm_provider!r}; expected 'openai' or 'ollama'."
-    )
 
-# Concurrency
+# =============================== Agents ==================================
+
 agents_concurrency = 4
 
-# Tool-loop guards for the compiled reviewer/validator subgraphs. If the model
-# never calls submit_evaluation / mark_validation_complete within this many LLM
-# rounds, the loop terminates gracefully via the fallback node instead of
-# crashing on the LangGraph recursion limit.
+# Reviewer/validator loop caps: if the terminal tool isn't called within this many
+# LLM rounds, the loop ends via the fallback node instead of hitting the recursion
+# limit. Countdown notes are injected from COUNTDOWN_LEAD_TURNS before the cap.
 reviewer_max_iterations = 25
-# First reviewer LLM turn at which the countdown note ("submit_evaluation in
-# your next turn or be terminated") is injected; turns >= this get a fresh note
-# each round. Derived so there are always COUNTDOWN_LEAD_TURNS of cushion
-# before the iterations cap.
+validator_max_iterations = 150
+integration_auditor_max_iterations = 20
 COUNTDOWN_LEAD_TURNS = 4
 reviewer_countdown_start = max(1, reviewer_max_iterations - COUNTDOWN_LEAD_TURNS)
-validator_max_iterations = 150
-# Same derivation for the validator track ("mark_validation_complete in your
-# next turn or be terminated").
 validator_countdown_start = max(1, validator_max_iterations - COUNTDOWN_LEAD_TURNS)
-# How many times the Validator may request more context (insufficient_context)
-# from the Reviewer for a single record. Past this cap the Validator must
-# conclude with the evidence it has.
+integration_auditor_countdown_start = max(1, integration_auditor_max_iterations - COUNTDOWN_LEAD_TURNS)
+# Max times the Validator may request more context from the Reviewer per record;
+# past this it must conclude on the evidence it has.
 validator_feedback_max_rounds = 1
 
-# Reviewer context compaction (opencode-style). When the estimated token count
-# of the reviewer's message history reaches model_context_window minus
-# context_reserved, the middle of the conversation is collapsed into a prior
-# LLM-generated summary and the most recent verbatim tail is preserved. Token
-# estimates use the conservative ~2 chars/token heuristic plus per-message
-# overhead and a fudge factor (utils.estimate_message_tokens), so the estimate
-# intentionally exceeds the model's real token count for code-heavy tool
-# histories.
-reviewer_model_context_window = 131072
+## ---- Tool-loop context compaction ----
+
+# Reviewer context compaction: when estimated history tokens reach the window
+# minus context_reserved, the middle is collapsed into an LLM summary, keeping
+# the most recent verbatim tail (estimated ~2 chars/token, deliberately
+# conservative).
 reviewer_context_reserved = 24000
-# Output-token budget requested from reviewer_llm (nodes.py): ~3% of the window
-# (derived above). The hard cap below subtracts this from the window so the
-# estimated input can never combine with the requested output past the model's
-# maximum context length.
-reviewer_max_completion_tokens = int(reviewer_model_context_window * OUTPUT_BUDGET_FRACTION)
-# Demotion threshold (chars) used inside the tool loop: any single AI/tool
-# message longer than this is moved out of the protected verbatim tail and into
-# the compressible middle (tool_loop._split_agent_history), so one degenerate
-# model dump — e.g. a reasoning run that ignores max_completion_tokens and emits
-# a ~120k-token 'finish_reason: length' response — is never pinned verbatim in
-# the window. No per-message truncation is applied: the middle compaction
-# summarizes it away, and the summarizer guard + hard safety cap keep a whole
-# middle that exceeds the window from reaching either LLM.
+# ~3% of the window; hard cap below keeps input + requested output within it.
+reviewer_max_completion_tokens = int(model_context_window * OUTPUT_BUDGET_FRACTION)
+# Messages longer than this move out of the verbatim tail into the compressible
+# middle (a degenerate long model dump is never pinned verbatim).
 reviewer_max_response_chars = 12000
-# Number of most-recent AI+tool interaction turns kept verbatim after compaction.
+# Most-recent AI+tool turns kept verbatim after compaction.
 reviewer_compaction_tail_turns = 1
-# Do not compact unless the compressible middle is worth at least this many
-# estimated tokens (avoids thrashing on tiny histories).
+# Minimum compressible tokens before compacting (avoids thrashing).
 reviewer_compaction_min_compressible_tokens = 4000
-# Hard safety margin: if the estimated token count still approaches the model
-# window even after the soft-threshold compaction was skipped, the reviewer
-# node force-truncates before invoking the LLM so it can never overflow the
-# model's maximum context length. The final ceiling reserves the requested
-# output budget (reviewer_max_completion_tokens) on top of this margin.
+# Force-truncate before invoking the LLM if the estimate still nears the window.
 reviewer_hard_reserved = 8192
 
-# Tool-loop guards for the compiled integration-auditor subgraph. The auditor
-# decides whether a `requires_integration` vulnerability combines with other
-# confirmed findings; if it never calls submit_integration_audit within this
-# many LLM rounds, the loop terminates via the fallback node.
-integration_auditor_max_iterations = 20
-# Same countdown derivation as the reviewer/validator tracks.
-integration_auditor_countdown_start = max(1, integration_auditor_max_iterations - COUNTDOWN_LEAD_TURNS)
-# Integration-auditor context compaction settings (mirror the reviewer's).
-integration_auditor_model_context_window = 131072
+# Integration-auditor context compaction (mirrors the reviewer's).
 integration_auditor_context_reserved = 24000
-integration_auditor_max_completion_tokens = int(integration_auditor_model_context_window * OUTPUT_BUDGET_FRACTION)
+integration_auditor_max_completion_tokens = int(model_context_window * OUTPUT_BUDGET_FRACTION)
 integration_auditor_max_response_chars = 12000
 integration_auditor_compaction_tail_turns = 1
 integration_auditor_compaction_min_compressible_tokens = 4000
 integration_auditor_hard_reserved = 8192
 
-# Contract verifier: max demands packed into ONE structured LLM call. The
-# verifier emits one DemandEvaluation per demand (status + reasoning + CWE), so
-# output tokens scale linearly with a node's demand count and any single-call
-# budget eventually truncates (openai.LengthFinishReasonError killed a run on
-# GLPI's TemplateRenderer::display with 225 downstream demands). Demands are
-# chunked into batches of this size, each cached separately, so a call's output
-# stays well under fast_max_completion_tokens (measured ~73-90 tokens per
-# evaluation; 40 x worst-case ~300 tokens still fits comfortably).
-verifier_max_demands_per_call = 40
-
-# Headless-browser toolset (browser_tools.py) for the validator. One shared
-# Firefox process serves all concurrent validators; each session_id gets an
-# isolated BrowserContext. browser_executable = None uses Playwright's own
-# patched Firefox channel build; set it to a path to point at a custom build.
-browser_enabled = True
-browser_timeout_ms = 30000
-# Bounded per-session console/pageerror/dialog ring buffer: max messages kept,
-# and per-message char cap, and the visible-text cap for browser_navigate output.
-browser_console_max_messages = 60
-browser_console_msg_chars = 500
-browser_describe_max_chars = 6000
-browser_executable = None
-# Idle-TTL safety-net reaper for browsers sessions not closed by the terminal
-# tool (grace-perioded so in-use sessions are never reaped).
-browser_idle_timeout_sec = 600
-
-# Kali attacker container (attacker_tools.py) for the validator: run_command /
-# write_attacker_file / read_attacker_file execute inside a
-# kalilinux/kali-rolling + kali-linux-headless box started lazily on the default
-# bridge network. The sandbox is published on all host interfaces and is
-# reachable from the attacker box at the bridge gateway (default 172.17.0.1);
-# the preprocessor sets sandbox_url to that gateway URL so every validator
-# tool (HTTP, browser, attacker shell) shares one target address. Falls open
-# (HTTP-only validation) if docker/build/container startup fails.
-attacker_enabled = True
-attacker_image_tag = "vulnscan-kali-attacker:latest"
-attacker_container_name = "vulnscan-kali-attacker"
-# Working directory for validator shell activity; file tools confine reads and
-# writes to this tree so PoC scripts and evidence stay predictable.
-attacker_workdir = "/work"
-# Hard cap (and default) for any single run_command; commands exceeding it are
-# killed. Building kali-linux-headless on first run can take a long time, so
-# the image build has its own generous timeout.
-attacker_command_timeout = 60
-attacker_build_timeout = 3600
-attacker_output_max_chars = 8000
-
 # Validator context compaction: same mechanism as the reviewer, applied to the
-# validator's HTTP-proving loop. HTTP responses from send_http_request can grow
-# without bound over long validation sessions, so the same soft-threshold
-# compaction plus hard safety cap keep the history under the model window.
-validator_model_context_window = 131072
+# HTTP-proving loop whose responses can grow without bound.
 validator_context_reserved = 24000
-# Output-token budget requested from smart_llm (validator): ~3% of the window
-# (derived above); see the reviewer note on why this is deliberately small.
-validator_max_completion_tokens = int(validator_model_context_window * OUTPUT_BUDGET_FRACTION)
-# Demotion threshold (chars) used inside the tool loop: any single AI/tool
-# message longer than this is moved out of the protected verbatim tail and into
-# the compressible middle (tool_loop._split_agent_history) — same semantics as
-# the reviewer's; see the reviewer note. HTTP/browser/run_command outputs can
-# otherwise grow without bound, but no per-message truncation is applied.
+# ~3% of the window; see the reviewer note.
+validator_max_completion_tokens = int(model_context_window * OUTPUT_BUDGET_FRACTION)
 validator_max_response_chars = 12000
-# Number of most-recent AI+tool interaction turns kept verbatim after compaction.
 validator_compaction_tail_turns = 1
-# Do not compact unless the compressible middle is worth at least this many
-# estimated tokens (avoids thrashing on tiny histories).
 validator_compaction_min_compressible_tokens = 4000
-# Hard safety margin: force-truncate before invoking the LLM if the estimate
-# approaches the model window even after soft-threshold compaction was skipped.
 validator_hard_reserved = 8192
 
-# smart_llm (nodes.py) backs both the validator and the integration auditor, so
-# it shares their output budget (derived from the validator window above).
-smart_max_completion_tokens = int(validator_model_context_window * OUTPUT_BUDGET_FRACTION)
+## ---- Contract verifier ----
 
+# Max demands per structured contract-verifier call: output scales with demand
+# count, so batches stay well under fast_max_completion_tokens.
+verifier_max_demands_per_call = 40
 
-graph = app_path / "graphify-out" / "graph.json"
-cache_dir = app_path / ".cache"
+## ---- Deduplication ----
 
-# Image tag used when the preprocessor builds the target container. If None,
-# it is derived from the app directory name (e.g. vulnscan-web_reactoops:latest).
-docker_image_tag = None
-
-
-# None = all
-communities_to_analyze = None # [32, 33, 54, 61]
-
-# File/path-level scan exclusion. Nodes/code whose source_file matches any
-# pattern are skipped before the explorer/contract-verifier work, dropped from
-# the CVE keyword-corpus, and blocked from reviewer file reads (search_codebase,
-# read_file). This lets a full repo (including third-party trees, tests, docs)
-# be scanned without manually pruning non-relevant paths first. Bare directory
-# names ("vendor") and globs ("tests/*", "*.md", "**/migrations/*") are both
-# supported, matched relative to the app root.
-scan_exclude_paths = []          # e.g. ["tests/", "docs/api/*", "**/migrations/*"]
-# Auto-exclude well-known dependency/test/doc paths even when the list above is
-# empty. Set to False to rely solely on scan_exclude_paths.
-scan_exclude_defaults = True
-
-# When True, the explorer dispatches multiple small nodes sharing a file in a
-# single batch. Set to False to force one dispatch per node (no batching).
-explorer_batching_enabled = True
-# Maximum combined code size (in chars) for a batched explorer dispatch.
-explorer_batch_char_threshold = 15000
-
-# Max expert roles assigned per community (top-K by heuristic score). Reduces
-# duplicate explorer scans of the same nodes by multiple expert roles.
-max_experts_per_community = 1
-
-# Semantic dedup: before reviewers are dispatched, hypotheses that
-# are the same real vulnerability described differently by different agents
-# (e.g. explorer roles calling it "plaintext password logging" vs "plaintext
-# credential logging") are merged via local Ollama embeddings so one reviewer
-# subgraph adjudicates the pattern once. Clustering groups by
-# (vulnerability_type, cwe_id) at semantic_dedup_threshold (default 0.80,
-# validated against real cached hypotheses). Dependency-origin records
-# (carry source_cve) are never merged — each is a distinct known CVE. Fails
-# open: if Ollama/embeddings is unreachable or semantic_dedup_enabled is False,
-# every hypothesis is dispatched unchanged.
+# Semantic dedup: merge hypotheses describing the same real vulnerability across
+# agents via local Ollama embeddings before review. Never merges source_cve
+# records; fails open to no dedup if Ollama is unreachable.
 semantic_dedup_enabled = True
 semantic_dedup_threshold = 0.80
 embeddings_model = "embeddinggemma"
 embeddings_base_url = "http://localhost:11434"
 
-# Demand dedup (contract-verifier input): every caller of a hub callee restates
-# the same contract in its own words, so the verifier would evaluate hundreds
-# of paraphrases of one requirement (GLPI's TemplateRenderer::display gathered
-# 225 downstream assumptions from 225 callers; embedding clustering at
-# semantic_dedup_threshold reduces them to 68). Merging runs per target node
-# after aggregation: cve_assumption demands are never merged, upstream
-# (callee-parameter) demands only merge on exact normalized identity within
-# the same (callee, parameter), downstream assumptions merge on exact identity
-# then embedding similarity. Same local Ollama embedder as the hypothesis
-# dedup; embeddings are disk-cached per (model, text) so re-runs are ~free;
-# fails open to exact-only merging when Ollama is unreachable.
+# Demand dedup (contract-verifier input): collapse paraphrases of one requirement
+# per target node (exact identity, then embedding similarity). cve_assumption
+# demands never merge; fails open to exact-only merging.
 demand_dedup_enabled = True
 embeddings_timeout = 60
 
-# When True, the Threat Intel agent enriches HIGH/CRITICAL CVEs with external
-# web evidence (Tavily). Set to False to skip the threat_intel node entirely
-# (and its Tavily calls/LLM tokens); the join barrier still fires via a no-op
-# task, and CVE analyzer results are used as-is.
+## ---- Explorer ----
+
+# Batch small nodes sharing a file into one explorer dispatch.
+explorer_batching_enabled = True
+explorer_batch_char_threshold = 15000
+
+# Max expert roles assigned per community (top-K by heuristic score).
+max_experts_per_community = 1
+
+## ---- Validator tools ----
+
+# Headless-browser toolset: one shared Firefox serves all validators; each
+# session_id gets an isolated context. None uses Playwright's patched Firefox.
+browser_enabled = True
+browser_timeout_ms = 30000
+# Bounded per-session console/pageerror/dialog ring buffer + navigate output cap.
+browser_console_max_messages = 60
+browser_console_msg_chars = 500
+browser_describe_max_chars = 6000
+browser_executable = None
+# Idle-TTL reaper for sessions not closed by the terminal tool.
+browser_idle_timeout_sec = 600
+
+# Kali attacker container (run_command/write_attacker_file/read_attacker_file),
+# started lazily on the default bridge network; the sandbox is reachable at the
+# bridge gateway so all validator tools share one target URL. Fails open.
+attacker_enabled = True
+attacker_image_tag = "vulnscan-kali-attacker:latest"
+attacker_container_name = "vulnscan-kali-attacker"
+# Confined working tree for validator shell activity.
+attacker_workdir = "/work"
+# Per-command cap; image build has its own generous timeout.
+attacker_command_timeout = 60
+attacker_build_timeout = 3600
+attacker_output_max_chars = 8000
+
+## ---- Threat intel / build ----
+
+# Enrich HIGH/CRITICAL CVEs with external web evidence (Tavily); False runs the
+# analyzer results as-is (barrier still fires via a no-op task).
 threat_intel_enabled = False
 
-# When True, the preprocessor always rebuilds the container image even if the
-# build definition (Dockerfile/compose) is unchanged since the last run.
+# Always rebuild the container image even if Dockerfile/compose is unchanged.
 force_rebuild = False
-
