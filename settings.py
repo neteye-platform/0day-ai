@@ -13,7 +13,7 @@ if _missing:
     )
 
 
-app_path = Path("../apps/glpi-11.0.7-clean")
+app_path = Path("../apps/htb")
 
 # LLM provider.
 # "openai" = ChatOpenAI against the internal gateway (needs OPENAI_API_KEY).
