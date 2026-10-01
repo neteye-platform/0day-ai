@@ -153,7 +153,7 @@ class VulnerabilityRecord(BaseModel):
     demand_id: Optional[str] = None
     source_cve: Optional[str] = Field(
         default=None,
-        description="The CVE ID a dependency-internal vulnerability was derived from. Set only on hypotheses emitted directly by the CVE analyzer (upgrade_only CVEs)."
+        description="The CVE ID a dependency-related hypothesis was derived from. Set on hypotheses emitted directly by the CVE analyzer (upgrade_only CVEs) and on contract-verifier findings for application_mitigation CVEs."
     )
     vulnerable_component: Optional[str] = Field(
         default=None,
@@ -240,11 +240,14 @@ class VulnerabilityRecord(BaseModel):
     def set_vuln_id(self) -> 'VulnerabilityRecord':
         # Systemic classification: deterministic CWE allowlist. Dependency-CVE
         # records are excluded — they already carry a stable per-CVE identity
-        # and route to the framework/dependency reviewer track.
+        # and route to the framework/dependency reviewer track. application_mitigation
+        # CVE findings are likewise excluded: they route to the dependency_mitigation
+        # reviewer track as node:CWE:<CVE-id>, never folded into systemic grouping.
         systemic = (
             self.cwe_id in SYSTEMIC_CWES
             and not self.source_cve
-            and self.vulnerability_type != "Known Dependency Vulnerability"
+            and self.vulnerability_type
+            not in ("Known Dependency Vulnerability", "Dependency Mitigation Vulnerability")
         )
         if systemic:
             self.vulnerability_type = "Systemic Vulnerability"

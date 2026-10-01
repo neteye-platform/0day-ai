@@ -1382,8 +1382,11 @@ def _contract_verifier_node(state: VerifierState) -> dict:
     if cached_data:
         return {"vulnerabilities": cached_data.get("hypothesis", [])}
 
-    # Build a lookup map of demand_id -> original description
+    # Build a lookup map of demand_id -> original description, plus a map to the
+    # full demand dict so FAILED evaluations can be traced back to their source
+    # (e.g. an application_mitigation CVE demand, which tags the output record).
     demand_lookup = {}
+    demand_meta = {}
     formatted_demands = []
 
     for d in demands:
@@ -1391,6 +1394,7 @@ def _contract_verifier_node(state: VerifierState) -> dict:
         # (e.g., matching whatever you put inside the [ID: ...] tag)
         d_id = d.get("parameter_name") or d.get("source") or "unknown"
         demand_lookup[d_id] = d.get("description")
+        demand_meta[d_id] = d
 
         dtype = d.get("type")
         source = d.get("source")
@@ -1425,14 +1429,25 @@ def _contract_verifier_node(state: VerifierState) -> dict:
             # Retrieve the clean, original description from Python memory
             original_desc = demand_lookup.get(eval.get("demand_id"), "No description found.")
 
-            new_vulnerabilities.append({
+            new_vuln = {
                 "affected_nodes": [target_node_id],
                 "cwe_id": eval.get("cwe_id"),
                 "description": f"Fails to satisfy demand: '{original_desc}'. Reasoning: {eval.get("reasoning")}",
                 "status": "hypothesis",
                 "demand_id": eval.get("demand_id"),
                 "vulnerable_component": eval.get("demand_id")
-            })
+            }
+            # application_mitigation CVE demands (type == "cve_assumption") produce
+            # a dependency-mitigation review: the flaw is in a third-party package
+            # and the app is expected to mitigate it. Tag the record so the reviewer
+            # routes it to the dependency_mitigation track (and so the CVE id is
+            # visible in the reviewer prompt); explorer demands stay code-level.
+            demand_source = demand_meta.get(eval.get("demand_id"), {})
+            if demand_source.get("type") == "cve_assumption":
+                new_vuln["vulnerability_type"] = "Dependency Mitigation Vulnerability"
+                new_vuln["source_cve"] = demand_source.get("source")
+
+            new_vulnerabilities.append(new_vuln)
 
     # Save to cache
     cache(cache_file, "write", {"hypothesis": new_vulnerabilities})
@@ -1480,12 +1495,15 @@ FRAMEWORK_DEPENDENCY_REVIEWER_TOOLS = [
 def _reviewer_mode_for(hypothesis: dict) -> str:
     """Route a hypothesis to its reviewer track.
 
-    'framework_dependency' (Known Dependency Vulnerability), 'systemic'
-    (Systemic Vulnerability) or 'code_level'.
+    'framework_dependency' (Known Dependency Vulnerability), 'dependency_mitigation'
+    (Dependency Mitigation Vulnerability — application-mitigable CVEs whose contract
+    verification failed), 'systemic' (Systemic Vulnerability) or 'code_level'.
     """
     vuln_type = hypothesis.get("vulnerability_type")
     if vuln_type == "Known Dependency Vulnerability":
         return "framework_dependency"
+    if vuln_type == "Dependency Mitigation Vulnerability":
+        return "dependency_mitigation"
     if vuln_type == "Systemic Vulnerability":
         return "systemic"
     return "code_level"
@@ -1623,6 +1641,8 @@ class ReviewerAgent(ToolLoopAgent):
         if mode == "framework_dependency":
             reviewer_tools = FRAMEWORK_DEPENDENCY_REVIEWER_TOOLS
         else:
+            # code_level, dependency_mitigation, systemic all trace first-party
+            # code and share the source-reading toolset.
             reviewer_tools = CODE_LEVEL_REVIEWER_TOOLS
         return smart_llm.bind_tools(
             reviewer_tools,

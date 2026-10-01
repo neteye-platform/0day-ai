@@ -47,7 +47,7 @@ class VerifierState(TypedDict):
 class ReviewerState(TypedDict):
     node_id: str
     expert_report: dict
-    mode: str  # "code_level" | "framework_dependency"
+    mode: str  # "code_level" | "framework_dependency" | "dependency_mitigation" | "systemic"
     # Number of LLM invocations in the tool loop. Bounds the loop so a model
     # that never submits a verdict ends gracefully via the fallback node.
     iterations: Annotated[int, operator.add]

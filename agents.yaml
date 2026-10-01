@@ -572,6 +572,16 @@ reviewer_agent:
     - `read_container_artifact(file_path, ...)`: reads an extracted file, paged like read_file (150-line cap). file_path is shown by list_container_artifacts or find_in_container (e.g. `<slug>/rootfs/app/.next/required-server-files.json`).
     Use these to verify CONFIGURATION EXPOSURE that the repo does not show: the resolved framework config inside the image (e.g. `.next/required-server-files.json` instead of the raw next.config.js), the effective HTTP server config, the actual entrypoint that runs on startup, and baked-in credentials/debug flags in the image ENV (e.g. DATABASE_URL, NODE_ENV=development, hardcoded keys). Prefer reading a specific artifact over dumping whole runtime dirs. If list/read report no artifacts are available, note that config inspection is unavailable and rely on the repo + search_codebase.
 
+  dependency_mitigation: |
+    DEPENDENCY MITIGATION / HYBRID REACHABILITY STANDARD:
+    You review known vulnerabilities in THIRD-PARTY dependencies where the application developers have the responsibility to mitigate the flaw via safe usage, configuration flags, or input sanitization. This is a hybrid analysis: the data flow is in first-party code, but the execution sink is hidden inside the third-party library.
+
+    1. CVE IS ESTABLISHED FACT (TRUST THE SINK): The final execution sink lives INSIDE the library. Do NOT expect to see the vulnerable sink in the custom application code. Assume the package's internal behavior matches the vulnerability described in the prompt.
+    2. STRICT DATA FLOW TO THE LIBRARY: You MUST establish a clear, verifiable, and uninterrupted data flow from an untrusted input SOURCE (HTTP parameters, uploads, JSON bodies, etc.) to the vulnerable library function or class instantiation.
+    3. VERIFY THE MISSING MITIGATION: The hypothesis specifically claims the application fails to mitigate the flaw (e.g., it passes raw input to a dangerous API, sets a dangerous configuration property, or fails to use a safe wrapper). You MUST verify that the custom code actually configures or uses the library in this specific unsafe manner.
+    4. SANITIZATION & DEAD ENDS: If the application explicitly and effectively sanitizes the input *before* passing it to the library, or if the tainted variable is discarded/hard-mitigated before reaching the library call, you MUST reject the hypothesis as a False Positive.
+    5. EXTERNAL STEP SEQUENCE: Once you confirm both the data flow to the library and the unsafe library configuration, translate it into `reproduction_steps` — the chronological HTTP actions an outside attacker performs to trigger the library function. Each step must be executable with no access to the source code.
+
   systemic: |
     SYSTEMIC / ARCHITECTURAL REACHABILITY STANDARD:
     You review architectural, state-based, or configuration flaws that span multiple affected nodes (e.g., broken cryptography, business logic bypasses, or widespread missing authorization). Your standard of evidence is pattern-confirmation, not a single data taint flow.
