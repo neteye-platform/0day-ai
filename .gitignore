@@ -1,15 +1,9 @@
 .env
 __pycache__/
-testing_db*
 states/
 results.json
-trace.json
 graphify-out/
 .langgraph_api/
-draw-diagram.py
 langgraph.json
-llms.txt
-run-graphify.py
-todo.md
 logs.txt
 attacker/.build.hash

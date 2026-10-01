@@ -33,7 +33,7 @@ container_demands_scope_to_members = True
 
 # None = all
 communities_to_analyze = None
-# communities_to_analyze = [0, 1, 2, 3, 5, 9, 12, 54, 77, 115, 150, 158, 205, 403]
+# communities_to_analyze = [60]
 
 # Path patterns (relative to app root) skipped before analysis and blocked from
 # reviewer file reads; globs and bare dir names supported.
@@ -50,8 +50,11 @@ scan_exclude_defaults = True
 llm_base_url = "http://localhost:11434/v1"
 llm_model = "qwen3-8-flash-next"
 llm_api_key = os.environ.get("OPENAI_API_KEY")
+# llm_base_url = "https://openrouter.ai/api/v1"
+# llm_model = "deepseek/deepseek-v4.1-flash"
+# llm_api_key = os.environ.get("OPENROUTER_API_KEY")
 # llm_base_url = "http://localhost:11434/v1"
-# llm_model = "nemotron-3-super:cloud"
+# llm_model = "qwen36"
 # llm_api_key = "ollama"
 
 # Single context-window size shared by the reviewer, validator, and integration
@@ -67,7 +70,7 @@ llm_max_completion_tokens = 16384
 
 # =============================== Agents ==================================
 
-agents_concurrency = 5
+agents_concurrency = 3
 
 # Reviewer/validator loop caps: if the terminal tool isn't called within this many
 # LLM rounds, the loop ends via the fallback node instead of hitting the recursion
@@ -75,7 +78,7 @@ agents_concurrency = 5
 reviewer_max_iterations = 25
 validator_max_iterations = 100
 integration_auditor_max_iterations = 20
-COUNTDOWN_LEAD_TURNS = 10
+COUNTDOWN_LEAD_TURNS = 8
 reviewer_countdown_start = max(1, reviewer_max_iterations - COUNTDOWN_LEAD_TURNS)
 validator_countdown_start = max(1, validator_max_iterations - COUNTDOWN_LEAD_TURNS)
 integration_auditor_countdown_start = max(1, integration_auditor_max_iterations - COUNTDOWN_LEAD_TURNS)
@@ -100,7 +103,7 @@ validator_min_cvss = 7.0
 # re-reviewed against the patched source; a re-confirmed record is validated
 # again in the resynced sandbox. When False the whole stage is inert and the
 # pipeline behaves exactly as before the feature existed.
-patcher_enabled = False
+patcher_enabled = True
 # Tool-loop cap for one patcher run (read + edit + submit_patch turns).
 patcher_max_iterations = 30
 patcher_countdown_start = max(1, patcher_max_iterations - COUNTDOWN_LEAD_TURNS)
@@ -242,7 +245,7 @@ explorer_max_prompt_chars = int(
 )
 
 # Max expert roles assigned per community (top-K by heuristic score).
-max_experts_per_community = 1
+max_experts_per_community = 2
 
 ## ---- Validator tools ----
 
