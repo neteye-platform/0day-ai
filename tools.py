@@ -1,17 +1,18 @@
 from typing import Annotated
-from langchain_core.tools import tool
 import json
-from langgraph.prebuilt import InjectedState
+from langchain_core.messages import ToolMessage
 import requests
 from pathlib import Path
 import tree_sitter
 import tree_sitter_python
 import tree_sitter_javascript
 import logging
-import os
 from bs4 import BeautifulSoup
+from langgraph.prebuilt import InjectedState
+from langchain_core.tools import tool, InjectedToolCallId
+from langgraph.types import Command
 
-from schemas import EvaluationToolInput, VulnerabilityReport
+from schemas import EvaluationToolInput, ValidationToolInput, VulnerabilityReport
 from utils import build_networkx_graph
 import settings
 
@@ -217,7 +218,18 @@ def submit_report(finding: VulnerabilityReport, state: Annotated[dict, InjectedS
     """
     report_dict = finding.model_dump()
     report_dict["role"] = state["task"].agent_role
-    return {"vulnerability_reports": [report_dict]}
+
+    return Command(
+        update={
+            "vulnerability_reports": [report_dict],
+            "messages": [
+                ToolMessage(
+                    content="Successfully saved finding. Please continue your audit.",
+                    tool_call_id=tool_call_id
+                )
+            ]
+        }
+    )
 
 
 @tool
@@ -226,37 +238,35 @@ def mark_task_complete(summary: str) -> dict:
     return {"audit_status": "completed", "summary": summary}
 
 
-@tool(args_schema=EvaluationToolInput)
+@tool
 def submit_evaluation(
-        is_exploitable: bool,
-        confidence_score: int,
-        reasoning: str,
-        entry_point_url: str = "",
-        http_method: str = "",
-        required_parameters: list = [],
-        auth_required: bool = False
-) -> dict:
+    evaluation: EvaluationToolInput,
+    state: Annotated[dict, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId]
+) -> Command:
     """Call this tool when you have finished reviewing the source code and made a final decision."""
-    return {
-        "is_exploitable": is_exploitable,
-        "confidence_score": confidence_score,
-        "reasoning": reasoning,
-        "entry_point_url": entry_point_url,
-        "http_method": http_method,
-        "required_parameters": required_parameters,
-        "auth_required": auth_required
-    }
+
+    evaluation_result = VulnerabilityEvaluation(
+        report_id=state.get("report_id", "Unknown"),
+        original_report=state.get("expert_report"),
+        **evaluation.model_dump()
+    )
+
+    return Command(
+        update={"filtered_reports": [evaluation_result]},
+        goto="__end__"
+    )
 
 
 @tool(response_format="content_and_artifact")
 def send_http_request(
-        method: str,
-        endpoint: str,
-        headers: dict,
-        body: str = "",
-        reset_session: bool = False,
-        extract_mode: str = "clean_html",
-        state: Annotated[dict, InjectedState] = None
+    method: str,
+    endpoint: str,
+    headers: dict,
+    body: str = "",
+    reset_session: bool = False,
+    extract_mode: str = "clean_html",
+    state: Annotated[dict, InjectedState] = None
 ) -> tuple[str, dict]:
     """
     Sends an HTTP request to the sandboxed application. Use this for testing web endpoints.
@@ -337,16 +347,27 @@ def send_http_request(
 
 
 @tool
-def mark_validation_complete(is_confirmed: bool, poc_payload: str, evidence: str) -> dict:
+def mark_validation_complete(
+    validation: ValidationToolInput,
+    state: Annotated[dict, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId]
+) -> dict:
     """
     Call this when you have definitively proven the vulnerability exists,
     or exhausted all options and believe it to be a false positive.
     """
-    return {
-        "is_confirmed": is_confirmed,
-        "poc_payload": poc_payload,
-        "execution_logs": evidence
-    }
+    report = state.get("report_to_test")
+    report_id = getattr(report, "report_id", "unknown")
+
+    result = ValidationResult(
+        report_id=report_id,
+        **validation.model_dump()
+    )
+
+    return Command(
+        update={"confirmed_vulnerabilities": [result]},
+        goto="__end__"
+    )
 
 
 @tool

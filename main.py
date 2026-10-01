@@ -8,14 +8,14 @@ from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_core.output_parsers import PydanticOutputParser
-from langgraph.types import Send
+from langgraph.types import Command, Send
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 
 import tools
 from utils import build_networkx_graph, run_stream
 from state import MasterState, ExpertState, ReviewerState, ValidatorState
-from schemas import VALIDATOR_AGENT, ExpertTask, VulnerabilityEvaluation, VulnerabilityReport, ManagerOutput, ReviewerOutput, ValidationResult, EXPERT_AGENTS, REVIEWER_AGENT, TOOLS
+from schemas import ManagerOutput, EXPERT_AGENTS, REVIEWER_AGENT, VALIDATOR_AGENT, TOOLS
 
 # ==========================================
 # Preprocessor
@@ -168,7 +168,7 @@ def expert_agent_node(state: ExpertState) -> dict:
     return {"messages": messages}
 
 
-def expert_agent_router(state: ExpertState) -> str:
+def expert_agent_router(state: ExpertState):
     last_message = state["messages"][-1]
 
     if last_message.tool_calls:
@@ -176,58 +176,18 @@ def expert_agent_router(state: ExpertState) -> str:
         for tc in last_message.tool_calls:
             if tc["name"] == "mark_task_complete":
                 return "__end__"
-            elif tc["name"] == "submit_report":
-                return "save_report"
 
         # Go to tools node
         return "tools"
 
-    # The LLM output plain text but DID NOT call a tool!
-    # Instead of ending, we route to a "nagging" node.
-    return "nag_agent"
-
-
-def save_report_node(state: ExpertState) -> dict:
-    """Intercepts the submit_report tool call to save findings to the graph state."""
-    role_name = state["task"].agent_role
-
-    last_message = state["messages"][-1]
-    reports = []
-    tool_responses = []
-
-    for tool_call in last_message.tool_calls:
-        if tool_call["name"] == "submit_report":
-            args = tool_call["args"]
-            finding_data = args.get("finding", args)
-
-            reports.append({
-                "role": role_name,
-                "vulnerability": finding_data.get("cwe_class", "Unknown"),
-                "details": finding_data.get("details", ""),
-                "source_node": finding_data.get("source_node", ""),
-                "sink_node": finding_data.get("sink_node", ""),
-                "trace_nodes": finding_data.get("trace_nodes", [])
-            })
-
-            tool_responses.append(
-                ToolMessage(
-                    content=f"Successfully saved finding. Please continue your audit.",
-                    tool_call_id=tool_call["id"]
-                )
-            )
-
-    return {
-        "vulnerability_reports": reports, 
-        "messages": tool_responses
-    }
-
-
-def nag_agent_node(state: ExpertState):
-    """If the agent tries to chat instead of working, hit it with a system prompt."""
-    nag_message = HumanMessage(
+    # The LLM failed to call a tool
+    message = HumanMessage(
         content=f"You did not invoke any tools. You must either use `{'`, `'.join(TOOLS.keys())}` to proceed."
     )
-    return {"messages": [nag_message]}
+    return Command(
+        goto="expert",
+        update={"messages": [message]}
+    )
 
 
 def dispatch_experts(state: MasterState):
@@ -311,40 +271,19 @@ def reviewer_agent_node(state: ReviewerState) -> dict:
     return {"messages": [response]}
 
 
-def reviewer_router(state: ReviewerState) -> str:
+def reviewer_router(state: ReviewerState):
     """Routes based on the tool called by the reviewer LLM."""
     last_message = state["messages"][-1]
 
     if last_message.tool_calls:
-        for tc in last_message.tool_calls:
-            if tc["name"] == "submit_evaluation":
-                return "save_evaluation"
         return "reviewer_tools"
 
-    # If the LLM just talks without using tools, we force it back to the agent to try again
-    return "reviewer_agent"
-
-
-def save_evaluation_node(state: ReviewerState) -> dict:
-    """Intercepts submit_evaluation and passes the result back to MasterState."""
-    last_message = state["messages"][-1]
-
-    for tool_call in last_message.tool_calls:
-        if tool_call["name"] == "submit_evaluation":
-            evaluation_result = VulnerabilityEvaluation(
-                report_id=state.get("report_id", "Unknown"),
-                is_exploitable=tool_call["args"].get("is_exploitable", False),
-                confidence_score=tool_call["args"].get("confidence_score", 0),
-                reasoning=tool_call["args"].get("reasoning", ""),
-                original_report=state.get("expert_report"),
-                entry_point_url=tool_call["args"].get("entry_point_url"),
-                http_method=tool_call["args"].get("http_method"),
-                required_parameters=tool_call["args"].get("required_parameters", []),
-                auth_required=tool_call["args"].get("auth_required", False)
-            )
-            return {"filtered_reports": [evaluation_result]}
-
-    return {"filtered_reports": []}
+    # The LLM failed to call a tool
+    message = HumanMessage(content=f"You did not invoke any tools. You must use a tool to proceed.")
+    return Command(
+        goto="reviewer_agent",
+        update={"messages": [message]}
+    )
 
 # ==========================================
 # Validator agent
@@ -408,33 +347,20 @@ def validator_agent_node(state: ValidatorState) -> dict:
         return {"messages": [response], "cookies": current_cookies}
 
 
-def validator_router(state: ValidatorState) -> str:
+def validator_router(state: ValidatorState):
     last_message = state["messages"][-1]
     if last_message.tool_calls:
         for tc in last_message.tool_calls:
             if tc["name"] == "mark_validation_complete":
                 return "save_validation"
         return "validator_tools"
-    return "validator_agent" # Loop back if it just talked without acting
 
-
-def save_validation_node(state: ValidatorState) -> dict:
-    """Intercepts mark_validation_complete and saves it to the MasterState."""
-    last_message = state["messages"][-1]
-
-    for tool_call in last_message.tool_calls:
-        if tool_call["name"] == "mark_validation_complete":
-            args = tool_call["args"]
-
-            result = ValidationResult(
-                report_id=state["report_to_test"].get("report_id", "unknown"),
-                is_confirmed=args.get("is_confirmed", False),
-                poc_payload=args.get("poc_payload", ""),
-                execution_logs=args.get("evidence", "")
-            )
-            return {"confirmed_vulnerabilities": [result]}
-
-    return {"confirmed_vulnerabilities": []}
+    # The LLM failed to call a tool
+    message = HumanMessage(content=f"You did not invoke any tools. You must use a tool to proceed.")
+    return Command(
+        goto="validator_agent",
+        update={"messages": [message]}
+    )
 
 # ==========================================
 # Build and Compile the Graph
@@ -445,32 +371,40 @@ def build_graph(checkpointer=None, interrupt_before=None):
     # Expert Sub-Graph
     expert_workflow = StateGraph(ExpertState)
     expert_workflow.add_node("expert", expert_agent_node)
-    expert_workflow.add_node("tools", ToolNode([tools.submit_report, tools.read_source_code, tools.check_package_vulnerability]))
-    expert_workflow.add_node("save_report", save_report_node)
-    expert_workflow.add_node("nag_agent", nag_agent_node)
+    expert_workflow.add_node("tools", ToolNode([
+        tools.submit_report,
+        tools.read_source_code,
+        tools.check_package_vulnerability,
+        tools.take_notes
+    ]))
     expert_workflow.add_edge(START, "expert")
     expert_workflow.add_conditional_edges("expert", expert_agent_router)
     expert_workflow.add_edge("tools", "expert")
-    expert_workflow.add_edge("save_report", "expert")
-    expert_workflow.add_edge("nag_agent", "expert")
     compiled_expert_agent = expert_workflow.compile()
 
-    # --- Reviewer Sub-Graph ---
+    # Reviewer Sub-Graph
     reviewer_workflow = StateGraph(ReviewerState)
     reviewer_workflow.add_node("reviewer_agent", reviewer_agent_node)
-    reviewer_workflow.add_node("reviewer_tools", ToolNode([tools.read_source_code, tools.get_node_connections, tools.search_codebase]))
-    reviewer_workflow.add_node("save_evaluation", save_evaluation_node)
+    reviewer_workflow.add_node("reviewer_tools", ToolNode([
+        tools.read_source_code,
+        tools.get_node_connections,
+        tools.search_codebase,
+        tools.submit_evaluation,
+        tools.take_notes
+    ]))
     reviewer_workflow.add_edge(START, "reviewer_agent")
     reviewer_workflow.add_conditional_edges("reviewer_agent", reviewer_router)
     reviewer_workflow.add_edge("reviewer_tools", "reviewer_agent")
-    reviewer_workflow.add_edge("save_evaluation", END)
     compiled_reviewer_agent = reviewer_workflow.compile()
 
     # Validator Sub-Graph
     validator_workflow = StateGraph(ValidatorState)
     validator_workflow.add_node("validator_agent", validator_agent_node)
-    validator_workflow.add_node("validator_tools", ToolNode([tools.send_http_request]))
-    validator_workflow.add_node("save_validation", save_validation_node)
+    validator_workflow.add_node("validator_tools", ToolNode([
+        tools.send_http_request,
+        tools.mark_validation_complete,
+        tools.take_notes
+    ]))
     validator_workflow.add_edge(START, "validator_agent")
     validator_workflow.add_conditional_edges("validator_agent", validator_router)
     validator_workflow.add_edge("validator_tools", "validator_agent")

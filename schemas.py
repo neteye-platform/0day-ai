@@ -118,6 +118,11 @@ class VulnerabilityEvaluation(BaseModel):
 class ReviewerOutput(BaseModel):
     reports: List[VulnerabilityEvaluation]
 
+class ValidationToolInput(BaseModel):
+    is_confirmed: bool = Field(description="True if the exploit successfully triggered in the sandbox.")
+    poc_payload: Optional[str] = Field(description="The exact payload, script, or HTTP request that triggered the vulnerability.")
+    execution_logs: str = Field(description="Relevant logs or output from the sandbox confirming the exploit.")
+
 class ValidationResult(BaseModel):
     report_id: str = Field(description="The ID/title of the vulnerability being tested.")
     is_confirmed: bool = Field(description="True if the exploit successfully triggered in the sandbox.")
