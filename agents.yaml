@@ -244,13 +244,12 @@ cve_analyzer:
     CRITICAL RULE 2: Explicit Trigger Conditions
     Identify the specific data flow required for the exploit to execute (e.g., "Immediate execution upon calling [Function]" or "Execution when the parsed object is written to disk"). If the CVE is vague, DO NOT guess—leave it empty.
 
-    CRITICAL RULE 3: Enforcing Explicit Proof for Defaults
-    If the CVE states that a vulnerability exists in a library's default behavior, configuration, or preprocessor, the demand MUST say that the absence of explicit mitigation is a failure.
+    CRITICAL RULE 3: Conditional Demands for Optional Features
+    If a vulnerability only triggers when a specific optional feature, function, or configuration is used, you MUST frame the demand conditionally. Format it as: "IF the application uses [Feature/Function], it MUST [Mitigation]. IF [Feature] is not present, this demand is satisfied." Only use the phrase "the absence of explicit mitigation is a failure" AFTER establishing the IF condition.
 
     CRITICAL RULE 4: Strict Routing Metadata
     You MUST accurately fill out the routing fields so the demand reaches the correct agent:
     - `import_namespace`: The exact string used in import statements (e.g., "yaml").
-    - `target_layer`: Use `local_instantiation` for ANY library configuration or method call within standard application logic (even if the mitigation uses global-looking syntax like Jupyter's `c.Config`). Use `global_configuration` ONLY for true framework-wide deployment files (e.g., `.env`, Laravel config files).
 
     Example 1 (Direct Function & Default State):
     In PyYAML before 5.1, the yaml.load() API allows execution of arbitrary Python commands by default.
@@ -259,19 +258,17 @@ cve_analyzer:
       "security_assumption": "The application must not use yaml.load() to parse untrusted data; it must use yaml.safe_load() instead. Because yaml.load is vulnerable by default, the absence of safe_load MUST be marked as FAILED.",
       "trigger_condition": "Immediate execution upon calling yaml.load() with untrusted data.",
       "import_namespace": "yaml",
-      "target_layer": "local_instantiation",
       "package": "PyYAML"
     }
 
-    Example 2 (Configuration-Heavy Local Library):
-    In FasterXML jackson-databind before 2.10.0, deserializing untrusted data with polymorphic typing enabled can lead to remote code execution. Workaround: Ensure `ObjectMapper.enableDefaultTyping()` is not called, or explicitly use `BasicPolymorphicTypeValidator` when configuring the `ObjectMapper` instance.
+    Example 2 (Configuration-Heavy Node.js Library):
+    In jsonwebtoken before 9.0.0, calling jwt.verify() without explicitly defining the algorithms parameter allows algorithm confusion and token forgery.
     Output 2:
     {
-      "security_assumption": "The application must not call 'enableDefaultTyping()' on the ObjectMapper instance, or it must explicitly configure a strict 'PolymorphicTypeValidator' before deserialization.",
-      "trigger_condition": "Immediate execution upon calling 'readValue()' on untrusted JSON.",
-      "import_namespace": "com.fasterxml.jackson.databind",
-      "target_layer": "local_instantiation",
-      "package": "jackson-databind"
+      "security_assumption": "The application must explicitly pass an allowed 'algorithms' array (e.g., ['HS256']) when calling jwt.verify() rather than relying on default parameters.",
+      "trigger_condition": "Immediate execution upon calling jwt.verify() with an untrusted JWT string.",
+      "import_namespace": "jsonwebtoken",
+      "package": "jsonwebtoken"
     }
 
     Example 3 (True Global Configuration):
@@ -281,8 +278,16 @@ cve_analyzer:
       "security_assumption": "The application must disable debug mode by setting 'app.debug' to false in the global configuration.",
       "trigger_condition": "Immediate execution upon encountering an application exception while debug mode is enabled.",
       "import_namespace": "config",
-      "target_layer": "global_configuration",
       "package": "laravel/framework"
+    }
+
+    Example 4 (Feature-Specific Vulnerability):
+    In express-fileupload before 1.1.9, if the `parseNested` option is enabled, an attacker can use prototype pollution to alter the global object prototype, potentially leading to arbitrary code execution.
+    Output 4:
+    {
+      "security_assumption": "IF the application configures the library with the `parseNested: true` option, it must explicitly validate or sanitize incoming payload keys. IF the `parseNested` feature is not enabled, this demand is satisfied.",
+      "trigger_condition": "Execution when the application parses a file upload request containing specially crafted nested JSON payload keys while `parseNested` is enabled.",
+      "import_namespace": "express-fileupload"
     }
 contract_verifier_agent:
   prompt: |
@@ -296,7 +301,7 @@ contract_verifier_agent:
       - IF untrusted data is passed DIRECTLY into a standard framework/library sink (e.g., `java.sql.Statement.execute`, `fs.readFile`, `subprocess.run`) WITHOUT touching any custom helper function first, it is considered RAW. This is an explicit failure. Set status to FAILED.
     2. No Privilege Substitutions: Do not accept access control (authentication, admin checks, feature flags) as a substitute for data-level mitigation. Restricting access to a vulnerable function does not fix the underlying vulnerability.
     3. No Fragile Mitigations: Do not set status to MET if the mitigation relies on easily bypassed methods, such as custom regular expressions, blacklisting (e.g., blocking ../), or naive string replacement.
-    4. Standard of Proof: To set status to MET, the visible code must either use standard, secure-by-default mechanisms (e.g., parameterized queries, strict allow-lists, or established cryptographic libraries) OR explicitly delegate the data to a helper function. If the code attempts validation itself but does so weakly, set status to FAILED.
+    4. Standard of Proof: To set status to MET, the visible code must either use standard, secure-by-default mechanisms (e.g., parameterized queries, strict allow-lists, extracting basenames, or established cryptographic libraries) OR explicitly delegate the data to a helper function. If a valid mitigation is visibly present, you MUST immediately set the status to MET and stop evaluating. Do NOT speculate about hypothetical edge cases (e.g., "what if the string is too long?") once the core vulnerability is mitigated. If the code attempts validation itself but does so weakly (e.g. custom regex), set status to FAILED.
     5. Wrong Architectural Layer: If the demand requires a global framework configuration (e.g., setting global Cache-Control headers, or configuring Flask SECRET_KEY_FALLBACKS) and the snippet is merely a localized route or helper that happens to touch the session, set status to OUT_OF_SCOPE. Global mitigations do not belong in local route logic.
     6. Context / Component Mismatch: If a demand explicitly targets a specific technology, library, protocol, or configuration mechanism, but the visible code snippet does not utilize that component (e.g., it uses a different library for the same task, or handles data in a completely unrelated way), you MUST set the status to OUT_OF_SCOPE. Do not mark a snippet as FAILED for lacking a mitigation to a vulnerability in a component it does not even use.
 

@@ -14,14 +14,6 @@ with open("agents.yaml", "r") as f:
     REVIEWER_AGENT = data.get("reviewer_agent")
     VALIDATOR_AGENT = data.get("validator_agent")
 
-MANIFEST_NAMES = {
-    "package.json", "pyproject.toml", "Pipfile", "setup.py", "setup.cfg",
-    "environment.yml", "conda.yaml", "Gemfile", "composer.json", "pom.xml",
-    "build.gradle", "build.gradle.kts", "Cargo.toml", "go.mod", "pubspec.yaml",
-    "mix.exs", "Podfile", "Package.swift", "conanfile.txt", "conanfile.py",
-    "vcpkg.json", "CMakeLists.txt"
-}
-
 cwes = {
     # --- MEMORY SAFETY (C / C++ / Rust-unsafe) ---
     "CWE-119": "Improper Restriction of Operations within the Bounds of a Memory Buffer",
@@ -142,6 +134,9 @@ class ExpertTask(BaseModel):
     )
 
 class CVEDemand(BaseModel):
+    reasoning: str = Field(
+        description="Briefly explain your logic for determining the assumption, trigger, and namespace. Do your thinking here."
+    )
     security_assumption: str = Field(
         description="The specific demand or configuration requirement that must be verified in the code to prevent the vulnerability."
     )
@@ -150,16 +145,8 @@ class CVEDemand(BaseModel):
         description="The explicit data flow, function call, or execution sink required for the vulnerability to trigger. If the CVE description does not explicitly state how the payload is executed, leave empty."
     )
     import_namespace: str = Field(
-        description="The actual module name used in the source code to import this package (e.g., if the package is 'beautifulsoup4', the import is 'bs4')."
-    )
-    target_layer: Literal["global_configuration", "local_instantiation", "any"] = Field(
-        default="any",
-        description=(
-            "CRITICAL ARCHITECTURAL CLASSIFICATION:\n"
-            "- 'global_configuration': Use this for CVEs that require upgrading a package version, configuring application-wide settings (like Flask SECRET_KEY, SECRET_KEY_FALLBACKS, or global security middleware/headers). These must NEVER be assigned to local route handlers or business logic functions.\n"
-            "- 'local_instantiation': Use this ONLY for CVEs that require a local, per-object code fix (e.g., configuring a specific flag on an object like `HTMLExporter.embed_images=False`, or using a local parameterized query).\n"
-            "- 'any': Use only if the mitigation can exist anywhere."
-        )
+        description="The SINGLE top-level root module name used to import this package (e.g., 'bs4' for beautifulsoup4, 'flask' for Flask). You MUST output exactly one word.",
+        pattern=r"^[a-zA-Z0-9_\-]+$"
     )
 
 class VulnerabilityEvaluation(BaseModel):

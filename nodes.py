@@ -1,9 +1,11 @@
 from pathlib import Path
 import json
 import re
+import subprocess
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.callbacks import BaseCallbackHandler
 from langgraph.types import Command, Send
 from langgraph.graph import END
 from typing import Any
@@ -18,23 +20,65 @@ from state import MasterState, ExplorerState, CVEAnalyzerState, VerifierState, R
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEDemand, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
 from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context
 
-# fast_llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
-# smart_llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
+# fast_llm = ChatOllama(model="gemma4:cloud", temperature=0.2, reasoning=False, num_ctx=32768)
+# smart_llm = ChatOllama(model="gemma4:cloud", temperature=0.6, reasoning=False, num_ctx=32768)
 # Maximum combined code size (in chars) for a batched explorer dispatch.
 EXPLORER_BATCH_CHAR_THRESHOLD = 7500
 
-model = "deepseek-v4-flash"
-fast_llm = ChatOpenAI(base_url="http://localhost:11434/v1", model=model, stream_usage=True, temperature=0.0, max_retries=5, max_tokens=4096, reasoning_effort="none") # Used for explorer and cve_analyzer
-smart_llm = ChatOpenAI(base_url="http://localhost:11434/v1", model=model, stream_usage=True, temperature=0.3, max_retries=5, max_tokens=8192, reasoning_effort="none")
-# smart_llm = ChatOpenAI(base_url="http://localhost:11434/v1", model=model, stream_usage=True, temperature=0.0, max_retries=5, max_tokens=4096, reasoning_effort="none") # Used for explorer and cve_analyzer
+class ErrorLoggingCallbackHandler(BaseCallbackHandler):
+    def on_llm_error(self, error: BaseException, **kwargs: Any) -> Any:
+        """Run when LLM errors out completely."""
+
+        # The callback kwargs contain the payloads sent to the LLM
+        payload = kwargs.get('prompts') or kwargs.get('messages')
+
+        # Combine the message into a single formatted block
+        error_message = (
+            "\n" + "="*40 + "\n"
+            "LLM EXHAUSTED ALL RETRIES\n"
+            + "="*40 + "\n"
+            f"REQUEST PAYLOAD:\n{payload}\n\n"
+            f"ERROR DETAILS:\n{error}\n"
+            + "="*40
+        )
+
+        logging.error(error_message)
+
+base_llm = ChatOpenAI(
+    base_url="http://localhost:11434/v1",
+    model="deepseek-v4-flash",
+    stream_usage=True,
+    temperature=0.4,
+    max_retries=3,
+    reasoning_effort="none"
+)
+
+# Helper function to avoid repeating the retry config everywhere
+def with_robust_retry(runnable):
+    return runnable.with_retry(
+        stop_after_attempt=5,
+        wait_exponential_jitter=True
+    )
+
+fast_llm = base_llm.bind(temperature=0.2, max_tokens=4096)
+smart_llm = base_llm.bind(temperature=0.8, max_tokens=16384)
+
 
 # ==========================================
 # Preprocessor
 # ==========================================
 
 def preprocessor_node(state: MasterState) -> dict[str, Any]:
+    # Ensure the knowledge graph exists; if not, build it from the target app's code
+    if not settings.graph.exists():
+        logging.info(f"Graph {settings.graph} not found. Running graphify extract...")
+        subprocess.run(
+            ["graphify", "extract", str(settings.app_path), "--code-only"],
+            check=True,
+        )
+
     # Run the OSV scanner to parse manifests and query the database
-    raw_vulns = run_osv_scanner(str(settings.app_path))
+    raw_vulns = run_osv_scanner(settings.app_path)
     logging.info(f"Found {len(raw_vulns)} raw vulns")
     clean_vulns = deduplicate_cves(raw_vulns)
     logging.info(f"{len(clean_vulns)} remaining CVEs after deduplication")
@@ -121,7 +165,7 @@ def manager_agent_node(state: MasterState) -> dict[str, Any]:
                         target_community=f"Community {comm_id}",
                         agent_role=agent,
                         task_description=expert_descriptions[agent]
-                    )
+                    ).model_dump()
                 )
                 assigned = True
 
@@ -132,7 +176,7 @@ def manager_agent_node(state: MasterState) -> dict[str, Any]:
                     target_community=f"Community {comm_id}",
                     agent_role="LogicFlowAuditor",
                     task_description=expert_descriptions["LogicFlowAuditor"]
-                )
+                ).model_dump()
             )
 
     return {"expert_tasks": heuristic_tasks}
@@ -202,10 +246,6 @@ def dispatch_explorers(state: MasterState):
                 nodes_in_file = [n for n, attr in G.nodes(data=True) if attr.get("source_file") == node_data.get("source_file")]
                 if len(nodes_in_file) <= 1:
                     continue
-
-            source_file = Path(node_data.get("source_file", ""))
-            if source_file.name in ["requirements.txt", "packages.json"]:
-                continue
 
             # Drop inert nodes (pure types, empty skeletons, flat constants) to save LLM budget
             if not is_node_worth_scanning(node_id):
@@ -300,6 +340,7 @@ def _explore_single(node_id: str, role_name: str) -> dict:
     human_msg = HumanMessage(content=user_prompt)
 
     explorer_llm = fast_llm.with_structured_output(AnalysisNote, method="json_schema", strict=True)
+    explorer_llm = with_robust_retry(explorer_llm)
     note = explorer_llm.invoke([sys_msg, human_msg])
 
     dict_note = note if isinstance(note, dict) else note.model_dump()
@@ -385,6 +426,7 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
     human_msg = HumanMessage(content=user_prompt)
 
     explorer_llm = fast_llm.with_structured_output(BatchedAnalysisResult, method="json_schema", strict=True)
+    explorer_llm = with_robust_retry(explorer_llm)
     result = explorer_llm.invoke([sys_msg, human_msg])
 
     result = result if isinstance(result, dict) else result.model_dump()
@@ -477,6 +519,7 @@ def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     ))
 
     cve_analyzer_llm = fast_llm.with_structured_output(CVEDemand, method="json_schema", strict=True)
+    explorer_llm = with_robust_retry(cve_analyzer_llm)
     demand = cve_analyzer_llm.invoke([sys_msg, human_msg])
 
     dict_demand = demand if isinstance(demand, dict) else demand.model_dump()
@@ -519,53 +562,6 @@ def build_import_map(graph_data: dict):
             except Exception:
                 node_imports_map[node_id] = set()
     return node_imports_map
-
-
-# File stems (basename without extension) whose whole-file skeleton represents an
-# application entry point / bootstrap. Language-agnostic: matches app.py, main.js,
-# server.go, __init__.py, index.tsx, factory.php, etc.
-_CONFIG_ENTRY_STEMS = {
-    "__init__", "app", "main", "index", "server",
-    "application", "config", "bootstrap", "factory",
-}
-
-# Rule 1: app/factory builder functions or classes (e.g. create_app, init_app,
-# make_application). Tokens are underscore-atomic and word-bounded.
-_APP_BUILDER_RE = re.compile(
-    r"\b(create|make|build|new|init|setup)_?(app|application|factory)\b|"
-    r"register_(blueprint|route|middleware)",
-    re.IGNORECASE,
-)
-
-# Rule 3: highly specific architectural role labels only. "app"/"index" are
-# deliberately excluded (reserved for the Rule 2 file-stem check). Matches
-# whole-word snake_case and CamelCase ("AppConfig") via word boundaries.
-_CONFIG_ROLE_RE = re.compile(
-    r"\b(middleware|server|bootstrap)\b|appconfig\b",
-    re.IGNORECASE,
-)
-
-
-def is_config_layer_node(node: dict) -> bool:
-    """True if the node represents an application factory, __init__ module, or
-    middleware/bootstrap configuration layer. Language- and framework-agnostic."""
-    label = node.get("label") or ""
-    source_file = Path(node.get("source_file") or "")
-
-    # Rule 1: app/factory builder function or class (e.g. create_app, init_app)
-    if _APP_BUILDER_RE.search(label):
-        return True
-
-    # Rule 3: architectural-role labels only (Middleware/Server/Bootstrap/AppConfig)
-    if _CONFIG_ROLE_RE.search(label):
-        return True
-
-    # Rule 2: entry file stem ONLY when this node is the whole-file skeleton itself.
-    # This prevents routing global demands to every helper inside main.py/app.py.
-    if label == source_file.name and source_file.stem.lower() in _CONFIG_ENTRY_STEMS:
-        return True
-
-    return False
 
 
 def _note_demands(dict_note: dict) -> list[dict]:
@@ -658,30 +654,8 @@ def _route_explorer_notes(notes: list, graph_data: dict, callers_map: dict, grou
     return updated_notes
 
 
-def _cve_candidates(target_layer: str, node_by_id: dict, node_imports_map: dict) -> list:
-    if target_layer == "global_configuration":
-        return [
-            nid for nid, nd in node_by_id.items()
-            if is_config_layer_node(nd) and nid in node_imports_map
-        ]
-    return list(node_imports_map.keys())
-
-
-def _cve_matches(nid: str, target_import: str, target_layer: str, node_imports_map: dict) -> bool:
-    imports = node_imports_map[nid]
-    if target_import not in imports:
-        return False
-    # local_instantiation requires strict AST usage of the namespace;
-    # global_configuration and any route on the import alone.
-    if target_layer == "local_instantiation":
-        return uses_namespace_in_ast(nid, target_import)
-    return True
-
-
-def _process_cve_demands(cves: list, node_imports_map: dict, graph_data: dict, grouped_demands: defaultdict) -> None:
-    """Route CVE demands to nodes that import the affected namespace."""
-    node_by_id = {n["id"]: n for n in graph_data.get("nodes", [])}
-
+def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: defaultdict) -> None:
+    """Route CVE demands to every node that imports and actually uses the affected namespace."""
     for demand in cves:
         target_import = demand.get("import_namespace", "")
         source_cve = demand.get("source_cve", "unknown")
@@ -691,25 +665,22 @@ def _process_cve_demands(cves: list, node_imports_map: dict, graph_data: dict, g
             f"Trigger: {demand.get('trigger_condition')}"
         )
 
-        # Route per target_layer. Default to "any" so older cache entries that
-        # predate target_layer keep their previous (broad) routing behavior.
-        target_layer = demand.get("target_layer", "any")
-
         matched_any = False
-        for node_id in _cve_candidates(target_layer, node_by_id, node_imports_map):
-            if _cve_matches(node_id, target_import, target_layer, node_imports_map):
-                grouped_demands[node_id].append({
-                    "source": source_cve,
-                    "type": "cve_assumption",
-                    "description": combined_desc,
-                    "target_layer": target_layer,
-                })
-                matched_any = True
-            else:
-                logging.info(f"[{node_id}] CVE SKIP: '{target_import}' not routed for layer='{target_layer}'.")
+        for node_id, imports in node_imports_map.items():
+            if target_import not in imports:
+                continue
+            if not uses_namespace_in_ast(node_id, target_import):
+                logging.info(f"[{node_id}] CVE SKIP: '{target_import}' imported but not used in the node's AST.")
+                continue
+            grouped_demands[node_id].append({
+                "source": source_cve,
+                "type": "cve_assumption",
+                "description": combined_desc,
+            })
+            matched_any = True
 
         if not matched_any:
-            logging.warning(f"[CVE DROP] {source_cve} for '{target_import}' (layer='{target_layer}') matched 0 nodes in the graph.")
+            logging.warning(f"[CVE DROP] {source_cve} for '{target_import}' matched 0 nodes in the graph.")
 
 
 def aggregate_demands_node(state: MasterState):
@@ -728,7 +699,7 @@ def aggregate_demands_node(state: MasterState):
     updated_notes = _route_explorer_notes(notes, graph_data, callers_map, grouped_demands)
 
     # Process CVE Demands
-    _process_cve_demands(cves, node_imports_map, graph_data, grouped_demands)
+    _process_cve_demands(cves, node_imports_map, grouped_demands)
 
     # Log the accurate total by summing the lengths of the lists
     total_demands = sum(len(d) for d in grouped_demands.values())
@@ -825,6 +796,7 @@ def contract_verifier_node(state: VerifierState) -> dict:
     human_msg = HumanMessage(content=f"```python\n{target_code}\n```\n\nSecurity Demands:\n{demands_string}")
 
     structured_llm = smart_llm.with_structured_output(VerifierOutput, method="json_schema", strict=True)
+    structured_llm = with_robust_retry(structured_llm)
     response = structured_llm.invoke([sys_msg, human_msg])
     response = response if isinstance(response, dict) else response.model_dump()
 
