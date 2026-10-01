@@ -38,7 +38,7 @@ if settings.llm_provider == "openai":
         model=settings.openai_model,
         stream_usage=True,
         temperature=0.2,
-        max_completion_tokens=4096,
+        max_completion_tokens=settings.fast_max_completion_tokens,
         reasoning_effort="none",
         http_client=build_debug_http_client(),
     )
@@ -47,7 +47,7 @@ if settings.llm_provider == "openai":
         model=settings.openai_model,
         stream_usage=True,
         temperature=0.8,
-        max_completion_tokens=16384,
+        max_completion_tokens=settings.smart_max_completion_tokens,
         reasoning_effort="medium",
         http_client=build_debug_http_client(),
     )
@@ -56,7 +56,7 @@ if settings.llm_provider == "openai":
         model=settings.openai_model,
         stream_usage=True,
         temperature=0.8,
-        max_completion_tokens=16384,
+        max_completion_tokens=settings.reviewer_max_completion_tokens,
         reasoning_effort="low",
         http_client=build_debug_http_client(),
     )
@@ -65,14 +65,14 @@ elif settings.llm_provider == "ollama":
         model=settings.ollama_model,
         base_url=settings.ollama_base_url,
         temperature=0.2,
-        num_predict=4096,
+        num_predict=settings.fast_max_completion_tokens,
         reasoning=False
     )
     smart_llm = ChatOllama(
         model=settings.ollama_model,
         base_url=settings.ollama_base_url,
         temperature=0.8,
-        num_predict=16384,
+        num_predict=settings.smart_max_completion_tokens,
         reasoning=True
     )
     reviewer_llm = smart_llm
@@ -1818,7 +1818,10 @@ class ReviewerAgent(ToolLoopAgent):
                 f"{qs_str}\n"
             )
 
-        if node_id:
+        # Synthetic `dependency:<package>` nodes (CVE upgrade-only / known
+        # dependency vulnerabilities) don't exist in the app graph: there is no
+        # source code to attach, so skip the lookup entirely.
+        if node_id and not node_id.startswith("dependency:"):
             target_node_source = get_node_code(node_id, reviewer_mode=True)
             if target_node_source:
                 formatted_vuln += (

@@ -13,7 +13,7 @@ if _missing:
     )
 
 
-app_path = Path("../apps/htb")
+app_path = Path("../apps/open-webui")
 
 # LLM provider.
 # "openai" = ChatOpenAI against the internal gateway (needs OPENAI_API_KEY).
@@ -21,6 +21,26 @@ app_path = Path("../apps/htb")
 llm_provider = "openai"
 openai_base_url = "http://localhost:11434/v1"
 openai_model = "deepseek-v4-flash"
+
+# Output-token budget for each agent's LLM is derived from that agent's model
+# context window by OUTPUT_BUDGET_FRACTION (see the per-agent
+# `*_max_completion_tokens` lines; `smart_max_completion_tokens` is computed at
+# the bottom, next to the validator window it is based on). The OpenAI-compat
+# gateway rejects any request whose input + requested output exceed the model
+# window, so capping the requested output at a small fraction of the window
+# keeps input headroom wide. The compaction hard cap reserves the same budget
+# (tool_loop.CompactionConfig.hard_cap).
+OUTPUT_BUDGET_FRACTION = 1 / 32
+
+# Hardcoded output-token cap for the fast LLM only (explorer, CVE analyzer,
+# threat-intel gate, contract verifier). Deliberately window-independent: these
+# agents make strict structured-output calls whose JSON must complete within the
+# cap, and a window-fraction budget would be far too large (e.g. ~130k for a 1M
+# window), wasting tokens on runaway/looping or hallucinating outputs. 16384 is
+# large enough for legitimate explorer/VerifierOutput JSON while still bounding
+# runaway generations.
+fast_max_completion_tokens = 16384
+
 ollama_model = "gemma4:cloud"
 ollama_base_url = "http://localhost:11434"
 
@@ -51,11 +71,26 @@ validator_feedback_max_rounds = 1
 # of the reviewer's message history reaches model_context_window minus
 # context_reserved, the middle of the conversation is collapsed into a prior
 # LLM-generated summary and the most recent verbatim tail is preserved. Token
-# estimates use the conservative ~2 chars/token heuristic
-# (utils.estimate_message_tokens), so the estimate intentionally exceeds the
-# model's real token count for code-heavy tool histories.
+# estimates use the conservative ~2 chars/token heuristic plus per-message
+# overhead and a fudge factor (utils.estimate_message_tokens), so the estimate
+# intentionally exceeds the model's real token count for code-heavy tool
+# histories.
 reviewer_model_context_window = 131072
 reviewer_context_reserved = 24000
+# Output-token budget requested from reviewer_llm (nodes.py): ~3% of the window
+# (derived above). The hard cap below subtracts this from the window so the
+# estimated input can never combine with the requested output past the model's
+# maximum context length.
+reviewer_max_completion_tokens = int(reviewer_model_context_window * OUTPUT_BUDGET_FRACTION)
+# Demotion threshold (chars) used inside the tool loop: any single AI/tool
+# message longer than this is moved out of the protected verbatim tail and into
+# the compressible middle (tool_loop._split_agent_history), so one degenerate
+# model dump — e.g. a reasoning run that ignores max_completion_tokens and emits
+# a ~120k-token 'finish_reason: length' response — is never pinned verbatim in
+# the window. No per-message truncation is applied: the middle compaction
+# summarizes it away, and the summarizer guard + hard safety cap keep a whole
+# middle that exceeds the window from reaching either LLM.
+reviewer_max_response_chars = 12000
 # Number of most-recent AI+tool interaction turns kept verbatim after compaction.
 reviewer_compaction_tail_turns = 1
 # Do not compact unless the compressible middle is worth at least this many
@@ -64,7 +99,8 @@ reviewer_compaction_min_compressible_tokens = 4000
 # Hard safety margin: if the estimated token count still approaches the model
 # window even after the soft-threshold compaction was skipped, the reviewer
 # node force-truncates before invoking the LLM so it can never overflow the
-# model's maximum context length.
+# model's maximum context length. The final ceiling reserves the requested
+# output budget (reviewer_max_completion_tokens) on top of this margin.
 reviewer_hard_reserved = 8192
 
 # Tool-loop guards for the compiled integration-auditor subgraph. The auditor
@@ -77,6 +113,8 @@ integration_auditor_countdown_start = max(1, integration_auditor_max_iterations 
 # Integration-auditor context compaction settings (mirror the reviewer's).
 integration_auditor_model_context_window = 131072
 integration_auditor_context_reserved = 24000
+integration_auditor_max_completion_tokens = int(integration_auditor_model_context_window * OUTPUT_BUDGET_FRACTION)
+integration_auditor_max_response_chars = 12000
 integration_auditor_compaction_tail_turns = 1
 integration_auditor_compaction_min_compressible_tokens = 4000
 integration_auditor_hard_reserved = 8192
@@ -124,6 +162,15 @@ attacker_output_max_chars = 8000
 # compaction plus hard safety cap keep the history under the model window.
 validator_model_context_window = 131072
 validator_context_reserved = 24000
+# Output-token budget requested from smart_llm (validator): ~3% of the window
+# (derived above); see the reviewer note on why this is deliberately small.
+validator_max_completion_tokens = int(validator_model_context_window * OUTPUT_BUDGET_FRACTION)
+# Demotion threshold (chars) used inside the tool loop: any single AI/tool
+# message longer than this is moved out of the protected verbatim tail and into
+# the compressible middle (tool_loop._split_agent_history) — same semantics as
+# the reviewer's; see the reviewer note. HTTP/browser/run_command outputs can
+# otherwise grow without bound, but no per-message truncation is applied.
+validator_max_response_chars = 12000
 # Number of most-recent AI+tool interaction turns kept verbatim after compaction.
 validator_compaction_tail_turns = 1
 # Do not compact unless the compressible middle is worth at least this many
@@ -132,6 +179,10 @@ validator_compaction_min_compressible_tokens = 4000
 # Hard safety margin: force-truncate before invoking the LLM if the estimate
 # approaches the model window even after soft-threshold compaction was skipped.
 validator_hard_reserved = 8192
+
+# smart_llm (nodes.py) backs both the validator and the integration auditor, so
+# it shares their output budget (derived from the validator window above).
+smart_max_completion_tokens = int(validator_model_context_window * OUTPUT_BUDGET_FRACTION)
 
 
 graph = app_path / "graphify-out" / "graph.json"
@@ -165,7 +216,7 @@ explorer_batch_char_threshold = 15000
 
 # Max expert roles assigned per community (top-K by heuristic score). Reduces
 # duplicate explorer scans of the same nodes by multiple expert roles.
-max_experts_per_community = 2
+max_experts_per_community = 1
 
 # Semantic dedup: before reviewers are dispatched, hypotheses that
 # are the same real vulnerability described differently by different agents
