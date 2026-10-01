@@ -649,7 +649,7 @@ def aggregate_demands_node(state: MasterState):
         grouped_demands = deduplicate_demands(
             grouped_demands,
             embedder,
-            settings.semantic_dedup_threshold,
+            settings.demand_dedup_threshold,
             disk_cache_dir=settings.cache_dir / "demand_embeddings",
         )
 

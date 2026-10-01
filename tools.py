@@ -818,6 +818,28 @@ def send_http_request(
         return f"Error: Request failed: {str(e)}", {}
 
 
+def propagate_validation_update(state: dict, updated_vuln: dict) -> list[dict]:
+    """Clone a validator's terminal update onto its grouped validation variants.
+
+    dispatch_validators may batch confirmed records that share (cwe_id,
+    vulnerable_component) exactly into ONE validator run (``validation_variants``
+    in ValidatorState); the batched verdict must reach every member's own
+    vuln_id so each record still lands in the vulnerabilities channel — and the
+    report — as an individual finding. Records are cloned, never merged.
+    """
+    updates = [updated_vuln]
+    for member in state.get("validation_variants") or []:
+        clone = dict(member)
+        clone["status"] = updated_vuln.get("status")
+        clone["poc_payload"] = updated_vuln.get("poc_payload")
+        clone["execution_logs"] = updated_vuln.get("execution_logs")
+        if updated_vuln.get("status") == "insufficient_context":
+            clone["review_round"] = (member.get("review_round") or 0) + 1
+            clone["open_questions"] = list(updated_vuln.get("open_questions") or [])
+        updates.append(clone)
+    return updates
+
+
 @tool(args_schema=ValidationToolInput)
 def mark_validation_complete(
     state: Annotated[dict, InjectedState],
@@ -862,7 +884,7 @@ def mark_validation_complete(
 
     return Command(
         update={
-            "vulnerabilities": [updated_vuln],
+            "vulnerabilities": propagate_validation_update(state, updated_vuln),
             "messages": [tool_msg]
         }
     )
@@ -921,7 +943,7 @@ def ask_for_context(
 
     return Command(
         update={
-            "vulnerabilities": [updated_vuln],
+            "vulnerabilities": propagate_validation_update(state, updated_vuln),
             "messages": [tool_msg]
         }
     )

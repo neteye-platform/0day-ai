@@ -1,33 +1,26 @@
-"""Embedding-based semantic dedup of vulnerability hypotheses.
+"""Embedding-based semantic dedup of vulnerability hypotheses and demands.
 
-Before ``dispatch_reviewers`` fans a hypothesis out to a full
-reviewer subgraph, hypotheses that are the SAME real vulnerability described
-differently by different agents (e.g. two explorer roles calling the same
-plaintext-logging flaw "plaintext password logging" vs "plaintext credential
-logging") are merged into one record, so a single reviewer + validator chain
-adjudicates the pattern instead of N duplicate chains.
+Before ``dispatch_reviewers`` fans a hypothesis out to a reviewer subgraph,
+records describing the SAME vulnerability differently are merged so one
+reviewer/validator chain adjudicates the pattern once; ``deduplicate_demands``
+does the same for demands before the contract verifier.
 
-Design constraints (threshold 0.80 was validated against real cached
-hypotheses):
+Hard constraints (thresholds tuned offline against the GLPI run's cached
+embeddings; see settings.py):
 
-  * Clustering happens ONLY within a (vulnerability_type, cwe_id) group — the
-    same label can never cross a CWE boundary.
-  * Dependency-origin records (those carrying ``source_cve``) are NEVER merged:
-    each is a distinct, already-canonical known CVE (deduplicate_cves collapses
-    to one record per CVE id).
-  * Cross-node merging is allowed only for "Systemic Vulnerability" records
-    (the same insecure pattern repeated across nodes). Non-systemic
-    (code-level) records are only merged within the SAME affected-node set, so
-    distinct localized defects in different functions are never collapsed.
-  * Fixed-representative (non-chaining) clustering prevents A~B~C transitive
-    over-merges.
-  * The merged record keeps its seed's vuln_id, unions all affected_nodes, and
-    concatenates the child descriptions, so no information is lost and the
-    reviewer/validator see every affected location.
-  * Embeddings are served by a local Ollama endpoint and cached per text hash,
-    so re-runs are ~free and the whole feature costs $0 of LLM spend.
-  * Fails open: any embedding error or an unreachable endpoint returns the
-    hypotheses unchanged (plain dedup by exact identity still happens).
+  * Clustering only within a (vulnerability_type, cwe_id) group.
+  * Dependency-origin records (``source_cve``) are never merged.
+  * Same-node-set records merge at ``threshold``; cross-node records pass the
+    two-tier gate in ``_pair_mergeable_fast`` (high-confidence cosine, or
+    cosine plus descriptive-component jaccard; degenerate anchors never carry
+    a merge alone), with cross-node cluster growth capped at
+    ``max_merged_cluster``.
+  * Fixed-representative (non-chaining) clustering prevents A~B~C over-merges.
+  * Merged records keep the seed's vuln_id, union affected_nodes, and fold in
+    child descriptions, so no information is lost.
+  * Embeddings (local Ollama) are batched and disk-cached per (model, text),
+    so re-runs are free.
+  * Fails open: any embedding error leaves only the exact-identity pre-merge.
 """
 from __future__ import annotations
 
@@ -41,7 +34,16 @@ from pathlib import Path
 
 import requests
 
+try:  # optional: large (vtype, cwe) groups need O(n²) similarity lookups.
+    import numpy as _np
+except ImportError:  # pragma: no cover - pure-Python fallback stays correct.
+    _np = None
+
 log = logging.getLogger("dedup")
+
+# Shared grouping-fallback identities, so buckets can't drift between paths.
+_DEFAULT_VTYPE = "Code Defect"
+_DEFAULT_CWE = "OTHER_UNCATEGORIZED"
 
 
 # ---------------------------------------------------------------------------
@@ -89,13 +91,16 @@ class Embeddings:
         self._cache[key] = vec
         return vec
 
+    # Chunk /api/embed requests: one monolithic multi-thousand request can
+    # stall the server (and the pipeline) past any useful timeout.
+    BATCH_CHUNK = 128
+
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Embed many texts, using Ollama's batch endpoint when available.
 
-        Tries ``/api/embed`` (one request for the whole list) and falls back to
-        sequential single-text ``embed()`` calls on older servers. The
-        per-text cache is consulted and filled either way, so repeated runs
-        only pay for unseen texts.
+        Tries ``/api/embed`` in chunks and falls back to sequential single-text
+        ``embed()`` calls on older servers. The per-text cache is consulted and
+        filled either way, so repeated runs only pay for unseen texts.
         """
         results: list[list[float] | None] = [None] * len(texts)
         missing: list[tuple[int, str]] = []
@@ -105,27 +110,28 @@ class Embeddings:
                 results[i] = cached
             else:
                 missing.append((i, t))
-        if missing:
-            try:
+        try:
+            for start in range(0, len(missing), self.BATCH_CHUNK):
+                chunk = missing[start:start + self.BATCH_CHUNK]
                 resp = requests.post(
                     f"{self.base_url}/api/embed",
-                    json={"model": self.model, "input": [t for _, t in missing]},
+                    json={"model": self.model, "input": [t for _, t in chunk]},
                     timeout=self.timeout,
                 )
                 resp.raise_for_status()
                 vecs = resp.json().get("embeddings") or []
-                if len(vecs) != len(missing):
+                if len(vecs) != len(chunk):
                     raise ValueError(
-                        f"batch size mismatch: {len(vecs)} embeddings for {len(missing)} texts"
+                        f"batch size mismatch: {len(vecs)} embeddings for {len(chunk)} texts"
                     )
-                for (i, t), vec in zip(missing, vecs):
+                for (i, t), vec in zip(chunk, vecs):
                     self._cache[self._key(t)] = vec
                     results[i] = vec
-            except Exception:
-                # Older Ollama without /api/embed (or a transient batch error):
-                # fall back to proven one-by-one requests, which raise on real
-                # unavailability so callers fail open.
-                for i, t in missing:
+        except Exception:
+            # Older Ollama without /api/embed (or transient error): one-by-one
+            # fallback, raising on real unavailability so callers fail open.
+            for i, t in missing:
+                if results[i] is None:
                     results[i] = self.embed(t)
         return results
 
@@ -140,10 +146,53 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 def _normalize_text(vulnerability_type, cwe_id, description) -> str:
-    """Embedding input: rich text (not the bare label) carries the semantic
-    signal; matches the text the validated threshold was tuned on."""
+    """Embedding input: rich text (not the bare label) carries the signal."""
     parts = [vulnerability_type or "", cwe_id or "", (description or "").lower()]
     return " ".join(p for p in parts if p).strip()
+
+
+def _hypothesis_text(vulnerability_type, cwe_id, vulnerable_component, description) -> str:
+    """Cross-node gate text: the component anchor leads, then the description."""
+    comp = (vulnerable_component or "").strip()
+    desc = (description or "").strip()
+    body = f"{comp}. {desc}" if comp else desc
+    return _normalize_text(vulnerability_type, cwe_id, body.lower())
+
+
+def component_tokens(component) -> frozenset[str]:
+    """Lowercased alphanumeric token set of a vulnerable_component string."""
+    return frozenset(re.sub(r"[^a-z0-9$_%.'\"\[\] ]+", " ", _norm(component)).split())
+
+
+# Structural punctuation: what a real selector/call-site carries but a bare
+# word label never does. Shared convention with
+# stage_validator._validation_group_key.
+_STRUCTURAL_RE = re.compile(r"[^\w$\s]")
+
+
+def is_degenerate_anchor(component) -> bool:
+    """True when a component string cannot serve as a cross-node identity.
+
+    Bare labels ('$str', 'uid', a node id) recur across hundreds of unrelated
+    callers, so identity between them proves nothing: only structural
+    punctuation (e.g. ``.prepare()``, ``request_params['filter']``) or a 3+
+    word descriptive phrase counts as identifying. Mirrors the convention of
+    stage_validator._validation_group_key.
+    """
+    raw = _norm(component)
+    if not raw.strip():
+        return True
+    if _STRUCTURAL_RE.search(raw):
+        return False
+    if len(component_tokens(component)) >= 3:
+        return False
+    return True
+
+
+def _token_jaccard(a: frozenset[str], b: frozenset[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / max(1, len(a | b))
 
 
 def _exact_key(record: dict) -> tuple:
@@ -154,7 +203,7 @@ def _exact_key(record: dict) -> tuple:
     as the embedding path (a systemic record can never merge with a code-level
     one and silently change the reviewer track)."""
     nodes = tuple(sorted({n for n in (record.get("affected_nodes") or []) if n}))
-    vtype = record.get("vulnerability_type") or "Code Defect"
+    vtype = record.get("vulnerability_type") or _DEFAULT_VTYPE
     cwe = record.get("cwe_id") or ""
     anchor = record.get("vulnerable_component") or record.get("description") or ""
     anchor = re.sub(r"\s+", " ", anchor.strip().lower())
@@ -164,8 +213,8 @@ def _exact_key(record: dict) -> tuple:
 def _sort_key(r: dict):
     """Deterministic processing order so the greedy clustering is reproducible."""
     return (
-        r.get("vulnerability_type") or "Code Defect",
-        r.get("cwe_id") or "OTHER_UNCATEGORIZED",
+        r.get("vulnerability_type") or _DEFAULT_VTYPE,
+        r.get("cwe_id") or _DEFAULT_CWE,
         tuple(sorted(n for n in r.get("affected_nodes") or [])),
         r.get("vuln_id") or "",
         r.get("description") or "",
@@ -176,11 +225,9 @@ def _sort_key(r: dict):
 # Clustering
 # ---------------------------------------------------------------------------
 def _merge_cluster(members: list[dict]) -> dict:
-    """Merge a cluster of hypothesis dicts into one record.
-
-    The seed (cluster representative) supplies the identity/fields; remaining
-    members add their affected_nodes and description context. Mirrors
-    merge_vulnerabilities' same-stage text combine.
+    """Merge a cluster into one record: the seed supplies identity/fields,
+    members union in affected_nodes and description context
+    (merge_vulnerabilities same-stage style).
     """
     base = members[0]
     merged = dict(base)
@@ -226,44 +273,133 @@ def _greedy_cluster_indices(vectors: list[list[float]], threshold: float) -> lis
     return clusters
 
 
-def _cluster_group(records: list[dict], embedder: Embeddings, threshold: float) -> list[dict]:
-    """Greedy fixed-representative clustering of one (type, cwe[, nodes]) group."""
-    if len(records) <= 1:
-        return records
-    try:
-        vectors = [embedder.embed(_normalize_text(r.get("vulnerability_type"), r.get("cwe_id"), r.get("description")))
-                   for r in records]
-    except Exception:
-        log.warning("Semantic dedup: embedding failed for a group; dispatching %d hypotheses unchanged.", len(records))
-        return records
-
-    out = []
-    for cl in _greedy_cluster_indices(vectors, threshold):
-        out.append(_merge_cluster([records[i] for i in cl]) if len(cl) > 1 else records[cl[0]])
-    return out
+# In the 0.93..0.95 band two descriptive components also need this jaccard
+# floor (barely-overlapping anchors = related-but-distinct defects); at
+# HIGH_CONFIDENCE_COSINE the embedding decides alone.
+CONFIDENT_BAND_MIN_JACCARD = 0.4
+HIGH_CONFIDENCE_COSINE = 0.95
 
 
-def cluster_vulnerabilities(hypotheses: list[dict], threshold: float = 0.80,
-                            embedder: Embeddings | None = None) -> list[dict]:
+def _pair_mergeable_fast(
+    nodes_a: tuple, nodes_b: tuple, sim: float,
+    ta: frozenset[str], tb: frozenset[str],
+    degen_a: bool, degen_b: bool,
+    threshold: float, cross_threshold: float,
+    anchor_confirmed_threshold: float, anchor_min_jaccard: float,
+) -> bool:
+    """Two-tier cross-node merge gate over precomputed per-record features."""
+    if nodes_a == nodes_b:
+        return sim >= threshold
+
+    degen = degen_a or degen_b
+    if sim >= cross_threshold:
+        return (degen or sim >= HIGH_CONFIDENCE_COSINE
+                or _token_jaccard(ta, tb) >= CONFIDENT_BAND_MIN_JACCARD)
+    if sim >= anchor_confirmed_threshold:
+        return (not degen) and _token_jaccard(ta, tb) >= anchor_min_jaccard
+    return False
+
+
+def _sim_matrix(vectors: list[list[float]]):
+    """Pairwise cosine lookup for a group: numpy-boosted when available."""
+    if _np is not None:
+        M = _np.asarray(vectors, dtype=_np.float64)
+        norms = _np.linalg.norm(M, axis=1, keepdims=True)
+        M = M / _np.maximum(norms, 1e-9)
+        S = M @ M.T
+
+        def lookup(i: int, j: int) -> float:
+            return float(S[i, j])
+        return lookup
+
+    def lookup(i: int, j: int) -> float:
+        return _cosine(vectors[i], vectors[j])
+    return lookup
+
+
+def _cluster_by_similarity(
+    records: list[dict], vectors: list[list[float]],
+    threshold: float, cross_threshold: float,
+    anchor_confirmed_threshold: float, anchor_min_jaccard: float,
+    max_merged_cluster: int,
+) -> list[list[int]]:
+    """Greedy fixed-representative clustering with the two-tier merge gate.
+
+    Candidates join their best-matching passing representative, never crossing
+    the (vulnerability_type, cwe_id) boundary. Cross-node growth is capped at
+    ``max_merged_cluster`` members (same-node-set members are exempt) so a
+    hub-parameter flood can't coalesce into one oversized review.
+    """
+    nodesets = [tuple(sorted(n for n in r.get("affected_nodes") or [])) for r in records]
+    comps = [r.get("vulnerable_component") for r in records]
+    tokens = [component_tokens(c) for c in comps]
+    degenerate = [is_degenerate_anchor(c) for c in comps]
+    sim = _sim_matrix(vectors)
+
+    seeds: list[int] = []
+    clusters: list[list[int]] = []
+    cross_members: dict[int, int] = {}  # cluster -> members with a different nodeset
+    for i in range(len(records)):
+        best, best_c = -1.0, -1
+        for c, seed in enumerate(seeds):
+            s = sim(i, seed)
+            if s <= best:
+                continue
+            if not _pair_mergeable_fast(
+                nodesets[i], nodesets[seed], s,
+                tokens[i], tokens[seed],
+                degenerate[i], degenerate[seed],
+                threshold, cross_threshold,
+                anchor_confirmed_threshold, anchor_min_jaccard,
+            ):
+                continue
+            cross = nodesets[i] != nodesets[seed]
+            if cross and max_merged_cluster and cross_members.get(c, 0) + 1 > max_merged_cluster:
+                continue
+            best, best_c = s, c
+        if best_c >= 0:
+            clusters[best_c].append(i)
+            if nodesets[i] != nodesets[seeds[best_c]]:
+                cross_members[best_c] = cross_members.get(best_c, 0) + 1
+        else:
+            seeds.append(i)
+            clusters.append([i])
+    return clusters
+
+
+def cluster_vulnerabilities(
+    hypotheses: list[dict], threshold: float = 0.80,
+    embedder: Embeddings | None = None, *,
+    cross_threshold: float = 0.93,
+    anchor_confirmed_threshold: float = 0.85,
+    anchor_min_jaccard: float = 0.6,
+    max_merged_cluster: int = 25,
+    disk_cache_dir=None,
+) -> list[dict]:
     """Merge duplicate hypotheses and return the (possibly reduced) dispatch list.
 
     ``hypotheses``: list of hypothesis dicts (status == "hypothesis") as they
     arrive at ``dispatch_reviewers``. Order is preserved; records are never
     dropped, only merged. Dependency-origin records (source_cve) pass through
-    untouched.
+    untouched. Same-node-set duplicates cluster at ``threshold``; cross-node
+    duplicates (the same defect reported from different caller nodes) go
+    through the two-tier gate in ``_pair_mergeable_fast``. Embeddings are batched
+    and served from the per-(model, text) ``disk_cache_dir`` when given.
+    Fails open: on any embedding error only the exact-identity pre-merge runs.
     """
     if not hypotheses:
         return hypotheses
 
-    outcome = [h for h in hypotheses if h.get("source_cve")]
-
-    # Cheap exact pre-merge: identical (type, nodes, cwe, anchor) but different
-    # casing/phrasing collapse without spending any embedding call. Each group
-    # goes through the same _merge_cluster the embedding path uses, so both
-    # paths share one merge semantics.
+    # Dependency records pass through untouched; the rest get the cheap exact
+    # pre-merge: identical (type, nodes, cwe, anchor) but different
+    # casing/phrasing collapse without spending an embedding call, through the
+    # same _merge_cluster the embedding path uses.
+    outcome: list[dict] = []
     exact: dict[tuple, list[dict]] = defaultdict(list)
     for h in hypotheses:
-        if not h.get("source_cve"):
+        if h.get("source_cve"):
+            outcome.append(h)
+        else:
             exact[_exact_key(h)].append(h)
     pool = sorted(
         (_merge_cluster(members) if len(members) > 1 else members[0]
@@ -271,22 +407,44 @@ def cluster_vulnerabilities(hypotheses: list[dict], threshold: float = 0.80,
         key=_sort_key,
     )
 
-    if embedder is None:
+    if embedder is None or len(pool) <= 1:
         outcome.extend(pool)
     else:
-        groups: dict[tuple, list[dict]] = {}
-        for h in pool:
-            vtype = h.get("vulnerability_type") or "Code Defect"
-            cwe = h.get("cwe_id") or "OTHER_UNCATEGORIZED"
-            if vtype == "Systemic Vulnerability":
-                key = (vtype, cwe)
-            else:
-                # code-level: only merge duplicates within the same node set.
-                key = (vtype, cwe, tuple(sorted(n for n in h.get("affected_nodes") or [])))
-            groups.setdefault(key, []).append(h)
-
-        for members in groups.values():
-            outcome.extend(_cluster_group(members, embedder, threshold))
+        try:
+            texts = [
+                _hypothesis_text(
+                    h.get("vulnerability_type"), h.get("cwe_id"),
+                    h.get("vulnerable_component"), h.get("description"),
+                )
+                for h in pool
+            ]
+            vectors = _embed_with_disk_cache(embedder, texts, disk_cache_dir)
+            if len(vectors) != len(pool) or any(v is None for v in vectors):
+                raise ValueError("embedding count mismatch in hypothesis dedup")
+        except Exception as e:
+            log.warning(
+                "Semantic dedup: embedding failed (%s); dispatching %d "
+                "hypotheses with exact-identity merging only.", e, len(pool),
+            )
+            outcome.extend(pool)
+        else:
+            groups: dict[tuple, list[int]] = {}
+            for i, h in enumerate(pool):
+                key = (
+                    h.get("vulnerability_type") or _DEFAULT_VTYPE,
+                    h.get("cwe_id") or _DEFAULT_CWE,
+                )
+                groups.setdefault(key, []).append(i)
+            for idxs in groups.values():
+                sub = [pool[i] for i in idxs]
+                sub_vecs = [vectors[i] for i in idxs]
+                clusters = _cluster_by_similarity(
+                    sub, sub_vecs, threshold, cross_threshold,
+                    anchor_confirmed_threshold, anchor_min_jaccard,
+                    max_merged_cluster,
+                )
+                for cl in clusters:
+                    outcome.append(_merge_cluster([sub[i] for i in cl]) if len(cl) > 1 else sub[cl[0]])
 
     log.info(
         "Semantic dedup: %d hypotheses -> %d unique dispatch records (%d merged).",
@@ -313,8 +471,8 @@ def _embed_with_disk_cache(
     cache_dir = Path(disk_cache_dir)
     results: list[list[float] | None] = [None] * len(texts)
     missing: list[tuple[int, str, Path]] = []
+    model = embedder.model
     for i, t in enumerate(texts):
-        model = getattr(embedder, "model", "")
         f = cache_dir / f"{hashlib.sha256(f'{model}:{t}'.encode('utf-8')).hexdigest()}.json"
         try:
             results[i] = json.loads(f.read_text())["embedding"]
@@ -342,25 +500,19 @@ def deduplicate_demands(
     """Merge near-duplicate demands per target node before contract verification.
 
     Every caller of a hub callee restates the same contract in its own words,
-    and the verifier emits one evaluation per demand — so paraphrase floods
-    multiply LLM spend without adding checkable information (one GLPI renderer
-    gathered 225 near-identical downstream assumptions from 225 callers;
-    clustering at the hypothesis-dedup threshold reduces them to 68).
+    and the verifier emits one evaluation per demand, so paraphrase floods
+    multiply LLM spend without adding checkable information.
 
-    Merging semantics per target node:
+    Merge rules per target node:
 
-      * ``cve_assumption`` demands are NEVER merged: each is a distinct CVE
-        contract whose ``source_cve`` tags downstream records.
+      * ``cve_assumption`` demands are never merged (distinct CVE contracts).
       * Upstream (callee-parameter) demands merge only on exact normalized
-        identity within the same ``(source, parameter_name)`` pair — merging
-        paraphrases across parameters could drop a distinct argument check,
-        so the embedder is never consulted for them.
-      * All other explorer demands (downstream caller assumptions) merge on
-        exact normalized identity first, then embedding similarity at
-        ``threshold``. The cluster seed (first demand in order) is kept
-        as-is: unlike hypothesis merges nothing is concatenated, since the
-        paraphrase variants carry no extra checkable information and the
-        demands feed a size-sensitive prompt.
+        identity within the same ``(source, parameter_name)`` pair — the
+        embedder is never consulted for them.
+      * All other explorer demands merge on exact normalized identity first,
+        then embedding similarity at ``threshold``; the cluster seed (first
+        demand in order) is kept as-is — nothing is concatenated, as the
+        paraphrases carry no extra checkable information.
       * Fails open: embedding errors keep the exact-merged demands for that
         target; with ``embedder=None`` only exact merging runs.
     """
@@ -390,9 +542,8 @@ def deduplicate_demands(
                 continue
 
             # Downstream caller assumptions (and any other explorer type):
-            # exact-normalized pre-merge, then embedding clustering on the
-            # survivors. The kept demand is each cluster's seed, in original
-            # order.
+            # exact-normalized pre-merge, then embedding clustering; each
+            # cluster keeps its seed demand, in original order.
             exact_desc: dict[str, int] = {}
             for i in idxs:
                 key = _norm(demands[i].get("description"))

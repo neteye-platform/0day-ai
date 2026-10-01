@@ -1746,7 +1746,14 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
 
 
 def safe_cache_filename(filename: str, max_bytes: int = 240) -> str:
-    """Keep a cache filename within filesystem component length limits."""
+    """Keep a cache filename within filesystem component length limits.
+
+    Path separators are never legal inside a single filesystem component: a
+    dependency node label containing '/' (e.g. 'dependency:golang.org/x/text')
+    would otherwise make cache() silently create nested directories instead of
+    one file.
+    """
+    filename = filename.replace("/", "_").replace("\\", "_").replace("\x00", "_")
     if len(filename.encode("utf-8")) <= max_bytes:
         return filename
 

@@ -75,6 +75,12 @@ class ValidatorState(TypedDict):
     # concurrent validators sharing the single web browser never collide even
     # if their LLM picks identical session labels.
     agent_id: Optional[str]
+    # Confirmed records that share (cwe, vulnerable_component) exactly with
+    # report_to_test: one validator exercises every variant's reproduction
+    # steps and its terminal verdict is written to the seed AND every variant
+    # (each variant still flows through the vulnerabilities channel as its own
+    # record — sharing only coalesces the validation runs, never the findings).
+    validation_variants: Optional[list[dict]]
     # Number of LLM invocations in the tool loop (same role as ReviewerState.iterations).
     iterations: Annotated[int, operator.add]
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]

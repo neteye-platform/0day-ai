@@ -114,11 +114,34 @@ semantic_dedup_threshold = 0.80
 embeddings_model = "embeddinggemma"
 embeddings_base_url = "http://localhost:11434"
 
+# Cross-node merging of code-level hypotheses (same defect reported from
+# different caller nodes). Thresholds measured on the GLPI run's embeddings:
+# hub-utility hypotheses anchor on bare parameter names ($str, $itemtype) whose
+# token identity is meaningless (cosine ~0.6 between different defects), while
+# genuine paraphrased duplicates sit at cosine >= 0.93 even with low component
+# overlap. At 0.85 + jaccard alone, degenerate anchors coalesce hundreds of
+# distinct per-target claims into one oversized review.
+dedup_cross_node_similarity = 0.93      # high-confidence tier (embedding decides)
+dedup_anchor_confirmed_similarity = 0.85  # mid tier: needs a strong descriptive component
+dedup_anchor_min_jaccard = 0.6          # component token overlap for the mid tier
+dedup_max_merged_cluster = 25           # cap on cross-node cluster growth
+
 # Demand dedup (contract-verifier input): collapse paraphrases of one requirement
 # per target node (exact identity, then embedding similarity). cve_assumption
 # demands never merge; fails open to exact-only merging.
 demand_dedup_enabled = True
+# 0.86, not the hypothesis 0.80: the global pairwise-cosine histogram of the
+# cached demand vectors shows 99.95% of DISTINCT demand pairs below 0.815 with
+# a monotone tail — the [0.80, 0.86) band is dominated by related-but-distinct
+# contract checks, while true paraphrases cluster above 0.90.
+demand_dedup_threshold = 0.86
 embeddings_timeout = 60
+
+# Confirmed records sharing (cwe, vulnerable_component) exactly are validated by
+# ONE validator that tests every finding's reproduction steps and records its
+# verdict on all of them (records are never dropped; each keeps its own report
+# section). Groups larger than this are validated individually.
+validator_variant_max_group = 6
 
 ## ---- Explorer ----
 

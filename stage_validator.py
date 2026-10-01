@@ -1,6 +1,7 @@
 """Validator stage: external exploit proofing against the live sandbox."""
 
 import logging
+import re
 import uuid
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -18,6 +19,32 @@ from state import MasterState, ReviewerState, ValidatorState
 from stage_reviewer import _primary_node, _reviewer_mode_for
 from tool_loop import CompactionConfig, ToolLoopAgent
 from utils import cache_validator, get_node_code
+
+
+_BARE_IDENT_RE = re.compile(r"^[\w$]+$")
+
+
+def _validation_group_key(record: dict):
+    """Batching key for a confirmed record, or None when it must be validated
+    alone.
+
+    Two findings share a validation run only when their CWE and normalized
+    vulnerable_component match EXACTLY (no embeddings — the validator's
+    verdict is written to every member, so membership may never rest on a
+    fuzzy similarity). Short pure-identifier anchors ('$str', a bare node id)
+    are never shareable: hundreds of distinct defects anchor on the parameter
+    name of one hub callee, and a proven-variant verdict must not rub off on
+    strangers that merely share that label. Descriptive labels (>= 3 words)
+    and structural selectors (a token containing punctuation, e.g.
+    request_params['filter']) do identify one specific flaw site.
+    """
+    comp = re.sub(r"\s+", " ", (record.get("vulnerable_component") or "").strip().lower())
+    if not comp:
+        return None
+    tokens = comp.split()
+    if not (len(tokens) >= 3 or any(not _BARE_IDENT_RE.match(t) for t in tokens)):
+        return None
+    return (record.get("cwe_id") or "", comp)
 
 
 def dispatch_validators(state: MasterState):
@@ -41,7 +68,7 @@ def dispatch_validators(state: MasterState):
         f"({[v.get('vuln_id') for v in confirmed_vulns]})."
     )
 
-    commands = []
+    direct: list[dict] = []
     for evaluation in confirmed_vulns:
         strategy = evaluation.get("validation_strategy") or "direct_to_validator"
         if strategy == "static_finding_only":
@@ -58,8 +85,45 @@ def dispatch_validators(state: MasterState):
                 f"the integration audit phase (after direct validation)."
             )
             continue
+        direct.append(evaluation)
+
+    # Batch confirmed records that describe the SAME flaw (identical
+    # (cwe_id, vulnerable_component) — e.g. one contract verdict per victim
+    # endpoint) into a single validator run carrying every variant's steps.
+    # Non-destructive: each member still flows through the vulnerabilities
+    # channel as its own record; only the sandbox work is shared.
+    groups: dict[tuple, list[dict]] = {}
+    for evaluation in direct:
+        if key := _validation_group_key(evaluation):
+            groups.setdefault(key, []).append(evaluation)
+    batched = {k: v for k, v in groups.items() if 1 < len(v) <= settings.validator_variant_max_group}
+    shared_ids = {id(r) for members in batched.values() for r in members}
+
+    commands = []
+    for members in batched.values():
+        seed, variants = members[0], members[1:]
+        logging.info(
+            f"Sharing one validation run across {len(members)} equivalent "
+            f"findings ({[m.get('vuln_id') for m in members]})."
+        )
+        payload = ValidatorState(
+            report_to_test=seed,
+            validation_variants=variants,
+            sandbox_url=state.get("sandbox_url"),
+            messages=[],
+            iterations=0,
+            vulnerabilities=[],
+            cookies={},
+            agent_id=uuid.uuid4().hex,
+        )
+        commands.append(Send("validator_agent", payload))
+
+    for evaluation in direct:
+        if id(evaluation) in shared_ids:
+            continue
         payload = ValidatorState(
             report_to_test=evaluation,
+            validation_variants=None,
             sandbox_url=state.get("sandbox_url"),
             messages=[],
             iterations=0,
@@ -196,6 +260,20 @@ class ValidatorAgent(ToolLoopAgent):
             state.get("report_to_test", {}), state.get("peer_payloads")
         )
 
+    def pre_agent(self, state):
+        # A cache hit stores the SEED's verdict; grouped validation variants
+        # are not part of the cache key, so replay them from the current state
+        # to give every batched member its own updated record.
+        cmd = super().pre_agent(state)
+        if cmd is None or not state.get("validation_variants"):
+            return cmd
+        cached = (cmd.update or {}).get("vulnerabilities") or [None]
+        if cached[0] is None:
+            return cmd
+        return Command(update={
+            "vulnerabilities": tools.propagate_validation_update(state, cached[0])
+        })
+
     def first_turn(self, state, llm_with_tools) -> dict:
         # System prompt composed from the capabilities this run actually grants
         # (attacker shell only when enabled; insufficient-context hatch only on
@@ -251,10 +329,49 @@ class ValidatorAgent(ToolLoopAgent):
                 f"payloads to complete the chain.\n"
                 f"{'\n\n'.join(blocks)}"
             )
+        # Grouped equivalent findings (same CWE + same vulnerable component,
+        # batched by dispatch_validators): render every member's reproduction
+        # steps so the single validation run exercises all of them — the
+        # terminal verdict will be recorded on each member record.
+        variants = state.get("validation_variants") or []
+        if variants:
+            blocks = []
+            for k, v in enumerate(variants, 2):
+                vnodes = [n for n in (v.get("affected_nodes") or []) if n]
+                vsteps = v.get("reproduction_steps") or []
+                vsteps_str = (
+                    "\n".join(f"  {i}. {s}" for i, s in enumerate(vsteps, 1))
+                    if vsteps else "  None provided by reviewer"
+                )
+                blocks.append(
+                    f"### VARIANT {k}: {v.get('vuln_id', 'Unknown')}\n"
+                    f"Affected Nodes: {', '.join(vnodes) if vnodes else 'Unknown'}\n"
+                    f"Description: {v.get('description', 'None')}\n"
+                    f"--- REPRODUCTION STEPS (from Reviewer, follow in order) ---\n"
+                    f"{vsteps_str}"
+                )
+            formatted_report += (
+                f"\n\n--- EQUIVALENT VARIANTS OF THE SAME PATTERN "
+                f"(validate EVERY record above and below) ---\n"
+                f"The findings below are duplicate reports of the SAME underlying "
+                f"vulnerability (identical CWE and vulnerable component) at other "
+                f"affected locations. Exercise the reproduction steps for EACH "
+                f"variant in addition to the core one; a generic proof of the "
+                f"shared pattern counts only if you demonstrate it applies to "
+                f"every variant's affected nodes. Record per-variant outcomes in "
+                f"execution_logs. Your single final verdict will be written to "
+                f"the core vulnerability AND to every variant.\n"
+                f"{'\n\n'.join(blocks)}"
+            )
         # Source of every affected node so the validator can reason about the
         # exact code under test without extra lookups.
+        all_nodes = list(affected)
+        for v in variants:
+            for n in (v.get("affected_nodes") or []):
+                if n and n not in all_nodes:
+                    all_nodes.append(n)
         code_sections = []
-        for node_id in affected:
+        for node_id in all_nodes:
             node_source = get_node_code(node_id)
             if node_source:
                 code_sections.append(
@@ -333,13 +450,24 @@ class ValidatorAgent(ToolLoopAgent):
         # Save to cache so subsequent runs skip the (doomed) tool-calling loop.
         cache_validator(dict(state.get("report_to_test", {})), state.get("peer_payloads"), updated_vuln)
 
+        # Batched variants stay unproven too: give each its own timeout note
+        # (status untouched, same as the seed's).
+        updates = [updated_vuln]
+        for member in state.get("validation_variants") or []:
+            clone = dict(member)
+            member_logs = clone.get("execution_logs") or ""
+            clone["execution_logs"] = (
+                f"{member_logs}\n{timeout_note}" if member_logs else timeout_note
+            )
+            updates.append(clone)
+
         # Per-agent cleanup, same as the terminal tool does.
         browser_tools.manager.close_agent_sessions(state.get("agent_id"))
         attacker_tools.manager.close_agent_sessions(state.get("agent_id"))
 
         return Command(
             update={
-                "vulnerabilities": [updated_vuln],
+                "vulnerabilities": updates,
             }
         )
 
