@@ -360,7 +360,7 @@ def run_command(
             "curl -sS -v http://<SHELL TARGET>/api/export?title=OR+1=1" or
             "nmap -sV -p- <SHELL TARGET host>".
         workdir (str): Directory to run the command in inside the container.
-            Defaults to the attacker workdir.
+            Defaults to /work
         timeout (int): Max seconds for this command (default and hard cap come
             from settings.attacker_command_timeout).
     """
@@ -376,17 +376,12 @@ def run_command(
     if not cwd.startswith("/"):
         cwd = f"/{cwd}"
 
-    target = manager.shell_target(state)
-    header = (
-        f"--- ATTACKER SHELL (container '{name}', workdir {cwd}) ---\n"
-        f"SHELL TARGET: {target if target else '(no sandbox configured - commands still run)'}\n"
-    )
     argv = ["docker", "exec", "-w", cwd, name, "/bin/bash", "-lc", command]
     exit_code, out, truncated = _exec_input(
         name, argv, timeout=eff_timeout, max_chars=max_chars
     )
     return (
-        f"{header}\n--- EXIT CODE: {exit_code} ---{' (output truncated)' if truncated else ''}\n"
+        f"ATTACKER SHELL (workdir {cwd}, exit code: {exit_code}{', output truncated' if truncated else ''})\n"
         f"{out}"
     )
 
@@ -521,3 +516,35 @@ def read_attacker_file(
             f"start_line={end + 1} to continue.] ..."
         )
     return f"{header}\n{body}"
+
+
+# -- host-facing helper for tools.send_http_request --------------------------------
+# send_http_request runs on the host, but files the attacker references are written
+# INSIDE the attacker container under the workdir. This lets the HTTP tool read
+# those bytes out of the container so a PoC payload can be uploaded via
+# files=... even though the request itself is issued from the host.
+
+def read_attacker_file_bytes(file_path: str) -> bytes | None:
+    """Read a whole file from the attacker container as raw bytes, or None.
+
+    Only paths confined to the attacker workdir are considered (non-workdir paths
+    never touch docker and keep the lazy-provisioning contract). Returns None when
+    the attacker container is unavailable or the file cannot be read.
+    """
+    target = _contains_workdir(file_path)
+    if target is None:
+        return None
+    name = manager.ensure()
+    if not name:
+        return None
+    try:
+        result = subprocess.run(
+            ["docker", "exec", name, "cat", str(target)],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout

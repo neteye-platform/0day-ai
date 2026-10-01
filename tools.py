@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Optional, Any, Union
 import json
 from langchain_core.messages import ToolMessage
 import requests
@@ -17,6 +17,7 @@ from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol
 from languages import MANIFEST_NAMES
 import settings
 import browser_tools
+import attacker_tools
 
 
 @tool
@@ -459,30 +460,48 @@ def submit_evaluation(
 def send_http_request(
     method: str,
     endpoint: str,
-    headers: dict,
-    state: Annotated[dict, InjectedState],
-    body: str = "",
+    headers: Optional[dict[str, str]] = None,
+    params: Optional[dict[str, Any]] = None,
+    data: Optional[dict[str, Any]] = None,
+    json_data: Optional[dict[str, Any]] = None,
+    files: Optional[dict[str, Union[str, tuple[str, str, str]]]] = None,
+    body: Optional[str] = None,
+    follow_redirects: bool = True,
     reset_session: bool = False,
-    extract_mode: str = "clean_html"
+    extract_mode: str = "clean_html",
+    state: Annotated[Optional[dict], InjectedState] = None,
 ) -> tuple[str, dict]:
     """
-    Sends an HTTP request to the sandboxed application. Use this for testing web endpoints.
-    This tool preserve session by default, so that you can register and account and login.
-    Use reset_session=True to clear the current session cookies.
+    Sends an HTTP request to the sandboxed application and maintains session state. Always returns raw response headers. The response body is parsed according to 'extract_mode'.
 
-    extract_mode options:
-    - 'clean_html' (default): Returns HTML with scripts/styles removed to save tokens.
-    - 'forms': Returns ONLY the <form> elements on the page.
-    - 'links': Returns ONLY the <a> tags.
-    - 'text': Returns only the visible text (good for reading error messages).
-    - 'raw': Returns the untouched body (use cautiously, may truncate).
-    - ANY CUSTOM TAG: Enter any HTML tag (e.g., 'script', 'input', 'iframe') to extract only those elements.
+    Parameters:
+    - method: HTTP method ('GET', 'POST', 'PUT', 'DELETE', etc.).
+    - endpoint: Target URL or path.
+    - headers: Optional dictionary of HTTP headers.
+    - params: Optional query parameters for the URL.
+    - data: Form fields sent as 'application/x-www-form-urlencoded' (e.g., {'username': 'u', 'password': 'p'}).
+    - json_data: Structured payload serialized automatically as 'application/json'.
+    - files: Files for multipart/form-data upload. Paths inside the attacker
+             workdir (default /work, i.e. files created with write_attacker_file)
+             are read from inside the attacker container; all other paths are
+             read from the host.
+             Format: {'field_name': '/path/to/file'}
+             Or with metadata: {'field_name': ('custom_filename.png', '/path/to/file', 'image/png')}
+    - body: Raw string body (used only if neither data, json_data, nor files is provided).
+    - follow_redirects: Whether to follow 301/302 redirects automatically (default True).
+    - reset_session: Clears stored cookies and session state before executing.
+    - extract_mode:
+            'clean_html' (default): Returns HTML with scripts/styles removed to save tokens.
+            'forms': Returns ONLY the <form> elements on the page.
+            'links': Returns ONLY the <a> tags.
+            'text': Returns only the visible text (good for reading error messages).
+            'raw': Returns the untouched body (use cautiously, may truncate).
+            ANY CUSTOM TAG: Enter any HTML tag (e.g., 'script', 'input', 'iframe') to extract only those elements.
     """
-    # WARNING: You can only call this a maximum of 4 times before you must use the `take_notes` tool. Plan your batches accordingly.
 
     # Build the full URL from the endpoint parameter
     endpoint = endpoint.strip()
-    sandbox_url = state.get("sandbox_url")
+    sandbox_url = state.get("sandbox_url") if state else None
     if not sandbox_url:
         return "Error: No sandbox is configured. The preprocessor could not start a sandbox container.", {}
     if endpoint.startswith(("http://", "https://")):
@@ -501,13 +520,45 @@ def send_http_request(
         session.cookies.update(state.get("cookies", {}))
 
     try:
-        response = session.request(
-            method=method,
-            url=url,
-            headers=headers,
-            data=body,
-            timeout=5
-        )
+        request_kwargs = {
+            "method": method,
+            "url": url,
+            "headers": headers,
+            "params": params,
+            "timeout": 5,
+            "allow_redirects": follow_redirects,
+        }
+
+        user_data = None
+        if json_data is not None:
+            request_kwargs["json"] = json_data
+        elif files is not None:
+            uploads = {}
+            for field, spec in files.items():
+                path = spec if isinstance(spec, (str, Path)) else spec[1]
+                container_bytes = attacker_tools.read_attacker_file_bytes(str(path))
+                if container_bytes is not None:
+                    if isinstance(spec, (str, Path)):
+                        uploads[field] = (
+                            Path(path).name, container_bytes, "application/octet-stream"
+                        )
+                    else:
+                        filename, _, content_type = spec
+                        uploads[field] = (filename, container_bytes, content_type)
+                else:
+                    uploads[field] = spec
+            request_kwargs["files"] = uploads
+            if data is not None:
+                user_data = data
+        elif data is not None:
+            user_data = data
+        elif body is not None:
+            user_data = body
+
+        if user_data is not None:
+            request_kwargs["data"] = user_data
+
+        response = session.request(**request_kwargs)
 
         raw_headers = "\r\n".join(f"{k}: {v}" for k, v in response.headers.items())
         http_response_head = f"HTTP/1.1 {response.status_code} {response.reason}\n{raw_headers}\r\n\r\n"
