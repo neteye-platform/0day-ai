@@ -3,6 +3,7 @@ import settings
 import logging
 import argparse
 from typing import List, Dict, Any
+from collections import defaultdict
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
@@ -267,6 +268,16 @@ def reviewer_node(state: MasterState):
         logger.debug("No reports to review. Skipping.")
         return {"filtered_reports": []}
 
+    # Group the reports by vulnerability and sink_node
+    grouped_reports = defaultdict(list)
+    for report in reports:
+        # Use .get() in case a dictionary is malformed
+        vuln = report.get("vulnerability", "Unknown")
+        sink = report.get("sink_node", "Unknown")
+        grouped_reports[(vuln, sink)].append(report)
+
+    logger.debug(f"Consolidated {len(reports)} raw reports into {len(grouped_reports)} unique groups.")
+
     # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
     llm = ChatOpenAI(
         base_url="http://localhost:11434/v1",
@@ -281,8 +292,21 @@ def reviewer_node(state: MasterState):
     ))
 
     valid_reports = []
-    for report in reports:
-        human_msg = HumanMessage(content=f"Vulnerability report to evaluate:\n{report}")
+    for (vuln, sink), group in grouped_reports.items():
+
+        # Format the group into a single, clean string for the LLM
+        formatted_group_text = f"Vulnerability: {vuln}\nSink Node: {sink}\n\nInstances found:\n"
+        for idx, item in enumerate(group, 1):
+            traces = item.get("trace_nodes", [])
+            trace_str = ", ".join(traces) if traces else "None"
+            formatted_group_text += (
+                f"  --- Instance {idx} ---\n"
+                f"  Role: {item.get('role', 'Unknown')}\n"
+                f"  Details: {item.get('details', '')}\n"
+                f"  Trace Nodes: {trace_str}\n"
+            )
+
+        human_msg = HumanMessage(content=f"Vulnerability report to evaluate:\n{formatted_group_text}")
 
         response_msg = llm.invoke([sys_msg, human_msg])
         response = parser.invoke(response_msg)
