@@ -27,7 +27,9 @@ from utils import (
 def _pack_node_batches(file_nodes: list[str], threshold: int,
                        node_map: dict, sub_nodes_index: dict) -> list[list[str]]:
     """Greedily pack node ids into batches whose combined code+context size
-    stays below `threshold`; an oversized node becomes its own batch."""
+    stays below `threshold`; an oversized node becomes its own batch (it is
+    then skipped by the explorer_max_prompt_chars guard in _explore_single/
+    _explore_batch, never sent whole to the LLM)."""
     batches: list[list[str]] = []
     current: list[str] = []
     current_len = 0
@@ -229,6 +231,17 @@ def _explore_single(node_id: str, role_name: str) -> dict:
     context = format_node_context(graph_data, node_id)
     context_block = f"{context}\n\n" if context else ""
 
+    prompt_size = len(source_code or "") + len(context)
+    if prompt_size > settings.explorer_max_prompt_chars:
+        logging.warning(
+            f"Skipping oversized explorer node {node_id}: prompt would be "
+            f"{prompt_size} chars > explorer_max_prompt_chars "
+            f"{settings.explorer_max_prompt_chars}; explorer prompts get no "
+            "compaction, a 400 is deterministic."
+        )
+        _record_stat("explorer_nodes_skipped_oversized")
+        return {"notes": [], "vulnerabilities": []}
+
     if target_node.get("source_file", "").endswith(target_node.get("label", "")):
         user_prompt = (
             f"{context_block}"
@@ -283,6 +296,7 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
 
     node_map = get_node_map(settings.graph)
     sections = []
+    oversized = 0
     for node_id in node_ids:
         target_node = node_map.get(node_id, {})
         source_code = get_node_code(node_id)
@@ -290,6 +304,16 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
         context_block = format_node_context(graph_data, node_id)
         if context_block:
             context_block += "\n\n"
+        if len(source_code or "") + len(context_block) > settings.explorer_max_prompt_chars:
+            # Same guard as the single-node path: no compaction here, and the
+            # batch packer lets an oversized node ride solo past its threshold.
+            logging.warning(
+                f"Skipping oversized explorer node {node_id} in batch: "
+                f"{len(source_code or '') + len(context_block)} chars > "
+                f"explorer_max_prompt_chars {settings.explorer_max_prompt_chars}."
+            )
+            oversized += 1
+            continue
         if target_node.get("source_file", "").endswith(target_node.get("label", "")):
             sections.append(
                 f"### Node '{node_id}' ({label}) — entire file skeleton\n"
@@ -306,6 +330,11 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
                 f"Report vulnerabilities affecting this specific node using ONLY the ID '{node_id}'.\n"
                 f"```python\n{source_code}\n```"
             )
+
+    if oversized:
+        _record_stat("explorer_nodes_skipped_oversized", oversized)
+    if not sections:
+        return {"notes": [], "vulnerabilities": []}
 
     user_prompt = (
         "Analyze each of the following nodes independently. "

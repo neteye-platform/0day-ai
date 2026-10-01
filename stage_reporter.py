@@ -175,6 +175,7 @@ def _build_pipeline_statistics(state: MasterState) -> str:
     for label, key in (
         ("Demands skipped at output cap (verifier)", "verifier_demands_skipped_output_cap"),
         ("Explorer nodes skipped at output cap", "explorer_nodes_skipped_output_cap"),
+        ("Explorer nodes skipped (prompt over explorer_max_prompt_chars)", "explorer_nodes_skipped_oversized"),
         ("CVE analyses skipped at output cap", "cve_analyses_skipped_output_cap"),
         ("Threat-intel enrichments skipped at output cap", "threat_intel_skipped_output_cap"),
         ("Edge-traversal batches skipped at output cap", "edge_traversal_batches_skipped_output_cap"),
