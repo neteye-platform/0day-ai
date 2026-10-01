@@ -119,7 +119,8 @@ def _route_downstream(demand: dict, current_node_id: str, graph_data: dict, grou
     clean_target = _TARGET_ARGS_RE.sub('', target_str).replace('`', '').strip()
     module, symbol = parse_call_target(clean_target)
 
-    if target_node_id := resolve_node_id(module, symbol, caller_node_id=current_node_id):
+    target_node_id, miss = resolve_node_id(module, symbol, caller_node_id=current_node_id)
+    if target_node_id:
         if target_node_id == current_node_id:
             # Drop assumptions about the node under analysis
             return
@@ -128,11 +129,21 @@ def _route_downstream(demand: dict, current_node_id: str, graph_data: dict, grou
             "type": "explorer_downstream_assumption",
             "description": desc
         })
-    elif warning_once(
-        ("downstream_drop", module, symbol),
-        f"[{current_node_id}] DOWNSTREAM DROP: Could not resolve '{module}' / '{symbol}' (Original: {target_str})",
-    ):
-        _record_stat("demands_dropped_unresolved_unique")
+    else:
+        # Tiered by the resolver's miss reason: expected misses (PHP/JS
+        # builtins, vendor classes the graph never contained, ambiguous bare
+        # names the resolver refuses to guess) are INFO; only a first-party
+        # class without the named member (hallucinated method / misattributed
+        # static receiver) is a real WARNING.
+        code, detail = miss
+        log = warning_once if code in ("method-absent", "no-symbol") else info_once
+        if log(
+            ("downstream_drop", module, symbol),
+            f"[{current_node_id}] DOWNSTREAM DROP: Could not resolve '{module}' / "
+            f"'{symbol}' (Original: {target_str}) — {detail}",
+        ):
+            _record_stat("resolve_targets_unresolved_unique")
+            _record_stat("demands_dropped_unresolved_unique")
 
 
 _CLASS_PROP_WINDOW_LINES = 400
@@ -325,7 +336,12 @@ def _route_upstream(demand: dict, current_node_id: str, callers_map: dict, group
             # Bare member call on a container: deliver via the member's edges.
             qualified = list(callers_map.get(container_members[current_node_id][symbol.lower()], []))
         else:
-            resolved = resolve_node_id(module, symbol, caller_node_id=current_node_id)
+            # A resolution miss is NOT an error here: the caller-invokes-symbol
+            # filter below is the routing oracle and can route the demand
+            # without a resolvable target node. Nothing is logged unless the
+            # demand actually ends up with no qualified caller (UPSTREAM
+            # SCOPE DROP).
+            resolved, _miss = resolve_node_id(module, symbol, caller_node_id=current_node_id)
             precise_callers = []
             if resolved and resolved != current_node_id:
                 resolved_node = (node_map or {}).get(resolved) or {}

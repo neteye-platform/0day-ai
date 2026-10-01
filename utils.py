@@ -119,19 +119,33 @@ _CALL_SITE_RE = re.compile(
 )
 
 
-def _repair_call_edges(graph_data: dict) -> None:
-    """Retarget ``calls`` edges graphify mis-bound to a class container.
+def _member_map_from_graph(graph_data: dict) -> dict[str, dict[str, str]]:
+    """``container_id -> {method_name_lower: member_node_id}`` for a graph.
 
-    The correct member is recovered from the edge's own call line (one regex
-    pass, no parser): one match retargets, several fan out, none keeps the
-    original edge. In memory only — node ids never change, caches never bust.
-    """
+    The graph's ``method``-relation edges are the authoritative membership
+    map and win. The legacy ``<container_id>_<method>`` id convention is a
+    fallback for member nodes lacking a ``method`` edge — it BREAKS whenever
+    graphify's collision-avoidance renames the class node
+    (``src_change_php_src_change_change`` vs member
+    ``src_change_change_gettypename``), which is exactly why the edges take
+    precedence. Non-method member labels (``#privateField`` accessors) are
+    skipped: they are never call targets."""
     nodes = {
         n["id"]: n
         for n in graph_data.get("nodes", [])
         if n.get("id")
     }
     members: dict[str, dict[str, str]] = {}
+    for edge in graph_data.get("links", []):
+        if edge.get("relation") != "method":
+            continue
+        container = nodes.get(edge.get("source") or "")
+        member = nodes.get(edge.get("target") or "")
+        if not container or not member:
+            continue
+        match = _MEMBER_LABEL_RE.match(member.get("label") or "")
+        if match:
+            members.setdefault(container["id"], {})[match.group(1).lower()] = member["id"]
     for nid, node in nodes.items():
         match = _MEMBER_LABEL_RE.match(node.get("label") or "")
         if not match:
@@ -149,7 +163,23 @@ def _repair_call_edges(graph_data: dict) -> None:
             or _MEMBER_LABEL_RE.match(parent.get("label") or "")
         ):
             continue
-        members.setdefault(parent_id, {})[match.group(1).lower()] = nid
+        members.setdefault(parent_id, {}).setdefault(mname, nid)
+    return members
+
+
+def _repair_call_edges(graph_data: dict) -> None:
+    """Retarget ``calls`` edges graphify mis-bound to a class container.
+
+    The correct member is recovered from the edge's own call line (one regex
+    pass, no parser): one match retargets, several fan out, none keeps the
+    original edge. In memory only — node ids never change, caches never bust.
+    """
+    nodes = {
+        n["id"]: n
+        for n in graph_data.get("nodes", [])
+        if n.get("id")
+    }
+    members = _member_map_from_graph(graph_data)
     if not members:
         return
 
@@ -821,28 +851,10 @@ def clear_warning_state() -> None:
 
 def build_container_members(graph_data: dict) -> dict[str, dict[str, str]]:
     """``container_id -> {method_name_lower: member_node_id}`` for class-like
-    nodes. A member node id is ``<container_id>_<method_name>``, its label is
-    ``.method()`` and it shares the container's ``source_file``; the container
-    itself is a non-member node. Same id-derivation as ``_repair_call_edges``."""
-    nodes = {n["id"]: n for n in graph_data.get("nodes", []) if n.get("id")}
-    members: dict[str, dict[str, str]] = {}
-    for nid, node in nodes.items():
-        match = _MEMBER_LABEL_RE.match(node.get("label") or "")
-        if not match:
-            continue
-        mname = match.group(1).lower()
-        if not nid.endswith("_" + mname):
-            continue
-        base = nid[: len(nid) - len(mname) - 1]
-        parent = nodes.get(base)
-        if (
-            not parent
-            or parent.get("source_file") != node.get("source_file")
-            or _MEMBER_LABEL_RE.match(parent.get("label") or "")
-        ):
-            continue
-        members.setdefault(base, {})[mname] = nid
-    return members
+    nodes. Membership comes from the graph's ``method`` edges, with the id
+    convention ``<container_id>_<method>`` (label ``.method()``, same
+    ``source_file``) only as fallback — see ``_member_map_from_graph``."""
+    return _member_map_from_graph(graph_data)
 
 
 def _norm_node_label(label) -> str:
@@ -893,6 +905,17 @@ def _resolver_indexes() -> dict:
         node_tuples.append((nid, source_file.replace("\\", "/").lower(), lower_label))
         exact_index.setdefault(_norm_node_label(n.get("label", "")), []).append(nid)
         labels[nid] = lower_label
+    # Class-like nodes with zero extracted members (``class X extends Y {}``
+    # — GLPI's style, every behaviour inherited) must still be hintable:
+    # without registering them the ancestor walk in ``_inherited_member``
+    # can never start, and ``X::add`` misses although CommonDBTM::add has a
+    # node. Class-relation endpoints are the authoritative class-node test.
+    for edge in graph_data.get("links", []):
+        if edge.get("relation") not in _CLASS_RELATIONS:
+            continue
+        for endp in (edge.get("source"), edge.get("target")):
+            if endp in node_ids:
+                members.setdefault(endp, {})
     for cid in members:
         label_key = _norm_node_label(nodes_by_id[cid].get("label", ""))
         if label_key:
@@ -1011,6 +1034,22 @@ def parse_call_target(clean_target: str) -> tuple[str, str]:
 def resolve_node_id(module, symbol, caller_node_id=None):
     """Resolve an explorer's ``target`` (module + symbol) to a graph node id.
 
+    Returns ``(node_id, miss)``: on a hit ``miss`` is ``""``; on a miss
+    ``node_id`` is ``None`` and ``miss`` is a ``(code, detail)`` pair the
+    caller uses to tier its log line — this function never logs misses
+    itself (the upstream routing caller falls back to caller filtering and
+    successfully ROUTES the demand, so a miss is not an error there):
+
+    - ``global-none``      moduleless symbol with no graph node (PHP/JS
+      builtins, vendor helpers, placeholder literals) — expected miss
+    - ``global-ambiguous`` shared bare label, resolution refused BY DESIGN
+      (misrouting a security demand beats a coin flip)
+    - ``class-absent``     the hint names no class in the graph at all
+      (vendor code, JS vars, hallucinated receivers) — expected miss
+    - ``method-absent``    first-party class, no own or inherited member node
+      (hallucinated method name or static receiver misattribution) — the
+      only actionable miss, worth a WARNING
+
     ``caller_node_id`` enables caller-scoped resolution: a module of
     ``parent``/``self``/``static``/``this``/``$this`` maps to the caller's own
     container (``parent`` = direct parents, ``self``/``static`` = the whole
@@ -1026,7 +1065,7 @@ def resolve_node_id(module, symbol, caller_node_id=None):
     symbol = (symbol or "").strip()
     if not symbol:
         warning_once(("resolve", "no-symbol"), "No symbol provided to resolve_node_id.")
-        return None
+        return None, ("no-symbol", "no symbol provided")
 
     idx = _resolver_indexes()
     lower_mod = module.lower()
@@ -1049,7 +1088,7 @@ def resolve_node_id(module, symbol, caller_node_id=None):
                 mid = idx["members"].get(cid, {}).get(base)
                 if mid:
                     _record_stat("demand_nodes_resolved_fallback")
-                    return mid
+                    return mid, ""
         # A pronoun missing class scope may still be a global helper
         # (e.g. ``parent::_n(...)``): fall through as moduleless.
         module = ""
@@ -1109,13 +1148,13 @@ def resolve_node_id(module, symbol, caller_node_id=None):
         if strict_hit or loose_hit:
             if strict_hit is None:
                 _record_stat("demand_nodes_resolved_fallback")
-            return strict_hit or loose_hit
+            return strict_hit or loose_hit, ""
         # The hint may name a class that INHERITS the method (defined on a
         # grand- or great-grandparent): walk the class closure before failing.
         mid = _inherited_member(idx, lower_class or base_module_name, lower_symbol_member)
         if mid:
             _record_stat("demand_nodes_resolved_fallback")
-            return mid
+            return mid, ""
         # The hint may instead name an ANCESTOR of the caller while the method
         # is defined on the caller's own class (the explorer attributed a
         # self::/static:: call to the parent it is inherited through, e.g.
@@ -1128,7 +1167,7 @@ def resolve_node_id(module, symbol, caller_node_id=None):
                     mid = idx["members"].get(cid, {}).get(lower_symbol_member)
                     if mid:
                         _record_stat("demand_nodes_resolved_fallback")
-                        return mid
+                        return mid, ""
     else:
         # No hint at all: global exact match only. When the label is shared by
         # several nodes, a bare call resolves to the function-style label node
@@ -1138,30 +1177,37 @@ def resolve_node_id(module, symbol, caller_node_id=None):
         hits = idx["exact"].get(lower_symbol_member, [])
         if len(hits) == 1:
             _record_stat("demand_nodes_resolved_fallback")
-            return hits[0]
+            return hits[0], ""
         fn_style = [
             nid for nid in hits
             if idx["labels"][nid] in (lower_symbol, lower_symbol_paren)
         ]
         if len(fn_style) == 1:
             _record_stat("demand_nodes_resolved_fallback")
-            return fn_style[0]
-        if warning_once(
-            ("resolve", "moduleless", lower_symbol, len(hits), len(fn_style)),
-            f"Failed to find graph node for [global] '{symbol}' "
-            f"({'no exact-label node' if not hits else f'{len(hits)} exact-label nodes ({len(fn_style)} function-style): ambiguous'}).",
-        ):
-            _record_stat("resolve_targets_unresolved_unique")
-        return None
+            return fn_style[0], ""
+        if hits:
+            return None, (
+                "global-ambiguous",
+                f"{len(hits)} exact-label nodes ({len(fn_style)} function-style): "
+                f"ambiguous, refusing to guess the class",
+            )
+        return None, ("global-none", "no exact-label node in the graph")
 
-    # Better logging to help debug what was actually searched
-    search_mod = module if module else "global"
-    if warning_once(
-        ("resolve", search_mod, lower_symbol, lower_class),
-        f"Failed to find graph node for [{search_mod}] '{symbol}' (Class: {class_name}).",
-    ):
-        _record_stat("resolve_targets_unresolved_unique")
-    return None
+    # Hinted and unresolved: distinguish "the class is simply not first-party"
+    # (vendor code / hallucinated receiver — never in the graph, expected)
+    # from "first-party class without this member" (hallucinated method name
+    # or a static receiver misattribution — the actionable case).
+    if _class_ids_for_hint(idx, lower_class or base_module_name):
+        return None, (
+            "method-absent",
+            f"class '{lower_class or base_module_name}' is in the graph but has no "
+            f"'{lower_symbol}' member of its own or inherited",
+        )
+    return None, (
+        "class-absent",
+        f"no class/module '{lower_class or base_module_name}' exists in the graph "
+        f"(vendor code, external library, or hallucinated receiver)",
+    )
 
 
 def _run_osv(cmd: list, label: str, skip_os: bool = False) -> list | None:
