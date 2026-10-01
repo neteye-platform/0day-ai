@@ -395,16 +395,19 @@ class ToolLoopAgent:
 
     def _log_progress_completion(self, state, note: str = "") -> None:
         """Advance the dispatch's progress ledger on a terminal route; no-op
-        for agents without a `progress_label`. The status of the resolved
-        record (when one is already in the channel) enriches the log line."""
+        for agents without a `progress_label`. Carries the HIT/MISS cache tag
+        (pre_agent writes cache_tag='HIT'; anything else went through the
+        loop) and the resolved record's status to enrich the log line."""
         if not self.progress_label:
             return
-        detail = self._subject(state)
+        tag = state.get("cache_tag") or "MISS"
+        detail = f"{self._subject(state)}, {tag}"
         detail += f", turns={state.get('iterations', 0)}"
         records = state.get("vulnerabilities") or []
         if records:
             detail += f", status={as_dict(records[-1]).get('status', 'unknown')}"
-        if note:
+        # A HIT is by definition zero-LLM-turn; the note would be redundant.
+        if note and tag != "HIT":
             detail += f", {note}"
         _log_agent_completion(
             state.get("progress_id", ""), self.progress_label, detail
@@ -416,7 +419,8 @@ class ToolLoopAgent:
         """Return the LLM bound to this agent's tool subset for this state."""
         raise NotImplementedError
 
-    # Verdict label used in the base pre_agent's cache-hit log line.
+    # Verdict label used in the cache-hit log line for agents WITHOUT a
+    # progress ledger (ledger agents carry HIT on the progress line instead).
     cache_hit_label: str = "Agent"
     # Opt-in fan-out progress label: when set, the router advances the
     # dispatch's progress ledger (state["progress_id"]) on every terminal
@@ -433,8 +437,12 @@ class ToolLoopAgent:
             return None
         cached = self.cached_verdict(state)
         if cached:
-            logging.info(f"{self.cache_hit_label} cache hit.")
-            return Command(update={"vulnerabilities": [cached]})
+            if not self.progress_label:
+                logging.info(f"{self.cache_hit_label} cache hit.")
+                return Command(update={"vulnerabilities": [cached]})
+            # Ledger agents get no separate line: the HIT rides on the
+            # progress completion produced by the pre_router terminal route.
+            return Command(update={"vulnerabilities": [cached], "cache_tag": "HIT"})
         return None
 
     def first_turn(self, state, llm_with_tools) -> dict:

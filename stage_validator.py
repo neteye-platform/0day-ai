@@ -279,7 +279,8 @@ class ValidatorAgent(ToolLoopAgent):
         if cached[0] is None:
             return cmd
         return Command(update={
-            "vulnerabilities": tools.propagate_validation_update(state, cached[0])
+            "vulnerabilities": tools.propagate_validation_update(state, cached[0]),
+            "cache_tag": "HIT",
         })
 
     def first_turn(self, state, llm_with_tools) -> dict:
