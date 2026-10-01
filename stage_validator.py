@@ -23,7 +23,11 @@ from utils import (
     boundary_deferred,
     cache_validator,
     cvss_gate_blocks,
+    dispatch_claim_taken,
+    ensure_sandbox_reachable,
     get_node_code,
+    info_once,
+    take_dispatch_claim,
     take_feedback_dispatch,
 )
 
@@ -98,6 +102,7 @@ def dispatch_validators(state: MasterState):
     )
 
     direct: list[dict] = []
+    pending_claims: list[tuple] = []
     for evaluation in confirmed_vulns:
         strategy = evaluation.get("validation_strategy") or "direct_to_validator"
         if strategy == "static_finding_only":
@@ -139,6 +144,24 @@ def dispatch_validators(state: MasterState):
                 f"will be reported unvalidated."
             )
             continue
+        # One claim per (record, lifecycle position): re-entries from the
+        # feedback loop (review_round bump) or a fresh patch cycle (patch_round
+        # bump) re-validate, but a firing while THIS validation run is still in
+        # flight (status still 'confirmed') is a duplicate. Claims are only
+        # peeked here and committed after the dead-sandbox abort point, so an
+        # aborted dispatch never burns claims for records that never went out.
+        claim_key = (
+            evaluation.get("vuln_id") or "", "direct",
+            evaluation.get("review_round") or 0, evaluation.get("patch_round") or 0,
+        )
+        if dispatch_claim_taken(*claim_key):
+            info_once(
+                ("validator-direct-claim", *claim_key),
+                f"{evaluation.get('vuln_id')} validation already in flight — "
+                f"duplicate dispatch suppressed.",
+            )
+            continue
+        pending_claims.append(claim_key)
         direct.append(evaluation)
 
     # Batch confirmed records that describe the SAME flaw (identical
@@ -182,6 +205,18 @@ def dispatch_validators(state: MasterState):
             evaluation.get("status") == "false_positive"
             and evaluation.get("patch_state") == "reviewed"
         ):
+            claim_key = (
+                evaluation.get("vuln_id") or "", "patch_verify",
+                evaluation.get("patch_round") or 0,
+            )
+            if dispatch_claim_taken(*claim_key):
+                info_once(
+                    ("validator-fix-proof-claim", *claim_key),
+                    f"{evaluation.get('vuln_id')} fix-proof already in flight — "
+                    f"duplicate dispatch suppressed.",
+                )
+                continue
+            pending_claims.append(claim_key)
             logging.info(
                 f"{evaluation.get('vuln_id')} is a reviewer-cleared PATCHED fix — "
                 f"dispatching dynamic fix-proof."
@@ -192,6 +227,16 @@ def dispatch_validators(state: MasterState):
         # Nothing to validate directly: advance to the integration-audit phase
         # (instead of ENDing) so deferred records still reach the auditor.
         return "integration_audit_dispatch"
+
+    # Dead-sandbox guard: every payload below would only observe an unreachable
+    # target (and cache a bogus verdict). Abort the run resumably instead of
+    # burning the sandbox phase's tokens.
+    ensure_sandbox_reachable(state.get("sandbox_url"), "validator")
+
+    # Past the abort point: commit every peeked claim so the sibling-superstep
+    # re-firings of this dispatcher see them as in flight.
+    for claim_key in pending_claims:
+        take_dispatch_claim(*claim_key)
 
     # Ledger id shared by the fan-out: the base router advances it (and logs
     # turns=) on every validator terminal route.

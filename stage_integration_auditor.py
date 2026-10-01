@@ -13,7 +13,15 @@ from run_stats import _record_stat, _start_agent_progress, affected_nodes_label,
 from schemas import INTEGRATION_AUDITOR_AGENT
 from state import IntegrationAuditorState, MasterState, ValidatorState
 from tool_loop import CompactionConfig, ToolLoopAgent
-from utils import append_note, boundary_deferred, cache_integration_auditor, cvss_gate_blocks
+from utils import (
+    append_note,
+    boundary_deferred,
+    cache_integration_auditor,
+    cvss_gate_blocks,
+    ensure_sandbox_reachable,
+    info_once,
+    take_dispatch_claim,
+)
 
 
 def dispatch_integration_audits(state: MasterState):
@@ -80,8 +88,29 @@ def dispatch_integration_audits(state: MasterState):
         # Validator/auditor phases fully drained: advance to reporter dispatch.
         return "reporter_dispatch"
 
+    # The audit loops may drive live sandbox tools and their verdicts are
+    # cached: never let one born against a dead sandbox poison the audit cache.
+    ensure_sandbox_reachable(state.get("sandbox_url"), "integration audit")
+
+    # One claim per (record, re-audit trigger): the record keeps its
+    # 'confirmed' status while its auditor run is in flight, so every later
+    # status-based re-firing of this dispatcher would burn a second full audit;
+    # a reviewer re-answer (review_round bump) or a new patch cycle
+    # (patch_round bump) re-keys and legitimately re-audits.
     commands = []
     for evaluation in pending:
+        claim_key = (
+            evaluation.get("vuln_id") or "", "audit",
+            evaluation.get("review_round") or 0,
+            evaluation.get("patch_round") or 0,
+        )
+        if not take_dispatch_claim(*claim_key):
+            info_once(
+                ("integration-audit-claim", *claim_key),
+                f"{evaluation.get('vuln_id')} chain audit already in flight — "
+                f"duplicate dispatch suppressed.",
+            )
+            continue
         others = [
             v for v in proven
             if v.get("vuln_id") != evaluation.get("vuln_id")
@@ -337,12 +366,31 @@ def route_integration_audit(state: MasterState):
         return "reporter_dispatch"
 
     by_id = {v.get("vuln_id"): v for v in all_vulns}
+    # Chained validators hammer the live sandbox for their PoC construction:
+    # abort resumably rather than cache verdicts against a dead target.
+    ensure_sandbox_reachable(state.get("sandbox_url"), "chained validation")
     # Ledger for this validator wave too: chained records log their terminal
     # validator line (status + turns) like the direct-dispatch ones do.
     progress_id = _start_agent_progress(len(chained))
     commands = []
     for record in chained:
         peer_ids = record.get("chained_with") or []
+        # One claim per (record, round, peer-set): `route_integration_audit`
+        # re-fires after every validator superstep while earlier chained runs
+        # are still in flight (status stays 'chained' until the re-validation
+        # lands); a genuine re-chain with a different proven peer set (or after
+        # a feedback round) still gets its fresh key and dispatches.
+        claim_key = (
+            record.get("vuln_id") or "", "chained",
+            record.get("review_round") or 0, tuple(sorted(peer_ids)),
+        )
+        if not take_dispatch_claim(*claim_key):
+            info_once(
+                ("chained-dispatch-claim", *claim_key),
+                f"{record.get('vuln_id')} chained validation already in flight — "
+                f"duplicate dispatch suppressed.",
+            )
+            continue
         peer_payloads = []
         for vid in peer_ids:
             peer = by_id.get(vid)
