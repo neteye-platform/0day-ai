@@ -183,6 +183,12 @@ embeddings_model = "embeddinggemma"
 embeddings_base_url = "http://localhost:11434"
 embeddings_timeout = 60
 
+# When True, the Threat Intel agent enriches HIGH/CRITICAL CVEs with external
+# web evidence (Tavily). Set to False to skip the threat_intel node entirely
+# (and its Tavily calls/LLM tokens); the join barrier still fires via a no-op
+# task, and CVE analyzer results are used as-is.
+threat_intel_enabled = False
+
 # When True, the preprocessor always rebuilds the container image even if the
 # build definition (Dockerfile/compose) is unchanged since the last run.
 force_rebuild = False
