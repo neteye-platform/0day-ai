@@ -15,13 +15,14 @@ Design / lifecycle
   the container is started on the default bridge network under a pinned name.
   A stale container of the same name is replaced; after that the running box is
   reused without any build cost.
-- BRIDGE + TARGET REWRITE: the sandbox is published on the host loopback
-  (``sandbox_url`` = ``http://127.0.0.1:<port>``). Inside a bridge-network
-  container the host is reachable at the docker bridge gateway (e.g. 172.17.0.1),
-  so every ``run_command`` result prints a ``SHELL TARGET`` header of the form
-  ``http://<gateway>:<port>`` the LLM must use for its commands, derived from
-  the ValidatorState ``sandbox_url``. ``sandbox_url`` itself stays untouched for
-  ``send_http_request``.
+- BRIDGE + TARGET REWRITE: the sandbox is published on all host interfaces and
+  is reachable from both the host and the attacker container at the docker bridge
+  gateway (e.g. 172.17.0.1). The preprocessor sets ``sandbox_url`` to that gateway
+  URL for every validator path, so ``run_command`` no longer needs a different
+  address. ``shell_target`` still derives the gateway host from ``sandbox_url``
+  (idempotent: it already is the gateway) and every ``run_command`` result echoes
+  it as a ``SHELL TARGET`` header, identical to the ``sandbox_url`` the other
+  tools use.
 - FAIL OPEN: if docker is absent, the daemon is down, the image cannot be
   built, or the container cannot start, the tools report "attacker container
   unavailable" and the validator continues with its HTTP/browser tools.
@@ -44,6 +45,7 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
 import settings
+from utils import docker_bridge_gateway
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +133,7 @@ class AttackerManager:
                 return None
 
             self._container_name = name
-            self._gateway = self._bridge_gateway()
+            self._gateway = docker_bridge_gateway()
             if self._gateway is None:
                 logger.warning(
                     "Could not discover the docker bridge gateway; commands still "
@@ -249,35 +251,17 @@ class AttackerManager:
         logger.info("Started attacker container '%s' from image %s.", name, image)
         return True
 
-    @staticmethod
-    def _bridge_gateway() -> str | None:
-        """Discover the docker default-bridge gateway IP (e.g. 172.17.0.1)."""
-        try:
-            r = subprocess.run(
-                [
-                    "docker", "network", "inspect", "bridge",
-                    "--format", "{{(index .IPAM.Config 0).Gateway}}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
-            logger.warning("Failed to resolve bridge gateway: %s", e)
-            return None
-        if r.returncode != 0:
-            return None
-        gw = r.stdout.strip()
-        return gw or None
-
     # -- target rewrite ---------------------------------------------------------
 
     def shell_target(self, state) -> str | None:
-        """Rewrite ``sandbox_url`` to the URL reachable from the attacker box.
+        """Return the sandbox URL reachable from the attacker box.
 
-        ``sandbox_url`` is ``http://127.0.0.1:<published_port>``; inside a
-        bridge container the host is at ``self._gateway``. Returns
-        ``http://<gateway>:<port>`` or None when no reachable target is known.
+        ``sandbox_url`` is already the docker bridge gateway URL (e.g.
+        ``http://172.17.0.1:<port>``); inside the bridge-networked attacker
+        container the host is at ``self._gateway``. This rewrites the host to
+        ``self._gateway`` (idempotent when ``sandbox_url`` already uses it) and
+        returns ``http://<gateway>:<port>``, or None when no reachable target is
+        known.
         """
         if not self._gateway:
             return None
@@ -368,11 +352,8 @@ def run_command(
     a PoC, or retrieve evidence that HTTP/browser tools cannot (e.g. raw TCP,
     TLS fingerprinting, payload fuzzing).
 
-    The sandbox application is published to the host loopback, so from inside
-    the attacker container it is reachable through the docker bridge gateway.
-    The result header always prints the SHELL TARGET URL you must use for
-    requests to the app (instead of 127.0.0.1). Standard tools and a fresh
-    root shell with full Kali packages are available.
+    The sandbox application is published on all host interfaces and is reachable
+    from inside the attacker container through the IP address of the ``sandbox_url``
 
     Args:
         command (str): The shell command to run, e.g.

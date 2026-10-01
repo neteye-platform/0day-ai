@@ -738,10 +738,41 @@ def _published_ports(container_name: str) -> list[int]:
     return ports
 
 
-def _probe_http_ports(ports: list[int]) -> str | None:
+def docker_bridge_gateway() -> str | None:
+    """Discover the docker default-bridge gateway IP (e.g. 172.17.0.1).
+
+    The sandbox is published on ``0.0.0.0``, so it is reachable from both the
+    host and any bridge-networked container (the attacker box) via this gateway
+    address. Returning it lets every validator path (HTTP request, browser,
+    attacker shell) share one target URL. Returns ``None`` if it cannot be
+    resolved, so callers can fall back to ``127.0.0.1``."""
+    try:
+        r = subprocess.run(
+            [
+                "docker", "network", "inspect", "bridge",
+                "--format", "{{(index .IPAM.Config 0).Gateway}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
+        logging.warning("Failed to resolve bridge gateway: %s", e)
+        return None
+    if r.returncode != 0:
+        return None
+    gw = r.stdout.strip()
+    return gw or None
+
+
+def _probe_http_ports(ports: list[int]) -> int | None:
     """Wait up to ``SANDBOX_START_TIMEOUT`` for any candidate host port to
-    answer an HTTP request. Returns the first responsive ``http://127.0.0.1:<port>``
-    URL or ``None`` if none ever responds."""
+    answer an HTTP request. Probes on the host loopback (``127.0.0.1``) and
+    returns the first responsive port, or ``None`` if none ever responds.
+
+    The returned host is the loopback only; callers should prefer
+    ``docker_bridge_gateway()`` to build the externally-reachable ``sandbox_url``
+    so the host and the attacker container agree on one target address."""
     deadline = time.monotonic() + SANDBOX_START_TIMEOUT
     remaining_ports = list(ports)
 
@@ -752,12 +783,23 @@ def _probe_http_ports(ports: list[int]) -> str | None:
         for port in remaining_ports:
             try:
                 requests.get(f"http://127.0.0.1:{port}", timeout=1)
-                return f"http://127.0.0.1:{port}"
+                return port
             except requests.RequestException:
                 next_ports.append(port)
         remaining_ports = next_ports
         time.sleep(1)
     return None
+
+
+def _sandbox_url_for_port(port: int) -> str:
+    """Build the externally-reachable sandbox URL for a published ``port``.
+
+    Prefers the docker bridge gateway (reachable from both the host and the
+    attacker container); falls back to ``127.0.0.1`` when the gateway cannot be
+    resolved. This keeps every validator tool pointed at the same target IP."""
+    gw = docker_bridge_gateway()
+    host = gw if gw else "127.0.0.1"
+    return f"http://{host}:{port}"
 
 
 def _remove_stale_compose_containers(path: Path) -> None:
@@ -857,8 +899,9 @@ def start_sandbox(kind: str, path: Path, tag: str, app_name: str) -> dict | None
 
         # Prefer the container that publishes a responsive HTTP port
         for container in containers:
-            url = _probe_http_ports(_published_ports(container))
-            if url:
+            port = _probe_http_ports(_published_ports(container))
+            if port:
+                url = _sandbox_url_for_port(port)
                 logging.info(f"Sandbox running: container={container} url={url}")
                 return {"container_name": container, "sandbox_url": url}
 

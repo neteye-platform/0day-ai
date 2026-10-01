@@ -80,8 +80,6 @@ def compile_validator():
     validator_workflow.add_node("validator_fallback", validator_fallback_node)
     validator_workflow.add_node("validator_tools", ToolNode([
         tools.send_http_request,
-        tools.list_files,
-        tools.read_sandbox_file,
         browser_tools.browser_navigate,
         browser_tools.browser_click,
         browser_tools.browser_fill,

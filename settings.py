@@ -86,9 +86,11 @@ browser_idle_timeout_sec = 600
 # Kali attacker container (attacker_tools.py) for the validator: run_command /
 # write_attacker_file / read_attacker_file execute inside a
 # kalilinux/kali-rolling + kali-linux-headless box started lazily on the default
-# bridge network. The sandbox is then reachable from it via the bridge gateway
-# (run_command prints the rewritten SHELL TARGET). Falls open (HTTP-only
-# validation) if docker/build/container startup fails.
+# bridge network. The sandbox is published on all host interfaces and is
+# reachable from the attacker box at the bridge gateway (default 172.17.0.1);
+# the preprocessor sets sandbox_url to that gateway URL so every validator
+# tool (HTTP, browser, attacker shell) shares one target address. Falls open
+# (HTTP-only validation) if docker/build/container startup fails.
 attacker_enabled = True
 attacker_image_tag = "vulnscan-kali-attacker:latest"
 attacker_container_name = "vulnscan-kali-attacker"
