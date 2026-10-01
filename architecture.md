@@ -157,6 +157,6 @@ Analyze interactions between communities to find cross-component and configurati
 
 ## Reporting Phase
 
-- **Reporter (single LLM call):** turn each proven finding into a human-readable section. A terminal barrier collects every reportable record — `exploitable`, `static_finding_only` confirmed, CVSS-gate-skipped confirmed, and patch-verified false positives — then spends exactly one structured LLM call per finding (title, distilled summary, reproduction steps rewritten from the proven PoC, corrected CVSS vector, worst-case impact, remediation). A failed call falls back to the record's own text, so nothing is dropped.
+- **Reporter (single LLM call):** turn each proven finding into a human-readable section. A terminal barrier collects every reportable record (`exploitable`, `static_finding_only` confirmed, CVSS-gate-skipped confirmed) then spends exactly one structured LLM call per finding (title, distilled summary, reproduction steps rewritten from the proven PoC, corrected CVSS vector, worst-case impact, remediation). A failed call falls back to the record's own text, so nothing is dropped.
 - **Assembler:** severity-ranks the sections and writes a fresh `report_<timestamp>/report.pdf` bundling each PoC script (`poc/`) and patch (`patches/`), a deterministic Pipeline Statistics section, and a per-agent Token Usage section.
 - **Token accounting:** every LLM turn in the pipeline is booked to a per-agent ledger (run_stats.py) that feeds the report.
