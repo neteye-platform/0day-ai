@@ -698,20 +698,38 @@ class EdgeTraversalOutput(BaseModel):
 # ==========================================
 
 class ReporterFinding(BaseModel):
-    vuln_id: str = Field(
-        description="The exact vuln_id of the vulnerability this assessment refers to (must match one of the provided records exactly)."
+    summary: str = Field(
+        description="A short, right-to-the-point description of the vulnerability (1-3 sentences) distilling the record's description and reviewer reasoning. Do not restate the whole evidence."
     )
     cvss_vector: str = Field(
-        description="A complete CVSS v3.1 base vector string, e.g. 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'. The pipeline recomputes the numeric base score from it."
+        description=(
+            "A complete CVSS v3.1 BASE vector string, e.g. 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'. "
+            "Pick the metrics honestly from the evidence, using these definitions:\n"
+            "AV  Attack Vector: N(network) / A(adjacent) / L(local) / P(physical)\n"
+            "AC  Attack Complexity: L(low) / H(high)\n"
+            "PR  Privileges Required: N(none) / L(low) / H(high)\n"
+            "UI  User Interaction: N(none) / R(required)\n"
+            "S   Scope: U(unchanged) / C(changed)\n"
+            "C,I,A  Confidentiality / Integrity / Availability impact: H(high) / L(low) / N(none)\n"
+            "Choose metrics that match the proven reproduction: a finding triggered over HTTP by an "
+            "unauthenticated attacker is AV:N/AC:L/PR:N/UI:N/S:U; a client-side XSS requires UI:R; an "
+            "admin-only route is PR:H; a compromise that moves past the vulnerable component into adjacent "
+            "assets (e.g. sandbox escape, RCE that reaches the host) is S:C. "
+            "The pipeline recomputes the numeric base score from this vector."
+        )
     )
     severity: Literal["Critical", "High", "Medium", "Low", "None"] = Field(
         description="Qualitative severity matching the CVSS v3 score ranges (Critical >= 9.0, High >= 7.0, Medium >= 4.0, Low >= 0.1, None = 0.0). Overridden by the pipeline if it disagrees with the vector's computed score."
     )
+    reproduction_steps: list[str] = Field(
+        description="Chronological, self-sufficient reproduction steps for this vulnerability, rewritten/updated from the validator's PoC payload and execution logs so a reader can reproduce it from scratch. State the exact HTTP method, path, parameters/headers/body, carried session state, and the observable evidence of success. Do NOT paste the raw PoC payload or raw execution logs."
+    )
     worst_case_scenario: str = Field(
         description="The decisive answer to 'what is the worst thing that could happen if a malicious actor exploits this vulnerability?', grounded in this vulnerability's real mechanics and the application's actual function."
     )
-    remediation: str = Field(
-        description="The concrete fix (code change, configuration, or library upgrade) that closes this vulnerability."
+    remediation: Optional[str] = Field(
+        default=None,
+        description="The concrete fix (code change, configuration, or library upgrade) that closes this vulnerability. Leave null when no concrete remediation is known."
     )
 
     @field_validator('cvss_vector')
@@ -723,15 +741,6 @@ class ReporterFinding(BaseModel):
         if not v.startswith("CVSS:3."):
             raise ValueError("cvss_vector must be a CVSS v3.x base vector (start with 'CVSS:3.').")
         return v
-
-
-class ReporterOutput(BaseModel):
-    executive_summary: str = Field(
-        description="2-4 sentences summarizing the security posture of the target: how many findings were proven, the overall worst-case risk, and the single most important action to take."
-    )
-    findings: list[ReporterFinding] = Field(
-        description="Exactly one assessment per provided vulnerability, keyed by vuln_id."
-    )
 
 
 # ==========================================

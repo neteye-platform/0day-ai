@@ -20,11 +20,20 @@ class MasterState(TypedDict):
 
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
 
+    # Per-vulnerability reporter outputs (one dict per reportable record,
+    # assembled into report.md by report_assembler_node). Append-reduced since
+    # the reporter fan-out writes them concurrently.
+    reporter_findings: Annotated[list[dict], operator.add]
+
 class ExplorerState(TypedDict):
     node_ids: list[str]
     role: str
     task_description: str
     progress_id: str
+
+class ReporterState(TypedDict):
+    # The single reportable vulnerability record this reporter task summarizes.
+    report: dict
 
 class CVEAnalyzerState(TypedDict):
     cve: dict

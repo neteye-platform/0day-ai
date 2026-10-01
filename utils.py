@@ -1804,27 +1804,23 @@ def cache_integration_auditor(report: dict, peers: Optional[list] = None, update
     return None
 
 
-def cache_reporter(records: list, output: Optional[dict] = None) -> Optional[dict]:
-    """Read (``output`` is None) or write the reporter's LLM assessment output.
+def cache_reporter(report: dict, finding: Optional[dict] = None) -> Optional[dict]:
+    """Read (``finding`` is None) or write a per-vulnerability reporter outcome.
 
-    Keyed on the content hash of the selected (exploitable/static) records,
-    sorted by vuln_id for order independence. Only the structured ``ReporterOutput``
-    payload is cached: the markdown render is NOT, so the deterministic
-    Pipeline Statistics section always reflects the current run even when a hit
-    skips the reporter LLM call.
+    Keyed on the content hash of the single reportable record (including its
+    ``poc_payload``/``execution_logs``, so a changed validator proof busts the
+    entry). The reporter runs once per vulnerability, so one cache file per
+    record. A hit returns the stored ``ReporterFinding`` dict.
     """
-    normalized = sorted(
-        (r for r in (records or []) if isinstance(r, dict)),
-        key=lambda r: (r.get("vuln_id", ""), json.dumps(r, sort_keys=True)),
-    )
-    digest = hashlib.md5(json.dumps(normalized, sort_keys=True).encode()).hexdigest()
-    cache_file = settings.cache_dir / "reporter" / f"{digest}.json"
-    if output is None:
+    report_hash = hashlib.md5(json.dumps(report or {}, sort_keys=True).encode()).hexdigest()
+    vuln_id = (report or {}).get("vuln_id") or "Unknown"
+    cache_file = settings.cache_dir / "reporter" / f"{safe_cache_filename(vuln_id)}_{report_hash}.json"
+    if finding is None:
         cached = cache(cache_file, "read")
-        if isinstance(cached, dict) and isinstance(cached.get("output"), dict):
-            return cached["output"]
+        if isinstance(cached, dict) and isinstance(cached.get("finding"), dict):
+            return cached["finding"]
         return None
-    cache(cache_file, "write", {"output": output})
+    cache(cache_file, "write", {"finding": finding})
     return None
 
 
