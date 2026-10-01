@@ -1,6 +1,7 @@
 """Edge Traversal stage: composite cross-boundary findings from trust-boundary edges."""
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -25,6 +26,31 @@ CROSS_BOUNDARY_VULN_TYPES = {
     "differential_parsing",
     "confused_deputy",
 }
+
+
+# Batch LLM calls are mutually independent (own prompt, own cache file) and
+# were run serially: total wall time was the SUM of batch latencies. They run
+# concurrently instead; results are reassembled in dispatch order, so the
+# emitted hypotheses — and every downstream cache key — are identical.
+_PARALLEL_BATCHES = 12
+
+
+def _run_batches_in_order(batches: list[list[dict]]) -> list[dict]:
+    total = len(batches)
+    if total <= 1:
+        results = [_run_edge_traversal_batch(b, i, total) for i, b in enumerate(batches, 1)]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=min(total, _PARALLEL_BATCHES),
+            thread_name_prefix="edge-traversal",
+        ) as pool:
+            results = list(pool.map(
+                _run_edge_traversal_batch,
+                batches,
+                range(1, total + 1),
+                [total] * total,
+            ))
+    return [h for r in results for h in r]
 
 
 def edge_traversal_node(state: MasterState):
@@ -58,10 +84,7 @@ def edge_traversal_node(state: MasterState):
         summarize_boundary_edges(edges),
     )
 
-    hypotheses: list[dict] = []
-    for idx, batch in enumerate(batches, 1):
-        batch_hypotheses = _run_edge_traversal_batch(batch, idx, len(batches))
-        hypotheses.extend(batch_hypotheses)
+    hypotheses = _run_batches_in_order(batches)
 
     logging.info(
         "Edge Traversal finished: %d composite hypothesis(es) from %d batch(es).",
