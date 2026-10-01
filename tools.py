@@ -435,10 +435,7 @@ def submit_evaluation(
     updated_vuln["status"] = "confirmed" if kwargs.get("is_exploitable") else "false_positive"
     updated_vuln["confidence_score"] = kwargs.get("confidence_score")
     updated_vuln["reviewer_reasoning"] = kwargs.get("reasoning")
-    updated_vuln["entry_point_url"] = kwargs.get("entry_point_url")
-    updated_vuln["http_method"] = kwargs.get("http_method")
-    updated_vuln["required_parameters"] = kwargs.get("required_parameters", [])
-    updated_vuln["auth_required"] = kwargs.get("auth_required", False)
+    updated_vuln["reproduction_steps"] = kwargs.get("reproduction_steps", [])
 
     tool_msg = ToolMessage(
         content="Evaluation submitted successfully. Ending review.",

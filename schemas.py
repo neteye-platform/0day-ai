@@ -92,6 +92,15 @@ class VulnerabilityRecord(BaseModel):
 
     # Reviewer additions
     reviewer_reasoning: Optional[str] = None
+    reproduction_steps: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Chronological, numbered steps the downstream Validator must execute to "
+            "trigger and prove the vulnerability from the outside. Each step must be "
+            "self-sufficient (HTTP method, path, parameters/headers/body, and any session "
+            "state carried from earlier steps) because the Validator cannot read source code."
+        ),
+    )
 
     # Validator additions
     poc_payload: Optional[str] = None
@@ -241,11 +250,11 @@ class VulnerabilityEvaluation(BaseModel):
     )
     confidence_score: int = Field(description="Confidence in this assessment from 1 to 10.")
     reasoning: str = Field(description="Brief technical explanation for the decision.")
-    entry_point_url: Optional[str] = Field(description="The specific HTTP route or URI path required to reach the source node (e.g., '/dashboard').")
-    http_method: Optional[str] = Field(description="The HTTP method required (e.g., 'POST', 'GET').")
-    required_parameters: Optional[list[str]] = Field(description="List of expected input names, headers, or form fields.")
-    auth_required: bool = Field(description="True if the route is protected by an authentication middleware.")
     original_report: list[dict]
+    reproduction_steps: Optional[list[str]] = Field(
+        default=None,
+        description="Chronological, numbered external actions required to trigger and prove the vulnerability."
+    )
 
 class ReviewerOutput(BaseModel):
     vulnerabilities: list[VulnerabilityEvaluation]
@@ -331,21 +340,20 @@ class EvaluationToolInput(BaseModel):
         description="True if the vulnerability has a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by mitigations, implemented by the application."
     )
     reasoning: str = Field(description="Brief technical explanation for the decision.")
-    entry_point_url: Optional[str] = Field(
-        description="The specific HTTP route or URI path required to reach the source node (e.g., '/dashboard').",
-        default=None
-    )
-    http_method: Optional[str] = Field(
-        description="The HTTP method required (e.g., 'POST', 'GET').",
-        default=None
-    )
-    required_parameters: Optional[list[str]] = Field(
-        description="List of expected input names, query parameters, headers, or form fields.",
-        default_factory=list
-    )
-    auth_required: bool = Field(
-        description="True if the route is protected by an authentication middleware.",
-        default=False
+    reproduction_steps: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Chronological, numbered sequence of exact external actions required to "
+            "trigger and prove the vulnerability, e.g. '1. Authenticate by POSTing valid "
+            "credentials to /api/login (fields: username, password) and capture the session "
+            "cookie.', '2. Send POST /api/export with JSON body {\"title\":\"<payload>\"} "
+            "while carrying the session cookie.', '3. Confirm the reflected payload in the "
+            "response body.'. The downstream Validator CANNOT read source code, so every "
+            "step must be self-sufficient and executable over HTTP alone: state the HTTP "
+            "method, path, required parameters/headers/body, and any session state carried "
+            "from earlier steps. Fill this when is_exploitable is true; leave empty for "
+            "false positives."
+        )
     )
 
 class ValidationToolInput(BaseModel):
