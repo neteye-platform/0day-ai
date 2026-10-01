@@ -564,10 +564,10 @@ reviewer_agent:
 
   code_level: |
     CODE-LEVEL REACHABILITY:
-    1. STRICT DATA FLOW: Prove an uninterrupted path from an untrusted SOURCE (HTTP parameters, headers, payloads) to an execution SINK or framework boundary.
+    1. STRICT DATA FLOW: Prove an uninterrupted path from an untrusted SOURCE to the ULTIMATE execution SINK. Never stop tracing just because data crosses a language boundary (e.g., backend to JavaScript).
     2. CONTRACT SUPREMACY: If the local code lacks the demanded sanitization, mark it vulnerable. Do not audit downstream framework internals to see if they act as a safety net.
     3. STRUCTURAL PAYLOADS: If untrusted input controls structural keys (dict/array keys), inspect downstream parsers for conditional logic. Extract hardcoded branch strings as fuzzing candidates for your reproduction steps.
-    4. DEAD ENDS: If the tainted variable is explicitly allowlisted or discarded before a sink, reject it as a False Positive.
+    4. DEAD ENDS: If the tainted variable is explicitly allowlisted or discarded, reject it. Contextual escaping or encoding only eliminates a finding if it neutralizes the vulnerability at the final consumer, not merely during intermediate serialization.
 
   framework_dependency: |
     FRAMEWORK DEPENDENCY REACHABILITY:
