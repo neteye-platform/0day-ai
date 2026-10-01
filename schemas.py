@@ -67,7 +67,7 @@ class VulnerabilityRecord(BaseModel):
     vuln_id: Optional[str] = None
 
     # Lifecycle tracking
-    status: Literal["hypothesis", "unreachable", "confirmed", "exploitable", "false_positive", "review_error"] = "hypothesis"
+    status: Literal["hypothesis", "unreachable", "confirmed", "exploitable", "false_positive", "review_error", "insufficient_context"] = "hypothesis"
 
     # Core details (from Explorer/Verifier)
     node_id: str
@@ -105,6 +105,24 @@ class VulnerabilityRecord(BaseModel):
     # Validator additions
     poc_payload: Optional[str] = None
     execution_logs: Optional[str] = None
+
+    # Validator -> Reviewer feedback loop
+    open_questions: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Specific questions the Validator raised about the evidence it needs "
+            "(set when status is 'insufficient_context'). The Reviewer must resolve "
+            "each one and re-emit self-sufficient reproduction steps."
+        ),
+    )
+    review_round: int = Field(
+        default=0,
+        description=(
+            "How many times the Validator has requested more context (insufficient_context) "
+            "for this record. The Validator may request context only once; round is "
+            "incremented on each request."
+        ),
+    )
 
     @field_validator('cwe_id', mode='before')
     @classmethod
@@ -360,3 +378,22 @@ class ValidationToolInput(BaseModel):
     is_confirmed: bool = Field(description="True if the exploit successfully triggered in the sandbox.")
     poc_payload: Optional[str] = Field(description="The exact payload, script, or HTTP request that triggered the vulnerability.")
     execution_logs: str = Field(description="Relevant logs or output from the sandbox confirming the exploit.")
+
+
+class AskForContextInput(BaseModel):
+    reasoning: str = Field(
+        description=(
+            "Why you cannot reach a verdict: the specific blocker (e.g. no sandbox is "
+            "reachable, the reproduction steps lack an exact HTTP method/path/body, the "
+            "endpoint or feature is unreachable or undocumented, or blocking "
+            "authentication/session details are missing)."
+        )
+    )
+    open_questions: list[str] = Field(
+        description=(
+            "The exact, specific questions the Reviewer must answer to make the record "
+            "testable (e.g. 'What is the exact HTTP method and path to reach the export "
+            "endpoint?', 'What credentials/session state are needed to reach it?', 'Is the "
+            "route exposed publicly or behind an unauthenticated login?')."
+        )
+    )

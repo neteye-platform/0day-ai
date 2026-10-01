@@ -178,7 +178,9 @@ class ToolLoopAgent:
     """
 
     state_type: type = dict
-    terminal_tool: str = ""
+    # A single terminal tool name, or a tuple of them (the validator ends its
+    # loop on either `ask_for_context` or `mark_validation_complete`).
+    terminal_tool: str | tuple[str, ...] = ""
     ask_message: str = (
         "You did not invoke any tools. Keep your reasoning brief and emit a tool call "
         "in this same response. You must use a tool to proceed."
@@ -221,6 +223,10 @@ class ToolLoopAgent:
         """Human-readable investigation subject used in log lines."""
         return state.get("node_id", "Unknown")
 
+    def _terminal_names(self) -> list[str]:
+        t = self.terminal_tool
+        return [t] if isinstance(t, str) else list(t)
+
     # -- per-agent hooks ------------------------------------------------------
 
     def bind_tools(self, state):
@@ -243,11 +249,12 @@ class ToolLoopAgent:
         return False
 
     def tool_batch_done(self, state) -> bool:
-        """True when the latest contiguous tool batch contains the terminal tool."""
+        """True when the latest contiguous tool batch contains a terminal tool."""
+        terminal_names = self._terminal_names()
         for msg in reversed(state["messages"]):
             if msg.type != "tool":
                 break
-            if getattr(msg, "name", "") == self.terminal_tool:
+            if getattr(msg, "name", "") in terminal_names:
                 return True
         return False
 
@@ -325,9 +332,10 @@ class ToolLoopAgent:
         # Termination countdown: once the iteration counter approaches the cap,
         # push the agent to emit its terminal tool next round.
         if current_turn >= self._countdown_start:
+            terminal_display = " or ".join(self._terminal_names())
             warning_msg = HumanMessage(content=(
                 f"System Warning: You are on turn {current_turn} of "
-                f"{self._max_iterations}. You must call {self.terminal_tool} in your next "
+                f"{self._max_iterations}. You must call {terminal_display} in your next "
                 f"turn based on the best available evidence, or the system will forcefully "
                 f"terminate this task."
             ))

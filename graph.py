@@ -17,7 +17,7 @@ from langgraph.types import RetryPolicy
 import settings
 import tools
 import browser_tools
-from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
+from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, route_validator_feedback, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
 from reachability import reachability_filter_node
 from state import MasterState, ReviewerState, ValidatorState
 from schemas import ReviewerOutput, ValidatorOutput
@@ -168,7 +168,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_conditional_edges("synchronization", dispatch_reviewers, ["reviewer_agent", END])
     # workflow.add_edge("reviewer_agent", "reviewer_sync")
     workflow.add_conditional_edges("reviewer_agent", dispatch_validators, ["validator_agent", END])
-    workflow.add_edge("validator_agent", END)
+    workflow.add_conditional_edges("validator_agent", route_validator_feedback, ["reviewer_agent", END])
 
     app = workflow.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)
     app = app.with_config({"max_concurrency": settings.simple_agents_concurrency})

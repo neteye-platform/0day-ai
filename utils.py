@@ -293,8 +293,10 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
         "review_error": 1,
         "unreachable": 1,
         "confirmed": 2,
-        "false_positive": 3,
-        "proven": 4
+        "insufficient_context": 3,
+        "exploitable": 4,
+        "false_positive": 5,
+        "proven": 5
     }
 
     # Process new incoming updates
@@ -313,6 +315,16 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
 
         if vid in vuln_map:
             current_status = vuln_map[vid].get("status", "hypothesis")
+
+            # --- FEEDBACK LOOP: REVIEWER RE-ANSWER REPLACES INSUFFICIENT CONTEXT ---
+            # When the Validator flagged a record insufficient_context and the Reviewer has
+            # re-reviewed it, the reviewer verdict must replace the flag unconditionally
+            # (confirmed and review_error have LOWER priority than insufficient_context, so
+            # the plain ladder would wrongly keep the flag).
+            re_review_statuses = {"confirmed", "false_positive", "exploitable", "review_error"}
+            if current_status == "insufficient_context" and new_status in re_review_statuses:
+                vuln_map[vid] = update
+                continue
 
             # --- STATUS UPGRADE: COMPLETELY REPLACE ---
             if status_priority.get(new_status, 0) > status_priority.get(current_status, 0):
