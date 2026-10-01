@@ -29,6 +29,10 @@ validator_max_iterations = 150
 # Same derivation for the validator track ("mark_validation_complete in your
 # next turn or be terminated").
 validator_countdown_start = max(1, validator_max_iterations - COUNTDOWN_LEAD_TURNS)
+# How many times the Validator may request more context (insufficient_context)
+# from the Reviewer for a single record. Past this cap the Validator must
+# conclude with the evidence it has.
+validator_feedback_max_rounds = 1
 
 # Reviewer context compaction (opencode-style). When the estimated token count
 # of the reviewer's message history reaches model_context_window minus

@@ -12,7 +12,7 @@ import docker
 from docker.errors import NotFound, APIError
 import re
 
-from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationToolInput
+from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationToolInput, AskForContextInput
 from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer
 from languages import MANIFEST_NAMES
 import settings
@@ -573,11 +573,11 @@ def mark_validation_complete(
     # Create a copy to avoid mutating the local dictionary directly
     updated_vuln = dict(report)
 
-    # Update the lifecycle status so the custom reducer merges it correctly
-    if kwargs.get("is_exploitable"):
+    # Update the lifecycle status so the custom reducer merges it correctly.
+    # is_confirmed drives the verdict (an unconvincing exploit = false positive).
+    if kwargs.get("is_confirmed"):
         updated_vuln["status"] = "exploitable"
     else:
-        # If the exploit fails, mark it as a false positive
         updated_vuln["status"] = "false_positive"
 
     # Inject the Validator's findings
@@ -591,6 +591,58 @@ def mark_validation_complete(
     tool_msg = ToolMessage(
         content="Validation complete. Ending validation phase.",
         name="mark_validation_complete",
+        tool_call_id=tool_call_id
+    )
+
+    return Command(
+        update={
+            "vulnerabilities": [updated_vuln],
+            "messages": [tool_msg]
+        }
+    )
+
+
+@tool(args_schema=AskForContextInput)
+def ask_for_context(
+    state: Annotated[dict, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    **kwargs
+) -> Command:
+    """
+    Call this when you CANNOT reach a verdict because the report leaves you
+    unable to test the vulnerability — no reachable sandbox/route, ambiguous
+    reproduction steps, a missing HTTP method/path/body, or blocking
+    authentication/session details. Flag the record as insufficient_context and
+    enumerate the specific questions the Reviewer must answer. This tool is
+    available only on your FIRST validation pass; after a re-review it is
+    removed and you must conclude via mark_validation_complete instead.
+    """
+    # Get the single vulnerability assigned to this Validator agent
+    report = state.get("report_to_test", {})
+
+    # Create a copy to avoid mutating the local dictionary directly
+    updated_vuln = dict(report)
+
+    # Flag the record with the concrete questions the Reviewer must resolve and
+    # bump the feedback round; route_validator_feedback re-dispatches it to the
+    # reviewer (only while review_round is within validator_feedback_max_rounds).
+    current_round = report.get("review_round") or 0
+    updated_vuln["status"] = "insufficient_context"
+    updated_vuln["review_round"] = current_round + 1
+    updated_vuln["open_questions"] = list(kwargs.get("open_questions") or [])
+    updated_vuln["execution_logs"] = kwargs.get("reasoning")
+    updated_vuln["poc_payload"] = None
+
+    # Close this validator's headless-browser sessions (per-agent, never
+    # touching other concurrently running validators' sessions).
+    browser_tools.manager.close_agent_sessions(state.get("agent_id"))
+
+    tool_msg = ToolMessage(
+        content=(
+            "Context insufficient. Requesting more context from the Reviewer; "
+            "you will not continue validating unless this record is re-dispatched."
+        ),
+        name="ask_for_context",
         tool_call_id=tool_call_id
     )
 

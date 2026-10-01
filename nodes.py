@@ -1645,6 +1645,19 @@ class ReviewerAgent(ToolLoopAgent):
         if report.get("source_cve"):
             formatted_vuln += f"- Source CVE: {report.get('source_cve')}\n"
 
+        feedback_qs = report.get("open_questions") or []
+        if feedback_qs:
+            qs_str = "\n".join(f"  {i}. {q}" for i, q in enumerate(feedback_qs, 1))
+            formatted_vuln += (
+                f"\n--- VALIDATOR FEEDBACK (INSUFFICIENT CONTEXT) ---\n"
+                f"The downstream Validator could not confirm this vulnerability because it "
+                f"lacked the information below. Resolve EACH question using your tools, then "
+                f"re-emit fully self-sufficient reproduction steps (exact HTTP method, path, "
+                f"parameters/headers/body, and any session state) with `submit_evaluation`. "
+                f"This is feedback round {report.get('review_round', 0)}.\n"
+                f"{qs_str}\n"
+            )
+
         if node_id:
             target_node_source = get_node_code(node_id, reviewer_mode=True)
             if target_node_source:
@@ -1740,17 +1753,61 @@ def dispatch_validators(state: MasterState):
     return commands
 
 
-class ValidatorAgent(ToolLoopAgent):
-    """Validator track: fixed HTTP-proof toolset, live cookie tracking, and a
-    single-terminal-tool end condition."""
+def route_validator_feedback(state: MasterState):
+    """Conditional router from the validator back into the reviewer.
 
-    terminal_tool = "mark_validation_complete"
+    When the Validator flags a record 'insufficient_context', send that record
+    (with its open questions back to the Reviewer for a re-review. Each record
+    may request context only validator_feedback_max_rounds times; records past
+    the cap are left in place, so the loop drains.
+    """
+    raw_vulns = state.get("vulnerabilities", [])
+    all_vulns = [
+        v if isinstance(v, dict) else v.model_dump()
+        for v in raw_vulns
+    ]
+    max_rounds = settings.validator_feedback_max_rounds
+    flagged = [
+        v for v in all_vulns
+        if v.get("status") == "insufficient_context"
+        and (v.get("review_round") or 0) <= max_rounds
+    ]
+
+    if not flagged:
+        return END
+
+    commands = []
+    for record in flagged:
+        payload = ReviewerState(
+            node_id=record.get("node_id", "Unknown"),
+            expert_report=record,
+            mode=_reviewer_mode_for(record),
+            iterations=0,
+            vulnerabilities=[],
+            messages=[]
+        )
+        commands.append(Send("reviewer_agent", payload))
+
+    logging.info(
+        f"Validator requested more context for {len(commands)} vulnerability(ies); "
+        f"dispatching reviewer feedback re-reviews."
+    )
+    return commands
+
+
+class ValidatorAgent(ToolLoopAgent):
+    """Validator track: fixed HTTP-proof toolset, live cookie tracking, and the
+    terminal-tool end conditions. Ends on `ask_for_context` (round 1 only — the
+    tool is unbound after a re-review so the agent cannot ask again) or on
+    `mark_validation_complete`."""
+
+    terminal_tool = ("ask_for_context", "mark_validation_complete")
 
     def _subject(self, state) -> str:
         return state.get("report_to_test", {}).get("node_id", "Unknown")
 
     def bind_tools(self, state):
-        return smart_llm.bind_tools([
+        validator_tools = [
             tools.send_http_request,
             # tools.list_files,
             # tools.read_sandbox_file,
@@ -1759,8 +1816,15 @@ class ValidatorAgent(ToolLoopAgent):
             browser_tools.browser_fill,
             browser_tools.browser_evaluate,
             browser_tools.browser_console,
-            tools.mark_validation_complete
-        ])
+        ]
+        # ask_for_context is bound ONLY on the first validation pass. Once the
+        # Reviewer has re-answered (review_round > 0), it is removed so the
+        # agent cannot be tempted to request more context a second time; it must
+        # conclude with mark_validation_complete.
+        if (state.get("report_to_test", {}).get("review_round") or 0) < settings.validator_feedback_max_rounds:
+            validator_tools.append(tools.ask_for_context)
+        validator_tools.append(tools.mark_validation_complete)
+        return smart_llm.bind_tools(validator_tools)
 
     def first_turn(self, state, llm_with_tools) -> dict:
         sys_msg = SystemMessage(content=VALIDATOR_AGENT.get('prompt'))
@@ -1782,9 +1846,20 @@ class ValidatorAgent(ToolLoopAgent):
             f"--- REPRODUCTION STEPS (from Reviewer, follow in order) ---\n"
             f"{steps_str}"
         )
+        round_note = ""
+        if (report.get("review_round") or 0) > 0:
+            round_note = (
+                "\n\nFINAL VALIDATION PASS: you previously flagged this record as needing "
+                "more context and the Reviewer has re-answered. The `ask_for_context` tool "
+                "is NOT available in this pass. You MUST now conclude with "
+                "`mark_validation_complete` — confirm with a working PoC and concrete "
+                "evidence, or mark `is_confirmed: false` — using the evidence available to "
+                "you. Do not fabricate evidence."
+            )
         human_msg = HumanMessage(content=(
             f"Target Sandbox: {state['sandbox_url']}\n\n"
-            f"Vulnerability to Prove:\n{formatted_report}\n"
+            f"Vulnerability to Prove:\n{formatted_report}"
+            f"{round_note}\n"
         ))
         messages = [sys_msg, human_msg]
         response = llm_with_tools.invoke(messages)
@@ -1811,8 +1886,13 @@ class ValidatorAgent(ToolLoopAgent):
         return {"cookies": current_cookies}
 
     def tool_batch_done(self, state) -> bool:
-        last_message = state["messages"][-1]
-        return getattr(last_message, "name", "") == "mark_validation_complete"
+        terminal_names = self._terminal_names()
+        for msg in reversed(state["messages"]):
+            if getattr(msg, "type", "") != "tool":
+                break
+            if getattr(msg, "name", "") in terminal_names:
+                return True
+        return False
 
     def fallback(self, state) -> Command:
         """Resolve a validation that hit the iteration cap without a
