@@ -137,37 +137,37 @@ expert_agents:
     4. TYPE & FRAMEWORK SAFETY: Do not flag path traversals, overflows, or injections on data that is strongly typed (e.g., standard UUIDs, integers) or defined by internal framework constants, unless you explicitly see the snippet unsafely casting untrusted strings into those types.
     5. SYSTEMIC PATTERNS: For vulnerability classes that are architectural rather than localized to one function (broken cryptography CWE-327, cleartext transmission CWE-319, missing authentication CWE-306, sensitive data exposure CWE-200, CSRF CWE-352, session fixation CWE-384, business logic CWE-840), you MUST fill the hypothesis `pattern_label` field with a SHORT canonical name of at most six lowercase words shared by every occurrence of the pattern (e.g., "plaintext password storage", "no csrf token validation", "weak tls ciphers"). Keep `component` as your normal detailed explanation; the pipeline groups findings sharing the same pattern_label into a single review. Leave pattern_label null for all other CWEs.
 
-    ALLOWED CWE LIST
-    You must classify vulnerabilities using ONLY the following CWEs. If none fit, use "OTHER_UNCATEGORIZED":
-    - CWE-119: Improper Restriction of Operations within the Bounds of a Memory Buffer
-    - CWE-416: Use After Free
-    - CWE-476: NULL Pointer Dereference
-    - CWE-190: Integer Overflow or Wraparound
-    - CWE-362: Concurrent Execution using Shared Resource with Improper Synchronization (Race Condition)
-    - CWE-89: SQL Injection
-    - CWE-78: OS Command Injection
-    - CWE-79: Cross-Site Scripting (XSS)
-    - CWE-94: Code Injection
-    - CWE-918: Server-Side Request Forgery (SSRF)
-    - CWE-862: Missing Authorization
-    - CWE-863: Incorrect Authorization
-    - CWE-639: Authorization Bypass Through User-Controlled Key (IDOR)
-    - CWE-306: Missing Authentication for Critical Function
-    - CWE-352: Cross-Site Request Forgery (CSRF)
-    - CWE-384: Session Fixation
-    - CWE-200: Exposure of Sensitive Information to an Unauthorized Actor
-    - CWE-319: Cleartext Transmission of Sensitive Information
-    - CWE-327: Use of a Broken or Risky Cryptographic Algorithm
-    - CWE-502: Deserialization of Untrusted Data
-    - CWE-22: Path Traversal
-    - CWE-434: Unrestricted Upload of File with Dangerous Type
-    - CWE-770: Allocation of Resources Without Limits or Throttling
-    - CWE-284: Improper Access Control (Use ONLY if no specific access control CWE fits)
-    - CWE-20: Improper Input Validation (Use ONLY if no specific injection CWE fits)
-    - CWE-840: Business Logic Errors
-    - OTHER_UNCATEGORIZED: Use ONLY if no other CWE fits
+    ALLOWED CWE LIST:
+    CWE-20: Improper Input Validation
+    CWE-22: Path Traversal
+    CWE-78: OS Command Injection
+    CWE-79: Cross-Site Scripting (XSS)
+    CWE-89: SQL Injection
+    CWE-94: Code Injection
+    CWE-119: Buffer Errors
+    CWE-190: Integer Overflow
+    CWE-200: Information Disclosure
+    CWE-284: Improper Access Control
+    CWE-306: Missing Authentication
+    CWE-319: Cleartext Transmission
+    CWE-327: Risky Cryptography
+    CWE-352: CSRF
+    CWE-362: Race Condition
+    CWE-384: Session Fixation
+    CWE-416: Use After Free
+    CWE-434: Unrestricted File Upload
+    CWE-476: NULL Pointer Dereference
+    CWE-502: Deserialization of Untrusted Data
+    CWE-639: Authorization Bypass (IDOR)
+    CWE-770: Allocation Without Limits
+    CWE-840: Business Logic Errors
+    CWE-862: Missing Authorization
+    CWE-863: Incorrect Authorization
+    CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes (Mass Assignment)
+    CWE-918: SSRF
+    OTHER_UNCATEGORIZED
 
-    EXAMPLES
+    EXAMPLES:
 
     Input Snippet:
     ```javascript
@@ -313,6 +313,7 @@ cve_analyzer:
     - CWE-918: Server-Side Request Forgery (SSRF)
     - CWE-862: Missing Authorization
     - CWE-863: Incorrect Authorization
+    - CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes (Mass Assignment)
     - CWE-639: Authorization Bypass Through User-Controlled Key (IDOR)
     - CWE-306: Missing Authentication for Critical Function
     - CWE-352: Cross-Site Request Forgery (CSRF)
@@ -428,6 +429,7 @@ contract_verifier_agent:
     - CWE-918: Server-Side Request Forgery (SSRF)
     - CWE-862: Missing Authorization
     - CWE-863: Incorrect Authorization
+    - CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes (Mass Assignment)
     - CWE-639: Authorization Bypass Through User-Controlled Key (IDOR)
     - CWE-306: Missing Authentication for Critical Function
     - CWE-352: Cross-Site Request Forgery (CSRF)
