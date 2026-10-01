@@ -121,6 +121,11 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
     assembled_states = {}
     raw_main_state = {}
 
+    # Token usage stats
+    tracked_msg_ids = set()
+    agent_token_stats = {}
+    token_stats = {"input": 0, "output": 0, "total": 0}
+
     for event in app.stream(inputs, stream_mode="values", subgraphs=True, config=config):
         namespace, state = event
 
@@ -143,6 +148,7 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
         if "messages" in state and state["messages"]:
             last_msg = state["messages"][-1]
             msg_type = getattr(last_msg, "type", "unknown")
+            msg_id = getattr(last_msg, "id")
 
             # Extract content safely, even if it's nested
             content = getattr(last_msg, "content", "")
@@ -154,17 +160,39 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
             snippet = snippet.replace('\n', ' ').strip()
 
             if msg_type == "ai":
-                # 1. Print the AI's thought process (Chain of Thought)
+                # Track token usgae
+                if msg_id and msg_id not in tracked_msg_ids:
+                    tracked_msg_ids.add(msg_id)
+                    usage = getattr(last_msg, "usage_metadata", {})
+                    if usage:
+                        in_tok = usage.get("input_tokens", 0)
+                        out_tok = usage.get("output_tokens", 0)
+                        tot_tok = usage.get("total_tokens", 0)
+
+                        # Initialize agent in stats dictionary if not present
+                        if graph_name not in agent_token_stats:
+                            agent_token_stats[graph_name] = {"input": 0, "output": 0, "total": 0}
+
+                        agent_token_stats[graph_name]["input"] += in_tok
+                        agent_token_stats[graph_name]["output"] += out_tok
+                        agent_token_stats[graph_name]["total"] += tot_tok
+
+                        token_stats["input"] += in_tok
+                        token_stats["output"] += out_tok
+                        token_stats["total"] += tot_tok
+
+                # Print the AI's thought process (Chain of Thought)
                 if snippet:
                     print(f"[{graph_name}] \033[96m🧠 AI: {snippet}\033[0m")
 
-                # 2. Print the Tool Call (if it decided to act)
+                # Print the Tool Call (if it decided to act)
                 if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
                     tool_strings = []
                     for tc in last_msg.tool_calls:
                         name = tc.get("name", "unknown")
                         args = tc.get("args", {})
                         if name == "SubmitReport":
+                            # Omit descriptio to keep logs clean
                             args_str = [a.get("vulnerability_type", "") for a in args.get("findings", [])]
                         else:
                             args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
@@ -192,6 +220,23 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
         json.dump(assembled_states, f, indent=2)
 
     print("[System] Execution Finished.")
+    # --- Print Token Usage Summary ---
+    print("\n" + "="*50)
+    print("📊 \033[1mToken Usage Summary by Agent\033[0m")
+    print("-" * 50)
+    
+    # Sort agents alphabetically for a cleaner readout (optional, but nice)
+    for agent_name in sorted(agent_token_stats.keys()):
+        stats = agent_token_stats[agent_name]
+        print(f"🔹 \033[96m{agent_name}\033[0m")
+        print(f"   In: {stats['input']:,}  |  Out: {stats['output']:,}  |  Total: {stats['total']:,}")
+    
+    print("-" * 50)
+    print("🏆 \033[1mGrand Totals\033[0m")
+    print(f"   Input Tokens:  {token_stats['input']:,}")
+    print(f"   Output Tokens: {token_stats['output']:,}")
+    print(f"   Total Tokens:  \033[95m{token_stats['total']:,}\033[0m")
+    print("="*50 + "\n")
 
     # Extract the vulnerability reports from the main graph to return
     main_state = assembled_states.get("Main_Graph", {})
