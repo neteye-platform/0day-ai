@@ -68,7 +68,7 @@ def run_graph(args):
         interrupt_list = [args.stop_before] if args.stop_before else None
         app = build_graph(checkpointer=memory, interrupt_before=interrupt_list)
         
-        config = {"configurable": {"thread_id": current_thread_id}}
+        config = {"configurable": {"thread_id": current_thread_id}, "max_concurrency": 3}
         
         # ⚠️ RESOLVE THE SHORT ID HERE
         if args.checkpoint:

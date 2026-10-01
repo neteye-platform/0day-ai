@@ -202,11 +202,7 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
                     for tc in last_msg.tool_calls:
                         name = tc.get("name", "unknown")
                         args = tc.get("args", {})
-                        if name == "submit_report":
-                            # Omit description to keep logs clean
-                            args_str = "finding_data_omitted"
-                        else:
-                            args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
+                        args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
                         tool_strings.append(f"{name}({args_str})")
 
                     print(f"[{graph_name}] \033[93m🛠️  Calling tool: {' | '.join(tool_strings)}\033[0m")
