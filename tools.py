@@ -20,13 +20,12 @@ import attacker_tools
 
 
 @tool
-def read_source_code(node_id: str, reason_for_reading: str, state: Annotated[dict, InjectedState]) -> str:
+def read_source_code(node_id: str, state: Annotated[dict, InjectedState]) -> str:
     """
     Fetches the source code for a given Node ID.
 
     Args:
         node_id (str): The exact ID of the node to read (e.g., 'src_main_query_db').
-        reason_for_reading (str): Explain exactly why you need to read THIS specific node next, and how you expect it to connect to your current knowledge.
     """
     messages = state.get("messages", [])
     for msg in messages[:-1]:
