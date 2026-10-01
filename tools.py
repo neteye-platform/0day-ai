@@ -372,7 +372,14 @@ def search_codebase(keyword: str, current_state: str, state: Annotated[dict, Inj
     results = []
     match_count = 0
     MAX_MATCHES = 20 # prevent context window overflow
-    query = re.compile(keyword) if regex else re.escape(keyword)
+    regex_fallbacks = []
+    try:
+        query = re.compile(keyword) if regex else re.escape(keyword)
+    except re.error as e:
+        regex_fallbacks.append(
+            f"NOTE: {keyword!r} was an invalid regular expression ({e}); searched as a literal string instead."
+        )
+        query = re.escape(keyword)
 
     # Recursively search all files
     for file_path in app_dir.rglob("*"):
@@ -410,10 +417,12 @@ def search_codebase(keyword: str, current_state: str, state: Annotated[dict, Inj
             # Safely skip binary files (images, compiled files, etc.)
             continue
 
-    if not results:
-        return f"No matches found for '{keyword}'."
+    prefix = "\n".join(regex_fallbacks) + "\n" if regex_fallbacks else ""
 
-    return "\n".join(results)
+    if not results:
+        return f"{prefix}No matches found for '{keyword}'."
+
+    return prefix + "\n".join(results)
 
 
 @tool
