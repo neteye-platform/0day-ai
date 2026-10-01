@@ -35,10 +35,12 @@ cwes = {
     "CWE-915": "Improperly Controlled Modification of Dynamically-Determined Object Attributes (Mass Assignment)",
     "CWE-639": "Authorization Bypass Through User-Controlled Key (IDOR)",
     "CWE-306": "Missing Authentication for Critical Function",
+    "CWE-287": "Improper Authentication",
     # --- STATE & SESSION (Web / API) ---
     "CWE-352": "Cross-Site Request Forgery (CSRF)",
     "CWE-384": "Session Fixation",
     # --- DATA & CRYPTOGRAPHY ---
+    "CWE-807": "Reliance on Untrusted Inputs in a Security Decision",
     "CWE-200": "Exposure of Sensitive Information to an Unauthorized Actor",
     "CWE-319": "Cleartext Transmission of Sensitive Information",
     "CWE-327": "Use of a Broken or Risky Cryptographic Algorithm",
@@ -74,8 +76,8 @@ CWE_KEYS = Literal[
     "CWE-119", "CWE-416", "CWE-476", "CWE-190", "CWE-362", "CWE-89",
     "CWE-78", "CWE-79", "CWE-94", "CWE-918", "CWE-862", "CWE-863",
     "CWE-915", "CWE-639", "CWE-306", "CWE-352", "CWE-384", "CWE-200",
-    "CWE-319",
-    "CWE-327", "CWE-502", "CWE-22", "CWE-434", "CWE-770", "CWE-284",
+    "CWE-319", "CWE-327", "CWE-502", "CWE-807", "CWE-287", "CWE-22",
+    "CWE-434", "CWE-770", "CWE-284",
     "CWE-20", "CWE-840", "OTHER_UNCATEGORIZED"
 ]
 
