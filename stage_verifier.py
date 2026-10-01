@@ -8,7 +8,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Send
 
 import settings
-from llms import fast_llm
+from llms import fast_llm, invoke_structured_capped
 from run_stats import _log_agent_completion, _record_stat, _start_agent_progress
 from schemas import VERIFIER_AGENT, VerifierOutput, cwes
 from stage_cve import _normalize_cwe_ids
@@ -176,6 +176,7 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
     structured_llm = fast_llm.with_structured_output(VerifierOutput, method="json_schema", strict=True)
 
     evaluations = []
+    skipped_demands = 0
     for b_idx in batch_starts:
         batch = demands[b_idx : b_idx + batch_size]
         batch_hash = hashlib.md5(json.dumps(batch, sort_keys=True).encode()).hexdigest()
@@ -193,11 +194,23 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
             human_msg = HumanMessage(
                 content=f"```python\n{target_code}\n```\n\nSecurity Demands:\n{batch_demands_string}"
             )
-            response = structured_llm.invoke([sys_msg, human_msg])
+            response = invoke_structured_capped(
+                structured_llm,
+                [sys_msg, human_msg],
+                f"Contract verifier {target_node_id} batch{b_idx}",
+            )
+            if response is None:
+                # Output cap exhausted: drop this batch (uncached, so a later
+                # run re-attempts it) instead of crashing the whole fan-out.
+                skipped_demands += len(batch)
+                continue
             response = response if isinstance(response, dict) else response.model_dump()
             batch_evals = response.get("evaluations") or []
             cache(batch_cache_file, "write", {"evaluations": batch_evals})
         evaluations.extend(batch_evals)
+
+    if skipped_demands:
+        _record_stat("verifier_demands_skipped_output_cap", skipped_demands)
 
     # Deterministic demand-verdict ledger for the report statistics (skipped on
     # a whole-node cache hit, which returned above).
@@ -240,7 +253,10 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
 
             new_vulnerabilities.append(new_vuln)
 
-    cache(cache_file, "write", {"hypothesis": new_vulnerabilities})
+    # A batch skipped at the output cap leaves the node under-evaluated: never
+    # persist that partial result, so the next run re-attempts the skipped batch.
+    if not skipped_demands:
+        cache(cache_file, "write", {"hypothesis": new_vulnerabilities})
 
     return {"vulnerabilities": new_vulnerabilities}, "MISS"
 

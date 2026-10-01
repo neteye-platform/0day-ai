@@ -9,8 +9,8 @@ from langgraph.types import Send
 from tavily import TavilyClient
 
 import settings
-from llms import fast_llm
-from run_stats import _log_agent_completion, _start_agent_progress
+from llms import fast_llm, invoke_structured_capped
+from run_stats import _log_agent_completion, _record_stat, _start_agent_progress
 from schemas import THREAT_INTEL_AGENT, CVEAnalysis
 from stage_cve import _backfill_osv_cwe_ids, _finalize_cve_analysis
 from state import MasterState, ThreatIntelState
@@ -146,7 +146,14 @@ def _threat_intel_node(state: ThreatIntelState) -> dict:
     ))
     sys_msg = SystemMessage(content=THREAT_INTEL_AGENT.get("prompt", ""))
     structured_llm = fast_llm.with_structured_output(CVEAnalysis, method="json_schema", strict=True)
-    response = structured_llm.invoke([sys_msg, human_msg])
+    response = invoke_structured_capped(
+        structured_llm, [sys_msg, human_msg], f"Threat Intel {cve_id}"
+    )
+    if response is None:
+        # Fail-open to the prior analyzer output (same path as an invalid response).
+        _record_stat("threat_intel_skipped_output_cap")
+        logging.warning(f"{cve_id}: Threat Intel hit the output cap; keeping prior output.")
+        return {"cve_demands": [prior] if prior else []}
     response = response if isinstance(response, dict) else response.model_dump()
     enriched = _finalize_cve_analysis(response, cve, enriched_by="threat_intel")
     if enriched is None:

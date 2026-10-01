@@ -6,8 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 from langchain_core.messages import HumanMessage, SystemMessage
 
 import settings
-from llms import fast_llm
-from run_stats import as_dict
+from llms import fast_llm, invoke_structured_capped
+from run_stats import _record_stat, as_dict
 from schemas import EDGE_TRAVERSAL_AGENT, EdgeTraversalOutput
 from state import MasterState
 from boundary_edges import (
@@ -108,7 +108,13 @@ def _run_edge_traversal_batch(batch: list[dict], idx: int, total: int) -> list[d
     human_msg = HumanMessage(content=prompt)
 
     structured_llm = fast_llm.with_structured_output(EdgeTraversalOutput, method="json_schema", strict=True)
-    output = structured_llm.invoke([sys_msg, human_msg])
+    output = invoke_structured_capped(
+        structured_llm, [sys_msg, human_msg], f"Edge Traversal batch {idx}/{total}"
+    )
+    if output is None:
+        # Uncached on purpose: the next run re-attempts this batch.
+        _record_stat("edge_traversal_batches_skipped_output_cap")
+        return []
     output = output if isinstance(output, dict) else output.model_dump()
 
     # Assertions are invariant/pruning evidence, not findings.

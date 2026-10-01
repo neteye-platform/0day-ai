@@ -21,12 +21,14 @@ from utils import (
     find_unsupported_code_files,
     get_cached_graph_data,
     build_symbol_index,
+    clear_warning_state,
 )
 
 
 def bootstrap_node(state: MasterState) -> dict[str, Any]:
     """Ensure the knowledge graph exists before the parallel branches start."""
     _reset_pipeline_stats()  # fresh ledger per pipeline invocation
+    clear_warning_state()    # ... and fresh once-per-run warning dedup
     if not settings.graph.exists():
         logging.info(f"Graph {settings.graph} not found. Running graphify extract...")
         subprocess.run(

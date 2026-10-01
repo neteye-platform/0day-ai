@@ -6,8 +6,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Send
 
 import settings
-from llms import fast_llm
-from run_stats import _log_agent_completion, _start_agent_progress
+from llms import fast_llm, invoke_structured_capped
+from run_stats import _log_agent_completion, _record_stat, _start_agent_progress
 from schemas import CVE_ANALYZER_AGENT, CVEAnalysis
 from state import CVEAnalyzerState, MasterState
 from utils import cache
@@ -161,7 +161,13 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     ))
 
     cve_analyzer_llm = fast_llm.with_structured_output(CVEAnalysis, method="json_schema", strict=True)
-    analysis = cve_analyzer_llm.invoke([sys_msg, human_msg])
+    analysis = invoke_structured_capped(
+        cve_analyzer_llm, [sys_msg, human_msg], f"CVE analyzer {cve_id}"
+    )
+    if analysis is None:
+        # Fail open: no demands for this CVE; uncached so a re-run retries it.
+        _record_stat("cve_analyses_skipped_output_cap")
+        return {"cve_demands": []}
 
     dict_analysis = analysis if isinstance(analysis, dict) else analysis.model_dump()
 

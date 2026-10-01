@@ -13,6 +13,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from langgraph.types import RetryPolicy
+from openai import LengthFinishReasonError
 
 import settings
 import tools
@@ -188,12 +189,30 @@ def compile_integration_auditor():
     return compiled_integration_auditor
 
 
+# LengthFinishReasonError is deterministic for a given prompt (the model burns
+# the whole completion budget and dies mid-JSON), so task-level retries would
+# just re-burn the same 16k output tokens five times and then crash the run.
+# The stage call sites handle it via llms.invoke_structured_capped instead.
+# Other deterministic failures (schema/validation, KeyError, OSError, ...) must
+# keep langgraph's fail-fast default too — only transient errors retry.
+try:  # lives in a private langgraph module; fall back to "retry others" if moved
+    from langgraph._internal._retry import default_retry_on as _default_retry_on
+except ImportError:  # pragma: no cover
+    def _default_retry_on(exc):
+        return True
+
+
+def _retry_on(exc):
+    return _default_retry_on(exc) and not isinstance(exc, LengthFinishReasonError)
+
+
 RETRY = RetryPolicy(
     initial_interval=1.0,
     backoff_factor=2.0,
     max_interval=60.0,
     max_attempts=5,
     jitter=True,
+    retry_on=_retry_on,
 )
 
 

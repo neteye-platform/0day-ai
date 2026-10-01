@@ -143,6 +143,20 @@ def _build_pipeline_statistics(state: MasterState) -> str:
         f"| Vulnerability findings reported | {len(state.get('reporter_findings', []))} |",
     ]
 
+    for label, key in (
+        ("Demands skipped at output cap (verifier)", "verifier_demands_skipped_output_cap"),
+        ("Explorer nodes skipped at output cap", "explorer_nodes_skipped_output_cap"),
+        ("CVE analyses skipped at output cap", "cve_analyses_skipped_output_cap"),
+        ("Threat-intel enrichments skipped at output cap", "threat_intel_skipped_output_cap"),
+        ("Edge-traversal batches skipped at output cap", "edge_traversal_batches_skipped_output_cap"),
+        ("Node resolutions via fallback (global-exact / caller-scoped)", "demand_nodes_resolved_fallback"),
+        ("Unresolved node targets (unique, logged once each)", "resolve_targets_unresolved_unique"),
+        ("Demands dropped: unresolvable target (unique)", "demands_dropped_unresolved_unique"),
+        ("Demands dropped: no qualifying caller (unique)", "demands_dropped_scoped_unique"),
+    ):
+        if stats.get(key):
+            lines.append(f"| {label} | {stats[key]} |")
+
     if verified_total:
         lines += [
             "",
