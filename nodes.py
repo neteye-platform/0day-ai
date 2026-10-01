@@ -1,11 +1,13 @@
 from pathlib import Path
 import json
+import os
 import re
 import subprocess
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.callbacks import BaseCallbackHandler
+from tavily import TavilyClient
 from langgraph.types import Command, Send
 from langgraph.graph import END
 from typing import Any
@@ -18,9 +20,9 @@ import uuid
 from languages import SYMBOL_QUERIES
 import settings
 import tools
-from state import MasterState, ExplorerState, CVEAnalyzerState, VerifierState, ReviewerState, ValidatorState
-from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches
+from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState
+from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
+from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity
 
 # fast_llm = ChatOllama(model="gemma4:cloud", temperature=0.2, reasoning=False, num_ctx=32768)
 # smart_llm = ChatOllama(model="gemma4:cloud", temperature=0.6, reasoning=False, num_ctx=32768)
@@ -613,6 +615,33 @@ def dispatch_cve_analyzers(state: MasterState):
     return commands
 
 
+def _finalize_cve_analysis(dict_analysis: dict, cve: dict, *, enriched_by: str | None = None) -> dict | None:
+    """Apply deterministic CVE output guards and attach routing metadata."""
+    cve_id = cve.get("id", "UNKNOWN-CVE")
+    fix_category = dict_analysis.get("fix_category")
+    if fix_category == "application_mitigation" and not dict_analysis.get("security_assumption"):
+        logging.warning(f"{cve_id}: classified as application_mitigation but no security_assumption. Dropping.")
+        return None
+    if fix_category == "upgrade_only" and not dict_analysis.get("hypothesis"):
+        logging.warning(f"{cve_id}: classified as upgrade_only but no hypothesis. Dropping.")
+        return None
+    if fix_category not in ("application_mitigation", "upgrade_only"):
+        logging.warning(f"{cve_id}: invalid fix_category '{fix_category}'. Dropping.")
+        return None
+
+    dict_analysis["required_keywords"] = list(dict.fromkeys(
+        kw.strip()
+        for kw in (dict_analysis.get("required_keywords") or [])
+        if kw and kw.strip()
+    ))
+    dict_analysis["source_cve"] = cve_id
+    dict_analysis["package"] = cve.get("package") or "unknown"
+    dict_analysis["fixed_version"] = cve.get("fixed_version")
+    if enriched_by:
+        dict_analysis["enriched_by"] = enriched_by
+    return dict_analysis
+
+
 def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     """LLM node that classifies a single CVE description and either extracts a
     security demand (application_mitigation) or emits a vulnerability hypothesis
@@ -649,6 +678,10 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     cwe_ids = cve.get("cwe_ids") or []
     if cwe_ids:
         enrichment += f"OSV CWE classifications: {', '.join(cwe_ids)}\n"
+    if cve.get("severity_label"):
+        enrichment += f"OSV severity: {cve['severity_label']}\n"
+    if cve.get("cvss_vector"):
+        enrichment += f"OSV CVSS vector: {cve['cvss_vector']}\n"
     if enrichment:
         enrichment = f"\n--- OSV ENRICHMENT ---\n{enrichment}"
 
@@ -669,30 +702,9 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
 
     dict_analysis = analysis if isinstance(analysis, dict) else analysis.model_dump()
 
-    # Deterministic guards: reject malformed/contradictory outputs before caching.
-    fix_category = dict_analysis.get("fix_category")
-    if fix_category == "application_mitigation" and not dict_analysis.get("security_assumption"):
-        logging.warning(f"{cve_id}: classified as application_mitigation but no security_assumption. Dropping.")
+    dict_analysis = _finalize_cve_analysis(dict_analysis, cve)
+    if dict_analysis is None:
         return {"cve_demands": []}
-    if fix_category == "upgrade_only" and not dict_analysis.get("hypothesis"):
-        logging.warning(f"{cve_id}: classified as upgrade_only but no hypothesis. Dropping.")
-        return {"cve_demands": []}
-    if fix_category not in ("application_mitigation", "upgrade_only"):
-        logging.warning(f"{cve_id}: invalid fix_category '{fix_category}'. Dropping.")
-        return {"cve_demands": []}
-
-    # Normalize required_keywords deterministically before caching: strip
-    # whitespace, drop empties, dedupe while preserving order.
-    dict_analysis["required_keywords"] = list(dict.fromkeys(
-        kw.strip()
-        for kw in (dict_analysis.get("required_keywords") or [])
-        if kw and kw.strip()
-    ))
-
-    # Tag the resulting analysis with the CVE ID for traceability during the Verification Phase
-    dict_analysis["source_cve"] = cve_id
-    dict_analysis["package"] = package_name
-    dict_analysis["fixed_version"] = fixed_version
 
     # Save to cache
     cache(cache_file, "write", dict_analysis)
@@ -709,6 +721,147 @@ def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     _log_agent_completion(
         state.get("progress_id", ""),
         "CVE analyzer",
+        f"cve={cve.get('id', 'UNKNOWN-CVE')}",
+    )
+    return result
+
+
+# ==========================================
+# Threat Intel agent
+# ==========================================
+
+def threat_intel_gate_node(state: MasterState) -> dict:
+    """Barrier after all per-CVE analyzer tasks have completed."""
+    return {}
+
+
+def _analysis_needs_threat_intel(cve: dict, analysis: dict | None) -> bool:
+    if is_high_severity(cve):
+        return True
+    if analysis is None:
+        return True
+    if "required_keywords" in analysis and not analysis.get("required_keywords"):
+        return True
+    trigger_keys = {"trigger_condition", "attacker_request_primitive"}
+    if trigger_keys & analysis.keys() and not any(analysis.get(key) for key in trigger_keys):
+        return True
+    return False
+
+
+def dispatch_threat_intel(state: MasterState):
+    """Dispatch only CVEs whose mechanics need external threat intelligence."""
+    if not os.environ.get("TAVILY_API_KEY"):
+        logging.warning("Threat Intel disabled: TAVILY_API_KEY is not configured.")
+        return "aggregate_demands"
+
+    analyzed = {}
+    for record in state.get("cve_demands", []):
+        record = record if isinstance(record, dict) else record.model_dump()
+        source_cve = record.get("source_cve")
+        if source_cve:
+            current = analyzed.get(source_cve)
+            if current is None or record.get("enriched_by") == "threat_intel":
+                analyzed[source_cve] = record
+
+    candidates = []
+    for cve in state.get("known_vulns", []):
+        cve_id = cve.get("id", "UNKNOWN-CVE")
+        prior = analyzed.get(cve_id)
+        if _analysis_needs_threat_intel(cve, prior):
+            candidates.append((cve, prior))
+
+    if not candidates:
+        logging.info("Threat Intel: no CVEs met the enrichment criteria.")
+        return "aggregate_demands"
+
+    progress_id = _start_agent_progress(len(candidates))
+    logging.info("Starting Threat Intel scan: 0/%d complete, %d remaining.", len(candidates), len(candidates))
+    return [
+        Send("threat_intel", ThreatIntelState(
+            cve=cve,
+            prior_analysis=prior,
+            progress_id=progress_id,
+        ))
+        for cve, prior in candidates
+    ]
+
+
+def _format_threat_intel_results(search_data: dict) -> str:
+    sections = []
+    answer = search_data.get("answer")
+    if answer:
+        sections.append(f"Tavily answer:\n{str(answer)[:2500]}")
+    for index, result in enumerate(search_data.get("results", [])[:5], 1):
+        if not isinstance(result, dict):
+            continue
+        sections.append(
+            f"Result {index}: {result.get('title', '')}\n"
+            f"URL: {result.get('url', '')}\n"
+            f"Content: {str(result.get('content', ''))[:1500]}"
+        )
+    return "\n\n".join(sections)[:9000]
+
+
+def _threat_intel_node(state: ThreatIntelState) -> dict:
+    cve = state.get("cve", {})
+    prior = state.get("prior_analysis")
+    cve_id = cve.get("id", "UNKNOWN-CVE")
+    package_name = cve.get("package") or "unknown"
+    cache_file = settings.cache_dir / "threat_intel" / f"{cve_id}.json"
+    cached = cache(cache_file, "read")
+    if cached:
+        return {"cve_demands": [cached]}
+
+    query = f"{cve_id} {package_name} root cause writeup exploit analysis"
+    try:
+        search_data = TavilyClient().search(
+            query=query,
+            search_depth="advanced",
+            max_results=5,
+            include_answer=True,
+        )
+    except Exception as exc:
+        logging.warning(f"{cve_id}: Tavily search failed; keeping analyzer output: {exc}")
+        return {"cve_demands": [prior] if prior else []}
+
+    descriptions = cve.get("descriptions") or ([cve.get("details")] if cve.get("details") else [])
+    enrichment = []
+    if cve.get("fixed_version"):
+        enrichment.append(f"Fixed version: {cve['fixed_version']}")
+    if cve.get("cwe_ids"):
+        enrichment.append(f"OSV CWE classifications: {', '.join(cve['cwe_ids'])}")
+    if cve.get("severity_label"):
+        enrichment.append(f"OSV severity: {cve['severity_label']}")
+    if cve.get("cvss_vector"):
+        enrichment.append(f"OSV CVSS vector: {cve['cvss_vector']}")
+    human_msg = HumanMessage(content=(
+        f"Analyze and complete this CVE using the external threat intelligence.\n\n"
+        f"CVE ID: {cve_id}\nPackage: {package_name}\n"
+        f"OSV descriptions:\n{chr(10).join(descriptions)}\n"
+        f"{' '.join(enrichment)}\n\n"
+        f"Prior CVE analyzer output (may be null or incomplete):\n"
+        f"{json.dumps(prior or {}, indent=2)}\n\n"
+        f"--- WEB INTEL ---\n{_format_threat_intel_results(search_data)}"
+    ))
+    sys_msg = SystemMessage(content=THREAT_INTEL_AGENT.get("prompt", ""))
+    structured_llm = fast_llm.with_structured_output(CVEAnalysis, method="json_schema", strict=True)
+    response = structured_llm.invoke([sys_msg, human_msg])
+    response = response if isinstance(response, dict) else response.model_dump()
+    enriched = _finalize_cve_analysis(response, cve, enriched_by="threat_intel")
+    if enriched is None:
+        logging.warning(f"{cve_id}: Threat Intel returned an invalid analysis; keeping prior output.")
+        return {"cve_demands": [prior] if prior else []}
+
+    cache(cache_file, "write", enriched)
+    return {"cve_demands": [enriched]}
+
+
+def threat_intel_node(state: ThreatIntelState) -> dict:
+    result = _threat_intel_node(state)
+    cve = state.get("cve", {})
+    _log_agent_completion(
+        state.get("progress_id", ""),
+        "Threat Intel",
         f"cve={cve.get('id', 'UNKNOWN-CVE')}",
     )
     return result
@@ -1038,6 +1191,23 @@ def filter_cve_demands_by_keywords(cves: list[dict]) -> list[dict]:
     return kept
 
 
+def _dedupe_enriched_cve_demands(cves: list[dict]) -> list[dict]:
+    """Keep one analyzer record per CVE, preferring Threat Intel output."""
+    by_cve: dict[str, dict] = {}
+    for record in cves:
+        source_cve = record.get("source_cve")
+        if not source_cve:
+            by_cve[f"__anonymous_{len(by_cve)}"] = record
+            continue
+        existing = by_cve.get(source_cve)
+        if existing is None or (
+            record.get("enriched_by") == "threat_intel"
+            and existing.get("enriched_by") != "threat_intel"
+        ):
+            by_cve[source_cve] = record
+    return list(by_cve.values())
+
+
 def aggregate_demands_node(state: MasterState):
     grouped_demands = defaultdict(list)
     try:
@@ -1049,7 +1219,8 @@ def aggregate_demands_node(state: MasterState):
 
         logging.info(f"Loaded graph data: {len(callers_map)} caller entries, {len(node_imports_map)} import entries.")
         notes = state.get("notes", [])
-        cves = filter_cve_demands_by_keywords(state.get("cve_demands", []))
+        cves = _dedupe_enriched_cve_demands(state.get("cve_demands", []))
+        cves = filter_cve_demands_by_keywords(cves)
         logging.info(f"Processing {len(notes)} notes and {len(cves)} CVE demands.")
 
         # Process Explorer Notes

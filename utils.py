@@ -1261,6 +1261,73 @@ def get_canonical_id(record):
     return record.get("id", "UNKNOWN")
 
 
+def _cvss_v3_base_score(vector: str | None) -> float | None:
+    """Calculate a CVSS v3.x base score from a CVSS vector.
+
+    OSV commonly stores the CVSS vector rather than a numeric score.  This
+    small implementation is only used for the coarse HIGH threshold; vectors
+    from other CVSS generations are intentionally ignored.
+    """
+    if not isinstance(vector, str) or not vector.startswith("CVSS:3."):
+        return None
+
+    metrics = {}
+    for part in vector.split("/")[1:]:
+        if ":" not in part:
+            continue
+        key, value = part.split(":", 1)
+        metrics[key] = value
+
+    required = ("AV", "AC", "PR", "UI", "S", "C", "I", "A")
+    if any(key not in metrics for key in required):
+        return None
+
+    weights = {
+        "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
+        "AC": {"L": 0.77, "H": 0.44},
+        "UI": {"N": 0.85, "R": 0.62},
+        "C": {"N": 0.0, "L": 0.22, "H": 0.56},
+        "I": {"N": 0.0, "L": 0.22, "H": 0.56},
+        "A": {"N": 0.0, "L": 0.22, "H": 0.56},
+    }
+    try:
+        av = weights["AV"][metrics["AV"]]
+        ac = weights["AC"][metrics["AC"]]
+        ui = weights["UI"][metrics["UI"]]
+        confidentiality = weights["C"][metrics["C"]]
+        integrity = weights["I"][metrics["I"]]
+        availability = weights["A"][metrics["A"]]
+        scope_changed = metrics["S"] == "C"
+        pr = {
+            "U": {"N": 0.85, "L": 0.62, "H": 0.27},
+            "C": {"N": 0.85, "L": 0.68, "H": 0.5},
+        }["C" if scope_changed else "U"][metrics["PR"]]
+    except KeyError:
+        return None
+
+    impact_subscore = 1 - ((1 - confidentiality) * (1 - integrity) * (1 - availability))
+    if impact_subscore <= 0:
+        return 0.0
+
+    if not scope_changed:
+        impact = 6.42 * impact_subscore
+    else:
+        impact = 7.52 * (impact_subscore - 0.029) - 3.25 * (impact_subscore - 0.02) ** 15
+    exploitability = 8.22 * av * ac * pr * ui
+    raw_score = min(impact + exploitability, 10.0)
+    if scope_changed:
+        raw_score = min(1.08 * (impact + exploitability), 10.0)
+    return min(10.0, (int(raw_score * 10 + 0.999999) / 10))
+
+
+def is_high_severity(record: dict) -> bool:
+    """Return whether an OSV-normalized record meets the HIGH threshold."""
+    label = str(record.get("severity_label") or "").upper()
+    if label:
+        return label in {"HIGH", "CRITICAL"}
+    return (_cvss_v3_base_score(record.get("cvss_vector")) or 0.0) >= 7.0
+
+
 def deduplicate_cves(vulns: list[dict]) -> list[dict]:
     """
     Extracts unique vulnerabilities by canonical ID and keeps up to 3 distinct
@@ -1277,6 +1344,8 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
     are carried forward when present in the OSV record:
     - fixed_version: first `fixed` event across affected version ranges.
     - cwe_ids: database_specific.cwe_ids (list) when the OSV entry classifies them.
+    - severity_label: database_specific.severity when available.
+    - cvss_vector: the first CVSS v3 vector when available.
     """
     best_records = {}
 
@@ -1306,6 +1375,22 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
     def extract_cwe_ids(record: dict) -> list[str]:
         return record.get("database_specific", {}).get("cwe_ids", []) or []
 
+    def extract_severity_label(record: dict) -> Optional[str]:
+        severity = record.get("database_specific", {}).get("severity")
+        if isinstance(severity, str) and severity.strip():
+            return severity.strip().upper()
+        return None
+
+    def extract_cvss_vector(record: dict) -> Optional[str]:
+        vectors = record.get("severity", []) or []
+        for entry in vectors:
+            if not isinstance(entry, dict):
+                continue
+            vector = entry.get("score")
+            if entry.get("type", "").upper().startswith("CVSS_V3") and isinstance(vector, str):
+                return vector
+        return None
+
     for vuln in vulns:
         canonical_id = get_canonical_id(vuln)
         current_details = vuln.get("details", "")
@@ -1320,6 +1405,8 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
                 "package": packages[0] if len(packages) >= 1 else "unknown",
                 "fixed_version": extract_fixed_version(vuln),
                 "cwe_ids": extract_cwe_ids(vuln),
+                "severity_label": extract_severity_label(vuln),
+                "cvss_vector": extract_cvss_vector(vuln),
             }
             continue
 
@@ -1338,6 +1425,10 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
                 record["fixed_version"] = extract_fixed_version(vuln)
             if not record.get("cwe_ids"):
                 record["cwe_ids"] = extract_cwe_ids(vuln)
+            if not record.get("severity_label"):
+                record["severity_label"] = extract_severity_label(vuln)
+            if not record.get("cvss_vector"):
+                record["cvss_vector"] = extract_cvss_vector(vuln)
 
     return list(best_records.values())
 

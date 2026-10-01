@@ -31,6 +31,13 @@ class CVEAnalyzerState(TypedDict):
     cve: dict
     progress_id: str
 
+
+class ThreatIntelState(TypedDict):
+    cve: dict
+    prior_analysis: Optional[dict]
+    progress_id: str
+
+
 class VerifierState(TypedDict):
     target_node_id: str
     target_code: str

@@ -11,6 +11,7 @@ with open("agents.yaml", "r") as f:
     MANAGER_AGENT = data.get("manager_agent")
     EXPERT_AGENTS = data.get("expert_agents")
     CVE_ANALYZER_AGENT = data.get("cve_analyzer")
+    THREAT_INTEL_AGENT = data.get("threat_intel")
     VERIFIER_AGENT = data.get("contract_verifier_agent")
     REVIEWER_AGENT = data.get("reviewer_agent")
     VALIDATOR_AGENT = data.get("validator_agent")
