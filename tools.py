@@ -409,12 +409,51 @@ def submit_evaluation(
 
     report = state.get("expert_report", {})
 
+    # FP gates (raised errors bounce back as corrective ToolMessages, like the
+    # EvaluationToolInput validators): the taint tracks must enumerate every
+    # traced use of the untrusted value; systemic demands one entry per
+    # affected node so an exemplar defense cannot dismiss the whole cluster.
+    mode = state.get("mode", "code_level")
+    concern = (kwargs.get("out_of_scope_concern") or "").strip()
+    if not kwargs.get("is_exploitable"):
+        if concern:
+            raise ValueError(
+                "false_positive rejected: you reported an observed source-to-sink flow "
+                "(`out_of_scope_concern`) but filed the finding as not exploitable. "
+                "Adjudicate it — rule it out by adding its sites to `untrusted_uses` with "
+                "the concrete blocking defense, or resubmit is_exploitable=true + "
+                "'direct_to_validator' describing the full observed chain in "
+                "`reproduction_steps` and keeping the concern so the Validator tests it."
+            )
+        uses = [u for u in (kwargs.get("untrusted_uses") or []) if str(u).strip()]
+        if mode in ("code_level", "dependency_mitigation") and not uses:
+            raise ValueError(
+                "false_positive rejected: `untrusted_uses` must list every site where the "
+                "untrusted value is used in the traced flow (file:line - operation - why it "
+                "cannot reach an execution sink), including derived variables and "
+                "warn-and-continue branches. If any use cannot be excluded, resubmit with "
+                "is_exploitable=true and that point in `reservations`; if a guard only warns "
+                "and continues, it is not a defense."
+            )
+        if mode == "systemic":
+            n_nodes = len(report.get("affected_nodes") or [])
+            if len(uses) < max(1, n_nodes):
+                raise ValueError(
+                    "false_positive rejected: one systemic verdict dismisses every bundled "
+                    f"instance, so `untrusted_uses` needs at least one entry per affected "
+                    f"node ({n_nodes}) citing that node's blocking defense (file:line). A "
+                    "defense proven on an exemplar instance proves nothing about the "
+                    "others; route unsettled nodes to the Validator via "
+                    "is_exploitable=true + `reservations` instead."
+                )
+
     # Mutate a copy of the single report
     updated_vuln = dict(report)
     updated_vuln["status"] = "confirmed" if kwargs.get("is_exploitable") else "false_positive"
     updated_vuln["reviewer_reasoning"] = kwargs.get("reasoning")
     updated_vuln["mitigation"] = kwargs.get("mitigation")
     updated_vuln["reservations"] = kwargs.get("reservations") or None
+    updated_vuln["out_of_scope_concern"] = kwargs.get("out_of_scope_concern") or None
     updated_vuln["reproduction_steps"] = kwargs.get("reproduction_steps", [])
     updated_vuln["validation_strategy"] = kwargs.get("validation_strategy")
 

@@ -32,8 +32,8 @@ repair_call_edges = True
 container_demands_scope_to_members = True
 
 # None = all
-communities_to_analyze = None
-# communities_to_analyze = [402]
+# communities_to_analyze = None
+communities_to_analyze = [5]
 
 # Path patterns (relative to app root) skipped before analysis and blocked from
 # reviewer file reads; globs and bare dir names supported.
@@ -64,7 +64,7 @@ llm_max_completion_tokens = 16384
 
 # =============================== Agents ==================================
 
-agents_concurrency = 6
+agents_concurrency = 2
 
 # Reviewer/validator loop caps: if the terminal tool isn't called within this many
 # LLM rounds, the loop ends via the fallback node instead of hitting the recursion

@@ -178,6 +178,13 @@ class VulnerabilityRecord(BaseModel):
             "Validator must prove or refute in the sandbox."
         ),
     )
+    out_of_scope_concern: Optional[str] = Field(
+        default=None,
+        description=(
+            "A source-to-sink flow the Reviewer observed while tracing that this record's "
+            "hypothesis does not cover; rendered for the Validator alongside reservations."
+        ),
+    )
     reproduction_steps: Optional[list[str]] = Field(
         default=None,
         description=(
@@ -567,11 +574,32 @@ class EvaluationToolInput(BaseModel):
     mitigation: Optional[str] = Field(
         default=None,
         description=(
-            "REQUIRED when is_exploitable is false: the defense that blocks exploitation, "
-            "cited to file + function. For filter/whitelist/parameterization defenses, name "
-            "each user-controllable field reaching the sink and its guard; if that list "
-            "cannot be complete, use is_exploitable=true + 'direct_to_validator' with "
-            "`reservations` instead."
+            "REQUIRED when is_exploitable is false: the defense blocking exploitation, cited "
+            "to file + function. A defense must HALT the flow — log/warn-only checks are not "
+            "defenses. Name every user-controllable field reaching the sink and its guard; "
+            "if the list cannot be complete, use is_exploitable=true + `reservations`."
+        ),
+    )
+    untrusted_uses: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "REQUIRED for code-level false positives: every use of the untrusted value in the "
+            "traced flow, one per line — file:line, operation, why it cannot reach a sink. "
+            "Include derived variables and warn-and-continue branches; follow the request "
+            "value under every name it takes (not just the flagged parameter or stored "
+            "field). If the value is never read at all, one entry citing the searches "
+            "proving that is enough. For systemic false positives: one entry per affected "
+            "node citing its own blocking defense. Any use you cannot exclude: "
+            "is_exploitable=true + `reservations`."
+        ),
+    )
+    out_of_scope_concern: Optional[str] = Field(
+        default=None,
+        description=(
+            "A source-to-sink flow you OBSERVED while tracing that this hypothesis does not "
+            "cover: name the request parameter, file:line, sink. A false positive carrying "
+            "one is rejected — rule it out via `untrusted_uses` or resubmit as exploitable "
+            "with the full chain in `reproduction_steps`."
         ),
     )
     reservations: Optional[list[str]] = Field(

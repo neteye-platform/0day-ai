@@ -17,7 +17,10 @@ _KEYS = dict(
 
 fast_llm = ChatOpenAI(temperature=0.2, reasoning_effort="none", **_KEYS)
 smart_llm = ChatOpenAI(temperature=0.8, reasoning_effort="medium", **_KEYS)
-reviewer_llm = ChatOpenAI(temperature=0.8, reasoning_effort="low", **_KEYS)
+reviewer_llm = ChatOpenAI(temperature=0.8, reasoning_effort="medium", **_KEYS)
+# The validator's per-turn output is tool calls, not reasoning; the sandbox is
+# the oracle, so extended reasoning is pure latency on every loop turn.
+validator_llm = ChatOpenAI(temperature=0.8, reasoning_effort="low", **_KEYS)
 
 
 def invoke_structured_capped(llm, messages, description: str):
