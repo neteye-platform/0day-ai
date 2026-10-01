@@ -1538,6 +1538,32 @@ def is_high_severity(record: dict) -> bool:
     return (_cvss_v3_base_score(record.get("cvss_vector")) or 0.0) >= 7.0
 
 
+def cvss_v3_base_score(vector: str | None) -> float | None:
+    """Public wrapper over ``_cvss_v3_base_score``.
+
+    Computes the CVSS v3.x base score (0.0-10.0) from a vector string, or
+    returns None when the vector is missing, malformed, or from another CVSS
+    generation. The reporter uses it to score each finding deterministically
+    from the LLM-emitted vector instead of trusting model arithmetic.
+    """
+    return _cvss_v3_base_score(vector)
+
+
+def cvss_severity_label(score: float | None) -> str:
+    """Map a CVSS base score to its v3 qualitative severity rating."""
+    if score is None:
+        return "Not assessed"
+    if score >= 9.0:
+        return "Critical"
+    if score >= 7.0:
+        return "High"
+    if score >= 4.0:
+        return "Medium"
+    if score > 0.0:
+        return "Low"
+    return "None"
+
+
 def deduplicate_cves(vulns: list[dict]) -> list[dict]:
     """
     Extracts unique vulnerabilities by canonical ID and keeps up to 3 distinct
@@ -1756,6 +1782,30 @@ def cache_integration_auditor(report: dict, peers: Optional[list] = None, update
     if updated_vuln is None:
         return cache(cache_file, "read")
     cache(cache_file, "write", updated_vuln)
+    return None
+
+
+def cache_reporter(records: list, output: Optional[dict] = None) -> Optional[dict]:
+    """Read (``output`` is None) or write the reporter's LLM assessment output.
+
+    Keyed on the content hash of the selected (exploitable/static) records,
+    sorted by vuln_id for order independence. Only the structured ``ReporterOutput``
+    payload is cached: the markdown render is NOT, so the deterministic
+    Pipeline Statistics section always reflects the current run even when a hit
+    skips the reporter LLM call.
+    """
+    normalized = sorted(
+        (r for r in (records or []) if isinstance(r, dict)),
+        key=lambda r: (r.get("vuln_id", ""), json.dumps(r, sort_keys=True)),
+    )
+    digest = hashlib.md5(json.dumps(normalized, sort_keys=True).encode()).hexdigest()
+    cache_file = settings.cache_dir / "reporter" / f"{digest}.json"
+    if output is None:
+        cached = cache(cache_file, "read")
+        if isinstance(cached, dict) and isinstance(cached.get("output"), dict):
+            return cached["output"]
+        return None
+    cache(cache_file, "write", {"output": output})
     return None
 
 

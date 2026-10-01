@@ -18,7 +18,7 @@ import settings
 import tools
 import browser_tools
 import attacker_tools
-from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, dispatch_integration_audits, integration_auditor_node, integration_auditor_router, integration_auditor_fallback_node, ask_integration_auditor_for_tool, route_integration_audit, route_validator_feedback, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node, edge_traversal_node
+from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, dispatch_integration_audits, integration_auditor_node, integration_auditor_router, integration_auditor_fallback_node, ask_integration_auditor_for_tool, route_integration_audit, route_validator_feedback, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node, edge_traversal_node, reporter_node
 from state import MasterState, ReviewerState, ValidatorState, IntegrationAuditorState
 from schemas import ReviewerOutput, ValidatorOutput
 
@@ -197,6 +197,10 @@ def build_graph(checkpointer=None, interrupt_before=None):
     # auditor once their `direct_to_validator` peers carry proven poc_payloads
     # (dispatch_integration_audits is the conditional path function).
     workflow.add_node("integration_audit_dispatch", lambda state: {})
+    # Single-shot terminal Reporter: after the validator/audit phases drain, it
+    # writes the final markdown report (report.md under the target app dir)
+    # covering the proven-exploitable + accepted-static findings.
+    workflow.add_node("reporter", reporter_node)
     # workflow.add_node("reviewer_sync", synchronization_node)
 
     workflow.add_edge(START, "bootstrap")
@@ -223,7 +227,9 @@ def build_graph(checkpointer=None, interrupt_before=None):
     # Contract-verifier barrier -> Edge Traversal (composite hypotheses are wired
     # synchronously on this chain, no extra fan-out/join) -> reviewer dispatch.
     workflow.add_edge("synchronization", "edge_traversal")
-    workflow.add_conditional_edges("edge_traversal", dispatch_reviewers, ["reviewer_agent", END])
+    # Reporter is the single sink: every early/terminal exit routes there so the
+    # final markdown report is written exactly once, even with zero hypotheses.
+    workflow.add_conditional_edges("edge_traversal", dispatch_reviewers, ["reviewer_agent", "reporter"])
     # workflow.add_edge("reviewer_agent", "reviewer_sync")
     # Evaluate dispatch from the barrier (never mid-superstep) so it reads the
     # fully-merged confirmed set before emitting validator/auditor Sends.
@@ -237,7 +243,8 @@ def build_graph(checkpointer=None, interrupt_before=None):
         {
             "validator_agent": "validator_agent",
             "integration_audit_dispatch": "integration_audit_dispatch",
-            "__end__": END,
+            # Never returned today, but the reporter must remain the sole sink.
+            "__end__": "reporter",
         },
     )
     # Stage 2: from the validator (once its whole superstep finished) either bounce
@@ -249,19 +256,23 @@ def build_graph(checkpointer=None, interrupt_before=None):
         {
             "reviewer_agent": "reviewer_agent",
             "integration_audit_dispatch": "integration_audit_dispatch",
-            "__end__": END,
+            "__end__": "reporter",
         },
     )
-    # Stage 2b: fan the audited records to the auditor (or END when none remain —
-    # covers the no-direct-tasks / post-chain drain cases).
+    # Stage 2b: fan the audited records to the auditor (or advance to the
+    # Reporter when none remain — covers the no-direct-tasks / post-chain drain
+    # cases, so report.md is always written).
     workflow.add_conditional_edges(
         "integration_audit_dispatch",
         dispatch_integration_audits,
-        ["integration_auditor", END],
+        ["integration_auditor", "reporter"],
     )
     # Stage 3: chained records go to the Validator with the peers' proven
-    # poc_payloads injected (see route_integration_audit); unchainable are terminal.
-    workflow.add_conditional_edges("integration_auditor", route_integration_audit, ["validator_agent", END])
+    # poc_payloads injected (see route_integration_audit); unchainable are
+    # terminal. When nothing chains the pipeline advances to the Reporter.
+    workflow.add_conditional_edges("integration_auditor", route_integration_audit, ["validator_agent", "reporter"])
+    # Single terminal sink: the Reporter runs exactly once and the graph ends.
+    workflow.add_edge("reporter", END)
 
     app = workflow.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)
     app = app.with_config({"max_concurrency": settings.agents_concurrency})
