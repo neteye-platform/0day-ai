@@ -39,14 +39,13 @@ AST_GRAMMAR_MAP = {
 }
 
 @tool
-def read_source_code(node_id: str, current_analysis: str, reason_for_reading: str) -> str:
+def read_source_code(node_id: str, reason_for_reading: str) -> str:
     """
     Fetches the source code for a given Node ID.
 
     Args:
         node_id: The exact ID of the node to read (e.g., 'src_main_query_db').
-        current_analysis: A detailed summary of the vulnerabilities, data flows, or logic flaws you have found in the code you have ALREADY read. If this is your first read, state your initial hypothesis. You MUST NOT leave this blank.
-        reason_for_reading: Explain exactly why you need to read THIS specific node next, and how you expect it to connect to your current analysis.
+        reason_for_reading: Explain exactly why you need to read THIS specific node next, and how you expect it to connect to your current knowledge.
     """
     try:
         with open(settings.graph, "r") as f:
@@ -177,7 +176,7 @@ def read_source_code(node_id: str, current_analysis: str, reason_for_reading: st
 @tool
 def check_package_vulnerability(package_name: str, version: str) -> list:
     """
-    Return known vulnerabilities for the give package version
+    Return known vulnerabilities for the given package version
     """
     query = {
         "package": {
@@ -223,17 +222,27 @@ def mark_task_complete(summary: str) -> dict:
     """Call this tool ONLY when you have analyzed EVERY single node assigned to you and are ready to finish."""
     return {"audit_status": "completed", "summary": summary}
 
+
+@tool
+def submit_evaluation(is_exploitable: bool, confidence_score: int, reasoning: str) -> dict:
+    """Call this tool when you have finished reviewing the source code and made a final decision."""
+    return {
+        "is_exploitable": is_exploitable,
+        "confidence_score": confidence_score,
+        "reasoning": reasoning
+    }
+
+
 @tool
 def send_http_request(method: str, endpoint: str, headers: dict, body: str = "") -> str:
     """
     Sends an HTTP request to the sandboxed application.
-    Use this for testing XSS, SQLi, SSRF, and command injection via web endpoints.
+    Use this for testing web endpoints.
     """
     if not endpoint.startswith(settings.sandbox_url):
         return f"You can only make requests to the sandbox application at {settings.sandbox_url}"
 
     import requests
-    # Ensure endpoint is pointing to the sandbox environment!
     try:
         response = requests.request(
             method=method,

@@ -130,7 +130,6 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
         namespace, state = event
 
         # Format the namespace so it's readable in the JSON
-        # The root graph has an empty namespace tuple ()
         if not namespace:
             graph_name = "Main_Graph"
             raw_main_state = state
@@ -139,16 +138,28 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
             graph_name = ' -> '.join(namespace)
 
         if hasattr(state.get("task"), "agent_role"):
-            graph_name = graph_name[:17] + f" ({state.get("task").agent_role})"
+            graph_name = graph_name[:17] + f" ({state.get('task').agent_role})"
 
         # Overwrite the key with the most recent full state.
         assembled_states[graph_name] = serialize_for_json(state)
 
+        # ==========================================
         # --- TERMINAL PROGRESS INDICATOR ---
-        if "messages" in state and state["messages"]:
+        # ==========================================
+        last_msg = None
+
+        # 1. Catch Subgraph Agents (they still use the 'messages' array)
+        if namespace and "messages" in state and state["messages"]:
             last_msg = state["messages"][-1]
+            
+        # 2. Catch the Manager (runs on Main Graph, uses 'manager_message' key)
+        elif not namespace and "manager_message" in state and state["manager_message"]:
+            last_msg = state["manager_message"]
+
+        # If we successfully grabbed a message from either source, process it:
+        if last_msg:
             msg_type = getattr(last_msg, "type", "unknown")
-            msg_id = getattr(last_msg, "id")
+            msg_id = getattr(last_msg, "id", None)
 
             # Extract content safely, even if it's nested
             content = getattr(last_msg, "content", "")
@@ -160,7 +171,7 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
             snippet = snippet.replace('\n', ' ').strip()
 
             if msg_type == "ai":
-                # Track token usgae
+                # Track token usage
                 if msg_id and msg_id not in tracked_msg_ids:
                     tracked_msg_ids.add(msg_id)
                     usage = getattr(last_msg, "usage_metadata", {})
@@ -191,9 +202,9 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
                     for tc in last_msg.tool_calls:
                         name = tc.get("name", "unknown")
                         args = tc.get("args", {})
-                        if name == "SubmitReport":
-                            # Omit descriptio to keep logs clean
-                            args_str = [a.get("vulnerability_type", "") for a in args.get("findings", [])]
+                        if name == "submit_report":
+                            # Omit description to keep logs clean
+                            args_str = "finding_data_omitted"
                         else:
                             args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
                         tool_strings.append(f"{name}({args_str})")
@@ -211,8 +222,9 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
 
         else:
             # Tell us exactly WHICH state keys were updated in the background
-            state_keys = ", ".join([k for k in state.keys() if k != "messages"])
-            print(f"[{graph_name}] \033[90mState updated: [{state_keys}]\033[0m")
+            state_keys = ", ".join([k for k in state.keys() if k not in ["messages", "manager_message"]])
+            if state_keys:
+                print(f"[{graph_name}] \033[90mState updated: [{state_keys}]\033[0m")
         # -----------------------------------
 
     # Dump the cohesive final states to a JSON file
@@ -220,12 +232,12 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
         json.dump(assembled_states, f, indent=2)
 
     print("[System] Execution Finished.")
+    
     # --- Print Token Usage Summary ---
     print("\n" + "="*50)
     print("📊 \033[1mToken Usage Summary by Agent\033[0m")
     print("-" * 50)
 
-    # Sort agents alphabetically for a cleaner readout (optional, but nice)
     for agent_name in sorted(agent_token_stats.keys()):
         stats = agent_token_stats[agent_name]
         print(f"🔹 \033[96m{agent_name}\033[0m")
@@ -238,6 +250,5 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
     print(f"   Total Tokens:  \033[95m{token_stats['total']:,}\033[0m")
     print("="*50 + "\n")
 
-    # Extract the vulnerability reports from the main graph to return
     main_state = assembled_states.get("Main_Graph", {})
     return {"vulnerability_reports": raw_main_state.get("vulnerability_reports", [])}
