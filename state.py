@@ -67,3 +67,11 @@ class ValidatorState(TypedDict):
     iterations: Annotated[int, operator.add]
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
     messages: Annotated[list, add_messages]
+
+class IntegrationAuditorState(TypedDict):
+    # A single `requires_chaining` record to be combined into a multi-step exploit chain.
+    report_to_test: dict
+    # Number of LLM invocations in the tool loop (same role as ReviewerState.iterations).
+    iterations: Annotated[int, operator.add]
+    vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
+    messages: Annotated[list, add_messages]

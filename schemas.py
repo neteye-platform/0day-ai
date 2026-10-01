@@ -171,6 +171,18 @@ class VulnerabilityRecord(BaseModel):
             "state carried from earlier steps) because the Validator cannot read source code."
         ),
     )
+    validation_strategy: Optional[Literal["validatable_now", "requires_chaining", "static_finding_only"]] = Field(
+        default=None,
+        description=(
+            "How the reviewed finding must be handled downstream (set by the Reviewer's "
+            "submit_evaluation): 'validatable_now' — an external trigger exists (e.g. XSS, "
+            "SQLi, arbitrary file read) so it goes straight to the Validator; "
+            "'requires_chaining' — real but locked behind auth, specific app state, or "
+            "another exploit, so it goes to the Integration Auditor; 'static_finding_only' — "
+            "real in source but with no network-reachable path, so it is accepted as static "
+            "evidence into the final report without Validator testing."
+        ),
+    )
 
     # Validator additions
     poc_payload: Optional[str] = None
@@ -487,6 +499,20 @@ class EvaluationToolInput(BaseModel):
     is_exploitable: bool = Field(
         description="True if the vulnerability has a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by mitigations, implemented by the application."
     )
+    validation_strategy: Optional[Literal["validatable_now", "requires_chaining", "static_finding_only"]] = Field(
+        default=None,
+        description=(
+            "How this finding must be handled downstream, chosen from the triage rules.\n"
+            "REQUIRED when is_exploitable is true (pick exactly one); leave unset for "
+            "false positives (is_exploitable false).\n"
+            "'static_finding_only' — 100% real in the source but has NO network-reachable "
+            "exploit path (e.g. plaintext passwords stored in the DB).\n"
+            "'validatable_now' — a known external trigger exists (e.g. XSS, SQL injection).\n"
+            "'requires_chaining' — the vulnerability is real but NOT exploitable in "
+            "isolation: it is locked behind authentication, specific application state, "
+            "or another exploit that must be chained first."
+        )
+    )
     reasoning: str = Field(description="Brief technical explanation for the decision.")
     reproduction_steps: list[str] = Field(
         default_factory=list,
@@ -503,6 +529,16 @@ class EvaluationToolInput(BaseModel):
             "false positives."
         )
     )
+
+    @model_validator(mode="after")
+    def strategy_required_when_exploitable(self):
+        if self.is_exploitable and not self.validation_strategy:
+            raise ValueError(
+                "validation_strategy is required when is_exploitable is true. "
+                "Pick one of 'validatable_now', 'requires_chaining', 'static_finding_only'. "
+                "Leave it unset only for false positives."
+            )
+        return self
 
 class ValidationToolInput(BaseModel):
     is_confirmed: bool = Field(description="True if the exploit successfully triggered in the sandbox.")
