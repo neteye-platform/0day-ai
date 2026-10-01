@@ -50,6 +50,15 @@ if settings.llm_provider == "openai":
         reasoning_effort="medium",
         http_client=build_debug_http_client(),
     )
+    reviewer_llm = ChatOpenAI(
+        base_url=settings.openai_base_url,
+        model=settings.openai_model,
+        stream_usage=True,
+        temperature=0.8,
+        max_completion_tokens=16384,
+        reasoning_effort="low",
+        http_client=build_debug_http_client(),
+    )
 elif settings.llm_provider == "ollama":
     fast_llm = ChatOllama(
         model=settings.ollama_model,
@@ -65,6 +74,7 @@ elif settings.llm_provider == "ollama":
         num_predict=16384,
         reasoning=True
     )
+    reviewer_llm = smart_llm
 else:
     raise ValueError(
         f"Unknown llm_provider {settings.llm_provider!r}; expected 'openai' or 'ollama'."
@@ -1703,7 +1713,7 @@ class ReviewerAgent(ToolLoopAgent):
             # code_level, dependency_mitigation, systemic all trace first-party
             # code and share the source-reading toolset.
             reviewer_tools = CODE_LEVEL_REVIEWER_TOOLS
-        return smart_llm.bind_tools(
+        return reviewer_llm.bind_tools(
             reviewer_tools,
             parallel_tool_calls=True
         )
