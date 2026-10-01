@@ -13,7 +13,7 @@ from langgraph.types import RetryPolicy
 
 import settings
 import tools
-from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, reviewer_agent_node, ask_reviewer_for_tool, dispatch_explorers, dispatch_cve_analyzers, dispatch_reviewers, dispatch_validators, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
+from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
 from reachability import reachability_filter_node
 from state import MasterState, ReviewerState, ValidatorState
 from schemas import ReviewerOutput, ValidatorOutput
@@ -106,6 +106,8 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("manager", manager_agent_node)
     workflow.add_node("explorer_agent", expert_explorer_node)
     workflow.add_node("cve_analyzer", cve_analyzer_node)
+    workflow.add_node("threat_intel_gate", threat_intel_gate_node)
+    workflow.add_node("threat_intel", threat_intel_node)
     workflow.add_node("aggregate_demands", aggregate_demands_node)
     workflow.add_node("contract_verifier", contract_verifier_node)
     workflow.add_node("reviewer_agent", compiled_reviewer_agent)
@@ -122,7 +124,13 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_conditional_edges("preprocessor", dispatch_cve_analyzers, ["cve_analyzer"])
 
     workflow.add_edge("explorer_agent", "aggregate_demands")
-    workflow.add_edge("cve_analyzer", "aggregate_demands")
+    workflow.add_edge("cve_analyzer", "threat_intel_gate")
+    workflow.add_conditional_edges(
+        "threat_intel_gate",
+        dispatch_threat_intel,
+        ["threat_intel", "aggregate_demands"],
+    )
+    workflow.add_edge("threat_intel", "aggregate_demands")
 
     workflow.add_conditional_edges("aggregate_demands", dispatch_verifiers, ["contract_verifier", "synchronization", END])
     workflow.add_edge("contract_verifier", "synchronization")
