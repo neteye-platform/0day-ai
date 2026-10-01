@@ -19,7 +19,13 @@ from stage_patcher import patchable_records
 from state import MasterState, ValidatorState
 from stage_reviewer import build_reviewer_payload
 from tool_loop import CompactionConfig, ToolLoopAgent
-from utils import boundary_deferred, cache_validator, cvss_gate_blocks, get_node_code
+from utils import (
+    boundary_deferred,
+    cache_validator,
+    cvss_gate_blocks,
+    get_node_code,
+    take_feedback_dispatch,
+)
 
 
 _BARE_IDENT_RE = re.compile(r"^[\w$]+$")
@@ -209,14 +215,26 @@ def route_validator_feedback(state: MasterState):
     to the Reviewer for a re-review; the review_round cap drains the loop.
     Otherwise, freshly `exploitable` records due a fix attempt (flag-gated) head
     to the patch dispatch; else return the `integration_audit_dispatch` marker.
+
+    This router fires after EVERY validator superstep, while records sent to
+    the Reviewer in an earlier wave are still in flight (they keep the
+    insufficient_context status until the re-answer lands). utils.
+    take_feedback_dispatch makes each flagged record's re-review dispatch
+    exactly once per round instead of re-Sending duplicates that each burn a
+    full cache-exempt reviewer run.
     """
     all_vulns = as_dicts(state.get("vulnerabilities", []))
     max_rounds = settings.validator_feedback_max_rounds
-    flagged = [
-        v for v in all_vulns
-        if v.get("status") == "insufficient_context"
-        and (v.get("review_round") or 0) <= max_rounds
-    ]
+    flagged = []
+    for v in all_vulns:
+        if v.get("status") != "insufficient_context":
+            continue
+        round_ = v.get("review_round") or 0
+        if round_ > max_rounds:
+            continue
+        if not take_feedback_dispatch(v.get("vuln_id") or "", round_):
+            continue
+        flagged.append(v)
 
     if not flagged:
         if settings.patcher_enabled and patchable_records(state):
@@ -316,24 +334,47 @@ class ValidatorAgent(ToolLoopAgent):
         return get_llm("validator").bind_tools(validator_tools)
 
     def cached_verdict(self, state):
-        return cache_validator(
+        cached = cache_validator(
             state.get("report_to_test", {}), state.get("peer_payloads")
         )
+        # The ask verdict of a live ask_for_context IS validator-cached, but it
+        # must NEVER short-circuit a pass on which the tool is no longer bound
+        # (_is_first_pass): ask_for_context is unbound there, so replaying the
+        # stale ask resurrects insufficient_context and re-trips the reviewer
+        # feedback loop forever. Refusing the cache on that pass forces a live
+        # run, which can only conclude via mark_validation_complete.
+        if (
+            cached is not None
+            and cached.get("status") == "insufficient_context"
+            and not _is_first_pass(state)
+        ):
+            return None
+        return cached
 
     def pre_agent(self, state):
         # A cache hit stores the SEED's verdict; grouped validation variants
         # are not part of the cache key, so replay them from the current state
         # to give every batched member its own updated record.
         cmd = super().pre_agent(state)
-        if cmd is None or not state.get("validation_variants"):
+        if cmd is None or not (cmd.update or {}).get("vulnerabilities"):
             return cmd
-        cached = (cmd.update or {}).get("vulnerabilities") or [None]
-        if cached[0] is None:
-            return cmd
-        return Command(update={
-            "vulnerabilities": tools.propagate_validation_update(state, cached[0]),
-            "cache_tag": "HIT",
-        })
+        cached = cmd.update["vulnerabilities"][0]
+        if cached.get("status") == "insufficient_context":
+            # The live ask_for_context bumps review_round BEFORE caching; the
+            # replay must carry that bump onto the MERGED record too, or the
+            # seed stays at the cached round forever and
+            # route_validator_feedback re-flags it on every superstep.
+            incoming_round = state.get("report_to_test", {}).get("review_round") or 0
+            cached = {**cached, "review_round": incoming_round + 1}
+        updates = (
+            tools.propagate_validation_update(state, cached)
+            if state.get("validation_variants")
+            else [cached]
+        )
+        update = dict(cmd.update)
+        update["vulnerabilities"] = updates
+        update.setdefault("cache_tag", "HIT")
+        return Command(update=update)
 
     def first_turn(self, state, llm_with_tools) -> dict:
         # System prompt composed from the capabilities this run actually grants
