@@ -80,6 +80,49 @@ def get_cached_graph_data(graph_path: Path):
     return filtered
 
 
+# Per-run memoization for the aggregate_demands pass only. Everything here is
+# deliberately process-scoped so ``clear_aggregate_caches`` can drop it when the
+# node returns: the reviewer/validator LLM stages never see this memory. Only
+# small extracted results are cached (alias sets, folded-code strings); parsed
+# tree-sitter trees are always transient.
+AGGREGATE_MEMO_ALIASES: dict[tuple[str, str], Optional[set[str]]] = {}
+AGGREGATE_MEMO_FOLDED: dict[str, Optional[str]] = {}
+
+
+def clear_aggregate_caches() -> None:
+    """Release the aggregate_demands memoization (source-text cache + extracted
+    results) once the node completes, so the ~codebase-size corpus does not
+    persist into the downstream LLM stages."""
+    AGGREGATE_MEMO_ALIASES.clear()
+    AGGREGATE_MEMO_FOLDED.clear()
+    read_file_text.cache_clear()
+
+
+@lru_cache(maxsize=8192)
+def read_file_text(source_file: str) -> Optional[str]:
+    """Read a source file's text exactly once and cache it in memory.
+
+    Keys are the raw ``source_file`` strings found on graph nodes (absolute or
+    app-relative); the file is resolved against ``settings.app_path``. Every
+    phase of the aggregate pass (keyword corpus, import extraction, folded-code
+    reads) shares this single copy, so no file text is ever duplicated.
+    Returns ``None`` for missing, binary, or unreadable files so the result is
+    cacheable. Call ``clear_aggregate_caches`` to release the cached text.
+    """
+    path = (settings.app_path / Path(source_file)).resolve()
+    if not path.exists():
+        logging.debug(f"read_file_text: skipping missing file '{path}'.")
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        logging.debug(f"read_file_text: skipping binary file '{path}'.")
+        return None
+    except OSError as e:
+        logging.debug(f"read_file_text: skipping unreadable file '{path}': {e}")
+        return None
+
+
 def load_code_corpus() -> dict[str, str]:
     """Read the contents of every unique source file whose graph nodes carry
     ``file_type == "code"``.
@@ -87,7 +130,8 @@ def load_code_corpus() -> dict[str, str]:
     Returns ``{source_file: content}`` so callers can search the whole
     codebase in a single pass (the deterministic pre-filter uses this instead
     of re-reading files per CVE). Unreadable, missing, or binary files are
-    skipped with a debug log.
+    skipped with a debug log. Content is served from the shared
+    ``read_file_text`` cache (one copy per file).
     """
     graph_data = get_cached_graph_data(settings.graph)
     code_files = sorted({
@@ -98,16 +142,9 @@ def load_code_corpus() -> dict[str, str]:
 
     corpus: dict[str, str] = {}
     for source_file in code_files:
-        path = settings.app_path / Path(source_file)
-        if not path.exists():
-            logging.debug(f"Code corpus: skipping missing file '{source_file}'.")
-            continue
-        try:
-            corpus[source_file] = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            logging.debug(f"Code corpus: skipping binary file '{source_file}'.")
-        except OSError as e:
-            logging.debug(f"Code corpus: skipping unreadable file '{source_file}': {e}")
+        content = read_file_text(source_file)
+        if content is not None:
+            corpus[source_file] = content
 
     logging.debug(f"Code corpus: indexed {len(corpus)}/{len(code_files)} code files.")
     return corpus
@@ -1213,20 +1250,96 @@ def cache(file: Path, action: str, content: dict = {}) -> Optional[dict]:
         logging.error(f"Unknown action: {action}")
 
 
-def uses_namespace_in_ast(node_id: str, target_namespace: str) -> bool:
+def _extract_namespace_aliases(source_file: str, target_namespace: str) -> Optional[set[str]]:
+    """Discover the identifiers aliased from a namespace in the import/use
+    statements of ``source_file`` (plus the namespace itself).
+
+    Parses the file once per (file, namespace); the resulting tree is discarded
+    immediately — only the small alias set is kept, and only for the duration of
+    the aggregate pass (see ``AGGREGATE_MEMO_ALIASES``). Returns ``None`` when
+    the file cannot be read or its language is unsupported.
+    """
+    full_text = read_file_text(source_file)
+    if full_text is None:
+        return None
+    ext = Path(source_file).suffix.lower()
+    if ext not in LANGUAGE_MAP:
+        return None
+
+    aliases = {target_namespace}
+    parser = tree_sitter.Parser(LANGUAGE_MAP[ext])
+    full_code_bytes = full_text.encode("utf-8")
+    try:
+        full_tree = parser.parse(full_code_bytes)
+
+        def extract_aliases(node: tree_sitter.Node):
+            node_type = node.type.lower()
+            # Check if this node is an import/use statement
+            if any(kw in node_type for kw in ["import", "use", "require", "include"]):
+                text = full_code_bytes[node.start_byte:node.end_byte].decode("utf-8")
+
+                # If this import statement pulls from our target namespace
+                if target_namespace in text:
+                    # Extract all identifiers within this statement as potential aliases
+                    def get_identifiers(n: tree_sitter.Node):
+                        if len(n.children) == 0:
+                            n_type = n.type.lower()
+                            if "identifier" in n_type or "name" in n_type:
+                                val = full_code_bytes[n.start_byte:n.end_byte].decode("utf-8")
+                                if val != target_namespace:
+                                    aliases.add(val)
+                        for c in n.children:
+                            get_identifiers(c)
+
+                    get_identifiers(node)
+            else:
+                for child in node.children:
+                    extract_aliases(child)
+
+        extract_aliases(full_tree.root_node)
+    except Exception as e:
+        logging.warning(f"Could not extract aliases from {source_file}: {e}")
+
+    return aliases
+
+
+def _namespace_aliases(source_file: str, target_namespace: str) -> Optional[set[str]]:
+    """Memoized per-run access to ``_extract_namespace_aliases`` so a single
+    (file, namespace) is parsed at most once across the whole aggregate pass."""
+    key = (source_file, target_namespace)
+    if key not in AGGREGATE_MEMO_ALIASES:
+        AGGREGATE_MEMO_ALIASES[key] = _extract_namespace_aliases(source_file, target_namespace)
+    return AGGREGATE_MEMO_ALIASES[key]
+
+
+def _folded_node_code(node_id: str, node_map=None, sub_nodes_index=None) -> Optional[str]:
+    """Memoized per-run default-mode folded code for a node (via
+    ``get_node_code``). Avoids re-reading/re-parsing the same node's file for
+    every (node, namespace) usage check."""
+    if node_id not in AGGREGATE_MEMO_FOLDED:
+        AGGREGATE_MEMO_FOLDED[node_id] = get_node_code(
+            node_id, node_map=node_map, sub_nodes_index=sub_nodes_index
+        )
+    return AGGREGATE_MEMO_FOLDED[node_id]
+
+
+def uses_namespace_in_ast(node_id: str, target_namespace: str,
+                          node_map: Optional[dict] = None,
+                          sub_nodes_index: Optional[dict] = None) -> bool:
     """
     Checks if a specific namespace (or its imported symbols) is used within a node's AST.
     """
-    source_code = get_node_code(node_id)
+    source_code = _folded_node_code(node_id, node_map, sub_nodes_index)
     if not source_code:
         return False
 
-    graph = settings.graph
-    graph_data = get_cached_graph_data(graph)
-    if not graph_data:
-        return False
-
-    target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), None)
+    target_node = (node_map or {}).get(node_id)
+    if target_node is None:
+        graph = settings.graph
+        graph_data = get_cached_graph_data(graph)
+        if not graph_data:
+            return False
+        target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), None)
     if not target_node or not target_node.get("source_file"):
         logging.error(f"Node '{node_id}' does not have a valid source file mapped.")
         return False
@@ -1238,49 +1351,13 @@ def uses_namespace_in_ast(node_id: str, target_namespace: str) -> bool:
         logging.warning(f"Unsupported extension '{ext}' for AST parsing on node '{node_id}'.")
         return False
 
-    parser = tree_sitter.Parser(LANGUAGE_MAP[ext])
-
     # Track the namespace and any symbols imported from it (e.g., 'g', 'request', 'Blueprint')
-    aliases = set([target_namespace])
-
-    # Parse the full file to discover aliases / imported components
-    try:
-        full_file_path = settings.app_path / Path(source_file)
-        if full_file_path.exists():
-            with open(full_file_path, "r", encoding="utf-8") as f:
-                full_code_bytes = f.read().encode("utf-8")
-
-            full_tree = parser.parse(full_code_bytes)
-
-            def extract_aliases(node: tree_sitter.Node):
-                node_type = node.type.lower()
-                # Check if this node is an import/use statement
-                if any(kw in node_type for kw in ["import", "use", "require", "include"]):
-                    text = full_code_bytes[node.start_byte:node.end_byte].decode("utf-8")
-
-                    # If this import statement pulls from our target namespace
-                    if target_namespace in text:
-                        # Extract all identifiers within this statement as potential aliases
-                        def get_identifiers(n: tree_sitter.Node):
-                            if len(n.children) == 0:
-                                n_type = n.type.lower()
-                                if "identifier" in n_type or "name" in n_type:
-                                    val = full_code_bytes[n.start_byte:n.end_byte].decode("utf-8")
-                                    if val != target_namespace:
-                                        aliases.add(val)
-                            for c in n.children:
-                                get_identifiers(c)
-
-                        get_identifiers(node)
-                else:
-                    for child in node.children:
-                        extract_aliases(child)
-
-            extract_aliases(full_tree.root_node)
-    except Exception as e:
-        logging.warning(f"Could not extract aliases from {source_file}: {e}")
+    aliases = _namespace_aliases(source_file, target_namespace)
+    if aliases is None:
+        aliases = {target_namespace}
 
     # Parse the specific node's folded code to check for actual usage
+    parser = tree_sitter.Parser(LANGUAGE_MAP[ext])
     source_bytes = source_code.encode("utf-8")
     tree = parser.parse(source_bytes)
 
@@ -1305,12 +1382,16 @@ def uses_namespace_in_ast(node_id: str, target_namespace: str) -> bool:
     return walk(tree.root_node)
 
 
-def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False) -> str | None:
+def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
+                  node_map: Optional[dict] = None,
+                  sub_nodes_index: Optional[dict] = None) -> str | None:
     graph = settings.graph
     graph_data = get_cached_graph_data(graph)
 
-    # Find the target node
-    target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), None)
+    # Find the target node (precomputed map when available, else linear scan)
+    target_node = (node_map or {}).get(node_id)
+    if target_node is None:
+        target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), None)
     if not target_node:
         logging.error(f"Error: Node ID '{node_id}' not found in graph.")
         return None
@@ -1330,16 +1411,18 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False) 
 
     # Handle standard text/document files
     if file_type == "document" or not source_location:
-        try:
-            with open(source_file, "r", encoding="utf-8") as f:
-                return f.read()
-        except UnicodeDecodeError:
-            return f"Error: '{source_file}' is binary."
-        except Exception as e:
+        content = read_file_text(source_file_path)
+        if content is None:
+            if source_file.exists():
+                return f"Error: '{source_file}' is binary."
+            logging.error(f"Source file '{source_file}' not found on disk.")
             return None
+        return content
 
-    with open(source_file, "r", encoding="utf-8") as f:
-        source_content = f.read()
+    source_content = read_file_text(source_file_path)
+    if source_content is None:
+        logging.error(f"Source file '{source_file}' not found on disk or unreadable.")
+        return None
     source_bytes = source_content.encode("utf-8")
 
     # Get target start line
@@ -1393,18 +1476,24 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False) 
         if raw:
             return source_bytes[target_ast_node.start_byte:target_ast_node.end_byte].decode("utf-8")
 
-        # Find all sub-nodes in the graph mapped to this file
+        # Find all sub-nodes in the graph mapped to this file (precomputed
+        # index when available, otherwise a full graph scan).
         sub_nodes = []
-        for n in graph_data.get("nodes", []):
-            if n.get("id") == target_node.get("id"):
-                continue
-
-            if n.get("source_file") == source_file_path and n.get("source_location"):
-                try:
-                    n_start_line = int(n["source_location"].replace("L", ""))
-                    sub_nodes.append((n_start_line, n.get("id")))
-                except ValueError:
+        file_index = (sub_nodes_index or {}).get(source_file_path)
+        if file_index is not None:
+            target_node_id = target_node.get("id")
+            sub_nodes = [(line_, nid) for line_, nid in file_index if nid != target_node_id]
+        else:
+            for n in graph_data.get("nodes", []):
+                if n.get("id") == target_node.get("id"):
                     continue
+
+                if n.get("source_file") == source_file_path and n.get("source_location"):
+                    try:
+                        n_start_line = int(n["source_location"].replace("L", ""))
+                        sub_nodes.append((n_start_line, n.get("id")))
+                    except ValueError:
+                        continue
 
         # Map sub-nodes to their AST bodies and filter based on your new rule
         sub_nodes.sort(key=lambda x: x[0])

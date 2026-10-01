@@ -18,7 +18,7 @@ import settings
 import tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, VerifierState, ReviewerState, ValidatorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files
+from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches
 
 # fast_llm = ChatOllama(model="gemma4:cloud", temperature=0.2, reasoning=False, num_ctx=32768)
 # smart_llm = ChatOllama(model="gemma4:cloud", temperature=0.6, reasoning=False, num_ctx=32768)
@@ -626,21 +626,51 @@ def build_caller_map(graph_data: dict):
 
 
 def build_import_map(graph_data: dict):
+    """Map every graph node to the import namespace set of its source file.
+
+    Imports are a property of the file, not of an individual node, so each
+    unique file is read and parsed (``extract_imports``) exactly once and the
+    resulting set is shared by all nodes mapped to it — instead of re-reading
+    and re-parsing the file once per node.
+    """
     node_imports_map = {}
+    nodes_by_file = defaultdict(list)
     for node in graph_data.get("nodes", []):
         node_id, src_path = node.get("id"), node.get("source_file")
+        if node_id and src_path:
+            nodes_by_file[src_path].append(node_id)
 
-        if not node_id or not src_path:
-            continue
-
+    for src_path in nodes_by_file:
         source_file = settings.app_path / Path(src_path)
-        if source_file.exists() and node_id not in node_imports_map:
-            try:
-                with open(source_file, "r", encoding="utf-8") as f:
-                    node_imports_map[node_id] = set(extract_imports(f.read(), src_path))
-            except Exception:
-                node_imports_map[node_id] = set()
+        if not source_file.exists():
+            continue
+        content = read_file_text(src_path)
+        try:
+            imports = set(extract_imports(content, src_path)) if content is not None else set()
+        except Exception:
+            imports = set()
+        for node_id in nodes_by_file[src_path]:
+            node_imports_map[node_id] = imports
+
     return node_imports_map
+
+
+def build_sub_nodes_index(graph_data: dict):
+    """Precompute ``{source_file: [(start_line, node_id), ...]`` once so each
+    ``get_node_code`` fold (in the CVE usage checks) does not rescan the whole
+    graph for sibling nodes sharing the same file. Only nodes with a parseable
+    ``source_location`` are indexed, matching the original scan."""
+    index = defaultdict(list)
+    for node in graph_data.get("nodes", []):
+        src_path = node.get("source_file")
+        source_location = node.get("source_location")
+        if not src_path or not source_location:
+            continue
+        try:
+            index[src_path].append((int(str(source_location).replace("L", "")), node.get("id")))
+        except ValueError:
+            continue
+    return dict(index)
 
 
 def _note_demands(dict_note: dict) -> list[dict]:
@@ -733,7 +763,9 @@ def _route_explorer_notes(notes: list, graph_data: dict, callers_map: dict, grou
     return updated_notes
 
 
-def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: defaultdict) -> list[dict]:
+def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: defaultdict,
+                         node_map: dict | None = None,
+                         sub_nodes_index: dict | None = None) -> list[dict]:
     """Route CVE analyzer outputs.
 
     Two output kinds are handled (mirroring the `fix_category` classifier):
@@ -743,8 +775,17 @@ def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: de
       vulnerability hypotheses (like explorer `vulns`), anchored to a synthetic
       `dependency:<package>` node. Exactly ONE hypothesis is emitted per CVE.
       Returns the list of hypothesis dicts for the `vulnerabilities` channel.
+
+    A one-time inverted index (``imports_by_namespace``) turns the per-CVE
+    all-node scan into a lookup of only the nodes importing the namespace, so
+    the cost scales with the number of *matching* nodes, not the codebase size.
     """
     hypotheses: list[dict] = []
+
+    imports_by_namespace: dict[str, list[str]] = defaultdict(list)
+    for node_id, imports in node_imports_map.items():
+        for imp in imports:
+            imports_by_namespace[imp].append(node_id)
 
     for record in cves:
         target_import = record.get("import_namespace", "")
@@ -753,7 +794,7 @@ def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: de
         fix_category = record.get("fix_category", "application_mitigation")
 
         if fix_category == "upgrade_only":
-            hypothesis = _build_cve_hypothesis(record, node_imports_map)
+            hypothesis = _build_cve_hypothesis(record, imports_by_namespace, node_map, sub_nodes_index)
             if hypothesis:
                 hypotheses.append(hypothesis)
             else:
@@ -768,10 +809,8 @@ def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: de
         )
 
         matched_any = False
-        for node_id, imports in node_imports_map.items():
-            if target_import not in imports:
-                continue
-            if not uses_namespace_in_ast(node_id, target_import):
+        for node_id in imports_by_namespace.get(target_import, []):
+            if not uses_namespace_in_ast(node_id, target_import, node_map, sub_nodes_index):
                 logging.info(f"[{node_id}] CVE SKIP: '{target_import}' imported but not used in the node's AST.")
                 continue
             grouped_demands[node_id].append({
@@ -787,7 +826,8 @@ def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: de
     return hypotheses
 
 
-def _build_cve_hypothesis(record: dict, node_imports_map: dict) -> dict | None:
+def _build_cve_hypothesis(record: dict, imports_by_namespace: dict, node_map: dict | None = None,
+                          sub_nodes_index: dict | None = None) -> dict | None:
     """Build a single vulnerability hypothesis for an upgrade-only CVE.
 
     Anchored to a synthetic `dependency:<package>` node (a library-internal flaw
@@ -814,8 +854,8 @@ def _build_cve_hypothesis(record: dict, node_imports_map: dict) -> dict | None:
     # Usage hints: nodes that import AND use the namespace, capped to bound prompt size.
     if target_import:
         matching_nodes = sorted(
-            node_id for node_id, imports in node_imports_map.items()
-            if target_import in imports and uses_namespace_in_ast(node_id, target_import)
+            node_id for node_id in imports_by_namespace.get(target_import, [])
+            if uses_namespace_in_ast(node_id, target_import, node_map, sub_nodes_index)
         )
         if matching_nodes:
             shown = matching_nodes[:5]
@@ -901,32 +941,38 @@ def filter_cve_demands_by_keywords(cves: list[dict]) -> list[dict]:
 
 def aggregate_demands_node(state: MasterState):
     grouped_demands = defaultdict(list)
+    try:
+        graph_data = get_cached_graph_data(settings.graph)
+        callers_map = build_caller_map(graph_data)
+        node_map = {n.get("id"): n for n in graph_data.get("nodes", []) if n.get("id")}
+        sub_nodes_index = build_sub_nodes_index(graph_data)
+        node_imports_map = build_import_map(graph_data)
 
-    graph_data = get_cached_graph_data(settings.graph)
-    callers_map = build_caller_map(graph_data)
-    node_imports_map = build_import_map(graph_data)
+        logging.info(f"Loaded graph data: {len(callers_map)} caller entries, {len(node_imports_map)} import entries.")
+        notes = state.get("notes", [])
+        cves = filter_cve_demands_by_keywords(state.get("cve_demands", []))
+        logging.info(f"Processing {len(notes)} notes and {len(cves)} CVE demands.")
 
-    logging.info(f"Loaded graph data: {len(callers_map)} caller entries, {len(node_imports_map)} import entries.")
-    notes = state.get("notes", [])
-    cves = filter_cve_demands_by_keywords(state.get("cve_demands", []))
-    logging.info(f"Processing {len(notes)} notes and {len(cves)} CVE demands.")
+        # Process Explorer Notes
+        updated_notes = _route_explorer_notes(notes, graph_data, callers_map, grouped_demands)
 
-    # Process Explorer Notes
-    updated_notes = _route_explorer_notes(notes, graph_data, callers_map, grouped_demands)
+        # Process CVE Analyzer Outputs (demands + upgrade-only hypotheses)
+        cve_hypotheses = _process_cve_demands(cves, node_imports_map, grouped_demands, node_map, sub_nodes_index)
+        logging.info(f"Emitted {len(cve_hypotheses)} upgrade-only CVE hypothesis(es) directly into the vulnerabilities channel.")
 
-    # Process CVE Analyzer Outputs (demands + upgrade-only hypotheses)
-    cve_hypotheses = _process_cve_demands(cves, node_imports_map, grouped_demands)
-    logging.info(f"Emitted {len(cve_hypotheses)} upgrade-only CVE hypothesis(es) directly into the vulnerabilities channel.")
+        # Log the accurate total by summing the lengths of the lists
+        total_demands = sum(len(d) for d in grouped_demands.values())
+        logging.info(f"Summary: Grouped {total_demands} total demands across {len(grouped_demands)} target nodes.")
 
-    # Log the accurate total by summing the lengths of the lists
-    total_demands = sum(len(d) for d in grouped_demands.values())
-    logging.info(f"Summary: Grouped {total_demands} total demands across {len(grouped_demands)} target nodes.")
-
-    return {
-        "grouped_demands": dict(grouped_demands),
-        "notes": updated_notes,
-        "vulnerabilities": cve_hypotheses,
-    }
+        return {
+            "grouped_demands": dict(grouped_demands),
+            "notes": updated_notes,
+            "vulnerabilities": cve_hypotheses,
+        }
+    finally:
+        # Deterministic pass: release the memoized source text / extracted
+        # results so they never persist into the downstream LLM stages.
+        clear_aggregate_caches()
 
 # ==========================================
 # Contract verifier node
