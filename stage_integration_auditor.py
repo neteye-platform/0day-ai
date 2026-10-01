@@ -8,21 +8,19 @@ from langgraph.types import Command, Send
 
 import tools
 from llms import fast_llm, smart_llm
-from run_stats import _record_stat, as_dicts, strip_step_numbering
+from run_stats import _record_stat, affected_nodes_label, as_dicts, steps_block
 from schemas import INTEGRATION_AUDITOR_AGENT
 from state import IntegrationAuditorState, MasterState, ValidatorState
 from tool_loop import CompactionConfig, ToolLoopAgent
-from utils import cache_integration_auditor
+from utils import append_note, cache_integration_auditor
 
 
 def dispatch_integration_audits(state: MasterState):
-    """Runs strictly AFTER all direct-to-validator records have been proven.
+    """Runs strictly AFTER all direct-to-validator records are proven.
 
-    Fans every still-`confirmed` `requires_integration` record to the auditor;
-    chain candidates are the OTHER `exploitable` records (proven payloads the
-    auditor can reason over). Records with no peers are resolved `unchainable`
-    by the auditor's first_turn, no LLM call. Returns Sends or the
-    `reporter_dispatch` marker when nothing is pending."""
+    Fans each pending `requires_integration` record to the auditor with the
+    other `exploitable` records as chain candidates; nothing pending →
+    `reporter_dispatch`."""
     all_vulns = as_dicts(state.get("vulnerabilities", []))
     pending = [
         v for v in all_vulns
@@ -60,8 +58,7 @@ def dispatch_integration_audits(state: MasterState):
         )
         commands.append(Send("integration_auditor", payload))
 
-    if commands:
-        _record_stat("integration_audits", len(commands))
+    _record_stat("integration_audits", len(commands))
     return commands
 
 
@@ -139,10 +136,7 @@ class IntegrationAuditorAgent(ToolLoopAgent):
         sys_msg = SystemMessage(content=INTEGRATION_AUDITOR_AGENT.get("prompt", ""))
 
         report = state.get("report_to_test", {})
-        affected = [n for n in (report.get("affected_nodes") or []) if n]
-        affected_str = (
-            ", ".join(affected) if affected else report.get("node_id", "Unknown")
-        )
+        affected_str = affected_nodes_label(report, report.get("node_id", "Unknown"))
         formatted_vuln = (
             f"--- CORE VULNERABILITY (requires_integration) ---\n"
             f"Vulnerability ID: {report.get('vuln_id', 'Unknown')}\n"
@@ -177,10 +171,8 @@ class IntegrationAuditorAgent(ToolLoopAgent):
                 + "\n".join(peer_lines)
             )
         else:
-            # No peers means a 'chained' verdict is impossible by construction:
-            # resolve 'unchainable' here (terminal, stays in the report) without
-            # an LLM loop; the empty-messages pre_router guard then ends the
-            # subgraph with this Command.
+            # 'chained' is impossible with zero peers: resolve terminal 'unchainable'
+            # in place; the empty-messages pre_router guard ends the subgraph here.
             logging.warning(
                 f"{report.get('vuln_id', 'Unknown')} is requires_integration but arrived "
                 f"at the auditor with an EMPTY confirmed_vulns peer list; resolving "
@@ -189,32 +181,21 @@ class IntegrationAuditorAgent(ToolLoopAgent):
                 f"parent channel (check the dispatch_integration_audits log lines "
                 f"in this run)."
             )
-            record = dict(report)
-            existing = record.get("integration_audit_reasoning") or ""
             note = (
                 "[integration auditor] No other proven vulnerabilities exist to "
                 "chain with; resolved 'unchainable' without invoking the LLM (a "
                 "'chained' verdict requires at least one other exploitable "
                 "vulnerability)."
             )
-            record["integration_audit_reasoning"] = (
-                f"{existing}\n{note}" if existing else note
-            )
+            record = append_note(report, "integration_audit_reasoning", note)
             record["status"] = "unchainable"
             # Cache so a repeat of the same report short-circuits in the base
             # pre_agent cache hook instead of re-running this branch.
-            cache_integration_auditor(dict(report), [], record)
+            cache_integration_auditor(report, [], record)
             return Command(update={"vulnerabilities": [record]})
 
-        steps = report.get("reproduction_steps") or []
-        # Strip the reviewer's own numbering so our counter never double-numbers.
-        steps_str = (
-            "\n".join(
-                f"  {i}. {strip_step_numbering(s)}"
-                for i, s in enumerate(steps, 1)
-            )
-            if steps else "  None provided by reviewer"
-        )
+        # strip_numbering: our counter must never double-number the reviewer's steps.
+        steps_str = steps_block(report.get("reproduction_steps") or [], strip_numbering=True)
         formatted_vuln += (
             f"\n--- REVIEWER'S ISOLATED REPRODUCTION STEPS (this record alone) ---\n"
             f"{steps_str}"
@@ -231,15 +212,13 @@ class IntegrationAuditorAgent(ToolLoopAgent):
     def fallback(self, state) -> Command:
         """Resolve an iteration-capped audit: keeps the record 'confirmed'
         (chain never proven) and records the timeout in the reasoning."""
-        updated_vuln = dict(state.get("report_to_test", {}))
         timeout_note = (
             f"[integration audit timeout] No verdict after {state.get('iterations', 0)} "
             f"tool-loop iterations; the chain was not resolved. Keeping the record as "
             f"'confirmed' (chain inconclusive) without a chained/unchainable verdict."
         )
-        existing = updated_vuln.get("integration_audit_reasoning") or ""
-        updated_vuln["integration_audit_reasoning"] = (
-            f"{existing}\n{timeout_note}" if existing else timeout_note
+        updated_vuln = append_note(
+            state.get("report_to_test", {}), "integration_audit_reasoning", timeout_note
         )
         cache_integration_auditor(
             dict(state.get("report_to_test", {})),
@@ -281,7 +260,7 @@ def route_integration_audit(state: MasterState):
     by_id = {v.get("vuln_id"): v for v in all_vulns}
     commands = []
     for record in chained:
-        peer_ids = (record.get("chained_with") or [])
+        peer_ids = record.get("chained_with") or []
         peer_payloads = []
         for vid in peer_ids:
             peer = by_id.get(vid)

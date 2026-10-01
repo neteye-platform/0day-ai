@@ -21,18 +21,12 @@ from utils import (
 )
 
 
-def synchronization_node(state: MasterState):
-    """Dummy node to act as a Map-Reduce barrier."""
-    return {}
-
-
 def dispatch_verifiers(state: MasterState):
     """Fan out one verifier task per target node with demands."""
     grouped_demands = state.get("grouped_demands", {})
 
-    # No app-level demands, but the run must still advance into synchronization
-    # so Edge Traversal can analyze the explorer notes; dispatch_reviewers then
-    # ends safely when nothing remains.
+    # Even with no demands, advance to synchronization so Edge Traversal
+    # still analyzes the explorer notes.
     if not grouped_demands:
         return "synchronization"
 
@@ -49,13 +43,11 @@ def dispatch_verifiers(state: MasterState):
 
         target_code = get_node_code(target_node_id)
 
-        # If we don't have code (e.g., it's a 3rd party library), skip it
         if not target_code:
             continue
 
         targets.append((target_node_id, target_code, demands_list))
 
-    # If all targets were 3rd party libraries and we generated 0 commands
     if not targets:
         return "synchronization"
 
@@ -126,9 +118,8 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
     if not demands or not target_code:
         return {"vulnerabilities": []}, ""
 
-    # Hash the demands so changed upstream/downstream contracts bust the cache.
-    # Deterministic across runs: deduplicate_demands() canonical-sorts the list,
-    # so the ordered hash below and the positional batch slices are stable keys.
+    # Hash over demands (already canonically sorted by dedup): content changes
+    # bust the cache, order stays stable across runs.
     demands_hash = hashlib.md5(json.dumps(demands, sort_keys=True).encode()).hexdigest()
     cache_file = settings.cache_dir / "contract_verifier" / f"{target_node_id}_{demands_hash}.json"
 
@@ -138,13 +129,11 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
 
     # Map the prompt [ID: ...] back to the original demand dict so FAILED
     # evaluations can be traced to their source (e.g. an CVE demand).
-    demand_lookup = {}
     demand_meta = {}
     formatted_demands = []
 
     for d in demands:
         d_id = d.get("parameter_name") or d.get("source") or "unknown"
-        demand_lookup[d_id] = d.get("description")
         demand_meta[d_id] = d
 
         dtype = d.get("type")
@@ -165,14 +154,12 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
         else:
             formatted_demands.append(f"- [ID: {source}] {desc}")
 
-    # Chunked calls: one evaluation per demand, so a hub node's output would
-    # truncate at llm_max_completion_tokens in a single call. Split, evaluate,
-    # merge in order; each batch cached separately so a retry only pays for the
-    # unfinished batches.
+    # Chunk calls so a hub node's per-demand output never truncates at the
+    # token cap; batches cache individually so retries pay only for unfinished ones.
     batch_size = settings.verifier_max_demands_per_call
     batch_starts = range(0, len(formatted_demands), batch_size)
 
-    sys_msg = SystemMessage(content=f"{VERIFIER_AGENT['prompt']}")
+    sys_msg = SystemMessage(content=VERIFIER_AGENT["prompt"])
     structured_llm = fast_llm.with_structured_output(VerifierOutput, method="json_schema", strict=True)
 
     evaluations = []
@@ -185,28 +172,26 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
             / "contract_verifier"
             / f"{target_node_id}_batch{b_idx}_{batch_hash}.json"
         )
-        batch_evals = None
         cached_batch = cache(batch_cache_file, "read")
         if cached_batch and isinstance(cached_batch.get("evaluations"), list):
-            batch_evals = cached_batch["evaluations"]
-        if batch_evals is None:
-            batch_demands_string = "\n".join(formatted_demands[b_idx : b_idx + batch_size])
-            human_msg = HumanMessage(
-                content=f"```python\n{target_code}\n```\n\nSecurity Demands:\n{batch_demands_string}"
-            )
-            response = invoke_structured_capped(
-                structured_llm,
-                [sys_msg, human_msg],
-                f"Contract verifier {target_node_id} batch{b_idx}",
-            )
-            if response is None:
-                # Output cap exhausted: drop this batch (uncached, so a later
-                # run re-attempts it) instead of crashing the whole fan-out.
-                skipped_demands += len(batch)
-                continue
-            response = response if isinstance(response, dict) else response.model_dump()
-            batch_evals = response.get("evaluations") or []
-            cache(batch_cache_file, "write", {"evaluations": batch_evals})
+            evaluations.extend(cached_batch["evaluations"])
+            continue
+        batch_demands_string = "\n".join(formatted_demands[b_idx : b_idx + batch_size])
+        human_msg = HumanMessage(
+            content=f"```python\n{target_code}\n```\n\nSecurity Demands:\n{batch_demands_string}"
+        )
+        response = invoke_structured_capped(
+            structured_llm,
+            [sys_msg, human_msg],
+            f"Contract verifier {target_node_id} batch{b_idx}",
+        )
+        if response is None:
+            # Output cap exhausted: drop the batch uncached so a later run re-attempts it.
+            skipped_demands += len(batch)
+            continue
+        response = response if isinstance(response, dict) else response.model_dump()
+        batch_evals = response.get("evaluations") or []
+        cache(batch_cache_file, "write", {"evaluations": batch_evals})
         evaluations.extend(batch_evals)
 
     if skipped_demands:
@@ -221,14 +206,12 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
             _record_stat(f"verifier_{status}", count)
 
     new_vulnerabilities = []
-    for eval in evaluations:
-        # DELEGATED, OUT_OF_SCOPE, and MET will be safely ignored
-        if eval.get("status") == "FAILED":
-            # Retrieve the clean, original description from Python memory
-            original_desc = demand_lookup.get(eval.get("demand_id"), "No description found.")
-
-            demand_source = demand_meta.get(eval.get("demand_id"), {})
-            verifier_cwe = eval.get("cwe")
+    for evaluation in evaluations:
+        if evaluation.get("status") == "FAILED":
+            entry = demand_meta.get(evaluation.get("demand_id"))
+            original_desc = entry.get("description") if entry is not None else "No description found."
+            demand_source = entry or {}
+            verifier_cwe = evaluation.get("cwe")
             if not verifier_cwe and demand_source.get("type") == "cve_assumption":
                 # Deterministic fallback when the model omitted the CWE (an
                 # explicit OTHER_UNCATEGORIZED is respected).
@@ -240,10 +223,10 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
             new_vuln = {
                 "affected_nodes": [target_node_id],
                 "cwe_id": verifier_cwe,
-                "description": f"Fails to satisfy demand: '{original_desc}'. Evidence: {eval.get("evidence")}",
+                "description": f"Fails to satisfy demand: '{original_desc}'. Evidence: {evaluation.get("evidence")}",
                 "status": "hypothesis",
-                "demand_id": eval.get("demand_id"),
-                "vulnerable_component": eval.get("demand_id")
+                "demand_id": evaluation.get("demand_id"),
+                "vulnerable_component": evaluation.get("demand_id")
             }
             # FAILED application_mitigation CVE demands become
             # dependency-mitigation reviews (routed by vulnerability_type).
@@ -253,8 +236,8 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
 
             new_vulnerabilities.append(new_vuln)
 
-    # A batch skipped at the output cap leaves the node under-evaluated: never
-    # persist that partial result, so the next run re-attempts the skipped batch.
+    # An output-cap skip leaves the node under-evaluated: never cache the
+    # partial result, so the next run re-attempts the skipped batch.
     if not skipped_demands:
         cache(cache_file, "write", {"hypothesis": new_vulnerabilities})
 

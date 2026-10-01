@@ -1,5 +1,3 @@
-"""Bootstrap + preprocessor stage: graph existence, SCA scan, sandbox, artifacts, symbol index."""
-
 import json
 import logging
 import subprocess

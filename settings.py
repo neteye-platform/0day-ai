@@ -138,6 +138,9 @@ demand_dedup_enabled = True
 # contract checks, while true paraphrases cluster above 0.90.
 demand_dedup_threshold = 0.86
 embeddings_timeout = 60
+# On expiry the embedding pass raises and dedup fails open to exact-identity
+# merging; partial work is already on disk, so repeated runs resume.
+embeddings_fallback_budget_sec = 300
 
 # Confirmed records sharing (cwe, vulnerable_component) exactly are validated by
 # ONE validator that tests every finding's reproduction steps and records its

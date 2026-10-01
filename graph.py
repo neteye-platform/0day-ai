@@ -50,7 +50,7 @@ from stage_validator import (
     validator_fallback_node,
     validator_router,
 )
-from stage_verifier import contract_verifier_node, dispatch_verifiers, synchronization_node
+from stage_verifier import contract_verifier_node, dispatch_verifiers
 from tool_loop import SequentialToolNode
 from credential_finder import credential_finder_node
 from state import MasterState, ReviewerState, ValidatorState, IntegrationAuditorState
@@ -59,9 +59,6 @@ from schemas import ReviewerOutput, ValidatorOutput
 
 def compile_reviewer():
     reviewer_workflow = StateGraph(ReviewerState, output_schema=ReviewerOutput)
-    # The agent node is a single LLM invocation that is pure w.r.t. state until
-    # it returns, so its retry policy re-runs just the failing message -- never
-    # the whole tool loop.
     reviewer_workflow.add_node("reviewer_agent", reviewer_agent_node, retry_policy=RETRY)
     reviewer_workflow.add_node("ask_reviewer_for_tool", ask_reviewer_for_tool)
     reviewer_workflow.add_node("reviewer_fallback", reviewer_fallback_node)
@@ -98,8 +95,6 @@ def compile_reviewer():
     )
     reviewer_workflow.add_edge("ask_reviewer_for_tool", "reviewer_agent")
     reviewer_workflow.add_edge("reviewer_fallback", END)
-    # Loop length is bounded by the explicit iteration counter in
-    # reviewer_router/fallback_node, well under the default recursion limit.
     compiled_reviewer_agent = reviewer_workflow.compile()
 
     return compiled_reviewer_agent
@@ -107,12 +102,9 @@ def compile_reviewer():
 
 def compile_validator():
     validator_workflow = StateGraph(ValidatorState, output_schema=ValidatorOutput)
-    # Same scoped-retry rationale as the reviewer agent node.
     validator_workflow.add_node("validator_agent", validator_agent_node, retry_policy=RETRY)
     validator_workflow.add_node("ask_validator_for_tool", ask_validator_for_tool)
     validator_workflow.add_node("validator_fallback", validator_fallback_node)
-    # Sequential: the validator batches DEPENDENT calls in one response (write
-    # the PoC file, then run it); same-turn calls must run in listed order.
     validator_workflow.add_node("validator_tools", SequentialToolNode([
         tools.send_http_request,
         browser_tools.browser_navigate,
@@ -155,7 +147,6 @@ def compile_validator():
 
 def compile_integration_auditor():
     integration_auditor_workflow = StateGraph(IntegrationAuditorState)
-    # Same scoped-retry rationale as the reviewer/validator agent nodes.
     integration_auditor_workflow.add_node("integration_auditor_agent", integration_auditor_node, retry_policy=RETRY)
     integration_auditor_workflow.add_node("ask_integration_auditor_for_tool", ask_integration_auditor_for_tool)
     integration_auditor_workflow.add_node("integration_auditor_fallback", integration_auditor_fallback_node)
@@ -192,21 +183,16 @@ def compile_integration_auditor():
     return compiled_integration_auditor
 
 
-# LengthFinishReasonError is deterministic for a given prompt (the model burns
-# the whole completion budget and dies mid-JSON), so task-level retries would
-# just re-burn the same 16k output tokens five times and then crash the run.
-# The stage call sites handle it via llms.invoke_structured_capped instead.
-# Other deterministic failures (schema/validation, KeyError, OSError, ...) must
-# keep langgraph's fail-fast default too — only transient errors retry.
+# Retry only transient errors: LengthFinishReasonError and other deterministic failures fail fast.
 try:  # lives in a private langgraph module; fall back to "retry others" if moved
-    from langgraph._internal._retry import default_retry_on as _default_retry_on
+    from langgraph._internal._retry import default_retry_on as default_retry_on
 except ImportError:  # pragma: no cover
-    def _default_retry_on(exc):
+    def default_retry_on(exc):
         return True
 
 
 def _retry_on(exc):
-    return _default_retry_on(exc) and not isinstance(exc, LengthFinishReasonError)
+    return default_retry_on(exc) and not isinstance(exc, LengthFinishReasonError)
 
 
 RETRY = RetryPolicy(
@@ -231,53 +217,32 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("threat_intel", threat_intel_node)
     workflow.add_node("aggregate_demands", aggregate_demands_node)
     workflow.add_node("contract_verifier", contract_verifier_node)
-    # Single synchronous Edge Traversal node: synthesizes trust-boundary edges
-    # from the explorer notes and emits composite hypotheses for the reviewer's
-    # cross_boundary track. Runs on the linear chain after the contract-verifier
-    # barrier (synchronization) and before dispatch_reviewers, so its findings
-    # land in the vulnerabilities channel before review dispatch.
     workflow.add_node("edge_traversal", edge_traversal_node)
-    # The reviewer/validator outer nodes are compiled subgraphs with internal
-    # per-message retries; explicitly disable wholesale (subgraph replay)
-    # retries here (set_node_defaults would otherwise apply RETRY to them).
+    # Subgraphs own their per-message retries; disable wholesale replay retry from set_node_defaults.
     workflow.add_node("reviewer_agent", compiled_reviewer_agent, retry_policy=RetryPolicy(max_attempts=1))
     workflow.add_node("validator_agent", compiled_validator_agent, retry_policy=RetryPolicy(max_attempts=1))
     workflow.add_node("integration_auditor", compiled_integration_auditor, retry_policy=RetryPolicy(max_attempts=1))
-    workflow.add_node("synchronization", synchronization_node)
-    # Barrier after the reviewer superstep, so dispatch_validators sees the fully
-    # merged record set (not a partial mid-superstep snapshot, which previously
-    # sent the auditor an empty `confirmed_vulns` peer list).
+    # Barrier for the contract-verifier fan-out: edge_traversal runs once after every verifier task has written.
+    workflow.add_node("synchronization", lambda state: {})
+    # Barrier so dispatch_validators sees the fully-merged record set, not a mid-superstep snapshot.
     workflow.add_node("validator_dispatch_gate", lambda state: {})
-    # Runs strictly AFTER the validator superstep: a barrier node whose
-    # conditional edges fan the deferred `requires_integration` records to the
-    # auditor once their `direct_to_validator` peers carry proven poc_payloads
-    # (dispatch_integration_audits is the conditional path function).
+    # Barrier after the validator superstep: fans deferred `requires_integration` records to the auditor once their peers carry proven poc_payloads.
     workflow.add_node("integration_audit_dispatch", lambda state: {})
-    # Reporter phase: the terminal barrier fans out ONE single-shot reporter per
-    # reportable vulnerability; each writes a finding, then report_assembler
-    # renders them into the timestamped report dir (report.pdf + poc/, under the
-    # target app dir).
+    # Terminal barrier: one single-shot reporter per reportable vuln, then report_assembler writes the report dir.
     workflow.add_node("reporter_dispatch", lambda state: {})
     workflow.add_node("reporter", reporter_node)
     workflow.add_node("report_assembler", report_assembler_node)
-    # workflow.add_node("reviewer_sync", synchronization_node)
 
     workflow.add_edge(START, "bootstrap")
     workflow.add_edge("bootstrap", "preprocessor")
     workflow.add_edge("bootstrap", "manager")
 
     workflow.add_conditional_edges("manager", dispatch_explorers, ["explorer_agent"])
-    # The credential finder runs right after the preprocessor finishes the
-    # container build/sandbox/artifact-setup phase, on the same linear branch
-    # that fans out into the CVE analyzers.
     workflow.add_edge("preprocessor", "credential_finder")
     workflow.add_conditional_edges("credential_finder", dispatch_cve_analyzers, ["cve_analyzer"])
 
     workflow.add_edge("cve_analyzer", "threat_intel_gate")
-    # AND-join barrier: aggregate_demands only fires once both the explorer
-    # branch and the CVE/threat-intel branch have written. A naive set of
-    # separate edges would trigger it on the FIRST writer (both write to the
-    # same EphemeralValue trigger channel), running it twice with partial input.
+    # AND-join barrier: fires once only after BOTH branches write (separate edges would trigger it on the first writer).
     workflow.add_conditional_edges(
         "threat_intel_gate",
         dispatch_threat_intel,
@@ -287,19 +252,10 @@ def build_graph(checkpointer=None, interrupt_before=None):
 
     workflow.add_conditional_edges("aggregate_demands", dispatch_verifiers, ["contract_verifier", "synchronization", END])
     workflow.add_edge("contract_verifier", "synchronization")
-    # Contract-verifier barrier -> Edge Traversal (composite hypotheses are wired
-    # synchronously on this chain, no extra fan-out/join) -> reviewer dispatch.
     workflow.add_edge("synchronization", "edge_traversal")
-    # Reporter dispatch is the single sink: every early/terminal exit routes
-    # there so the report dir is created exactly once, even with zero hypotheses.
     workflow.add_conditional_edges("edge_traversal", dispatch_reviewers, ["reviewer_agent", "reporter_dispatch"])
-    # workflow.add_edge("reviewer_agent", "reviewer_sync")
-    # Evaluate dispatch from the barrier (never mid-superstep) so it reads the
-    # fully-merged confirmed set before emitting validator/auditor Sends.
     workflow.add_edge("reviewer_agent", "validator_dispatch_gate")
-    # Stage 1: prove every direct_to_validator record. requires_integration records
-    # are DEFERRED by dispatch_validators — the auditor must run only AFTER these
-    # are proven so its chain candidates carry real validator poc_payloads.
+    # Stage 1: prove direct_to_validator records; requires_integration records are DEFERRED so the auditor only sees proven poc_payloads.
     workflow.add_conditional_edges(
         "validator_dispatch_gate",
         dispatch_validators,
@@ -310,9 +266,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
             "__end__": "reporter_dispatch",
         },
     )
-    # Stage 2: from the validator (once its whole superstep finished) either bounce
-    # insufficient_context records back to the Reviewer OR, when no feedback is
-    # pending, advance into the integration-audit phase.
+    # Stage 2: after the validator superstep, bounce insufficient_context records to the Reviewer; otherwise advance to the audit phase.
     workflow.add_conditional_edges(
         "validator_agent",
         route_validator_feedback,
@@ -322,20 +276,14 @@ def build_graph(checkpointer=None, interrupt_before=None):
             "__end__": "reporter_dispatch",
         },
     )
-    # Stage 2b: fan the audited records to the auditor (or advance to reporter
-    # dispatch when none remain — covers the no-direct-tasks / post-chain drain
-    # cases, so the report dir is always written).
+    # Stage 2b: fan deferred records to the auditor, or advance to reporter dispatch when none remain.
     workflow.add_conditional_edges(
         "integration_audit_dispatch",
         dispatch_integration_audits,
         ["integration_auditor", "reporter_dispatch"],
     )
-    # Stage 3: chained records go to the Validator with the peers' proven
-    # poc_payloads injected (see route_integration_audit); unchainable are
-    # terminal. When nothing chains the pipeline advances to reporter dispatch.
+    # Stage 3: chained records re-validate with peers' proven poc_payloads (see route_integration_audit); the rest advance to reporter dispatch.
     workflow.add_conditional_edges("integration_auditor", route_integration_audit, ["validator_agent", "reporter_dispatch"])
-    # Fan out one reporter per reportable vulnerability (or skip straight to the
-    # assembler); the reporter node's outgoing edge is the fan-out barrier.
     workflow.add_conditional_edges("reporter_dispatch", dispatch_reporters, ["reporter", "report_assembler"])
     workflow.add_edge("reporter", "report_assembler")
     workflow.add_edge("report_assembler", END)

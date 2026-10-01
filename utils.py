@@ -708,6 +708,14 @@ _STATUS_PRIORITY = {
 }
 
 
+def append_note(record: dict, field: str, note: str) -> dict:
+    """Return a copy of `record` with `note` appended to its `field` text."""
+    record = dict(record)
+    existing = record.get(field) or ""
+    record[field] = f"{existing}\n{note}" if existing else note
+    return record
+
+
 def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dict]:
     vuln_map = {}
 

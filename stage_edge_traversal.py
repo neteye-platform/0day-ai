@@ -19,19 +19,8 @@ from boundary_edges import (
 )
 from utils import cache, get_cached_graph_data, safe_cache_filename
 
-# Composite-vulnerability classes emitted here; routed to the reviewer's
-# `cross_boundary` track (see stage_reviewer._reviewer_mode_for).
-CROSS_BOUNDARY_VULN_TYPES = {
-    "cross_boundary_contract_mismatch",
-    "differential_parsing",
-    "confused_deputy",
-}
-
-
-# Batch LLM calls are mutually independent (own prompt, own cache file) and
-# were run serially: total wall time was the SUM of batch latencies. They run
-# concurrently instead; results are reassembled in dispatch order, so the
-# emitted hypotheses — and every downstream cache key — are identical.
+# Independent batch LLM calls run concurrently; results are reassembled in
+# dispatch order, so emitted hypotheses and downstream cache keys are unchanged.
 _PARALLEL_BATCHES = 12
 
 
@@ -62,12 +51,11 @@ def edge_traversal_node(state: MasterState):
         logging.info("Edge Traversal disabled via settings.edge_traversal_enabled=False.")
         return {}
 
-    note_map = {}
-    for note in state.get("notes", []):
-        dict_note = as_dict(note)
-        node_id = dict_note.get("node_id")
-        if node_id:
-            note_map[str(node_id)] = dict_note
+    note_map = {
+        str(dict_note["node_id"]): dict_note
+        for note in state.get("notes", [])
+        if (dict_note := as_dict(note)).get("node_id")
+    }
 
     graph_data = get_cached_graph_data(settings.graph)
 
@@ -152,5 +140,5 @@ def _edge_traversal_finding_to_record(finding) -> dict:
         "vulnerability_type": vuln_type,
         "validation_strategy": f.get("validation_strategy"),
         # Stable per-(pair, type) anchor: distinct boundary edges never collide.
-        "vulnerable_component": f"edge:{vuln_type}:" + "->".join(nodes) if nodes else f"edge:{vuln_type}",
+        "vulnerable_component": f"edge:{vuln_type}" + (":" + "->".join(nodes) if nodes else ""),
     }
