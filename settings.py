@@ -108,10 +108,6 @@ patcher_countdown_start = max(1, patcher_max_iterations - COUNTDOWN_LEAD_TURNS)
 # loop re-runs while a re-validated patch was REJECTED and this budget is left;
 # a record still rejected at budget exhaustion ships flagged as not fixed.
 patcher_max_attempts = 2
-# Cap on file edits a single patch may apply (minimalism enforced mechanically).
-patcher_max_edits = 6
-# Replacement chunks above this line count bounce as "refactoring, not patching".
-patcher_max_edit_lines = 40
 
 ## ---- Tool-loop context compaction ----
 

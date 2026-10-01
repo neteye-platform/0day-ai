@@ -42,6 +42,23 @@ _patch_lock = threading.Lock()
 # Lines of the replaced region echoed back into the ToolMessage.
 _ECHO_MAX_LINES = 30
 
+# Soft minimalism budgets (advisories, never rejections): an edit past either
+# budget is applied normally, but the FIRST budget crossing bounces back as an
+# advisory note in the tool reply (the stamp rides on the patch_log entry, so
+# later edits and resumed runs stay quiet).
+_EDIT_BUDGET = 6
+_EDIT_LINES_BUDGET = 40
+
+
+def _issued_advisories(applied: list) -> set[str]:
+    """Advisory keys already surfaced in earlier turns of this patch (the
+    warn-once history stored on the patch_log entries)."""
+    issued: set[str] = set()
+    for entry in applied:
+        if isinstance(entry, dict):
+            issued.update(entry.get("advisories") or [])
+    return issued
+
 
 def _reject(tool_call_id: str, text: str) -> Command:
     """Bounce a write-tool call with a corrective error ToolMessage (a
@@ -77,10 +94,12 @@ def patch_source_file(
     code, and never disable or bypass the feature.
 
     The tool refuses files outside the application directory, excluded paths
-    (dependency trees/tests/docs), ranges larger than the configured cap, and a
-    range that already equals the replacement (idempotence guard on replay).
-    Its reply echoes the replaced lines and a unified diff: CHECK IT — a wrong
-    range is fixable by the next edit only if you notice it here.
+    (dependency trees/tests/docs), and a range that already equals the
+    replacement (idempotence guard on replay). Edits past the soft minimalism
+    budgets (a handful of hunks, a few dozen lines per hunk) are still applied
+    but answered with an advisory note — a big change is refactoring, not
+    patching. Its reply echoes the replaced lines and a unified diff: CHECK IT
+    — a wrong range is fixable by the next edit only if you notice it here.
 
     Args:
         file_path: Path relative to the application root (e.g. 'src/db.py').
@@ -89,13 +108,6 @@ def patch_source_file(
         replacement: The exact new content for that range ('' deletes it).
     """
     applied = state.get("patch_log") or []
-    if len(applied) >= settings.patcher_max_edits:
-        return _reject(
-            tool_call_id,
-            f"Edit refused: this patch already applied {len(applied)} edits "
-            f"(cap: {settings.patcher_max_edits}). A bigger change is refactoring, "
-            "not patching — refine the edits you have or call submit_patch.",
-        )
 
     app_dir = Path(settings.app_path).resolve()
     target = (app_dir / file_path).resolve()
@@ -117,21 +129,6 @@ def patch_source_file(
         )
 
     new_lines = _split(replacement)  # '' deletes the range
-    if len(new_lines) > settings.patcher_max_edit_lines:
-        return _reject(
-            tool_call_id,
-            f"Edit refused: the replacement itself is {len(new_lines)} lines, "
-            f"exceeding the {settings.patcher_max_edit_lines}-line patch cap. "
-            "Pasting a rewritten function is refactoring, not patching — shrink "
-            "the change to the minimum that blocks the exploit flow.",
-        )
-    if end_line - start_line + 1 > settings.patcher_max_edit_lines:
-        return _reject(
-            tool_call_id,
-            f"Edit refused: replacing {end_line - start_line + 1} lines exceeds the "
-            f"{settings.patcher_max_edit_lines}-line patch cap. Shrink the edit to "
-            "the minimum that blocks the exploit flow.",
-        )
 
     with _patch_lock:
         try:
@@ -144,15 +141,14 @@ def patch_source_file(
             )
         lines = content.splitlines()
         total = len(lines)
-        if not (1 <= start_line <= end_line <= min(total, start_line - 1 + settings.patcher_max_edit_lines)):
-            # Bounds AND the size cap fail with the same corrective message; a
-            # range past EOF usually means the file shifted since the last read.
+        if not 1 <= start_line <= end_line <= total:
+            # A range past EOF usually means the file shifted since the last read.
             return _reject(
                 tool_call_id,
                 f"Edit refused: lines {start_line}-{end_line} are not a valid range of "
-                f"'{rel}' ({total} lines; cap {settings.patcher_max_edit_lines} per edit). "
+                f"'{rel}' ({total} lines). "
                 "If the file shifted since your last read, re-read it with read_file "
-                "and use its printed numbering; otherwise shrink the edit.",
+                "and use its printed numbering.",
             )
         old_lines = lines[start_line - 1:end_line]
         if old_lines == new_lines:
@@ -196,6 +192,31 @@ def patch_source_file(
     logging.info(f"Patcher: patched {rel} (lines {start_line}-{end_line}, "
                  f"{len(old_lines)} -> {len(new_lines)} lines).")
 
+    # Soft minimalism advisories, each surfaced only on its FIRST crossing.
+    issued = _issued_advisories(applied)
+    advisories: list[tuple[str, str]] = []
+    edit_count = len([e for e in applied if isinstance(e, dict)]) + 1
+    if edit_count >= _EDIT_BUDGET and "count" not in issued:
+        advisories.append((
+            "count",
+            f"SOFT BUDGET: this is edit #{edit_count} of the patch (recommended "
+            f"budget ~{_EDIT_BUDGET} small hunks). A bigger change is refactoring, "
+            "not patching — refine what you have or call submit_patch.",
+        ))
+    if (max(len(new_lines), end_line - start_line + 1) > _EDIT_LINES_BUDGET
+            and "lines" not in issued):
+        advisories.append((
+            "lines",
+            f"SOFT BUDGET: this hunk spans over {_EDIT_LINES_BUDGET} lines "
+            "(recommended per-edit budget). Pasting a rewritten function is "
+            "refactoring, not patching — shrink to the minimum that blocks the "
+            "exploit flow.",
+        ))
+    entry: dict = {"file": rel, "diff": diff}
+    if advisories:
+        entry["advisories"] = [key for key, _ in advisories]
+    advisory_block = "".join(f"\n--- {text} ---" for _, text in advisories)
+
     return Command(update={
         "messages": [ToolMessage(
             content=(
@@ -203,12 +224,12 @@ def patch_source_file(
                 f"{len(new_lines)} line(s).\n"
                 f"--- OLD LINES (verify this is what you meant to replace) ---\n{echo}\n"
                 f"--- DIFF ---\n{diff}\n"
-                f"--- {shift_note} ---"
+                f"--- {shift_note} ---{advisory_block}"
             ),
             name="patch_source_file",
             tool_call_id=tool_call_id,
         )],
-        "patch_log": [{"file": rel, "diff": diff}],
+        "patch_log": [entry],
     })
 
 
