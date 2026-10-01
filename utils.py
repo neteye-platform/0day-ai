@@ -1856,7 +1856,7 @@ def cache_reviewer(node_id: str, report: dict, updated_vuln: Optional[dict] = No
     same ``.cache/reviewer/`` namespace.
     """
     report_hash = hashlib.md5(json.dumps(report, sort_keys=True).encode()).hexdigest()
-    cache_file = settings.cache_dir / "reviewer" / f"{node_id}_{report_hash}.json"
+    cache_file = settings.cache_dir / "reviewer" / safe_cache_filename(f"{node_id}_{report_hash}.json")
     if updated_vuln is None:
         return cache(cache_file, "read")
     cache(cache_file, "write", updated_vuln)
@@ -1881,9 +1881,7 @@ def cache_validator(report: dict, peer_payloads: Optional[list] = None, updated_
     )
     content = {"report": report, "peer_payloads": peers}
     report_hash = hashlib.md5(json.dumps(content, sort_keys=True).encode()).hexdigest()
-    cache_file = (
-        settings.cache_dir / "validator" / f"{safe_cache_filename(vuln_id)}_{report_hash}.json"
-    )
+    cache_file = settings.cache_dir / "validator" / safe_cache_filename(f"{vuln_id}_{report_hash}.json")
     if updated_vuln is None:
         return cache(cache_file, "read")
     cache(cache_file, "write", updated_vuln)
@@ -1907,7 +1905,7 @@ def cache_integration_auditor(report: dict, peers: Optional[list] = None, update
     content = {"report": report, "confirmed_vulns": peers_sorted}
     report_hash = hashlib.md5(json.dumps(content, sort_keys=True).encode()).hexdigest()
     cache_file = (
-        settings.cache_dir / "integration_auditor" / f"{safe_cache_filename(vuln_id)}_{report_hash}.json"
+        settings.cache_dir / "integration_auditor" / safe_cache_filename(f"{vuln_id}_{report_hash}.json")
     )
     if updated_vuln is None:
         return cache(cache_file, "read")
@@ -1925,7 +1923,7 @@ def cache_reporter(report: dict, finding: Optional[dict] = None) -> Optional[dic
     """
     report_hash = hashlib.md5(json.dumps(report or {}, sort_keys=True).encode()).hexdigest()
     vuln_id = (report or {}).get("vuln_id") or "Unknown"
-    cache_file = settings.cache_dir / "reporter" / f"{safe_cache_filename(vuln_id)}_{report_hash}.json"
+    cache_file = settings.cache_dir / "reporter" / safe_cache_filename(f"{vuln_id}_{report_hash}.json")
     if finding is None:
         cached = cache(cache_file, "read")
         if isinstance(cached, dict) and isinstance(cached.get("finding"), dict):
