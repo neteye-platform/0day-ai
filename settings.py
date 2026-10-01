@@ -161,11 +161,27 @@ scan_exclude_defaults = True
 # single batch. Set to False to force one dispatch per node (no batching).
 explorer_batching_enabled = True
 # Maximum combined code size (in chars) for a batched explorer dispatch.
-explorer_batch_char_threshold = 10000
+explorer_batch_char_threshold = 15000
 
 # Max expert roles assigned per community (top-K by heuristic score). Reduces
 # duplicate explorer scans of the same nodes by multiple expert roles.
 max_experts_per_community = 2
+
+# Semantic dedup: before reviewers are dispatched, hypotheses that
+# are the same real vulnerability described differently by different agents
+# (e.g. explorer roles calling it "plaintext password logging" vs "plaintext
+# credential logging") are merged via local Ollama embeddings so one reviewer
+# subgraph adjudicates the pattern once. Clustering groups by
+# (vulnerability_type, cwe_id) at semantic_dedup_threshold (default 0.80,
+# validated against real cached hypotheses). Dependency-origin records
+# (carry source_cve) are never merged — each is a distinct known CVE. Fails
+# open: if Ollama/embeddings is unreachable or semantic_dedup_enabled is False,
+# every hypothesis is dispatched unchanged.
+semantic_dedup_enabled = True
+semantic_dedup_threshold = 0.80
+embeddings_model = "embeddinggemma"
+embeddings_base_url = "http://localhost:11434"
+embeddings_timeout = 60
 
 # When True, the preprocessor always rebuilds the container image even if the
 # build definition (Dockerfile/compose) is unchanged since the last run.

@@ -173,38 +173,49 @@ def masked_source_for_parsing(source_text: str, file_path: str | Path | None) ->
     return "".join(parts)
 
 
-def load_code_corpus() -> dict[str, str]:
-    """Read the contents of every unique source file whose graph nodes carry
-    ``file_type == "code"``.
+def iter_code_files():
+    """    Yield every unique, non-excluded source file whose graph nodes carry
+    ``file_type == "code"``, in first-seen order.
 
-    Returns ``{source_file: content}`` so callers can search the whole
-    codebase in a single pass (the deterministic pre-filter uses this instead
-    of re-reading files per CVE). Unreadable, missing, or binary files are
-    skipped with a debug log. Content is served from the shared
-    ``read_file_text`` cache (one copy per file).
+    Streaming: callers can scan the whole repo exactly once without
+    materializing every file in memory (no O(files) RAM corpus).
     """
     graph_data = get_cached_graph_data(settings.graph)
-    code_files = sorted({
-        node.get("source_file")
-        for node in graph_data.get("nodes", [])
-        if node.get("file_type") == "code" and node.get("source_file")
-    })
-
-    corpus: dict[str, str] = {}
-    for source_file in code_files:
+    seen: set[str] = set()
+    for node in graph_data.get("nodes", []):
+        source_file = node.get("source_file")
+        if node.get("file_type") != "code" or not source_file or source_file in seen:
+            continue
         if is_path_excluded(source_file):
             continue
-        content = read_file_text(source_file)
-        if content is not None:
-            corpus[source_file] = content
+        seen.add(source_file)
+        yield source_file
 
-    included = len(corpus)
-    skipped = len(code_files) - included
-    logging.debug(
-        f"Code corpus: indexed {included}/{len(code_files)} code files "
-        f"({skipped} excluded by path filter)."
-    )
-    return corpus
+
+def scan_codebase_for_keywords(all_keywords: list[str]):
+    """Scan all code files once and return the set of keywords present in any.
+
+    Streaming: files are read one at a time via ``read_file_text`` and searched
+    with plain per-keyword substring checks (exact, so overlapping keywords
+    like ``yaml.load`` / ``yaml.load_all`` are each reported); scanning stops
+    early once every keyword has been found. Returns ``(present,
+    scanned_bytes)`` so callers can distinguish 'no matches' from 'nothing to
+    scan'.
+    """
+    kws = sorted({k for k in all_keywords if k})
+    if not kws:
+        return set(), 0
+    present: set[str] = set()
+    scanned_bytes = 0
+    for source_file in iter_code_files():
+        content = read_file_text(source_file)
+        if content is None:
+            continue
+        scanned_bytes += len(content)
+        present.update(kw for kw in kws if kw in content)
+        if len(present) >= len(kws):
+            break
+    return present, scanned_bytes
 
 
 def find_unsupported_code_files(graph_data: dict) -> dict[str, list[str]]:
