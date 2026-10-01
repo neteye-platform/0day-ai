@@ -13,6 +13,12 @@ LANGUAGE_MAP = {
     ".ts": tree_sitter.Language(tree_sitter_typescript.language_typescript()),
     ".tsx": tree_sitter.Language(tree_sitter_typescript.language_tsx()),
     ".go": tree_sitter.Language(tree_sitter_go.language()),
+    # .vue single-file components are parsed with the TypeScript grammar: non-
+    # <script> regions are masked out (newlines preserved) before parsing, so the
+    # script body — raw JS or TS — parses as a normal program whose line numbers
+    # stay SFC-accurate (see utils.masked_source_for_parsing). TS is a superset
+    # of JS, so it is the safe default regardless of the declared script lang.
+    ".vue": tree_sitter.Language(tree_sitter_typescript.language_typescript()),
 }
 
 # Dependency manifest and lockfile names across all supported ecosystems.
@@ -112,6 +118,12 @@ AST_GRAMMAR_MAP = {
     },
 }
 
+# .vue SFCs reuse the TypeScript AST structure end-to-end: the non-<script>
+# regions are blanked into spaces before parsing, so the tree-sitter tree (and
+# thus every AST_GRAMMAR_MAP/SYMBOL_QUERIES rule below) only ever sees the
+# script body as a regular TS program.
+AST_GRAMMAR_MAP[".vue"] = AST_GRAMMAR_MAP[".ts"]
+
 SYMBOL_QUERIES = {
     ".php": """
         (class_declaration
@@ -166,3 +178,4 @@ SYMBOL_QUERIES = {
 
 # .jsx and .tsx use the exact same AST structure for methods as their base languages
 SYMBOL_QUERIES[".jsx"] = SYMBOL_QUERIES[".js"]
+SYMBOL_QUERIES[".vue"] = SYMBOL_QUERIES[".ts"]

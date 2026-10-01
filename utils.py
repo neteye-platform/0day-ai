@@ -124,6 +124,53 @@ def read_file_text(source_file: str) -> Optional[str]:
         return None
 
 
+# Matches an entire `<script …>…</script>` block (open tag with any attributes,
+# verbatim body, close tag).
+_VUE_SCRIPT_RE = re.compile(
+    r"""(<script\b(?:"[^"]*"|'[^']*'|[^>"'])*>)([\s\S]*?)(</script\s*>)""",
+    re.IGNORECASE,
+)
+
+
+def masked_source_for_parsing(source_text: str, file_path: str | Path | None) -> str:
+    """Return source text that is safe / useful to hand a tree-sitter parser.
+
+    For a ``.vue`` single-file component, blank everything outside the
+    ``<script>`` bodies (keeping ``\\r``/``\\n``) so the TypeScript grammar sees
+    only the script logic while line numbers stay SFC-accurate — the same
+    convention the upstream graphify extractor uses, so ``source_location``
+    values on graph nodes map 1:1 onto the parsed text. Idempotent for text that
+    is already masked. Every other extension is returned unchanged.
+    """
+    if not source_text:
+        return source_text
+    try:
+        suffix = Path(file_path).suffix.lower() if file_path else ""
+    except TypeError:
+        suffix = ""
+    if suffix != ".vue":
+        return source_text
+
+    def _blank(s: str) -> str:
+        return re.sub(r"[^\r\n]", " ", s)
+
+    # Idempotency guard: an already-masked text has no literal <script> tags
+    # left, so bail without touching it. Also covers template-only SFCs.
+    if not _VUE_SCRIPT_RE.search(source_text):
+        return source_text
+
+    parts: list[str] = []
+    pos = 0
+    for m in _VUE_SCRIPT_RE.finditer(source_text):
+        parts.append(_blank(source_text[pos:m.start()]))
+        parts.append(_blank(m.group(1)))  # <script …> open tag
+        parts.append(m.group(2))          # script body, verbatim
+        parts.append(_blank(m.group(3)))  # </script> close tag
+        pos = m.end()
+    parts.append(_blank(source_text[pos:]))
+    return "".join(parts)
+
+
 def load_code_corpus() -> dict[str, str]:
     """Read the contents of every unique source file whose graph nodes carry
     ``file_type == "code"``.
@@ -1516,7 +1563,7 @@ def _extract_namespace_aliases(source_file: str, target_namespace: str) -> Optio
 
     aliases = {target_namespace}
     parser = tree_sitter.Parser(LANGUAGE_MAP[ext])
-    full_code_bytes = full_text.encode("utf-8")
+    full_code_bytes = masked_source_for_parsing(full_text, source_file).encode("utf-8")
     try:
         full_tree = parser.parse(full_code_bytes)
 
@@ -1671,7 +1718,7 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
     if source_content is None:
         logging.error(f"Source file '{source_file}' not found on disk or unreadable.")
         return None
-    source_bytes = source_content.encode("utf-8")
+    source_bytes = masked_source_for_parsing(source_content, source_file_path).encode("utf-8")
 
     # Get target start line
     try:
@@ -1845,6 +1892,12 @@ SCAN_SIGNAL_TYPES: dict[str, set[str]] = {
         "if_statement", "for_statement", "while_statement", "switch_statement",
         "try_statement", "template_substitution",
     },
+    # .vue scripts parse with the TypeScript grammar, so they share its signals.
+    ".vue": {
+        "call_expression", "new_expression", "import_statement",
+        "if_statement", "for_statement", "while_statement", "switch_statement",
+        "try_statement", "template_substitution",
+    },
     ".php": {
         "function_call_expression", "member_call_expression", "scoped_call_expression",
         "object_creation_expression", "namespace_use_declaration", "include_expression",
@@ -1862,6 +1915,7 @@ _IMPORT_TYPES: dict[str, set[str]] = {
     ".jsx": {"import_statement"},
     ".ts": {"import_statement"},
     ".tsx": {"import_statement"},
+    ".vue": {"import_statement"},
     ".php": {"namespace_use_declaration"},
 }
 
@@ -2238,6 +2292,10 @@ def extract_imports(source_code: str, file_path: str) -> list[str]:
     if not lang or not grammar or "import_query" not in grammar:
         return []
 
+    # Callers may pass the raw SFC text; mask non-<script> regions first so the
+    # TS grammar (and its import_query) only sees the script body.
+    source_code = masked_source_for_parsing(source_code, file_path)
+
     parser = tree_sitter.Parser(lang)
     tree = parser.parse(bytes(source_code, "utf8"))
 
@@ -2285,9 +2343,19 @@ def index_file(filepath: str | Path) -> list[dict]:
     language = LANGUAGE_MAP[ext]
     query_code = SYMBOL_QUERIES[ext]
 
-    # Parse the file (read_bytes() replaces the 'with open()' block)
+    # Parse the file (read_bytes() replaces the 'with open()' block). For .vue
+    # SFCs, mask non-<script> regions first so the TS symbol queries only see
+    # the script body; newlines are preserved so start/end lines stay
+    # SFC-accurate and get_definition can read them back from the real file.
     parser = tree_sitter.Parser(language)
-    tree = parser.parse(path.read_bytes())
+    if ext == ".vue":
+        tree = parser.parse(
+            masked_source_for_parsing(
+                path.read_text(encoding="utf-8", errors="replace"), path
+            ).encode("utf-8")
+        )
+    else:
+        tree = parser.parse(path.read_bytes())
 
     # Execute the language-specific query
     query = tree_sitter.Query(language, query_code)
