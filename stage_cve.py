@@ -5,7 +5,7 @@ from langgraph.types import Send
 
 import settings
 from llms import fast_llm, invoke_structured_capped
-from run_stats import _log_agent_completion, _record_stat, _start_agent_progress
+from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping
 from schemas import CVE_ANALYZER_AGENT, CVEAnalysis
 from state import CVEAnalyzerState, MasterState
 from utils import cache
@@ -116,6 +116,7 @@ def osv_enrichment_lines(cve: dict) -> list[str]:
 def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     """Classify one CVE: extract a security demand (application_mitigation) or
     emit a vulnerability hypothesis (upgrade_only)."""
+    raise_if_stopping()
     cve = state.get("cve", {})
     package_name = cve.get("package") or "unknown"
     cve_id = cve.get("id", "UNKNOWN-CVE")

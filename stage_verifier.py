@@ -9,7 +9,7 @@ from langgraph.types import Send
 
 import settings
 from llms import fast_llm, invoke_structured_capped
-from run_stats import _log_agent_completion, _record_stat, _start_agent_progress
+from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping
 from schemas import VERIFIER_AGENT, VerifierOutput, cwes
 from stage_cve import _normalize_cwe_ids
 from state import MasterState, VerifierState
@@ -246,6 +246,7 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
 
 def contract_verifier_node(state: VerifierState) -> dict:
     """Graph node wrapper: runs the verifier and advances its progress ledger."""
+    raise_if_stopping()
     result, cache_tag = _contract_verifier_node(state)
     detail = f"node={state.get('target_node_id', 'unknown')}"
     if cache_tag:

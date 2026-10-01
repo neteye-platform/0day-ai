@@ -5,7 +5,7 @@ from pathlib import Path
 
 import settings
 from dedup import deduplicate_demands
-from run_stats import _record_stat, as_dict, get_embedder
+from run_stats import _record_stat, as_dict, get_embedder, raise_if_stopping
 from stage_cve import _normalize_cwe_ids
 from state import MasterState
 from utils import (
@@ -598,6 +598,7 @@ def _dedupe_enriched_cve_demands(cves: list[dict]) -> list[dict]:
 def aggregate_demands_node(state: MasterState):
     """AND-join barrier output: convert all notes + CVE records into grouped
     demands and upgrade-only hypotheses."""
+    raise_if_stopping()  # before the fail-open try: RunStopped must never be swallowed
     grouped_demands = defaultdict(list)
     try:
         graph_data = get_cached_graph_data(settings.graph)

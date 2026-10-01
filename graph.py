@@ -3,6 +3,7 @@ import logging
 import argparse
 import os
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -51,7 +52,7 @@ from stage_validator import (
     validator_router,
 )
 from stage_verifier import contract_verifier_node, dispatch_verifiers
-from run_stats import gen_run_id, langsmith_detached_node
+from run_stats import RunStopped, gen_run_id, install_signal_handlers, langsmith_detached_node
 from tool_loop import SequentialToolNode, concise_tool_error
 from credential_finder import credential_finder_node
 from state import MasterState, ReviewerState, ValidatorState, IntegrationAuditorState
@@ -193,6 +194,9 @@ except ImportError:  # pragma: no cover
 
 
 def _retry_on(exc):
+    # RunStopped is the cooperative Ctrl+C unwind: retrying it would defeat the stop.
+    if isinstance(exc, RunStopped):
+        return False
     return default_retry_on(exc) and not isinstance(exc, LengthFinishReasonError)
 
 
@@ -220,8 +224,9 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("contract_verifier", contract_verifier_node)
     workflow.add_node("edge_traversal", edge_traversal_node)
     # Subgraphs own their per-message retries; disable wholesale replay retry from set_node_defaults.
-    # langsmith_detached_node is identity when trace splitting is off; when on, each dispatch
-    # runs the subgraph as its own root trace in the agent's dedicated LangSmith project.
+    # The wrapper always starts with the cooperative-stop check (raise_if_stopping);
+    # with trace splitting off it is a plain subgraph.invoke pass-through, when on each
+    # dispatch runs the subgraph as its own root trace in the agent's dedicated LangSmith project.
     workflow.add_node("reviewer_agent", langsmith_detached_node(compiled_reviewer_agent, "reviewer"), retry_policy=RetryPolicy(max_attempts=1))
     workflow.add_node("validator_agent", langsmith_detached_node(compiled_validator_agent, "validator"), retry_policy=RetryPolicy(max_attempts=1))
     workflow.add_node("integration_auditor", langsmith_detached_node(compiled_integration_auditor, "integration_auditor"), retry_policy=RetryPolicy(max_attempts=1))
@@ -344,33 +349,80 @@ if __name__ == "__main__":
     )
 
     from langgraph.checkpoint.sqlite import SqliteSaver
+    from langgraph.types import Command
 
     Path("states").mkdir(parents=True, exist_ok=True)
+    done_flag = Path("states/scan-complete.flag")
+    thread_file = Path("states/current_thread.txt")
+
+    # Every scan runs on its own checkpoint thread (pointer kept in
+    # states/current_thread.txt). A completed scan (flag present) means this
+    # start is a NEW scan: mint a fresh thread so the old run's append-channel
+    # values (notes, vulnerabilities, ...) can never accumulate into it. If the
+    # flag is absent, the pointer thread is the interrupted scan and gets
+    # resumed from its sqlite checkpoints.
+    pointer_thread = thread_file.read_text().strip() if thread_file.exists() else None
+    if done_flag.exists():
+        done_flag.unlink()
+        pointer_thread = None
+    thread_id = pointer_thread or f"scan-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    thread_file.write_text(thread_id)
 
     # Stamp the entry config so this run's ROOT trace correlates with the
     # project-split subagent traces (run_stats.langsmith_detached_node).
     config = {
-        "configurable": {"thread_id": "scan-1"},
+        "configurable": {"thread_id": thread_id},
         "metadata": {"pipeline_run_id": run_id, "target": settings.app_path.name},
         "tags": ["pipeline"],
     }
-    done_flag = Path("states/scan-complete.flag")
+
+    # Two-phase Ctrl+C (see run_stats.install_signal_handlers): 1st press
+    # cooperatively stops after the running agents, 2nd press exits now;
+    # SIGTERM/SIGHUP exit immediately. Exits leave resumable checkpoints.
+    run_live = threading.Event()
+    install_signal_handlers(run_live)
+
+    # A force-killed previous process leaked per-agent attacker containers
+    # (close_agent_sessions never ran); sweep them before the scan starts.
+    attacker_tools.manager.sweep_stale_containers()
 
     with SqliteSaver.from_conn_string("states/pipeline_checkpoints.sqlite") as checkpointer:
         app = build_graph(checkpointer=checkpointer)
         try:
-            prior = app.get_state(config).values
-            if prior and not done_flag.exists():
-                logging.info("Resuming previously interrupted run from checkpoint.")
-                run_id = prior.get("pipeline_run_id") or run_id
+            snapshot = app.get_state(config)
+            if snapshot.next:
+                # Resume needs a None/Command input: a plain dict is treated as
+                # a NEW run and restarts from bootstrap. The Command UPDATE
+                # patches pipeline_run_id for pre-change checkpoints while the
+                # pending tasks keep running (task writes already committed are
+                # durable and never re-executed).
+                run_id = snapshot.values.get("pipeline_run_id") or run_id
                 config["metadata"]["pipeline_run_id"] = run_id
-                # Resume passes the id IN as a partial state update: a
-                # pre-change checkpoint never ran bootstrap with the field, and
-                # bootstrap will not re-run now, so without this the subagent
-                # dispatches would read None while the root trace claims an id.
-                final_state = app.invoke({"pipeline_run_id": run_id}, config)
+                run_input = Command(update={"pipeline_run_id": run_id})
+                logging.info(
+                    "Resuming interrupted scan on thread %s (pending step: %s).",
+                    thread_id, ", ".join(dict.fromkeys(snapshot.next)),
+                )
             else:
-                final_state = app.invoke(initial_state, config)
+                if snapshot.values and thread_id == pointer_thread:
+                    # The pointed thread already ran to END (e.g. killed just
+                    # before the done flag was touched): reusing it would
+                    # accumulate the old run's channel values into the new one.
+                    thread_id = f"scan-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                    thread_file.write_text(thread_id)
+                    config["configurable"]["thread_id"] = thread_id
+                    logging.info(
+                        "Thread %s already completed; starting fresh scan on thread %s.",
+                        pointer_thread, thread_id,
+                    )
+                run_input = initial_state
+                logging.info("Starting fresh scan on thread %s.", thread_id)
+
+            run_live.set()
+            try:
+                final_state = app.invoke(run_input, config)
+            finally:
+                run_live.clear()
 
             out_file = "results.json"
             with open(out_file, "w") as f:
@@ -380,6 +432,17 @@ if __name__ == "__main__":
 
         except FileNotFoundError:
             print("Waiting for actual graph.json to execute.")
+        except RunStopped:
+            logging.info(
+                "Stopped after the in-flight agents finished. Progress is "
+                "checkpointed: rerun `python graph.py` to resume this scan."
+            )
+            sys.exit(130)
         except KeyboardInterrupt:
-            done_flag.unlink(missing_ok=True)
-            exit(1)
+            # Only reachable when SIGINT races the run_live transition; while
+            # the loop is live the signal handler itself acts.
+            logging.info(
+                "Interrupted. Progress is checkpointed: "
+                "rerun `python graph.py` to resume this scan."
+            )
+            sys.exit(130)

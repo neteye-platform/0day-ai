@@ -22,6 +22,91 @@ from pathlib import Path
 import settings
 from dedup import Embeddings
 
+# ---------------------------------------------------------------------------
+# Cooperative run stop (Ctrl+C). The first SIGINT only sets this event: every
+# queued fan-out task raises RunStopped at its entry, langgraph then cancels
+# the rest of the queue, waits for the in-flight agents to finish (each one
+# commits its durable writes as it completes), and re-raises out of the run.
+# In-flight agents never read the flag, so a running reviewer/validator still
+# finishes its whole loop and submits normally. Everything checkpointed stays
+# in sqlite, so the next `python graph.py` resumes exactly where this stopped.
+
+_stop_requested = threading.Event()
+
+
+class RunStopped(Exception):
+    """Pipeline stop requested; raised at task entry to unwind the run."""
+
+
+def request_stop() -> None:
+    _stop_requested.set()
+
+
+def stop_requested() -> bool:
+    return _stop_requested.is_set()
+
+
+def raise_if_stopping() -> None:
+    if _stop_requested.is_set():
+        raise RunStopped("Pipeline stop requested (Ctrl+C).")
+
+
+_sigint_armed = threading.Event()
+
+
+def install_signal_handlers(run_live: threading.Event) -> None:
+    """Two-phase Ctrl+C handling for the pipeline entrypoint.
+
+    The first SIGINT arms the cooperative stop (``request_stop()``): queued
+    fan-out tasks raise RunStopped at their entry, langgraph cancels the rest
+    of the queue and waits for the in-flight agents to finish and commit their
+    results, then the exception unwinds in the caller and the process exits
+    with a resumable checkpoint. The second SIGINT exits straight from the
+    handler, because background threads cannot be killed and the run's
+    executor would otherwise block waiting for them. While ``run_live`` is
+    unset (startup/shutdown windows) there is no run to unwind, so even the
+    first SIGINT exits immediately. SIGTERM/SIGHUP always exit immediately.
+    """
+    import os
+    import signal
+
+    def _hard_exit(message: str, code: int):
+        print(f"\n{message}", flush=True)
+        logging.info(message)
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+        os._exit(code)
+
+    def _on_sigint(signum, frame):
+        if _sigint_armed.is_set() or not run_live.is_set():
+            _hard_exit(
+                "Terminating immediately: agents still executing are abandoned "
+                "(their in-flight work is lost; everything checkpointed earlier "
+                "is kept and will resume on the next start).",
+                130,
+            )
+        _sigint_armed.set()
+        request_stop()
+        print(
+            "\nStop requested: the agents currently executing will finish and "
+            "their results are checkpointed; queued agents are skipped. "
+            "Press Ctrl+C again to terminate immediately.",
+            flush=True,
+        )
+
+    def _on_sigterm(signum, frame):
+        _hard_exit(
+            f"Signal {signum} received: terminating immediately "
+            "(checkpoints are kept; the next start resumes this scan).",
+            143,
+        )
+
+    signal.signal(signal.SIGINT, _on_sigint)
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _on_sigterm)
+
+
 _agent_progress: dict[str, dict[str, int]] = {}
 _agent_progress_lock = threading.Lock()
 _PROGRESS_DIR = Path("states") / "progress"
@@ -158,7 +243,12 @@ def langsmith_detached_node(subgraph, agent: str):
     callbacks (e.g. a caller-supplied custom tracing handler).
     """
     if not langsmith_split_active():
-        return subgraph
+        def node(state, config):
+            raise_if_stopping()
+            return subgraph.invoke(state, config)
+
+        node.__name__ = f"{agent}_node"
+        return node
 
     from langsmith.run_helpers import tracing_context
 
@@ -167,6 +257,7 @@ def langsmith_detached_node(subgraph, agent: str):
     def node(state, config):
         from langchain_core.runnables.config import var_child_runnable_config
 
+        raise_if_stopping()
         run_id = state.get("pipeline_run_id") if isinstance(state, dict) else None
         subject = payload_subject(state)
         metadata = {"agent": agent}
