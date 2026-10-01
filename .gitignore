@@ -4,3 +4,10 @@ testing_db*
 states/
 trace.json
 graphify-out/
+.langgraph_api/
+architecture.md
+draw-diagram.py
+langgraph.json
+llms.txt
+run-graphify.py
+todo.md
