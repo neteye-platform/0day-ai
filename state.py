@@ -71,6 +71,10 @@ class ValidatorState(TypedDict):
 class IntegrationAuditorState(TypedDict):
     # A single `requires_chaining` record to be combined into a multi-step exploit chain.
     report_to_test: dict
+    # Full records of all OTHER confirmed vulnerabilities (excludes report_to_test
+    # itself). Rendered as a summary for the agent and served to
+    # get_vulnerability_details for deep dives into a specific peer.
+    confirmed_vulns: list[dict]
     # Number of LLM invocations in the tool loop (same role as ReviewerState.iterations).
     iterations: Annotated[int, operator.add]
     vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
