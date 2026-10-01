@@ -127,6 +127,8 @@ expert_agents:
     2. Upstream Contracts: Demand caller validation ONLY for parameters flowing into operational sinks. Do not demand validation for internal IDs, booleans, or strongly-typed entities.
        - `target` form is exactly one of: the literal parameter/context name (e.g. `$id`, `order_id`, `req.query.ws`) — delivered to every caller of the analyzed node — or the exact call form of one member defined inside it (e.g. `Session::validateCSRF($data)`) — delivered only to callers that invoke that member.
     3. Downstream Contracts: Emit when delegating security-critical logic (authorization, rate-limiting, persistence).
+       - `target` MUST name a first-party callee in the exact form written at the call site (`Class::method`, `Class::getInstance()->method`, or the receiver as written); attribute a method to the class the call itself names, never to a parent you assume defines it.
+       - NEVER target language built-ins/stdlib functions, third-party/vendor classes, or dynamic/template names. Attach such expectations to a contract on the enclosing member or the relevant parameter instead.
 
     ALLOWED CWE LIST:
     CWE-22: Path Traversal
