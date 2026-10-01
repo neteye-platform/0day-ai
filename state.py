@@ -25,14 +25,17 @@ class ExplorerState(TypedDict):
     node_ids: list[str]
     role: str
     task_description: str
+    progress_id: str
 
 class CVEAnalyzerState(TypedDict):
     cve: dict
+    progress_id: str
 
 class VerifierState(TypedDict):
     target_node_id: str
     target_code: str
     incoming_demands: list[dict] # List of assumptions about one node
+    progress_id: str
 
 class ReviewerState(TypedDict):
     node_id: str

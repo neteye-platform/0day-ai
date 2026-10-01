@@ -12,6 +12,8 @@ from typing import Any
 from collections import defaultdict
 import hashlib
 import logging
+import threading
+import uuid
 
 from languages import SYMBOL_QUERIES
 import settings
@@ -24,6 +26,9 @@ from utils import build_networkx_graph, compact_tool_history, extract_imports, g
 # smart_llm = ChatOllama(model="gemma4:cloud", temperature=0.6, reasoning=False, num_ctx=32768)
 # Maximum combined code size (in chars) for a batched explorer dispatch.
 EXPLORER_BATCH_CHAR_THRESHOLD = 7500
+
+_agent_progress: dict[str, dict[str, int]] = {}
+_agent_progress_lock = threading.Lock()
 
 class ErrorLoggingCallbackHandler(BaseCallbackHandler):
     def on_llm_error(self, error: BaseException, **kwargs: Any) -> Any:
@@ -268,6 +273,7 @@ def dispatch_explorers(state: MasterState):
 
     G = build_networkx_graph(settings.graph)
     commands: list[Send] = []
+    progress_id = uuid.uuid4().hex
     skipped_nodes = 0
     batched_batches = 0
     single_batches = 0
@@ -309,7 +315,8 @@ def dispatch_explorers(state: MasterState):
                 payload = ExplorerState(
                     node_ids=batch,
                     role=task.get("agent_role", ""),
-                    task_description=task.get("task_description", "")
+                    task_description=task.get("task_description", ""),
+                    progress_id=progress_id,
                 )
                 if len(batch) > 1:
                     batched_batches += 1
@@ -321,11 +328,80 @@ def dispatch_explorers(state: MasterState):
                 )
                 commands.append(Send("explorer_agent", payload))
 
+    if commands:
+        with _agent_progress_lock:
+            _agent_progress[progress_id] = {"total": len(commands), "completed": 0}
+
     logging.info(
-        f"Dispatching {len(commands)} explorers ({batched_batches} multi-node batches, "
-        f"{single_batches} single-node), skipped {skipped_nodes} inert nodes."
+        "Starting explorer scan: 0/%d complete, %d remaining "
+        "(%d multi-node batches, %d single-node), skipped %d inert nodes.",
+        len(commands),
+        len(commands),
+        batched_batches,
+        single_batches,
+        skipped_nodes,
     )
+
     return commands
+
+
+def _log_explorer_completion(state: ExplorerState) -> None:
+    progress_id = state.get("progress_id")
+    if not progress_id:
+        return
+
+    with _agent_progress_lock:
+        progress = _agent_progress.get(progress_id)
+        if progress is None:
+            return
+        progress["completed"] += 1
+        completed = progress["completed"]
+        total = progress["total"]
+        remaining = total - completed
+        if remaining == 0:
+            _agent_progress.pop(progress_id, None)
+
+    logging.info(
+        "Explorer progress: %d/%d complete, %d remaining (role=%s, nodes=%s).",
+        completed,
+        total,
+        remaining,
+        state.get("role", "unknown"),
+        ", ".join(state.get("node_ids", [])),
+    )
+
+
+def _start_agent_progress(total: int) -> str:
+    progress_id = uuid.uuid4().hex
+    if total:
+        with _agent_progress_lock:
+            _agent_progress[progress_id] = {"total": total, "completed": 0}
+    return progress_id
+
+
+def _log_agent_completion(progress_id: str, agent_name: str, detail: str) -> None:
+    if not progress_id:
+        return
+
+    with _agent_progress_lock:
+        progress = _agent_progress.get(progress_id)
+        if progress is None:
+            return
+        progress["completed"] += 1
+        completed = progress["completed"]
+        total = progress["total"]
+        remaining = total - completed
+        if remaining == 0:
+            _agent_progress.pop(progress_id, None)
+
+    logging.info(
+        "%s progress: %d/%d complete, %d remaining (%s).",
+        agent_name,
+        completed,
+        total,
+        remaining,
+        detail,
+    )
 
 
 def expert_explorer_node(state: ExplorerState) -> dict:
@@ -333,8 +409,12 @@ def expert_explorer_node(state: ExplorerState) -> dict:
     role_name = state.get("role")
 
     if len(node_ids) == 1:
-        return _explore_single(node_ids[0], role_name)
-    return _explore_batch(node_ids, role_name)
+        result = _explore_single(node_ids[0], role_name)
+    else:
+        result = _explore_batch(node_ids, role_name)
+
+    _log_explorer_completion(state)
+    return result
 
 
 def _explore_single(node_id: str, role_name: str) -> dict:
@@ -511,20 +591,26 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
 def dispatch_cve_analyzers(state: MasterState):
     """Reads the deduplicated SCA results and dispatches tasks to the CVE Analyzer."""
     commands: list[Send] = []
+    progress_id = _start_agent_progress(len(state.get("known_vulns", [])))
 
     known_vulns = state.get("known_vulns", [])
 
     for cve_record in known_vulns:
         payload = CVEAnalyzerState(
-            cve=cve_record
+            cve=cve_record,
+            progress_id=progress_id,
         )
         commands.append(Send("cve_analyzer", payload))
 
-    logging.info(f"Dispatching {len(commands)} cve analyzers.")
+    logging.info(
+        "Starting CVE analyzer scan: 0/%d complete, %d remaining.",
+        len(commands),
+        len(commands),
+    )
     return commands
 
 
-def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
+def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     """LLM node that classifies a single CVE description and either extracts a
     security demand (application_mitigation) or emits a vulnerability hypothesis
     (upgrade_only, e.g. RCE in the HTTP server where only a package upgrade fixes it)."""
@@ -612,6 +698,17 @@ def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     return {
         "cve_demands": [dict_analysis]
     }
+
+
+def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
+    result = _cve_analyzer_node(state)
+    cve = state.get("cve", {})
+    _log_agent_completion(
+        state.get("progress_id", ""),
+        "CVE analyzer",
+        f"cve={cve.get('id', 'UNKNOWN-CVE')}",
+    )
+    return result
 
 # ==========================================
 # Aggregate demands node
@@ -985,6 +1082,7 @@ def dispatch_verifiers(state: MasterState):
         return END
 
     commands: list[Send] = []
+    progress_id = uuid.uuid4().hex
 
     for target_node_id, demands_list in grouped_demands.items():
         target_code = get_node_code(target_node_id)
@@ -996,7 +1094,8 @@ def dispatch_verifiers(state: MasterState):
         payload = {
             "target_node_id": target_node_id,
             "target_code": target_code,
-            "incoming_demands": demands_list
+            "incoming_demands": demands_list,
+            "progress_id": progress_id,
         }
 
         commands.append(Send("contract_verifier", payload))
@@ -1005,11 +1104,17 @@ def dispatch_verifiers(state: MasterState):
     if not commands:
         return "synchronization"
 
-    logging.info(f"Dispatching {len(commands)} contract verifiers.")
+    with _agent_progress_lock:
+        _agent_progress[progress_id] = {"total": len(commands), "completed": 0}
+    logging.info(
+        "Starting contract verifier scan: 0/%d complete, %d remaining.",
+        len(commands),
+        len(commands),
+    )
     return commands
 
 
-def contract_verifier_node(state: VerifierState) -> dict:
+def _contract_verifier_node(state: VerifierState) -> dict:
     target_node_id = state.get("target_node_id")
     target_code = state.get("target_code")
     demands = state.get("incoming_demands", [])
@@ -1084,6 +1189,16 @@ def contract_verifier_node(state: VerifierState) -> dict:
     return {
         "vulnerabilities": new_vulnerabilities
     }
+
+
+def contract_verifier_node(state: VerifierState) -> dict:
+    result = _contract_verifier_node(state)
+    _log_agent_completion(
+        state.get("progress_id", ""),
+        "Contract verifier",
+        f"node={state.get('target_node_id', 'unknown')}",
+    )
+    return result
 
 # ==========================================
 # Reviewer agent
@@ -1367,4 +1482,3 @@ def ask_validator_for_tool(state: ValidatorState):
     """Fallback node to force the LLM to use a tool."""
     message = HumanMessage(content=f"You did not invoke any tools. You must use a tool to proceed.")
     return {"messages": [message]}
-
