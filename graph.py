@@ -142,6 +142,8 @@ if __name__ == "__main__":
         app_summary="",
         known_vulns=[],
         expert_tasks=[],
+        sandbox_url=None,
+        container_name=None,
         notes=[],
         cve_demands=[],
         grouped_demands={},

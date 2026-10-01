@@ -150,15 +150,18 @@ def send_http_request(
 
     # Build the full URL from the endpoint parameter
     endpoint = endpoint.strip()
+    sandbox_url = state.get("sandbox_url")
+    if not sandbox_url:
+        return "Error: No sandbox is configured. The preprocessor could not start a sandbox container.", {}
     if endpoint.startswith(("http://", "https://")):
         url = endpoint
     else:
         if not endpoint.startswith("/"):
             endpoint = f"/{endpoint}"
-        url = f"{settings.sandbox_url}{endpoint}"
+        url = f"{sandbox_url}{endpoint}"
 
-    if not url.startswith(settings.sandbox_url):
-        return f"Error: You can only make requests to the sandbox application at {settings.sandbox_url}", {}
+    if not url.startswith(sandbox_url):
+        return f"Error: You can only make requests to the sandbox application at {sandbox_url}", {}
 
     session = requests.Session()
 
@@ -366,7 +369,7 @@ def get_node_connections(node_id: str, thought: str, current_state: str) -> str:
 
 
 @tool
-def list_files(path: str = ".") -> str:
+def list_files(path: str = ".", state: Annotated[dict, InjectedState] = {}) -> str:
     """
     Lists files and directories in the specified path within the sandbox container.
     CRITICAL INSTRUCTION: Use this tool ONLY to verify the success of an exploit.
@@ -379,7 +382,9 @@ def list_files(path: str = ".") -> str:
     Returns:
         str: The raw output of the `ls -la` command, or an error message if the path doesn't exist.
     """
-    container_name = settings.container_name
+    container_name = state.get("container_name")
+    if not container_name:
+        return "Error: No sandbox container is configured. Ensure the preprocessor started the sandbox."
 
     try:
         client = docker.from_env()
@@ -404,7 +409,7 @@ def list_files(path: str = ".") -> str:
 
 
 @tool
-def read_file(path: str) -> str:
+def read_file(path: str, state: Annotated[dict, InjectedState] = {}) -> str:
     """
     Reads the content of a file from the sandbox container.
     CRITICAL INSTRUCTION: Use this tool ONLY to verify the success of an exploit.
@@ -414,7 +419,9 @@ def read_file(path: str) -> str:
     Args:
         path: The absolute or relative path to the file inside the sandbox.
     """
-    container_name = settings.container_name
+    container_name = state.get("container_name")
+    if not container_name:
+        return "Error: No sandbox container is configured. Ensure the preprocessor started the sandbox."
 
     try:
         client = docker.from_env()

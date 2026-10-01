@@ -18,7 +18,7 @@ import settings
 import tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, VerifierState, ReviewerState, ValidatorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, load_code_corpus
+from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, load_code_corpus
 
 # fast_llm = ChatOllama(model="gemma4:cloud", temperature=0.2, reasoning=False, num_ctx=32768)
 # smart_llm = ChatOllama(model="gemma4:cloud", temperature=0.6, reasoning=False, num_ctx=32768)
@@ -85,8 +85,10 @@ def bootstrap_node(state: MasterState) -> dict[str, Any]:
 def preprocessor_node(state: MasterState) -> dict[str, Any]:
     raw_vulns = []
 
-    # Build any container image(s) found in the app repo and scan those
+    # Build any container image(s) found in the app repo, scan those, then start
+    # the sandbox in the background and record its runtime data in the state.
     builds = find_container_builds(settings.app_path)
+    sandbox_data = None
     if builds:
         for kind, build_file in builds:
             tag = settings.docker_image_tag or f"vulnscan-{settings.app_path.name}:latest"
@@ -95,6 +97,7 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
                 for image in images:
                     logging.info(f"Scanning container image {image} with osv-scanner.")
                     raw_vulns.extend(run_osv_scanner_image(image))
+                sandbox_data = start_sandbox(kind, build_file, images[0], settings.app_path.name)
             else:
                 logging.warning(f"Failed to build image from {build_file}. Falling back to repo scan.")
                 raw_vulns = run_osv_scanner(settings.app_path)
@@ -130,7 +133,9 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
     logging.info(f"Saved {len(global_symbol_index)} symbols to {index_file_path}.")
 
     return {
-        "known_vulns": clean_vulns
+        "known_vulns": clean_vulns,
+        "sandbox_url": sandbox_data["sandbox_url"] if sandbox_data else None,
+        "container_name": sandbox_data["container_name"] if sandbox_data else None,
     }
 
 # ==========================================
@@ -1167,7 +1172,8 @@ def dispatch_validators(state: MasterState):
     for evaluation in confirmed_vulns:
         payload = ValidatorState(
             report_to_test=evaluation,
-            sandbox_url=settings.sandbox_url,
+            sandbox_url=state.get("sandbox_url"),
+            container_name=state.get("container_name"),
             messages=[],
             vulnerabilities=[], 
             cookies={}
