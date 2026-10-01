@@ -492,8 +492,8 @@ def _explore_single(node_id: str, role_name: str) -> dict:
     source_code = get_node_code(node_id)
 
     sys_msg = SystemMessage(content=(
-        f"{EXPERT_AGENTS[role_name]['prompt']}\n\n"
         f"{EXPERT_AGENTS['explorer_prompt']}\n\n"
+        f"{EXPERT_AGENTS[role_name]['prompt']}"
     ))
 
     graph_data = get_cached_graph_data(settings.graph)
@@ -558,8 +558,8 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
     graph_data = get_cached_graph_data(settings.graph)
 
     sys_msg = SystemMessage(content=(
-        f"{EXPERT_AGENTS[role_name]['prompt']}\n\n"
         f"{EXPERT_AGENTS['explorer_prompt']}\n\n"
+        f"{EXPERT_AGENTS[role_name]['prompt']}\n\n"
         f"{EXPERT_AGENTS['batch_prompt']}"
     ))
 
