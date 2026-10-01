@@ -1,5 +1,4 @@
 import json
-import sys
 import os
 import settings
 import operator
@@ -151,7 +150,7 @@ def manager_agent_node(state: MasterState) -> Dict[str, Any]:
     # llm = ChatOllama(model="gemma4:26b", temperature=0)
     llm = ChatOpenAI(
         base_url="http://localhost:11434/v1",
-        model="mistral-3.5-128b",
+        model="kimi-k2-7-code",
         temperature=0
     )
     structured_llm = llm.with_structured_output(ManagerOutput)
@@ -186,7 +185,7 @@ def expert_agent_node(state: ExpertState) -> dict:
     # llm = ChatOllama(model="gemma4:26b", temperature=0)
     llm = ChatOpenAI(
         base_url="http://localhost:11434/v1",
-        model="mistral-3.5-128b",
+        model="kimi-k2-7-code",
         temperature=0
     )
 
@@ -345,7 +344,6 @@ app = workflow.compile()
 # Execution
 # ==========================================
 if __name__ == "__main__":
-    os.makedirs("agent_logs", exist_ok=True)
     initial_state = MasterState(
         graph_path=os.path.join(settings.app_path, "graphify-out/graph.json"),
         app_summary="",
@@ -360,10 +358,10 @@ if __name__ == "__main__":
         print("\n\n" + "="*60)
         print("🛡️  FINAL VULNERABILITY AUDIT REPORT")
         print("="*60)
-        
+
         # Now we safely extract reports from the captured final state
         reports = final_state.get("vulnerability_reports", [])
-        
+
         if not reports:
             print("No vulnerabilities reported by the expert agents.")
         else:
