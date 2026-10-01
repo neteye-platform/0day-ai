@@ -17,6 +17,8 @@ from utils import build_networkx_graph, run_stream
 from state import MasterState, ExpertState, ReviewerState, ValidatorState
 from schemas import ManagerOutput, EXPERT_AGENTS, REVIEWER_AGENT, VALIDATOR_AGENT, TOOLS
 
+MAX_MESSAGES = 4
+
 # ==========================================
 # Preprocessor
 # ==========================================
@@ -85,18 +87,19 @@ def preprocessor_node(state: MasterState) -> Dict[str, Any]:
 def manager_agent_node(state: MasterState) -> Dict[str, Any]:
     """The Manager LLM reads the programmatic summary and dispatches tasks."""
 
-    # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
-    llm = ChatOpenAI(
-        base_url="http://localhost:11434/v1",
-        model="glm-5-2",
-        temperature=0
-    )
-    parser = PydanticOutputParser(pydantic_object=ManagerOutput)
+    llm = ChatOllama(model="qwen3.6:35b", temperature=0, format="json")
+    # llm = ChatOpenAI(
+    #     base_url="http://localhost:11434/v1",
+    #     model="glm-5-2",
+    #     temperature=0
+    # )
+    structured_llm = llm.with_structured_output(ManagerOutput)
 
-    roles_docs = "\n".join([
-        f"- {role}: {config['manager_description']}"
-        for role, config in EXPERT_AGENTS.items()
-    ])
+    roles_docs = ""
+    for role, config in EXPERT_AGENTS.items():
+        if role == "prompt":
+            continue
+        roles_docs += f"- {role}: {config['manager_description']}"
     sys_msg = SystemMessage(content=(
         "You are the Lead Security Architect. Analyze the topology summary. "
         "Assign communities to one or more appropriate PREDEFINED Expert Agents. "
@@ -105,14 +108,12 @@ def manager_agent_node(state: MasterState) -> Dict[str, Any]:
         "CRITICAL INSTRUCTIONS:\n"
         "- You must populate the 'target_communities' array for every task with the exact Community IDs (as strings, e.g., '0', '1') provided in the topology summary. Never leave the 'target_communities' array empty.\n"
         "- Do not assign more than 3 communities to a single task. If a complex logic flow spans, for example, 7 communities, break it down into overlapping tasks (e.g., Task 1: Comm 6,7,8. Task 2: Comm 8,9,10). This prevents context overload."
-        f"{parser.get_format_instructions()}"
     ))
     human_msg = HumanMessage(content=f"Here is the app topology:\n{state.get('app_summary')}")
 
-    response_msg = llm.invoke([sys_msg, human_msg])
-    response = parser.invoke(response_msg)
+    response = structured_llm.invoke([sys_msg, human_msg])
 
-    return {"expert_tasks": response.tasks, "manager_message": response_msg}
+    return {"expert_tasks": response.tasks, "manager_message": response}
 
 # ==========================================
 # Expert agents
@@ -124,12 +125,12 @@ def expert_agent_node(state: ExpertState) -> dict:
     if not state.get("subgraph_nodes"):
         return {"vulnerability_reports": []}
 
-    # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
-    llm = ChatOpenAI(
-        base_url="http://localhost:11434/v1",
-        model="glm-5-2",
-        temperature=0
-    )
+    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    # llm = ChatOpenAI(
+    #     base_url="http://localhost:11434/v1",
+    #     model="glm-5-2",
+    #     temperature=0
+    # )
 
     agent_tools = [tools.submit_report]
     tool_names = EXPERT_AGENTS[role_name].get("tools", [])
@@ -140,27 +141,30 @@ def expert_agent_node(state: ExpertState) -> dict:
     llm_with_tools = llm.bind_tools(agent_tools, tool_choice="any")
 
     if not state.get("messages"):
-        tool_rules = ""
-        for tool_name in EXPERT_AGENTS[role_name].get("tools", []):
-            rule = TOOLS[tool_name].get("rule", "")
-            tool_rules += f"- {tool_name}: {rule}\n"
-
-        sys_msg_content = (
+        sys_msg = SystemMessage(content=(
             f"{EXPERT_AGENTS[role_name]['prompt']}\n\n"
-            f"### Operational Rules\n\n{tool_rules}\n"
-        )
-        sys_msg = SystemMessage(content=sys_msg_content)
-
+            f"{EXPERT_AGENTS['prompt']}"
+        ))
         human_msg = HumanMessage(content=(
             f"Your Task: {state['task'].task_description}\n\n"
-            f"Your Assigned Nodes: {state['subgraph_nodes']}\n\n"
+            f"Your Assigned Nodes: {state['subgraph_nodes']}"
         ))
 
         messages = [sys_msg, human_msg]
         response = llm_with_tools.invoke(messages)
         messages = [sys_msg, human_msg, response]
     else:
-        messages = state["messages"]
+        dynamic_msgs = []
+        if state.get("notes"):
+            notes_str = "\n".join([f"- {n}" for n in state["notes"]])
+            saved_notes = f"\n\n### Persistent Scratchpad\n{notes_str}\n"
+            dynamic_msgs.append(HumanMessage(content=saved_notes))
+
+        history = state["messages"][2:]
+        rolling_history = history[-MAX_MESSAGES:]
+        sys_msg = state["messages"][0]
+        human_msg = state["messages"][1]
+        messages = [sys_msg, human_msg] + dynamic_msgs + rolling_history
 
         response = llm_with_tools.invoke(messages)
         messages = [response]
@@ -258,16 +262,35 @@ def dispatch_reviewers(state: MasterState):
 
 def reviewer_agent_node(state: ReviewerState) -> dict:
     """Review the vulnerability reports and keep only what is actually relevant"""
-    # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
-    llm = ChatOpenAI(
-        base_url="http://localhost:11434/v1",
-        model="glm-5-2",
-        temperature=0
-    )
+    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    # llm = ChatOpenAI(
+    #     base_url="http://localhost:11434/v1",
+    #     model="glm-5-2",
+    #     temperature=0
+    # )
 
-    llm_with_tools = llm.bind_tools([tools.read_source_code, tools.search_codebase, tools.get_node_connections, tools.submit_evaluation])
+    llm_with_tools = llm.bind_tools([
+        tools.read_source_code,
+        tools.search_codebase,
+        tools.get_node_connections,
+        tools.submit_evaluation,
+        tools.take_notes
+    ], tool_choice="any")
 
-    response = llm_with_tools.invoke(state["messages"])
+    sys_msg = state["messages"][0]
+    human_msg = state["messages"][1]
+    dynamic_msgs = []
+    if state.get("notes"):
+        notes_str = "\n".join([f"- {n}" for n in state["notes"]])
+        saved_notes = f"\n\n### Persistent Scratchpad\n{notes_str}\n"
+        dynamic_msgs.append(HumanMessage(content=saved_notes))
+
+    history = state["messages"][2:]
+    rolling_history = history[-MAX_MESSAGES:]
+
+    messages_to_pass = [sys_msg, human_msg] + dynamic_msgs + rolling_history
+
+    response = llm_with_tools.invoke(messages_to_pass)
     return {"messages": [response]}
 
 
@@ -312,15 +335,18 @@ def dispatch_validators(state: MasterState):
 
 
 def validator_agent_node(state: ValidatorState) -> dict:
-    # llm = ChatOllama(model="qwen3.6:35b", temperature=0)
-    llm = ChatOpenAI(
-        base_url="http://localhost:11434/v1",
-        model="glm-5-2",
-        temperature=0.2
-    )
+    llm = ChatOllama(model="qwen3.6:35b", temperature=0)
+    # llm = ChatOpenAI(
+    #     base_url="http://localhost:11434/v1",
+    #     model="glm-5-2",
+    #     temperature=0
+    # )
 
-    validator_tools = [tools.send_http_request, tools.mark_validation_complete]
-    llm_with_tools = llm.bind_tools(validator_tools, tool_choice="any")
+    llm_with_tools = llm.bind_tools([
+        tools.send_http_request,
+        tools.mark_validation_complete,
+        tools.take_notes
+    ], tool_choice="any")
     current_cookies = state.get("cookies", {})
 
     if not state.get("messages"):
@@ -333,17 +359,29 @@ def validator_agent_node(state: ValidatorState) -> dict:
         response = llm_with_tools.invoke(messages)
         return {"messages": [sys_msg, human_msg, response]}
     else:
-        # Iterate backwards through the messages to catch all recent tool calls
+        # Update cookies from the recent history
         for msg in reversed(state["messages"]):
             if getattr(msg, "type", "") == "ai":
-                # Stop looking once we hit the AI's generation that triggered these tools
                 break
             if getattr(msg, "type", "") == "tool" and getattr(msg, "name", "") == "send_http_request":
                 if hasattr(msg, "artifact") and msg.artifact:
                     # Merge the new cookies into the current state
                     current_cookies.update(msg.artifact)
 
-        response = llm_with_tools.invoke(state["messages"])
+        sys_msg = state["messages"][0]
+        human_msg = state["messages"][1]
+
+        dynamic_msgs = []
+        if state.get("notes"):
+            notes_str = "\n".join([f"- {n}" for n in state["notes"]])
+            saved_notes = f"\n\n### Persistent Scratchpad\n{notes_str}\n"
+            dynamic_msgs.append(HumanMessage(content=saved_notes))
+        history = state["messages"][2:]
+        rolling_history = history[-MAX_MESSAGES:]
+
+        messages_to_pass = [sys_msg, human_msg] + dynamic_msgs + rolling_history
+
+        response = llm_with_tools.invoke(messages_to_pass)
         return {"messages": [response], "cookies": current_cookies}
 
 
