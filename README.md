@@ -103,6 +103,7 @@ The scan generates a timestamped report directory (e.g., `<target>/report_<times
 | --- | --- |
 | `graph.py` | Main entrypoint, graph wiring, fan-out barriers, and conditional routers. |
 | `settings.py`, `agents.yaml`, `schemas.py` | Configuration, agent system prompts, and Pydantic schemas. |
+| `languages.py` | Supported target language definitions, file mappings, and AST parser configurations. |
 | `state.py`, `utils.py`, `run_stats.py`, `llms.py` | State channels, caching, progress ledgers, token accounting, and LLM instances. |
 | `stage_*.py` | Modular implementations for each pipeline stage (e.g., manager, cve, threat intel, reviewer, validator, patcher). |
 | `tool_loop.py` | Shared bounded-memory tool-loop machinery for subgraphs. |
