@@ -46,6 +46,82 @@ def read_source_code(node_id: str, reason_for_reading: str, current_state: str, 
     return node_code
 
 
+# Maximum number of lines read_file will return in a single call.
+READ_FILE_MAX_LINES = 150
+
+
+@tool
+def read_file(file_path: str, thought: str, current_state: str, start_line: int = 1, end_line: int | None = None) -> str:
+    """
+    Reads a specific line range of a file from the application directory by path.
+    Use this for files that are NOT in the application graph (e.g., Dockerfile, config files, templates).
+    For code that IS in the graph, prefer read_source_code or get_definition.
+    Never returns more than 150 lines per call; use start_line/end_line to page through large files.
+
+    Args:
+        file_path (str): Path to the file, relative to the application root (e.g., 'Dockerfile', 'config/settings.py').
+        start_line (int): First line to read, 1-indexed and inclusive. Defaults to 1.
+        end_line (int): Last line to read, 1-indexed and inclusive. Defaults to the end of the file (or the 150-line cap).
+        thought (str): Explain explicitly why you need to read this file and what you expect to find in it.
+        current_state (str): A detailed summary of the your current state and the outcome of your previous command.
+    """
+    app_dir = Path(settings.app_path).resolve()
+    target = (app_dir / file_path).resolve()
+
+    if not target.is_relative_to(app_dir):
+        return (
+            f"Error: '{file_path}' resolves to '{target}', which is outside the "
+            f"application directory '{app_dir}'. Only files within the app are readable."
+        )
+
+    if not target.is_file():
+        return f"Error: File '{file_path}' not found in the application directory."
+
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        return f"Error: '{file_path}' appears to be a binary file and cannot be read as text."
+    except Exception as e:
+        return f"Error reading file '{file_path}': {e}"
+
+    total_lines = len(lines)
+    if total_lines == 0:
+        return f"File '{file_path}' is empty (0 lines)."
+
+    requested_start = start_line
+    if start_line < 1:
+        start_line = 1
+    if start_line > total_lines:
+        return f"Error: start_line {requested_start} is beyond the end of '{file_path}' (file has {total_lines} lines)."
+
+    requested_end = end_line if end_line is not None else total_lines
+    if requested_end < start_line:
+        return f"Error: end_line ({requested_end}) is smaller than start_line ({start_line})."
+
+    end = min(requested_end, total_lines)
+
+    truncated = False
+    if end - start_line + 1 > READ_FILE_MAX_LINES:
+        end = start_line + READ_FILE_MAX_LINES - 1
+        truncated = True
+
+    body = "".join(
+        f"{i:>6}: {line}" for i, line in enumerate(lines[start_line - 1:end], start_line)
+    )
+
+    header = f"File: {file_path} (lines {start_line}-{end} of {total_lines})\n"
+
+    if truncated:
+        body += (
+            f"\n... [TRUNCATED: requested lines {requested_start}-{requested_end} exceeds the "
+            f"{READ_FILE_MAX_LINES}-line limit. Shown lines {start_line}-{end}. "
+            f"Call read_file again with start_line={end + 1} to continue reading.] ..."
+        )
+
+    return f"{header}\n{body}"
+
+
 @tool
 def check_package_vulnerability(packages: list[PackageCheck]) -> list:
     """
@@ -412,7 +488,7 @@ def list_files(path: str = ".", state: Annotated[dict, InjectedState] = {}) -> s
 
 
 @tool
-def read_file(path: str, state: Annotated[dict, InjectedState] = {}) -> str:
+def read_sandbox_file(path: str, state: Annotated[dict, InjectedState] = {}) -> str:
     """
     Reads the content of a file from the sandbox container.
     CRITICAL INSTRUCTION: Use this tool ONLY to verify the success of an exploit.
