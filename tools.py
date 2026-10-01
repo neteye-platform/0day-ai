@@ -20,12 +20,16 @@ import attacker_tools
 
 
 @tool
-def read_source_code(node_id: str, state: Annotated[dict, InjectedState]) -> str:
+def read_source_code(node_id: str, include_context: bool = False, state: Annotated[Optional[dict], InjectedState] = None) -> str:
     """
     Fetches the source code for a given Node ID.
 
     Args:
         node_id (str): The exact ID of the node to read (e.g., 'src_main_query_db').
+        include_context (bool): If True, return the node's code within its full file
+            context (sibling bodies pruned). If False (default), return only the node's
+            own code without file context; assume all necessary imports and global
+            variables are securely defined elsewhere.
     """
     messages = state.get("messages", [])
     for msg in messages[:-1]:
@@ -33,10 +37,12 @@ def read_source_code(node_id: str, state: Annotated[dict, InjectedState]) -> str
         if msg.get("type") == "ai":
             tool_calls = msg.get("tool_calls", [])
             for tc in tool_calls:
-                if tc.get("name") == "read_source_code" and tc.get("args", {}).get("node_id") == node_id:
+                if (tc.get("name") == "read_source_code"
+                        and tc.get("args", {}).get("node_id") == node_id
+                        and tc.get("args", {}).get("include_context", False) == include_context):
                     return f"System Notice: You have already read the source code for '{node_id}' in a previous step. The code is static and it will not change."
 
-    node_code = get_node_code(node_id, reviewer_mode=True)
+    node_code = get_node_code(node_id, reviewer_mode=True, raw=not include_context)
 
     if not node_code:
         return "Error: Could not extract code block."
