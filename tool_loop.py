@@ -47,8 +47,26 @@ class CompactionConfig:
         return self._get("model_context_window") - self._get("context_reserved")
 
     def hard_cap(self) -> int:
-        """Estimated-token ceiling below which the LLM must never be invoked."""
-        return self._get("model_context_window") - self._get("hard_reserved")
+        """Estimated-token ceiling below which the LLM must never be invoked.
+
+        Reserves both the configured hard margin AND the per-request output
+        budget (``<prefix>_max_completion_tokens``): the OpenAI-compat gateway
+        rejects any request whose input + requested output exceeds the model
+        window, so the estimated input alone must stay under
+        ``window - output_budget - hard_reserved``.
+        """
+        return (
+            self._get("model_context_window")
+            - self._get("max_completion_tokens")
+            - self._get("hard_reserved")
+        )
+
+    @property
+    def max_response_chars(self) -> int:
+        """Char size above which a single AI/tool message is considered
+        oversized and demoted out of the verbatim tail into the compressible
+        middle (see ``_split_agent_history``). No truncation is applied."""
+        return self._get("max_response_chars")
 
     @property
     def tail_turns(self) -> int:
@@ -58,9 +76,17 @@ class CompactionConfig:
     def min_compressible(self) -> int:
         return self._get("compaction_min_compressible_tokens")
 
+    @property
+    def model_context_window(self) -> int:
+        return self._get("model_context_window")
+
+    @property
+    def hard_reserved(self) -> int:
+        return self._get("hard_reserved")
+
 
 def _split_agent_history(
-    messages: list[AnyMessage], tail_turns: int
+    messages: list[AnyMessage], tail_turns: int, max_chars: int = 0
 ) -> tuple[list, list, list]:
     """Split an agent history into (protected_head, middle, verbatim_tail).
 
@@ -68,6 +94,14 @@ def _split_agent_history(
     HumanMessage (the hypothesis/objective under review). Tail = the last
     ``tail_turns`` AI+tool turns kept word-for-word. Middle = everything
     between them, including any prior context summary.
+
+    When ``max_chars`` > 0, any AI/tool message in the prospective tail whose
+    content exceeds it is demoted back into the compressible middle instead of
+    being retained verbatim. Such a pathological single message (e.g. a
+    ~120k-token 'finish_reason: length' dump) can never be summarized away
+    while protected in the tail, and retaining it verbatim would dominate the
+    model window no matter how much of the middle is collapsed — so it is made
+    compressible so the normal middle-compaction absorbs it.
     """
     msgs = list(messages)
     head: list = []
@@ -97,7 +131,23 @@ def _split_agent_history(
             if ai_seen >= tail_turns:
                 break
 
-    return head, rest[:boundary], rest[boundary:]
+    middle = rest[:boundary]
+    tail = rest[boundary:]
+
+    if max_chars and tail:
+        oversized = [
+            m
+            for m in tail
+            if m.type in ("ai", "tool")
+            and isinstance(getattr(m, "content", ""), str)
+            and len(m.content) > max_chars
+        ]
+        if oversized:
+            oversized_ids = {id(o) for o in oversized}
+            tail = [m for m in tail if id(m) not in oversized_ids]
+            middle = middle + oversized
+
+    return head, middle, tail
 
 
 def _render_message_transcript(messages: list[AnyMessage]) -> str:
@@ -264,8 +314,43 @@ class ToolLoopAgent:
     # -- memory management ----------------------------------------------------
 
     def summarize(self, middle: list[AnyMessage]) -> SystemMessage | None:
+        # The cheap summarizer is a fast_llm call with its own output budget
+        # (settings.fast_max_completion_tokens); its transcript (rendered inside
+        # the summary prompt) must fit window - output budget - hard reserved.
+        # The token estimate is deliberately ~2.9x over real prose, so an
+        # over-budget estimate usually means ONE degenerate single message (a
+        # ~100k-token 'finish_reason: length' dump) dominates the middle. Never
+        # give up on the summary: drop the single largest message(s) until the
+        # survivor fits, then run the summarizer on it — dropping a degenerate
+        # dump whole is strictly better than the hard safety cap dropping the
+        # ENTIRE middle. No truncation is applied; if nothing survives we return
+        # None and callers fail open as usual.
+        summarizer_budget = (
+            self.compaction.model_context_window
+            - settings.fast_max_completion_tokens
+            - self.compaction.hard_reserved
+        )
+        working = list(middle)
+        if estimate_message_tokens(working) >= summarizer_budget:
+            logging.warning(
+                "middle estimates %d tokens >= summarizer budget %d; dropping "
+                "largest message(s) before summarizing",
+                estimate_message_tokens(working),
+                summarizer_budget,
+            )
+            while working and estimate_message_tokens(working) >= summarizer_budget:
+                idx = max(
+                    range(len(working)),
+                    key=lambda i: estimate_message_tokens([working[i]]),
+                )
+                dropped = working.pop(idx)
+                logging.debug(
+                    "dropped %s message (%d est tokens) from middle before summarizing",
+                    getattr(dropped, "type", "?"),
+                    estimate_message_tokens([dropped]),
+                )
         return _generate_agent_context_summary(
-            middle, self.summary_ledger, self.summary_llm
+            working, self.summary_ledger, self.summary_llm
         )
 
     def prepare_history(self, full_messages, subject: str, current_turn: int):
@@ -281,12 +366,26 @@ class ToolLoopAgent:
         did_compact = False
         hard_capped = False
 
+        # Split with oversized-tail demotion only — NO per-message truncation.
+        # A pathological single message (e.g. a ~120k-token 'finish_reason:
+        # length' dump) is moved OUT of the protected verbatim tail and into
+        # the compressible middle, where the threshold compaction below
+        # summarizes the FULL middle (demoted message included). The demoted
+        # message is never pinned verbatim in the tail no matter its size;
+        # summarize() drops the largest message(s) just long enough to fit the
+        # summarizer window, and the hard safety cap is the last-resort ceiling
+        # for the main LLM, so compaction fails open as usual.
+        max_chars = self.compaction.max_response_chars
+        head, middle, tail = _split_agent_history(
+            full_messages, self.compaction.tail_turns, max_chars
+        )
+        messages_for_llm = head + middle + tail
+
         # Opencode-style threshold compaction: once the estimated token count of
         # the history reaches the configured limit, collapse the middle into a
         # summary and keep a short verbatim tail. Fail open if summarization
         # errors; also skip when the compressible middle is trivially small.
-        if estimate_message_tokens(full_messages) >= self.compaction.threshold():
-            head, middle, tail = _split_agent_history(full_messages, self.compaction.tail_turns)
+        if estimate_message_tokens(messages_for_llm) >= self.compaction.threshold():
             compressible = estimate_message_tokens(middle)
             if (
                 len(head) == 2
@@ -294,13 +393,12 @@ class ToolLoopAgent:
             ):
                 summary_msg = self.summarize(middle)
                 if summary_msg is not None:
-                    tail_copies = [m.model_copy(deep=True) for m in tail]
-                    messages_for_llm = head + [summary_msg] + tail_copies
+                    messages_for_llm = head + [summary_msg] + tail
                     updates = [
                         RemoveMessage(id=REMOVE_ALL_MESSAGES),
                         *head,
                         summary_msg,
-                        *tail_copies,
+                        *tail,
                     ]
                     did_compact = True
 
@@ -310,12 +408,11 @@ class ToolLoopAgent:
         # maximum context window. Force-truncate to the protected head plus a
         # summary (or, failing that, the single most recent verbatim turn).
         if estimate_message_tokens(messages_for_llm) >= self.compaction.hard_cap():
-            head, middle, tail = _split_agent_history(full_messages, self.compaction.tail_turns)
             summary_msg = self.summarize(middle)
             if summary_msg is not None:
-                forced = head + [summary_msg] + [m.model_copy(deep=True) for m in tail]
+                forced = head + [summary_msg] + tail
             else:
-                forced = head + [m.model_copy(deep=True) for m in tail[-2:]]
+                forced = head + tail[-2:]
             if estimate_message_tokens(forced) < estimate_message_tokens(messages_for_llm):
                 messages_for_llm = forced
                 updates = [
