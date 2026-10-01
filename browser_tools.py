@@ -15,8 +15,15 @@ Isolation / concurrency contract
   validators can never collide even if they pick the same session label.
 - ``session_id`` is a required, explicit argument on every browser call;
   there is no shared "last-used" session to fall back on.
-- The manager lock guards only session-map access; network-bound page calls
-  run without the lock so sessions proceed in parallel.
+- ALL Playwright object traffic (browser/context/page ops, cookie seeding and
+  reading, session teardown) is marshalled onto ONE dedicated browser thread
+  (``ThreadPoolExecutor(max_workers=1)``). The sync Playwright API binds every
+  object to the thread+greenlet that created it, and LangGraph's ``ToolNode``
+  offloads sync tool calls to arbitrary workers of the shared default thread
+  pool - a later call landing on a different worker would make Playwright
+  raise ``greenlet.error: Cannot switch to a different thread``. Pinning every
+  Playwright call to the single worker guarantees that affinity invariant, so
+  concurrent validators are serialized at the browser and safe.
 - Everything fails open: if Playwright/Firefox is unavailable the tools
   report a clear "browser unavailable" error and the validator continues
   HTTP-only.
@@ -29,15 +36,16 @@ Lifecycle
 ---------
 Sessions are closed per-agent at the terminal tool (``mark_validation_complete``)
 or the validator fallback via ``close_agent_sessions``. An idle-TTL reaper acts
-as a last-resort safety net and never reaps in-use sessions.
+as a last-resort safety net and never reaps in-use sessions. All teardown is
+routed through the same dedicated browser thread.
 """
 
 import atexit
+import concurrent.futures
 import json
 import logging
 import threading
 import time
-from contextlib import contextmanager
 from typing import Annotated
 from urllib.parse import urlparse
 
@@ -66,7 +74,6 @@ class _Session:
         "delivered",
         "last_used",
         "in_use",
-        "lock",
     )
 
     def __init__(self, session_id, context, page):
@@ -77,7 +84,6 @@ class _Session:
         self.delivered = 0      # watermark: index already surfaced to the LLM
         self.last_used = time.time()
         self.in_use = False
-        self.lock = threading.RLock()  # serializes same-session page ops
 
 
 def _host(url) -> str:
@@ -103,11 +109,46 @@ class BrowserSessionManager:
         self._disabled = False
         self._disabled_reason = None
         self._reaper_started = False
+        # Single dedicated worker for EVERY Playwright object call. The sync
+        # Playwright API binds objects to the thread+greenlet that created
+        # them; ToolNode runs sync tools on arbitrary shared-pool workers, so
+        # without this pin a later browser_* call would land on a different
+        # thread and Playwright would raise `greenlet.error`.
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="pw-browser"
+        )
+        self._browser_tid = None
+
+    def _browser_thread_run(self, fn):
+        """Run zero-arg callable ``fn`` on the dedicated browser thread.
+
+        Inline-runs when already on that thread (e.g. page event callbacks);
+        otherwise submits the job and waits, bounded by a timeout so a wedged
+        page op cannot block the browser thread forever. Any exception raised
+        by ``fn`` (including a timeout) propagates to the caller and is handled
+        by the tool's fail-open path.
+        """
+        if self._browser_tid == threading.get_ident():
+            return fn()
+        future = self._executor.submit(fn)
+        attempt_s = (
+            int(getattr(settings, "browser_timeout_ms", 30000)) / 1000.0
+        ) + 30.0
+        try:
+            return future.result(timeout=attempt_s)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise
 
     # -- availability ------------------------------------------------------
 
     def _browser_boot(self):
-        """Return a usable shared browser or None (fail open, one attempt)."""
+        """Return a usable shared browser or None (fail open, one attempt).
+
+        Runs on the dedicated browser thread (via ``_browser_thread_run``), so
+        the launched browser is always owned by that thread and the thread id
+        is recorded there for the affinity check.
+        """
         if self._disabled or not getattr(settings, "browser_enabled", True):
             return None
         with self._browser_lock:
@@ -132,6 +173,7 @@ class BrowserSessionManager:
                     self._browser = self._playwright.firefox.launch(
                         channel="firefox", headless=True
                     )
+                self._browser_tid = threading.get_ident()
                 return self._browser
             except Exception as e:  # fail open: no browser, keep HTTP path
                 self._disabled = True
@@ -145,7 +187,7 @@ class BrowserSessionManager:
     def _stop_locked(self):
         try:
             if self._browser is not None:
-                self._browser.close()
+                self._browser_thread_run(self._browser.close)
         except Exception:
             pass
         self._browser = None
@@ -159,10 +201,11 @@ class BrowserSessionManager:
             self._stop_locked()
         if self._playwright is not None:
             try:
-                self._playwright.stop()
+                self._browser_thread_run(self._playwright.stop)
             except Exception:
                 pass
             self._playwright = None
+        self._executor.shutdown(wait=True)
 
     # -- console/dialog capture ----------------------------------------------
 
@@ -179,7 +222,7 @@ class BrowserSessionManager:
     def _on_dialog(self, session, dialog):
         self._append_event(session, f"[dialog] {dialog.message}"[: settings.browser_console_msg_chars])
         try:
-            dialog.dismiss()
+            self._browser_thread_run(dialog.dismiss)
         except Exception:
             pass
 
@@ -229,7 +272,7 @@ class BrowserSessionManager:
                 "browser_console."
             )
 
-        browser = self._browser_boot()
+        browser = self._browser_thread_run(self._browser_boot)
         if browser is None:
             return None, self._unavailable_msg()
 
@@ -237,11 +280,21 @@ class BrowserSessionManager:
             s = self._sessions.get(key)
             if s is not None:
                 return s, None  # another thread created it while we launched
-            context = browser.new_context()
-            self._seed_cookies(context, state)
-            page = context.new_page()
-            s = _Session(session_id, context, page)
-            self._bind_handlers(s)
+
+            def _build():
+                context = browser.new_context()
+                self._seed_cookies(context, state)
+                page = context.new_page()
+                s = _Session(session_id, context, page)
+                self._bind_handlers(s)
+                return s
+
+            try:
+                s = self._browser_thread_run(_build)
+            except Exception as e:
+                return None, (
+                    f"Error: failed to create browser session: {str(e)[:300]}"
+                )
             self._sessions[key] = s
             self._start_reaper()
             return s, None
@@ -276,12 +329,16 @@ class BrowserSessionManager:
         """Flatten the context's cookie jar into a ``{name: value}`` dict."""
         flat = {}
         try:
-            for c in session.context.cookies():
-                if c.get("name") and c.get("value") is not None:
-                    flat[c["name"]] = c["value"]
+            def _cookies():
+                return {
+                    c["name"]: c["value"]
+                    for c in session.context.cookies()
+                    if c.get("name") and c.get("value") is not None
+                }
+            flat = self._browser_thread_run(_cookies)
         except Exception:
             pass
-        return flat
+        return flat or {}
 
     def browser_artifact(self, session) -> dict:
         return {"session_id": session.session_id, "cookies": self.cookie_artifact(session)}
@@ -312,23 +369,23 @@ class BrowserSessionManager:
 
     def _close_session(self, session: _Session):
         try:
-            session.context.close()
+            self._browser_thread_run(session.context.close)
         except Exception:
             pass
 
-    @contextmanager
-    def use(self, session: _Session):
-        """Serializes same-session page ops AND marks the session in-use with a
-        fresh timestamp, so the idle reaper never reaps a session that is being
-        actively used or is merely between an agent's LLM turns."""
-        with session.lock:
-            session.in_use = True
+    def use(self, session: _Session, body):
+        """Run zero-arg callable ``body`` (touching only Playwright objects) on
+        the dedicated browser thread, marking the session in-use with a fresh
+        timestamp so the idle reaper never reaps it mid-flight. Returns the
+        body's return value; exceptions propagate to the caller's fail-open
+        handlers."""
+        session.in_use = True
+        session.last_used = time.time()
+        try:
+            return self._browser_thread_run(body)
+        finally:
+            session.in_use = False
             session.last_used = time.time()
-            try:
-                yield session
-            finally:
-                session.in_use = False
-                session.last_used = time.time()
 
     # -- idle reaper (safety net) ----------------------------------------------
 
@@ -443,7 +500,7 @@ def browser_navigate(
     if ure:
         return ure, manager.browser_artifact(session)
     try:
-        with manager.use(session):
+        def _navigate():
             try:
                 session.page.goto(
                     target,
@@ -455,12 +512,14 @@ def browser_navigate(
                     f"Error: navigation failed: {str(e)[:500]}",
                     manager.browser_artifact(session),
                 )
-            snap = _describe(session)
+            return _describe(session), manager.browser_artifact(session)
+
+        snap, art = manager.use(session, _navigate)
         hint = (
             f"\n\n[Keep using session_id {session_id!r} for all browser calls "
             "on this vulnerability.]"
         )
-        return snap + hint, manager.browser_artifact(session)
+        return snap + hint, art
     except Exception as e:
         return f"Error: browser_navigate failed: {str(e)[:500]}", manager.unavailable_art()
 
@@ -484,7 +543,7 @@ def browser_click(
     if err:
         return err, manager.unavailable_art()
     try:
-        with manager.use(session):
+        def _click():
             try:
                 session.page.click(selector, timeout=settings.browser_timeout_ms)
             except Exception as e:
@@ -498,8 +557,10 @@ def browser_click(
                 )
             except Exception:
                 pass
-            snap = _describe(session)
-        return snap, manager.browser_artifact(session)
+            return _describe(session), manager.browser_artifact(session)
+
+        snap, art = manager.use(session, _click)
+        return snap, art
     except Exception as e:
         return f"Error: browser_click failed: {str(e)[:500]}", manager.unavailable_art()
 
@@ -525,7 +586,7 @@ def browser_fill(
     if err:
         return err, manager.unavailable_art()
     try:
-        with manager.use(session):
+        def _fill():
             try:
                 session.page.fill(selector, value, timeout=settings.browser_timeout_ms)
             except Exception as e:
@@ -533,8 +594,10 @@ def browser_fill(
                     f"Error: could not fill {selector!r}: {str(e)[:500]}",
                     manager.browser_artifact(session),
                 )
-            snap = _describe(session)
-        return snap, manager.browser_artifact(session)
+            return _describe(session), manager.browser_artifact(session)
+
+        snap, art = manager.use(session, _fill)
+        return snap, art
     except Exception as e:
         return f"Error: browser_fill failed: {str(e)[:500]}", manager.unavailable_art()
 
@@ -560,7 +623,7 @@ def browser_evaluate(
     if err:
         return err, manager.unavailable_art()
     try:
-        with manager.use(session):
+        def _evaluate():
             try:
                 result = session.page.evaluate(expression)
             except Exception as e:
@@ -577,7 +640,10 @@ def browser_evaluate(
                 f"--- NEW BROWSER EVENTS (console/pageerror/dialog since last call) ---\n"
                 + (events or "(none)")
             )
-        return out, manager.browser_artifact(session)
+            return out, manager.browser_artifact(session)
+
+        out, art = manager.use(session, _evaluate)
+        return out, art
     except Exception as e:
         return f"Error: browser_evaluate failed: {str(e)[:500]}", manager.unavailable_art()
 
@@ -601,17 +667,19 @@ def browser_console(
     if err:
         return err, manager.unavailable_art()
     try:
-        with manager.use(session):
+        def _console():
             events = manager._drain_new(session)
             head = ""
             try:
                 head = f"URL: {session.page.url}"
             except Exception:
                 pass
-        out = (
-            f"{head}\n--- BROWSER EVENTS (console/pageerror/dialog since last call) ---\n"
-            + (events or "(none)")
-        )
-        return out, manager.browser_artifact(session)
+            return (
+                f"{head}\n--- BROWSER EVENTS (console/pageerror/dialog since last call) ---\n"
+                + (events or "(none)")
+            ), manager.browser_artifact(session)
+
+        out, art = manager.use(session, _console)
+        return out, art
     except Exception as e:
         return f"Error: browser_console failed: {str(e)[:500]}", manager.unavailable_art()
