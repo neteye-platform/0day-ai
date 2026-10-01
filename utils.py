@@ -156,7 +156,7 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
                 content = str(content)
 
             # Create a clean, single-line snippet
-            snippet = (content[:100] + "...") if len(content) > 100 else content
+            snippet = (content[:200] + "...") if len(content) > 200 else content
             snippet = snippet.replace('\n', ' ').strip()
 
             if msg_type == "ai":
@@ -224,13 +224,13 @@ def run_stream(app, inputs, config=None, output_file="trace.json"):
     print("\n" + "="*50)
     print("📊 \033[1mToken Usage Summary by Agent\033[0m")
     print("-" * 50)
-    
+
     # Sort agents alphabetically for a cleaner readout (optional, but nice)
     for agent_name in sorted(agent_token_stats.keys()):
         stats = agent_token_stats[agent_name]
         print(f"🔹 \033[96m{agent_name}\033[0m")
         print(f"   In: {stats['input']:,}  |  Out: {stats['output']:,}  |  Total: {stats['total']:,}")
-    
+
     print("-" * 50)
     print("🏆 \033[1mGrand Totals\033[0m")
     print(f"   Input Tokens:  {token_stats['input']:,}")

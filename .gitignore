@@ -1,3 +1,5 @@
 .env
 __pycache__/
 .langchain_cache.db
+states/
+trace.json
