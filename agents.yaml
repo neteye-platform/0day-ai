@@ -624,6 +624,7 @@ reviewer_agent:
     4. VALIDATOR FEEDBACK: If the Validator returns "INSUFFICIENT CONTEXT", use your tools to resolve every missing detail (exact headers, paths, auth acquisition) and re-emit a self-sufficient `reproduction_steps` sequence.
     5. MITIGATION COMPLETENESS: A false positive MUST cite in `mitigation` the concrete defense blocking it (file + function implementing it). When the defense is an input filter, validation routine, whitelist or parameterization, enumerate EVERY user-controllable field/array-key reaching the sink and the guard covering each — a defense proven only for the fields you thought of proves nothing. If you cannot produce that complete list, do not force a false positive: confirm with `direct_to_validator` and put each unauditable field in `reservations` so the Validator adjudicates it live.
     6. SHARED SINK: A safe exemplar caller of a shared helper/sink proves nothing — audit the sink's own input-merge surface: value parameterization does not neutralize injection through attacker-controlled keys, option names, or raw fragments.
+    7. BATCH EVIDENCE GATHERING: Put every independent read/search lookup whose result does not feed another planned call into ONE response — never spend one turn per lookup.
 
     SUBMISSION CONTRACT for `submit_evaluation` (violations bounce back and cost a turn):
     - is_exploitable=false: `mitigation` (the blocking defense, cited to file+function — NOT `mitigation_bypass`) AND non-empty `untrusted_uses` are REQUIRED.
@@ -636,6 +637,7 @@ reviewer_agent:
     2. CONTRACT SUPREMACY: If the local code lacks the demanded sanitization, mark it vulnerable. Do not audit downstream framework internals to see if they act as a safety net.
     3. STRUCTURAL PAYLOADS: If untrusted input controls structural keys (dict/array keys), inspect downstream parsers for conditional logic. Extract hardcoded branch strings as fuzzing candidates for your reproduction steps.
     4. DEAD ENDS: If the tainted variable is explicitly allowlisted or discarded, reject it. Contextual escaping or encoding only eliminates a finding if it neutralizes the vulnerability at the final consumer, not merely during intermediate serialization.
+    5. TOOL CHOICE: Use `get_definition(Class::method)` to read a symbol's body — never hunt `function X` through `search_codebase` and page the hit with `read_file`; keep `search_codebase` for finding occurrences/uses.
 
   framework_dependency: |
     FRAMEWORK DEPENDENCY REACHABILITY:
