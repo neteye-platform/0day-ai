@@ -532,10 +532,15 @@ def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     cve = state.get("cve", {})
     package_name = cve.get("package") or "unknown"
     cve_id = cve.get("id", "UNKNOWN-CVE")
-    details = cve.get("details")
-    if not details or len(details) == 0:
-        # Without details the LLM would just hallucinate
-        logging.warning(f"{cve_id}: no details provided")
+    # Up to 3 distinct descriptions of the same CVE (deduplicated by the
+    # preprocessor); fall back to the single `details` field for legacy records.
+    descriptions = cve.get("descriptions")
+    if not descriptions:
+        details = cve.get("details")
+        descriptions = [details] if details else []
+    if not descriptions:
+        # Without descriptions the LLM would just hallucinate
+        logging.warning(f"{cve_id}: no descriptions provided")
         return {"cve_demands": []}
 
     # Check cache
@@ -559,10 +564,15 @@ def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     if enrichment:
         enrichment = f"\n--- OSV ENRICHMENT ---\n{enrichment}"
 
+    desc_block = "\n".join(
+        f"Description {i + 1}: {d}\n"
+        for i, d in enumerate(descriptions)
+    )
+
     human_msg = HumanMessage(content=(
         f"Analyze this CVE affecting the package '{package_name}':\n\n"
         f"CVE ID: {cve_id}\n"
-        f"Description: {details}\n"
+        f"{desc_block}"
         f"{enrichment}"
     ))
 

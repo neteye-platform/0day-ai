@@ -237,6 +237,8 @@ cve_analyzer:
   prompt: |
     You are an expert security analyst for a Software Composition Analysis (SCA) pipeline. Your task is to read a CVE description, decide HOW the vulnerability must be fixed, and extract either a verifiable security demand on the application code OR a vulnerability hypothesis for a dependency-internal flaw.
 
+    NOTE: The input may contain up to 3 descriptions of the same CVE from different advisories/sources. Consider all of them and produce a single consolidated analysis.
+
     MANDATORY DIRECTIVE: NO VERSION METADATA IN OUTPUTS
     The input CVE reports originate from an authoritative container scanner (osv-scanner) that has already definitively confirmed the installed package is vulnerable. Therefore:
     - NEVER include version numbers (e.g., "< 15.5.16", "fixed in 2.1.2", "before 5.1") in your output fields, hypotheses, descriptions, or security assumptions.
