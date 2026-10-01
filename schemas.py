@@ -320,6 +320,9 @@ class CVEAnalysis(BaseModel):
             "exists; the only fix is upgrading the package."
         )
     )
+    is_enabled_by_default: bool = Field(
+        description="True if the CVE description implies it's standard behavior, or if the workaround requires explicitly DISABLING it."
+    )
     import_namespace: str = Field(
         description="The SINGLE top-level root module name used to import this package (e.g., 'bs4' for beautifulsoup4, 'flask' for Flask). You MUST output exactly one word. Required for BOTH fix categories to locate usage sites in application code.",
         pattern=r"^[a-zA-Z0-9_\-]+$"
@@ -328,17 +331,19 @@ class CVEAnalysis(BaseModel):
         default_factory=list,
         description=(
             "Strict, machine-readable list of code-level triggers that MUST appear verbatim in the "
-            "application's source code for this vulnerability to be triggerable: specific function/method "
-            "names (e.g. 'yaml.load', 'jwt.verify'), option/flag names (e.g. 'parseNested', 'remotePatterns'), "
-            "import paths, file paths, or directives (e.g. 'next/image', '/_next/image'). "
-            "REQUIRED for BOTH fix categories. NEVER use generic terms "
-            "like 'import', 'request', 'file', 'input', or 'data'. Use the bare package name "
-            "ONLY if no finer-grained method/option trigger exists."
+            "application's source code. CRITICAL: You MUST include the high-level public API wrappers "
+            "(e.g., 'requests.get', 'app.use') that developers actually write, especially if the vulnerability "
+            "resides in a hidden internal class or sub-dependency. "
+            "REQUIRED for BOTH fix categories. NEVER use generic terms. Keep to 1-5 highly specific keywords."
         )
     )
     security_assumption: Optional[str] = Field(
         default=None,
-        description="REQUIRED iff fix_category is 'application_mitigation'. The specific demand or configuration requirement that must be verified in the code."
+        description=(
+            "REQUIRED iff fix_category is 'application_mitigation'. The specific demand or configuration requirement. "
+            "This MUST be framed around the public API the developer interacts with. If the vulnerable internal "
+            "component is enabled by default by a higher-level class, state that explicitly in the assumption."
+        )
     )
     trigger_condition: Optional[str] = Field(
         default=None,
