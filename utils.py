@@ -1,3 +1,4 @@
+from collections import defaultdict
 import logging
 import re
 from pathlib import Path
@@ -383,14 +384,12 @@ def cache(file: Path, action: str, content: dict = {}) -> Optional[dict]:
 
 def uses_namespace_in_ast(node_id: str, target_namespace: str) -> bool:
     """
-    Checks if a specific namespace is used within a node's AST,
-    using the semantically folded source code.
+    Checks if a specific namespace (or its imported symbols) is used within a node's AST.
     """
     source_code = get_node_code(node_id)
     if not source_code:
         return False
 
-    # Extract node data to determine the file extension
     graph = settings.graph
     graph_data = get_cached_graph_data(graph)
     if not graph_data:
@@ -404,32 +403,68 @@ def uses_namespace_in_ast(node_id: str, target_namespace: str) -> bool:
     source_file = target_node.get("source_file")
     ext = Path(source_file).suffix.lower()
 
-    # Map extension to tree-sitter language
     if ext not in LANGUAGE_MAP:
         logging.warning(f"Unsupported extension '{ext}' for AST parsing on node '{node_id}'.")
         return False
 
-    # Initialize parser
     parser = tree_sitter.Parser(LANGUAGE_MAP[ext])
 
-    # Parse the folded code
+    # Track the namespace and any symbols imported from it (e.g., 'g', 'request', 'Blueprint')
+    aliases = set([target_namespace])
+
+    # Parse the full file to discover aliases / imported components
+    try:
+        full_file_path = settings.app_path / Path(source_file)
+        if full_file_path.exists():
+            with open(full_file_path, "r", encoding="utf-8") as f:
+                full_code_bytes = f.read().encode("utf-8")
+
+            full_tree = parser.parse(full_code_bytes)
+
+            def extract_aliases(node: tree_sitter.Node):
+                node_type = node.type.lower()
+                # Check if this node is an import/use statement
+                if any(kw in node_type for kw in ["import", "use", "require", "include"]):
+                    text = full_code_bytes[node.start_byte:node.end_byte].decode("utf-8")
+
+                    # If this import statement pulls from our target namespace
+                    if target_namespace in text:
+                        # Extract all identifiers within this statement as potential aliases
+                        def get_identifiers(n: tree_sitter.Node):
+                            if len(n.children) == 0:
+                                n_type = n.type.lower()
+                                if "identifier" in n_type or "name" in n_type:
+                                    val = full_code_bytes[n.start_byte:n.end_byte].decode("utf-8")
+                                    if val != target_namespace:
+                                        aliases.add(val)
+                            for c in n.children:
+                                get_identifiers(c)
+
+                        get_identifiers(node)
+                else:
+                    for child in node.children:
+                        extract_aliases(child)
+
+            extract_aliases(full_tree.root_node)
+    except Exception as e:
+        logging.warning(f"Could not extract aliases from {source_file}: {e}")
+
+    # Parse the specific node's folded code to check for actual usage
     source_bytes = source_code.encode("utf-8")
     tree = parser.parse(source_bytes)
 
     def walk(node: tree_sitter.Node) -> bool:
-        # Ignore import/require statements so we only match actual usage
-        if any(keyword in node.type for keyword in ["import", "include", "use_declaration"]):
+        # Ignore import statements in the folded snippet to strictly verify actual usage
+        if any(keyword in node.type.lower() for keyword in ["import", "include", "use_declaration"]):
             return False
 
-        # If it's a leaf node, check its text
+        # If it's a leaf node, check if its text matches the namespace OR any of its extracted aliases
         if len(node.children) == 0:
-            # Safely ignore comments and string literals
-            if "comment" not in node.type and "string" not in node.type:
+            if "comment" not in node.type.lower() and "string" not in node.type.lower():
                 token_text = source_bytes[node.start_byte:node.end_byte].decode("utf-8")
-                if token_text == target_namespace:
+                if token_text in aliases:
                     return True
 
-        # Recurse through children
         for child in node.children:
             if walk(child):
                 return True

@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import re
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import PydanticOutputParser
@@ -148,12 +149,14 @@ def dispatch_explorers(state: MasterState):
         community_nodes = [n for n, attr in G.nodes(data=True) if str(attr.get("community")) == clean_id]
 
         # Filter out skeleton nodes, but keep functions, classes, and non-code files
-        # TODO: If the file contains only the skeleton we should keep it
         for node_id in community_nodes:
             node_data = G.nodes[node_id]
 
-            # if node_data.get("source_file", "").endswith(node_data.get("label")):
-            #     continue
+            if node_data.get("source_file", "").endswith(node_data.get("label")):
+                # Skip skeletons only if they are not the only node in that file
+                nodes_in_file = [n for n, attr in G.nodes(data=True) if attr.get("source_file") == node_data.get("source_file")]
+                if len(nodes_in_file) <= 1:
+                    continue
 
             source_file = Path(node_data.get("source_file", ""))
             if source_file.name in ["requirements.txt", "packages.json"]:
@@ -192,11 +195,11 @@ def expert_explorer_node(state: ExplorerState) -> dict:
     # LLM invocation
     source_code = get_node_code(node_id)
 
-    parser = PydanticOutputParser(pydantic_object=AnalysisNote)
+    # parser = PydanticOutputParser(pydantic_object=AnalysisNote)
     sys_msg = SystemMessage(content=(
         f"{EXPERT_AGENTS[role_name]['prompt']}\n\n"
         f"{EXPERT_AGENTS['explorer_prompt']}\n\n"
-        f"{parser.get_format_instructions()}"
+        # f"{parser.get_format_instructions()}"
     ))
 
     graph_data = get_cached_graph_data(settings.graph)
@@ -217,16 +220,8 @@ def expert_explorer_node(state: ExplorerState) -> dict:
         )
     human_msg = HumanMessage(content=user_prompt)
 
-    response = llm.invoke([sys_msg, human_msg])
-
-    try:
-        fixed_json_string = repair_json(response.content)
-        note = parser.invoke(fixed_json_string)
-    except Exception as e:
-        logging.error(f"Failed to parse LLM output. Agent: {role_name}. Node: {node_id}. Error: {e}\n\n{response.content}")
-        return {
-            "notes": []
-        }
+    explorer_llm = llm.with_structured_output(AnalysisNote)
+    note = explorer_llm.invoke([sys_msg, human_msg])
 
     dict_note = note if isinstance(note, dict) else note.model_dump()
     dict_note["node_id"] = node_id
@@ -298,11 +293,9 @@ def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
         return {"cve_demands": [cached_demand]}
 
     # LLM invocation
-    parser = PydanticOutputParser(pydantic_object=CVEDemand)
-
     sys_msg = SystemMessage(content=(
         f"{CVE_ANALYZER_AGENT['prompt']}\n\n"
-        f"{parser.get_format_instructions()}"
+        # f"{parser.get_format_instructions()}"
     ))
     human_msg = HumanMessage(content=(
         f"Analyze this CVE affecting the package '{package_name}':\n\n"
@@ -310,11 +303,10 @@ def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
         f"Description: {details}\n\n"
     ))
 
-    response = llm.invoke([sys_msg, human_msg])
-    fixed_json_string = repair_json(response.content)
-    demand: CVEDemand = parser.invoke(fixed_json_string)
+    cve_analyzer_llm = llm.with_structured_output(CVEDemand)
+    demand = cve_analyzer_llm.invoke([sys_msg, human_msg])
 
-    dict_demand = demand.model_dump()
+    dict_demand = demand if isinstance(demand, dict) else demand.model_dump()
     # Tag the resulting demand with the CVE ID for traceability during the Verification Phase
     dict_demand["source_cve"] = cve_id
     dict_demand["package"] = package_name
@@ -331,176 +323,149 @@ def cve_analyzer_node(state: CVEAnalyzerState) -> dict:
 # Aggregate demands node
 # ==========================================
 
-def aggregate_demands_node(state: MasterState):
-    grouped_demands = {}
+def build_caller_map(graph_data: dict):
+    callers_map = defaultdict(list)
+    for edge in graph_data.get("links", []):
+        callers_map[edge.get("target")].append(edge.get("source"))
+    return callers_map
+
+
+def build_import_map(graph_data: dict):
     node_imports_map = {}
-    updated_notes = []
-
-    # Extract graph data and build a caller map for upstream routing
-    graph_data = get_cached_graph_data(settings.graph)
-    callers_map = {}  # Maps a node_id to a list of its callers (incoming edges)
-    for edge in graph_data.get("edges", []):
-        src = edge.get("source")
-        dst = edge.get("target")
-        if dst not in callers_map:
-            callers_map[dst] = []
-        callers_map[dst].append(src)
-
-    # Extract imports for CVE matching
     for node in graph_data.get("nodes", []):
-        node_id = node.get("id")
-        source_file_path = node.get("source_file")
+        node_id, src_path = node.get("id"), node.get("source_file")
 
-        if not node_id or not source_file_path:
+        if not node_id or not src_path:
             continue
 
-        source_file = settings.app_path / Path(source_file_path)
+        source_file = settings.app_path / Path(src_path)
         if source_file.exists() and node_id not in node_imports_map:
             try:
                 with open(source_file, "r", encoding="utf-8") as f:
-                    code_content = f.read()
-                node_imports_map[node_id] = set(extract_imports(code_content, source_file_path))
+                    node_imports_map[node_id] = set(extract_imports(f.read(), src_path))
             except Exception:
                 node_imports_map[node_id] = set()
+    return node_imports_map
+
+
+def aggregate_demands_node(state: MasterState):
+    grouped_demands = defaultdict(list)
+    updated_notes = []
+
+    graph_data = get_cached_graph_data(settings.graph)
+    callers_map = build_caller_map(graph_data)
+    node_imports_map = build_import_map(graph_data)
+
+    logging.info(f"Loaded graph data: {len(callers_map)} caller entries, {len(node_imports_map)} import entries.")
+    notes = state.get("notes", [])
+    cves = state.get("cve_demands", [])
+    logging.info(f"Processing {len(notes)} notes and {len(cves)} CVE demands.")
 
     # Process Explorer Notes
-    for note in state.get("notes", []):
-        # Ensure we are working with a mutable dictionary
+    for note in notes:
         dict_note = note if isinstance(note, dict) else note.model_dump()
         current_node_id = dict_note.get("node_id")
+        demands = dict_note.setdefault("demands", [])
 
-        if "upstream_assumptions" not in dict_note:
-            dict_note["upstream_assumptions"] = []
-
-        # Check if the node is an internal sink (has 0 source interfaces)
         has_source = any(
-            iface.get("interface_type") == "source" 
+            isinstance(iface, str) and (iface.upper().startswith("[SOURCE]") or iface.lower().startswith("source"))
             for iface in dict_note.get("business_interfaces", [])
         )
 
+        # Convert localized vulnerabilities into upstream demands
         if not has_source and dict_note.get("vulnerability_hypotheses"):
-            # Convert localized vulnerabilities into upstream demands
-            for vuln in dict_note.get("vulnerability_hypotheses", []):
-                dict_note["upstream_assumptions"].append({
-                    "description": f"Must prevent {vuln.get('cwe_id')}: {vuln.get('description')}",
-                    "parameter_name": "context (auto-converted internal sink)"
+            vulns = dict_note.pop("vulnerability_hypotheses")
+            logging.info(f"[{current_node_id}] Treated as internal sink. Converting {len(vulns)} vulnerabilities into upstream demands.")
+            
+            for vuln in vulns:
+                demands.append({
+                    "direction": "upstream",
+                    "target": "context (auto-converted internal sink)",
+                    "description": f"Must prevent {vuln.get('cwe_id')} at {vuln.get('vulnerable_component')}"
                 })
-            # Wipe the localized vulnerabilities so they don't reach the Reviewer
             dict_note["vulnerability_hypotheses"] = []
 
-        # --- DOWNSTREAM ASSUMPTIONS ---
-        for assumption in dict_note.get("downstream_assumptions", []):
-            target_node_id = resolve_node_id(assumption.get("module"), assumption.get("symbol"))
-            if target_node_id:
-                if target_node_id not in grouped_demands:
-                    grouped_demands[target_node_id] = []
+        # Process the unified SecurityDemand objects
+        for demand in demands:
+            direction = demand.get("direction")
+            target_str = demand.get("target", "")
+            desc = demand.get("description")
 
-                grouped_demands[target_node_id].append({
-                    "source": current_node_id,
-                    "type": "explorer_downstream_assumption",
-                    "description": assumption.get("description")
-                })
+            if direction == "downstream":
+                # STRIP LLM HALLUCINATIONS: Remove backticks, parentheses, and arguments
+                clean_target = re.sub(r'\(.*?\)', '', target_str).replace('`', '').strip()
 
-        # --- UPSTREAM ASSUMPTIONS ---
-        for assumption in dict_note.get("upstream_assumptions", []):
-            # Fetch all nodes that call this current_node_id
-            callers = callers_map.get(current_node_id, [])
-            for caller_id in callers:
-                if caller_id not in grouped_demands:
-                    grouped_demands[caller_id] = []
+                # Handle correct `::` format, OR fallback to `module.symbol` dot notation
+                if "::" in clean_target:
+                    module, symbol = clean_target.split("::", 1)
+                elif "." in clean_target:
+                    module, symbol = clean_target.rsplit(".", 1)
+                else:
+                    module, symbol = clean_target, "unknown"
 
-                grouped_demands[caller_id].append({
-                    "source": current_node_id,
-                    "type": "explorer_upstream_assumption",
-                    "description": assumption.get("description"),
-                    "parameter_name": assumption.get("parameter_name", "unknown")
-                })
+                if target_node_id := resolve_node_id(module, symbol):
+                    grouped_demands[target_node_id].append({
+                        "source": current_node_id,
+                        "type": "explorer_downstream_assumption",
+                        "description": desc
+                    })
+                else:
+                    logging.warning(f"[{current_node_id}] DOWNSTREAM DROP: Could not resolve '{module}' / '{symbol}' (Original: {target_str})")
+
+            elif direction == "upstream":
+                # DEBUG: Check if incoming edges are missing
+                callers = callers_map.get(current_node_id, [])
+                if callers:
+                    for caller_id in callers:
+                        grouped_demands[caller_id].append({
+                            "source": current_node_id,
+                            "type": "explorer_upstream_assumption",
+                            "description": desc,
+                            "parameter_name": target_str
+                        })
+                else:
+                    logging.warning(f"[{current_node_id}] UPSTREAM DROP: No callers found in graph for this node.")
+                    
+            else:
+                logging.warning(f"[{current_node_id}] UNKNOWN DIRECTION: '{direction}'. Demand dropped.")
 
         updated_notes.append(dict_note)
 
-    # Process CVE Demands (unchanged)
-    for demand in state.get("cve_demands", []):
+    # Process CVE Demands
+    for demand in cves:
         target_import = demand.get("import_namespace", "")
+        source_cve = demand.get("source_cve", "unknown")
 
+        combined_desc = (
+            f"Security Context: {demand.get('security_assumption')} | "
+            f"Trigger: {demand.get('trigger_condition')}"
+        )
+
+        matched_any = False
         for node_id, imports in node_imports_map.items():
             if target_import in imports:
+                # DEBUG: Check if AST strict matching is rejecting the import
                 if uses_namespace_in_ast(node_id, target_import):
-                    if node_id not in grouped_demands:
-                        grouped_demands[node_id] = []
-
                     grouped_demands[node_id].append({
-                        "source": demand.get("source_cve"),
+                        "source": source_cve,
                         "type": "cve_assumption",
-                        "description": demand.get("security_assumption")
+                        "description": combined_desc
                     })
+                    matched_any = True
+                else:
+                    logging.info(f"[{node_id}] CVE SKIP: '{target_import}' found in imports but uses_namespace_in_ast() returned False.")
 
-    logging.info(f"Grouped {len(grouped_demands)} demands.")
+        if not matched_any:
+            logging.warning(f"[CVE DROP] {source_cve} for '{target_import}' matched 0 nodes in the graph.")
 
-    # Return both the grouped demands and the filtered notes
+    # Log the accurate total by summing the lengths of the lists
+    total_demands = sum(len(d) for d in grouped_demands.values())
+    logging.info(f"Summary: Grouped {total_demands} total demands across {len(grouped_demands)} target nodes.")
+
     return {
-        "grouped_demands": grouped_demands,
+        "grouped_demands": dict(grouped_demands), 
         "notes": updated_notes 
     }
-
-# def aggregate_demands_node(state: MasterState):
-#     grouped_demands = {}
-#     node_imports_map = {}
-#
-#     # Extract imports for all graph nodes
-#     graph_data = get_cached_graph_data(settings.graph)
-#     for node in graph_data.get("nodes", []):
-#         node_id = node.get("id")
-#         source_file_path = node.get("source_file")
-#
-#         if not node_id or not source_file_path:
-#             continue
-#
-#         # Resolve full path on disk
-#         source_file = settings.app_path / Path(source_file_path)
-#         if source_file.exists() and node_id not in node_imports_map:
-#             try:
-#                 with open(source_file, "r", encoding="utf-8") as f:
-#                     code_content = f.read()
-#                 # Use your tree-sitter helper
-#                 node_imports_map[node_id] = set(extract_imports(code_content, source_file_path))
-#             except Exception:
-#                 node_imports_map[node_id] = set()
-#
-#     # Process Explorer Notes (for assumptions_to_verify)
-#     for note in state.get("notes", []):
-#         dict_note = note if isinstance(note, dict) else note.model_dump()
-#         dict_note.get("node_id")
-#
-#         for assumption in dict_note.get("assumptions_to_verify", []):
-#             target_node_id = resolve_node_id(assumption.get("module"), assumption.get("symbol"))
-#             if target_node_id:
-#                 if target_node_id not in grouped_demands:
-#                     grouped_demands[target_node_id] = []
-#
-#                 grouped_demands[target_node_id].append({
-#                     "source": dict_note.get("node_id"),
-#                     "type": "explorer_assumption",
-#                     "description": assumption.get("description")
-#                 })
-#
-#     # Process CVE Demands (now checked against ALL nodes in the codebase)
-#     for demand in state.get("cve_demands", []):
-#         target_import = demand.get("import_namespace", "")
-#
-#         for node_id, imports in node_imports_map.items():
-#             if target_import in imports:
-#                 if uses_namespace_in_ast(node_id, target_import):
-#                     if node_id not in grouped_demands:
-#                         grouped_demands[node_id] = []
-#
-#                     grouped_demands[node_id].append({
-#                         "source": demand.get("source_cve"),
-#                         "type": "cve_assumption",
-#                         "description": demand.get("security_assumption")
-#                     })
-#
-#     logging.info(f"Grouped {len(grouped_demands)} demands.")
-#     return {"grouped_demands": grouped_demands}
 
 # ==========================================
 # Contract verifier node
@@ -584,18 +549,17 @@ def contract_verifier_node(state: VerifierState) -> dict:
     demands_string = "\n".join(formatted_demands)
 
     # LLM Invocation
-    parser = PydanticOutputParser(pydantic_object=VerifierOutput)
-    sys_msg = SystemMessage(content=f"{VERIFIER_AGENT['prompt']}\n\n{parser.get_format_instructions()}")
+    sys_msg = SystemMessage(content=f"{VERIFIER_AGENT['prompt']}")
     human_msg = HumanMessage(content=f"```python\n{target_code}\n```\n\nSecurity Demands:\n{demands_string}")
 
-    response = llm.invoke([sys_msg, human_msg])
-    fixed_json_string = repair_json(response.content)
-    parsed_output: VerifierOutput = parser.invoke(fixed_json_string)
+    structured_llm = llm.with_structured_output(VerifierOutput)
+    response = structured_llm.invoke([sys_msg, human_msg])
+    response = response if isinstance(response, dict) else response.model_dump()
 
     new_vulnerabilities = []
-    for eval in parsed_output.evaluations:
+    for eval in response.get("evaluations", []):
         # DELEGATED, OUT_OF_SCOPE, and MET will be safely ignored
-        if eval.status == "FAILED":
+        if eval.get("status") == "FAILED":
             # Retrieve the clean, original description from Python memory
             original_desc = demand_lookup.get(eval.demand_id, "No description found.")
 
