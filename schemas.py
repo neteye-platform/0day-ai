@@ -79,6 +79,10 @@ class VulnerabilityRecord(BaseModel):
     vulnerability_type: str = "Code Defect"
     description: str
     demand_id: Optional[str] = None
+    source_cve: Optional[str] = Field(
+        default=None,
+        description="The CVE ID a dependency-internal vulnerability was derived from. Set only on hypotheses emitted directly by the CVE analyzer (upgrade_only CVEs)."
+    )
     vulnerable_component: Optional[str] = Field(
         default=None,
         description="The structural anchor from the Explorer hypothesis."
@@ -133,20 +137,54 @@ class ExpertTask(BaseModel):
         description="Detailed instructions on what specific vulnerability classes, architectural risks, or cross-component interactions to investigate within this subgraph."
     )
 
-class CVEDemand(BaseModel):
-    reasoning: str = Field(
-        description="Briefly explain your logic for determining the assumption, trigger, and namespace. Do your thinking here."
+class CVEHypothesis(BaseModel):
+    cwe: CWE_KEYS = Field(description="The matching CWE ID from the provided list.")
+    description: str = Field(
+        description="Reviewer-facing description: the CVE ID, the exact flaw inside the library, which library feature/usage exposes it, the attacker-controlled trigger, and the fixed version when known."
     )
-    security_assumption: str = Field(
-        description="The specific demand or configuration requirement that must be verified in the code to prevent the vulnerability."
+    affected_component: str = Field(
+        description="The concrete, greppable usage pattern the Reviewer should hunt for in application code (e.g., 'app.run(debug=True)', 'serve(app)', 'express-fileupload middleware'). For transitive dependencies, name the likely parent-framework usage (e.g., 'render_template implies Jinja2')."
+    )
+
+class CVEAnalysis(BaseModel):
+    reasoning: str = Field(
+        description="Briefly explain your logic for the classification and the resulting demand or hypothesis. Do your thinking here."
+    )
+    fix_category: Literal["application_mitigation", "upgrade_only"] = Field(
+        description=(
+            "'application_mitigation': the application developer can prevent the exploit through visible source code "
+            "(safe alternative function, configuration flag, sanitization before the call, avoiding an optional feature). "
+            "'upgrade_only': the flaw lives entirely inside the dependency's own code and NO application-level workaround "
+            "exists; the only fix is upgrading the package."
+        )
+    )
+    import_namespace: str = Field(
+        description="The SINGLE top-level root module name used to import this package (e.g., 'bs4' for beautifulsoup4, 'flask' for Flask). You MUST output exactly one word. Required for BOTH fix categories to locate usage sites in application code.",
+        pattern=r"^[a-zA-Z0-9_\-]+$"
+    )
+    required_keywords: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Strict, machine-readable list of code-level triggers that MUST appear verbatim in the "
+            "application's source code for this vulnerability to be triggerable: specific function/method "
+            "names (e.g. 'yaml.load', 'jwt.verify'), option/flag names (e.g. 'parseNested', 'remotePatterns'), "
+            "import paths, file paths, or directives (e.g. 'next/image', '/_next/image'). "
+            "REQUIRED for BOTH fix categories. NEVER use generic terms "
+            "like 'import', 'request', 'file', 'input', or 'data'. Use the bare package name "
+            "ONLY if no finer-grained method/option trigger exists."
+        )
+    )
+    security_assumption: Optional[str] = Field(
+        default=None,
+        description="REQUIRED iff fix_category is 'application_mitigation'. The specific demand or configuration requirement that must be verified in the code."
     )
     trigger_condition: Optional[str] = Field(
         default=None,
         description="The explicit data flow, function call, or execution sink required for the vulnerability to trigger. If the CVE description does not explicitly state how the payload is executed, leave empty."
     )
-    import_namespace: str = Field(
-        description="The SINGLE top-level root module name used to import this package (e.g., 'bs4' for beautifulsoup4, 'flask' for Flask). You MUST output exactly one word.",
-        pattern=r"^[a-zA-Z0-9_\-]+$"
+    hypothesis: Optional[CVEHypothesis] = Field(
+        default=None,
+        description="REQUIRED iff fix_category is 'upgrade_only'. The vulnerability hypothesis describing the dependency-internal flaw."
     )
 
 class VulnerabilityEvaluation(BaseModel):

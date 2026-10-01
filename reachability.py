@@ -618,6 +618,13 @@ def filter_by_reachability(G: nx.DiGraph, vulnerabilities: list) -> list:
         if vuln_dict.get("status") != "hypothesis":
             updated.append(vuln)
             continue
+        # Dependency-CVE hypotheses (e.g. upgrade-only RCE in the HTTP server)
+        # anchor to a synthetic `dependency:<package>` node that is never part of
+        # the execution graph. Exposure assessment is delegated to the Reviewer,
+        # so they are exempt from the static reachability filter.
+        if vuln_dict.get("source_cve"):
+            updated.append(vuln)
+            continue
         if vuln_dict.get("node_id") not in reachable:
             vuln_dict["status"] = "unreachable"
             unreachable += 1

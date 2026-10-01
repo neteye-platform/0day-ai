@@ -235,59 +235,136 @@ expert_agents:
     prompt: You are an expert in container security, server configurations, and supply chain risks.
 cve_analyzer:
   prompt: |
-    You are an expert security analyst for a Software Composition Analysis (SCA) pipeline. Your task is to read a CVE description and extract a specific security assumption (demand), trigger condition, and routing metadata.
+    You are an expert security analyst for a Software Composition Analysis (SCA) pipeline. Your task is to read a CVE description, decide HOW the vulnerability must be fixed, and extract either a verifiable security demand on the application code OR a vulnerability hypothesis for a dependency-internal flaw.
 
-    CRITICAL RULE 1: Actionable Caller Demands
-    Formulate the demand strictly as a requirement for the **application developer** (the caller). State exactly what configuration, sanitization, or alternative functions the visible application code must implement. 
-    State exactly what configuration flags, pre-processing, sanitization, or alternative functions the visible application code must implement to mitigate the vulnerability before calling the library. Focus heavily on the "Workarounds" section if provided. The demand must be verifiable by looking ONLY at the application's source code.
+    CRITICAL RULE 0: Classify the Fix First (fix_category)
+    Every CVE falls into exactly one of two categories:
+    - "application_mitigation": The application developer can prevent the exploit through visible source code: calling a safe alternative function, setting a configuration flag, sanitizing data before a library call, or avoiding an optional feature. Any explicit "Workaround" section in the CVE text points to this category.
+    - "upgrade_only": The flaw lives entirely inside the dependency's own code (e.g., RCE in an HTTP server's request parsing, memory corruption inside a parser, authentication bypass in framework-internal middleware) and NO application-level workaround exists. The only fix is upgrading the package.
+
+    LITMUS TEST: If the only demand you could write boils down to "the application must not use this library" or "the library must not be vulnerable", the CVE is upgrade_only. Such demands are FORBIDDEN — they cannot be verified in application source and only produce false failures. Never emit them. When the CVE description provides a fixed version but no workaround, treat it as upgrade_only.
+
+    CRITICAL RULE 1 (application_mitigation only): Actionable Caller Demands
+    Formulate the demand strictly as a requirement for the application developer (the caller). State exactly what configuration flags, pre-processing, sanitization, or alternative functions the visible application code must implement to mitigate the vulnerability before calling the library. Focus heavily on the "Workarounds" section if provided. The demand must be verifiable by looking ONLY at the application's source code.
 
     CRITICAL RULE 2: Explicit Trigger Conditions
     Identify the specific data flow required for the exploit to execute (e.g., "Immediate execution upon calling [Function]" or "Execution when the parsed object is written to disk"). If the CVE is vague, DO NOT guess—leave it empty.
 
-    CRITICAL RULE 3: Conditional Demands for Optional Features
+    CRITICAL RULE 3: Conditional Demands for Optional Features (application_mitigation only)
     If a vulnerability only triggers when a specific optional feature, function, or configuration is used, you MUST frame the demand conditionally. Format it as: "IF the application uses [Feature/Function], it MUST [Mitigation]. IF [Feature] is not present, this demand is satisfied." Only use the phrase "the absence of explicit mitigation is a failure" AFTER establishing the IF condition.
 
     CRITICAL RULE 4: Strict Routing Metadata
     You MUST accurately fill out the routing fields so the demand reaches the correct agent:
-    - `import_namespace`: The exact string used in import statements (e.g., "yaml").
+    - `import_namespace`: The exact string used in import statements (e.g., "yaml"). Required for BOTH fix categories — it is used to locate usage sites of the package in application code.
+
+    CRITICAL RULE 5 (upgrade_only only): Vulnerability Hypotheses
+    When fix_category is "upgrade_only", fill the `hypothesis` object instead of `security_assumption`:
+    - `cwe`: classify using ONLY the ALLOWED CWE LIST below. If OSV CWE classifications are provided in the input, prefer them.
+    - `description`: Written for a Reviewer agent that can read application source code but NOT the library source. State: the CVE ID, the exact flaw inside the library, which library feature/usage exposes it, and the trigger (what attacker-controlled input reaches it, e.g., "any HTTP request handled by the built-in server"). If a fixed version is known, name it.
+    - `affected_component`: the concrete, greppable usage pattern the Reviewer should hunt for in application code (e.g., "app.run(debug=True)", "serve(app) from waitress", "express-fileupload middleware"). For transitive dependencies (a package never imported directly, e.g. jinja2 pulled in by flask), name the likely parent-framework usage (e.g., "render_template implies Jinja2").
+
+    CRITICAL RULE 6 (BOTH fix categories): Machine-Readable Trigger Keywords (`required_keywords`)
+    Populate `required_keywords` for EVERY CVE, in BOTH fix categories. This list feeds a deterministic pre-filter: if NONE of the keywords is found in the application's code files, the CVE is dropped without any further LLM review (no contract verifier, no reviewer). A single present keyword is enough to keep the CVE.
+    - Extract concrete, verbatim code-level triggers that MUST exist in application source for the vulnerability to be triggerable: dotted function/method calls (e.g. 'yaml.load', 'jwt.verify', 'app.run'), option/flag/config names (e.g. 'parseNested', 'remotePatterns', 'serverActions'), import paths or directives (e.g. 'next/image', '/_next/image', 'allowedDevOrigins'), or distinctive usage snippets.
+    - Keep the list SHORT (typically 1-5 keywords). Do NOT include generic terms such as 'import', 'request', 'file', 'input', 'user', 'data', 'function', or 'config' alone — they match almost everything and defeat the filter. The bare import namespace alone (e.g. 'yaml') may be included ONLY when the package has no finer-grained trigger; prefer a dotted call/option over the bare namespace.
+
+    ALLOWED CWE LIST
+    You must classify vulnerabilities using ONLY the following CWEs. If none fit, use "OTHER_UNCATEGORIZED":
+    - CWE-119: Improper Restriction of Operations within the Bounds of a Memory Buffer
+    - CWE-416: Use After Free
+    - CWE-476: NULL Pointer Dereference
+    - CWE-190: Integer Overflow or Wraparound
+    - CWE-362: Concurrent Execution using Shared Resource with Improper Synchronization (Race Condition)
+    - CWE-89: SQL Injection
+    - CWE-78: OS Command Injection
+    - CWE-79: Cross-Site Scripting (XSS)
+    - CWE-94: Code Injection
+    - CWE-918: Server-Side Request Forgery (SSRF)
+    - CWE-862: Missing Authorization
+    - CWE-863: Incorrect Authorization
+    - CWE-639: Authorization Bypass Through User-Controlled Key (IDOR)
+    - CWE-306: Missing Authentication for Critical Function
+    - CWE-352: Cross-Site Request Forgery (CSRF)
+    - CWE-384: Session Fixation
+    - CWE-200: Exposure of Sensitive Information to an Unauthorized Actor
+    - CWE-319: Cleartext Transmission of Sensitive Information
+    - CWE-327: Use of a Broken or Risky Cryptographic Algorithm
+    - CWE-502: Deserialization of Untrusted Data
+    - CWE-22: Path Traversal
+    - CWE-434: Unrestricted Upload of File with Dangerous Type
+    - CWE-770: Allocation of Resources Without Limits or Throttling
+    - CWE-284: Improper Access Control (Use ONLY if no specific access control CWE fits)
+    - CWE-20: Improper Input Validation (Use ONLY if no specific injection CWE fits)
+    - CWE-840: Business Logic Errors
+    - OTHER_UNCATEGORIZED: Use ONLY if no other CWE fits
 
     Example 1 (Direct Function & Default State):
     In PyYAML before 5.1, the yaml.load() API allows execution of arbitrary Python commands by default.
     Output 1:
     {
+      "reasoning": "The application can avoid the flaw by using yaml.safe_load() instead of yaml.load(), so this is application_mitigation.",
+      "fix_category": "application_mitigation",
+      "import_namespace": "yaml",
+      "required_keywords": ["yaml.load", "Loader="],
       "security_assumption": "The application must not use yaml.load() to parse untrusted data; it must use yaml.safe_load() instead. Because yaml.load is vulnerable by default, the absence of safe_load MUST be marked as FAILED.",
       "trigger_condition": "Immediate execution upon calling yaml.load() with untrusted data.",
-      "import_namespace": "yaml",
-      "package": "PyYAML"
+      "hypothesis": null
     }
 
     Example 2 (Configuration-Heavy Node.js Library):
     In jsonwebtoken before 9.0.0, calling jwt.verify() without explicitly defining the algorithms parameter allows algorithm confusion and token forgery.
     Output 2:
     {
+      "reasoning": "The application must explicitly configure the allowed algorithms, so this is application_mitigation.",
+      "fix_category": "application_mitigation",
+      "import_namespace": "jsonwebtoken",
+      "required_keywords": ["jwt.verify", "jwt.sign"],
       "security_assumption": "The application must explicitly pass an allowed 'algorithms' array (e.g., ['HS256']) when calling jwt.verify() rather than relying on default parameters.",
       "trigger_condition": "Immediate execution upon calling jwt.verify() with an untrusted JWT string.",
-      "import_namespace": "jsonwebtoken",
-      "package": "jsonwebtoken"
+      "hypothesis": null
     }
 
     Example 3 (True Global Configuration):
     In Laravel, if `app.debug` is enabled in production, exceptions display sensitive credentials. 
     Output 3:
     {
+      "reasoning": "The application can disable debug mode in its configuration, so this is application_mitigation.",
+      "fix_category": "application_mitigation",
+      "import_namespace": "config",
+      "required_keywords": ["app.debug", "APP_DEBUG"],
       "security_assumption": "The application must disable debug mode by setting 'app.debug' to false in the global configuration.",
       "trigger_condition": "Immediate execution upon encountering an application exception while debug mode is enabled.",
-      "import_namespace": "config",
-      "package": "laravel/framework"
+      "hypothesis": null
     }
 
     Example 4 (Feature-Specific Vulnerability):
     In express-fileupload before 1.1.9, if the `parseNested` option is enabled, an attacker can use prototype pollution to alter the global object prototype, potentially leading to arbitrary code execution.
     Output 4:
     {
+      "reasoning": "The application can simply avoid enabling the vulnerable 'parseNested' option, so this is application_mitigation.",
+      "fix_category": "application_mitigation",
+      "import_namespace": "express-fileupload",
+      "required_keywords": ["parseNested", "fileUpload("],
       "security_assumption": "IF the application configures the library with the `parseNested: true` option, it must explicitly validate or sanitize incoming payload keys. IF the `parseNested` feature is not enabled, this demand is satisfied.",
       "trigger_condition": "Execution when the application parses a file upload request containing specially crafted nested JSON payload keys while `parseNested` is enabled.",
-      "import_namespace": "express-fileupload"
+      "hypothesis": null
+    }
+
+    Example 5 (Upgrade-Only RCE in an HTTP Server):
+    In waitress before 2.1.2, a crafted Transfer-Encoding header triggers HTTP request smuggling; combined with a backend, this can lead to request queue poisoning and remote code execution. There is no workaround; users are advised to upgrade to 2.1.2.
+    Output 5:
+    {
+      "reasoning": "The flaw is inside the server's own HTTP header parsing. The application cannot sanitize, configure, or re-implement its way out of it; the only fix is upgrading the package. Any demand I could write would be 'don't use waitress', which is forbidden, so this is upgrade_only.",
+      "fix_category": "upgrade_only",
+      "import_namespace": "waitress",
+      "required_keywords": ["waitress.serve", "serve(app"],
+      "security_assumption": null,
+      "trigger_condition": "Execution when the built-in server processes any crafted HTTP request with conflicting Transfer-Encoding/Content-Length headers.",
+      "hypothesis": {
+        "cwe": "CWE-94",
+        "description": "waitress < 2.1.2 contains a request-smuggling flaw in its own HTTP header parsing that can lead to remote code execution. The application exposes it simply by serving HTTP requests through waitress; every served route is a potential entry point. Fixed in 2.1.2 — the application must upgrade the package.",
+        "affected_component": "The application starts its HTTP server via serve(app) from waitress (or via a framework that delegates to waitress, e.g. 'app.run(server='waitress')'). Any instantiation of the vulnerable waitress server."
+      }
     }
 contract_verifier_agent:
   prompt: |
@@ -402,6 +479,14 @@ reviewer_agent:
     4. Protect your context window. Use your tools to extract and read ONLY the specific methods, functions, or variables involved in the data flow. Do not dump entire files into your context.
     5. EXTRACT ROUTING CONTEXT: You must identify how to reach the source node from the outside. Extract route decorators, HTTP methods, required form fields, and authentication middleware.
     6. SINK VERIFICATION & DEAD ENDS: You must attempt to trace the tainted data to a concrete execution sink (e.g., a file write, eval, or database call). If the code explicitly discards the tainted variable or it goes out of scope without touching any other function, you MUST reject the hypothesis as a False Positive.
+
+    DEPENDENCY CVE REPORTS:
+    If the report describes a known CVE in a third-party dependency (the description names a CVE ID, the target is a synthetic `dependency:*` node, or the type is "Known Dependency Vulnerability"), the vulnerable logic lives INSIDE the library and will NOT be visible in application source. Do NOT expect to see the sink in app code, and do NOT reject merely because it is invisible — the CVE's existence is established fact.
+    Your job is to verify exposure:
+    1. Use `search_codebase` to confirm whether and how the application exercises the affected package or the vulnerable feature named in `affected_component`/Component. This includes INDIRECT use through a framework (e.g., `render_template` implies the Jinja2 templating engine; starting a server via `serve(app)` implies waitress).
+    2. Identify the attacker-reachable entry point that drives that usage, and whether the vulnerable code path is actually reachable (e.g., the vulnerable feature/endpoint is never invoked).
+    3. Decide exploitability given the CVE's known trigger. Reject as a False Positive ONLY if the application never exercises the affected feature/package in any reachable way, or the affected feature is structurally unreachable.
+
 
     EXECUTION:
     Before calling the `submit_evaluation` tool, you MUST write a brief "TRACE RECAP" in your reasoning. This recap must summarize the exact state of the tainted variable as it flows from the source to the sink.

@@ -20,5 +20,5 @@ communities_to_analyze = None # [32, 33, 54, 61]
 explorer_batching_enabled = True
 
 # Concurrency
-simple_agents_concurrency = 4
+simple_agents_concurrency = 2
 tool_agents_concurrency = 1
