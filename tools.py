@@ -1198,6 +1198,54 @@ def _compile_pattern(keyword: str, is_regex: bool) -> re.Pattern:
         return re.compile(re.escape(keyword))
 
 
+def _split_top_level(text: str) -> list[str]:
+    """Split on commas outside braces — commas inside {} belong to a brace
+    alternative, not to the comma-separated list."""
+    parts, depth, cur = [], 0, ""
+    for ch in text:
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth = max(0, depth - 1)
+        cur += ch
+    parts.append(cur)
+    return parts
+
+
+def _split_file_patterns(file_pattern: str) -> tuple[list[str], list[str]]:
+    """Split a file_pattern spec (comma-separated globs, '!' prefix excludes)
+    into a (positive, negated) pair. fnmatch ignores braces, so '*.{php,js}'
+    is expanded to its alternatives first (LLMs write this form)."""
+
+    def expand(part: str) -> list[str]:
+        start = part.find("{")
+        if start == -1:
+            return [part]
+        depth = 0
+        for i in range(start, len(part)):
+            if part[i] == "{":
+                depth += 1
+            elif part[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    head, group, tail = part[:start], part[start + 1:i], part[i + 1:]
+                    return [head + alt + rest
+                            for a in _split_top_level(group) for alt in expand(a)
+                            for rest in expand(tail)]
+        return [part]  # unbalanced: leave verbatim (matches nothing, but never crashes)
+
+    positive, negated = [], []
+    for part in _split_top_level(file_pattern):
+        for alt in expand(part.strip()):
+            if alt:
+                (negated if alt.startswith("!") else positive).append(alt.removeprefix("!"))
+    return positive, negated
+
+
 @tool
 def search_codebase(
     query: str,
@@ -1218,7 +1266,7 @@ def search_codebase(
 
     Args:
         query (str): The string or pattern to search in the codebase.
-        file_pattern (str, optional): Glob to restrict files (e.g., '*.php', 'src/api/*'). Matched against the app-relative path and the plain file name.
+        file_pattern (str, optional): Comma-separated globs to restrict files (e.g., '*.php', 'src/api/*'); prefix a glob with '!' to EXCLUDE matches (e.g., 'src/*.php,!src/User.php'). Each glob is matched against the app-relative path and the plain file name.
         match_whole_word (bool): Match distinct words only. Defaults to True.
         is_regex (bool): Set to True if the query parameter is a regular expression, False for a literal string (default = False). When True you can search multiple keywords at once with an alternation regex like 'auth|login|token'.
 
@@ -1260,6 +1308,7 @@ def search_codebase(
     results = []
     match_count = 0
     MAX_MATCHES = 20 # prevent context window overflow
+    pos_globs, neg_globs = _split_file_patterns(file_pattern) if file_pattern else ([], [])
     pattern = _compile_pattern(query, is_regex)
     # Whole-word boundaries only make sense when both ends of the raw query are
     # word chars; skipping them keeps '$foo' and 'foo(' style queries searchable.
@@ -1284,8 +1333,12 @@ def search_codebase(
             rel = str(file_path)
         if is_path_excluded(rel):
             continue
-        # Optional glob restriction (app-relative path or bare file name).
-        if file_pattern and not (fnmatch(rel, file_pattern) or fnmatch(file_path.name, file_pattern)):
+        # Optional glob restriction (app-relative path or bare file name);
+        # positive globs any-match, '!' globs exclude (agents reach for this
+        # negation naturally, e.g. '!src/User.php').
+        if pos_globs and not any(fnmatch(rel, g) or fnmatch(file_path.name, g) for g in pos_globs):
+            continue
+        if neg_globs and any(fnmatch(rel, g) or fnmatch(file_path.name, g) for g in neg_globs):
             continue
 
         try:

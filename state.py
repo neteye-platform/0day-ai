@@ -10,7 +10,9 @@ class MasterState(TypedDict):
     # Minted by bootstrap (resume-safe), copied into every subagent dispatch:
     # stamped as LangSmith metadata on the main and the project-split subagent
     # traces so all traces of one pipeline run correlate.
-    pipeline_run_id: str
+    # First-non-empty-wins merge: `Command(update=...)` resume patches land on the
+    # same unfinished superstep; un-annotated, step finalization would crash.
+    pipeline_run_id: Annotated[str, lambda prev, new: prev or new]
 
     known_vulns: list[dict]
     expert_tasks: list[ExpertTask]
