@@ -17,13 +17,24 @@ from llms import invoke_tracked, smart_llm
 from run_stats import _record_stat, _snapshot_pipeline_stats, as_dict, as_dicts, raise_if_stopping, snapshot_token_totals, strip_step_numbering
 from schemas import REPORTER_AGENT, ReporterFinding, cwes
 from state import MasterState, ReporterState
-from utils import cache_reporter, cvss_severity_label, cvss_v3_base_score
+from utils import cache_reporter, cvss_gate_blocks, cvss_severity_label, cvss_v3_base_score
 
 
 # Reportable = proven exploitable, or confirmed with a static-only proof.
 # false_positive / unchainable / review_error / unproven are excluded — except
 # a false positive reached THROUGH the patch lifecycle: the auto-verified fix is
 # itself the deliverable, and its section documents the applied patch.
+def _below_cvss_gate(record: dict) -> bool:
+    """Confirmed finding the CVSS validation gate held back from the
+    Validator/Auditor dispatch. Applies the SAME predicate the dispatchers
+    applied (incl. the 'missing strategy means direct' resolution), so a record
+    reported as unvalidated here is exactly one the gate skipped. Such a finding
+    was never dynamically proven — the user asked below-threshold confirmed
+    findings to reach the report untested rather than die unseen."""
+    strategy = record.get("validation_strategy") or "direct_to_validator"
+    return cvss_gate_blocks({**record, "validation_strategy": strategy}, settings.validator_min_cvss)
+
+
 def _is_reportable(record: dict) -> bool:
     if record.get("status") == "exploitable":
         return True
@@ -33,10 +44,9 @@ def _is_reportable(record: dict) -> bool:
         and record.get("patch_state") in ("reviewed", "verified")
     ):
         return True
-    return (
-        record.get("status") == "confirmed"
-        and record.get("validation_strategy") == "static_finding_only"
-    )
+    if record.get("status") == "confirmed" and record.get("validation_strategy") == "static_finding_only":
+        return True
+    return _below_cvss_gate(record)
 
 
 def _render_reporter_prompt(record: dict) -> str:
@@ -56,6 +66,16 @@ def _render_reporter_prompt(record: dict) -> str:
         lines.append(f"Affected nodes: {', '.join(affected)}")
     if record.get("source_cve"):
         lines.append(f"Source CVE: {record['source_cve']}")
+    reviewer_vector = str(record.get("cvss_vector") or "").strip()
+    if reviewer_vector:
+        reviewer_score = cvss_v3_base_score(reviewer_vector)
+        lines.append(
+            f"Reviewer CVSS estimate (pre-validation): {reviewer_vector}"
+            + (
+                f" (score {reviewer_score:.1f}, {cvss_severity_label(reviewer_score)})"
+                if reviewer_score is not None else ""
+            )
+        )
     if record.get("confidence_score") is not None:
         lines.append(f"Confidence: {record['confidence_score']}/10")
     lines += ["", "Description:", str(record.get("description") or "_none_")]
@@ -88,17 +108,37 @@ def _render_reporter_prompt(record: dict) -> str:
         "execution logs, a CVSS v3.1 base vector, a worst-case scenario, and a "
         "remediation.",
     ]
+    if reviewer_vector:
+        lines.append(
+            "Your cvss_vector is the report's final assessment: start from the "
+            "Reviewer's pre-validation estimate and correct any metric the proven "
+            "reproduction contradicts (e.g. a required login ⇒ real PR, a payload "
+            "that never fires ⇒ lower impact); when there is no Proof of Concept, "
+            "the Reviewer's estimate stands."
+        )
+    if _below_cvss_gate(record):
+        lines.append(
+            "This finding was NEVER dynamically validated (its severity estimate "
+            "fell below the pipeline's CVSS validation gate). Write the summary and "
+            "steps from the Reviewer's evidence and NEVER phrase the finding as "
+            "proven, triggered, or confirmed in a live sandbox."
+        )
     return "\n".join(lines)
 
 
 def _assessment_for(finding: dict, record: dict) -> tuple[float | None, str, str]:
     """Deterministic CVSS score + label: the score is computed from the vector
     (never taken from the model) and the label re-derived, so the report can
-    never disagree with the vector. Model label only as fallback for a missing
-    or malformed vector."""
+    never disagree with the vector. A missing/malformed reporter vector falls
+    back to the Reviewer's estimate on the record; the model label is only the
+    last resort."""
     vector = str(finding.get("cvss_vector") or "").strip()
     score = cvss_v3_base_score(vector)
     if score is None:
+        reviewer_vector = str(record.get("cvss_vector") or "").strip()
+        reviewer_score = cvss_v3_base_score(reviewer_vector)
+        if reviewer_score is not None:
+            return reviewer_score, reviewer_vector, cvss_severity_label(reviewer_score)
         return None, vector or "N/A", str(finding.get("severity") or "Not assessed")
     return score, vector, cvss_severity_label(score)
 
@@ -155,6 +195,13 @@ def _build_pipeline_statistics(state: MasterState) -> str:
         f"| Contract-verifier evaluations (total) | {verified_total} |",
         f"| Vulnerability findings reported | {len(state.get('reporter_findings', []))} |",
     ]
+    gate_skipped_total = sum(
+        1 for v in as_dicts(state.get("vulnerabilities", [])) if _below_cvss_gate(v)
+    )
+    if gate_skipped_total:
+        lines.append(
+            f"| Records below CVSS validation gate (reported unvalidated) | {gate_skipped_total} |"
+        )
 
     if stats.get("patcher_records"):
         patched_verified = sum(
@@ -376,7 +423,8 @@ def _render_report_markdown(
         if r.get("status") == "false_positive"
         and r.get("patch_diff") and r.get("patch_state") != "verified"
     )
-    static = len(records) - exploitable - patched_verified - patched_static
+    gate_skipped = sum(1 for r in records if _below_cvss_gate(r))
+    static = len(records) - exploitable - patched_verified - patched_static - gate_skipped
 
     lines = [
         f"# Vulnerability Report — {settings.app_path.name}",
@@ -393,6 +441,10 @@ def _render_report_markdown(
             if patched_static else []
         ),
         f"- **Static findings (no network-reachable path):** {static}",
+        *(
+            [f"- **Confirmed, not dynamically validated (below CVSS validation gate):** {gate_skipped}"]
+            if gate_skipped else []
+        ),
         "",
     ]
     if statistics:
@@ -438,6 +490,11 @@ def _render_report_markdown(
         poc_file = (poc_files or {}).get(record.get("vuln_id"))
         if poc_file:
             lines.append(f"**PoC script:** `poc/{poc_file}`")
+        if _below_cvss_gate(record):
+            lines.append(
+                "**Validation:** not performed — the Reviewer's CVSS estimate fell below "
+                "the pipeline's validation gate, so this finding carries NO dynamic proof.  "
+            )
 
         summary = finding.get("summary") or record.get("description") or "_none_"
         steps = finding.get("reproduction_steps") or record.get("reproduction_steps") or []
@@ -579,7 +636,7 @@ def reporter_node(state: ReporterState) -> dict:
             finding = {
                 "title": "",
                 "summary": report.get("description") or "",
-                "cvss_vector": "",
+                "cvss_vector": str(report.get("cvss_vector") or ""),
                 "severity": None,
                 "reproduction_steps": list(report.get("reproduction_steps") or []),
                 "worst_case_scenario": "",

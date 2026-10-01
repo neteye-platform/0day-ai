@@ -2492,7 +2492,11 @@ def cvss_v3_base_score(vector: str | None) -> float | None:
         confidentiality = weights["C"][metrics["C"]]
         integrity = weights["I"][metrics["I"]]
         availability = weights["A"][metrics["A"]]
-        scope_changed = metrics["S"] == "C"
+        # S is strictly validated like the other metrics: any value other than
+        # U/C (bounced/typo'd vectors) must return None, never be silently
+        # treated as Unchanged — the result gates Validator dispatch (utils.
+        # cvss_gate_blocks) and labels report severities.
+        scope_changed = {"U": False, "C": True}[metrics["S"]]
         pr = {
             "U": {"N": 0.85, "L": 0.62, "H": 0.27},
             "C": {"N": 0.85, "L": 0.68, "H": 0.5},
@@ -2536,6 +2540,36 @@ def cvss_severity_label(score: float | None) -> str:
     if score > 0.0:
         return "Low"
     return "None"
+
+
+def cvss_gate_blocks(record: dict, threshold: float | None) -> bool:
+    """True when a Reviewer-confirmed finding awaiting validation must be SKIPPED
+    by the Validator/Auditor dispatch because the Reviewer's CVSS estimate scores
+    below `threshold` (settings.validator_min_cvss).
+
+    The gate only matches records the dispatch would fan out (status 'confirmed'
+    with a 'direct_to_validator' or 'requires_integration' strategy) and FAILS
+    OPEN: a missing or unparseable estimate always validates, so verdicts cached
+    before the Reviewer shipped its own vector never silently skip the sandbox.
+    Below-threshold records stay 'confirmed' and are reported unvalidated
+    (stage_reporter._is_reportable applies this same predicate, so reportability
+    provably matches what dispatch actually skipped). A threshold <= 0 disables
+    the gate entirely (byte-identical pre-gate behavior)."""
+    if not threshold or threshold <= 0:
+        return False
+    if record.get("status") != "confirmed":
+        return False
+    if record.get("validation_strategy") not in ("direct_to_validator", "requires_integration"):
+        return False
+    # Records inside the patch lifecycle (which only a VALIDATED record can
+    # enter) are never gate-blocked: their fix adjudication must keep flowing
+    # even if settings changed between runs.
+    if record.get("patch_state") or record.get("patch_diff"):
+        return False
+    score = cvss_v3_base_score(record.get("cvss_vector"))
+    if score is None:
+        return False
+    return score < threshold
 
 
 def deduplicate_cves(vulns: list[dict]) -> list[dict]:
@@ -2712,6 +2746,23 @@ def _content_hash_cache(subdir: str, prefix: str, content: dict, result: Optiona
     return None
 
 
+def _strip_cvss_key(value):
+    """Recursively drop the 'cvss_vector' key (dicts and dict-in-lists) from a
+    cache-KEY payload copy. The reviewer's CVSS estimate is an incidental value
+    the Validator/Auditor/Patcher loops never consume — same reasoning as the
+    sandbox_url exclusion — so it must not define their cache identity: a
+    reviewer-supplied vector (or the null key the schema stamps onto every
+    record) would otherwise evict every banked verdict and force pointless
+    sandbox re-validation / patch replay. VALUE storage is untouched; only the
+    hashed copy is normalized. The reporter cache deliberately does NOT strip
+    it (its prompt now shows the estimate)."""
+    if isinstance(value, dict):
+        return {k: _strip_cvss_key(v) for k, v in value.items() if k != "cvss_vector"}
+    if isinstance(value, list):
+        return [_strip_cvss_key(v) for v in value]
+    return value
+
+
 def _cache_stored_record(
     subdir: str, prefix: str, content: dict, updated_vuln: Optional[dict], token_usage: Optional[dict]
 ) -> Optional[dict]:
@@ -2780,7 +2831,7 @@ def cache_validator(report: dict, peer_payloads: Optional[list] = None, updated_
         key=lambda p: p.get("vuln_id", ""),
     )
     return _cache_stored_record(
-        "validator", vuln_id, {"report": report, "peer_payloads": peers}, updated_vuln, token_usage
+        "validator", vuln_id, _strip_cvss_key({"report": report, "peer_payloads": peers}), updated_vuln, token_usage
     )
 
 
@@ -2802,7 +2853,7 @@ def cache_integration_auditor(report: dict, peers: Optional[list] = None, update
         key=lambda p: p.get("vuln_id", ""),
     )
     return _cache_stored_record(
-        "integration_auditor", vuln_id, {"report": report, "confirmed_vulns": peers_sorted}, updated_vuln, token_usage
+        "integration_auditor", vuln_id, _strip_cvss_key({"report": report, "confirmed_vulns": peers_sorted}), updated_vuln, token_usage
     )
 
 
@@ -2817,7 +2868,7 @@ def cache_patcher(report: dict, updated_vuln: Optional[dict] = None,
     resumed/repeated run never re-applies the edits. ``token_usage`` rides the
     stored value and is booked back on a read — see _cache_stored_record."""
     vuln_id = (report or {}).get("vuln_id") or "Unknown"
-    return _cache_stored_record("patchers", vuln_id, report or {}, updated_vuln, token_usage)
+    return _cache_stored_record("patchers", vuln_id, _strip_cvss_key(report or {}), updated_vuln, token_usage)
 
 
 def cache_reporter(report: dict, finding: Optional[dict] = None,

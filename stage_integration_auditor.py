@@ -6,13 +6,14 @@ import uuid
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Command, Send
 
+import settings
 import tools
 from llms import fast_llm, smart_llm
 from run_stats import _record_stat, _start_agent_progress, affected_nodes_label, as_dicts, record_llm_usage, steps_block
 from schemas import INTEGRATION_AUDITOR_AGENT
 from state import IntegrationAuditorState, MasterState, ValidatorState
 from tool_loop import CompactionConfig, ToolLoopAgent
-from utils import append_note, cache_integration_auditor
+from utils import append_note, cache_integration_auditor, cvss_gate_blocks
 
 
 def dispatch_integration_audits(state: MasterState):
@@ -22,11 +23,23 @@ def dispatch_integration_audits(state: MasterState):
     other `exploitable` records as chain candidates; nothing pending →
     `reporter_dispatch`."""
     all_vulns = as_dicts(state.get("vulnerabilities", []))
-    pending = [
-        v for v in all_vulns
-        if v.get("status") == "confirmed"
-        and v.get("validation_strategy") == "requires_integration"
-    ]
+    gated, pending = [], []
+    for v in all_vulns:
+        if v.get("status") != "confirmed" or v.get("validation_strategy") != "requires_integration":
+            continue
+        # Gate-checked here (dispatch_validators defers these before its own
+        # gate fires): a below-threshold estimate buys no auditor spend either;
+        # the record stays 'confirmed' and is reported unvalidated.
+        if cvss_gate_blocks(v, settings.validator_min_cvss):
+            gated.append(v)
+        else:
+            pending.append(v)
+    for v in gated:
+        logging.info(
+            f"{v.get('vuln_id')} CVSS estimate {v.get('cvss_vector')} below gate "
+            f"threshold {settings.validator_min_cvss} — integration audit skipped, "
+            f"will be reported unvalidated."
+        )
     proven = [v for v in all_vulns if v.get("status") == "exploitable"]
     logging.info(
         f"dispatch_integration_audits sees {len(all_vulns)} records, "

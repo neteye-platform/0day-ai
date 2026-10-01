@@ -67,7 +67,7 @@ llm_max_completion_tokens = 16384
 
 # =============================== Agents ==================================
 
-agents_concurrency = 4
+agents_concurrency = 5
 
 # Reviewer/validator loop caps: if the terminal tool isn't called within this many
 # LLM rounds, the loop ends via the fallback node instead of hitting the recursion
@@ -82,6 +82,14 @@ integration_auditor_countdown_start = max(1, integration_auditor_max_iterations 
 # Max times the Validator may request more context from the Reviewer per record;
 # past this it must conclude on the evidence it has.
 validator_feedback_max_rounds = 1
+
+# CVSS validation gate: a Reviewer-confirmed record whose own CVSS vector estimate
+# (submitted via submit_evaluation) computes below this base score is never sent to
+# the Validator/Integration Auditor — it stays 'confirmed' and is reported without
+# dynamic proof. Findings with a missing/unparseable estimate ALWAYS validate
+# (fail-open, so verdicts cached before the reviewer shipped vectors behave as
+# before). 0 (or negative) disables the gate entirely.
+validator_min_cvss = 7.0
 
 ## ---- Patcher agent ----
 

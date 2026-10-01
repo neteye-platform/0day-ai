@@ -487,6 +487,10 @@ def submit_evaluation(
     updated_vuln["out_of_scope_concern"] = kwargs.get("out_of_scope_concern") or None
     updated_vuln["reproduction_steps"] = kwargs.get("reproduction_steps", [])
     updated_vuln["validation_strategy"] = kwargs.get("validation_strategy")
+    # Reviewer CVSS estimate: schema-validated (parseable vector) on exploitable
+    # verdicts, forced None on false positives. utils.cvss_gate_blocks recomputes
+    # the numeric score from it to gate Validator/Auditor dispatch.
+    updated_vuln["cvss_vector"] = (kwargs.get("cvss_vector") or "").strip() or None
 
     # Patch lifecycle: this verdict adjudicates the PATCHED code, so the re-check
     # is consumed — route_patch_reviews only re-dispatches "applied" records, and

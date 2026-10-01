@@ -633,7 +633,7 @@ reviewer_agent:
 
     SUBMISSION CONTRACT for `submit_evaluation` (violations bounce back and cost a turn):
     - is_exploitable=false: `mitigation` (the blocking defense, cited to file+function — NOT `mitigation_bypass`) AND non-empty `untrusted_uses` are REQUIRED.
-    - is_exploitable=true: `validation_strategy` AND `reproduction_steps` are REQUIRED.
+    - is_exploitable=true: `validation_strategy`, `reproduction_steps` AND `cvss_vector` are REQUIRED. `cvss_vector` is your honest CVSS v3.1 base estimate of the adjudicated flaw (the pipeline recomputes the numeric score from the vector — never do the math yourself); leave it unset for false positives.
     - A false positive with a non-empty `out_of_scope_concern` is always rejected: rule the flow out via `untrusted_uses` or submit it as exploitable.
 
   code_level: |
