@@ -2,12 +2,12 @@
 
 Houses the ``ToolLoopAgent`` base class and its supporting helpers (the
 settings-backed compaction budget, history splitting, transcript rendering, and
-ledger summarization) shared by the reviewer and validator agents. Contains
-nothing reviewer- or validator-specific: the two concrete subclasses live in
-``nodes.py`` and supply their per-agent behavior through the base class's
-overridable hooks (``bind_tools``, ``pre_agent``, ``first_turn``,
-``session_state``, ``pre_router``, ``tool_batch_done``, ``fallback``) plus their
-own summary-ledger prompt text.
+ledger summarization) shared by the reviewer, validator and integration
+auditor. Contains nothing agent-specific: the concrete subclasses live in the
+``stage_*`` modules and supply per-agent behavior through the base class's
+overridable hooks (``bind_tools``, ``cached_verdict``, ``first_turn``,
+``session_state``, ``tool_batch_done``, ``fallback``) plus their own
+summary-ledger prompt text.
 """
 
 import json
@@ -278,8 +278,21 @@ class ToolLoopAgent:
         """Return the LLM bound to this agent's tool subset for this state."""
         raise NotImplementedError
 
+    # Verdict label used in the base pre_agent's cache-hit log line.
+    cache_hit_label: str = "Agent"
+
+    def cached_verdict(self, state) -> dict | None:
+        """Cached verdict record for this state, or None (base: never cached)."""
+        return None
+
     def pre_agent(self, state):
-        """Early return (e.g. a cache-hit Command); None to keep going."""
+        """Short-circuit the loop with a cached verdict before any LLM turn."""
+        if state.get("messages"):
+            return None
+        cached = self.cached_verdict(state)
+        if cached:
+            logging.info(f"{self.cache_hit_label} cache hit.")
+            return Command(update={"vulnerabilities": [cached]})
         return None
 
     def first_turn(self, state, llm_with_tools) -> dict:
@@ -290,8 +303,10 @@ class ToolLoopAgent:
         return {}
 
     def pre_router(self, state) -> bool:
-        """True to end the loop immediately (e.g. nothing was dispatched)."""
-        return False
+        """End the loop when a verdict already sits in `vulnerabilities` without
+        any LLM turn (pre_agent cache hit or a deterministic first_turn
+        resolution), so the router never indexes the still-empty `messages`."""
+        return not state.get("messages") and bool(state.get("vulnerabilities"))
 
     def tool_batch_done(self, state) -> bool:
         """True when the latest contiguous tool batch contains a successful

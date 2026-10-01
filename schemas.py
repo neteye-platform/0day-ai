@@ -524,13 +524,18 @@ class DemandEvaluation(BaseModel):
     status: Literal["MET", "FAILED", "DELEGATED", "OUT_OF_SCOPE"] = Field(
         description=(
             "MET: If the visible code explicitly implements standard, robust security controls (e.g., parameterized queries) that neutralize the threat.\n"
-            "FAILED: the code explicitly manipulates data insecurely IN PLAIN SIGHT, or implements a visibly weak/fragile mitigation (e.g., custom regex for path traversal).\n"
+            "FAILED: The code manipulates data insecurely, implements a weak/fragile mitigation, or completely omits a required check/counter (e.g. unmetered credential verification).\n"
             "DELEGATED: the code passes the untrusted data to a helper function, validator, or sanitizer whose implementation is NOT visible in the snippet.\n"
             "OUT_OF_SCOPE: the demand targets a different layer (e.g., expecting a database helper to handle HTTP cookies) or a different context (e.g., HTML configuration on a Markdown exporter)."
         )
     )
-    reasoning: str = Field(description="Brief explanation referencing specific lines of code.")
-    cwe: Optional[CWE_KEYS] = Field(description="The matching CWE ID from the provided list.")
+    evidence: str = Field(
+        description="A single factual statement (max 30 words) specifying the exact function call, sanitizer, or missing check that justifies the status."
+    )
+    cwe: Optional[CWE_KEYS] = Field(
+        default=None,
+        description="The matching CWE ID if status is FAILED; null otherwise."
+    )
 
 class VerifierOutput(BaseModel):
     evaluations: list[DemandEvaluation]
