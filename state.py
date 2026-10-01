@@ -56,6 +56,9 @@ class ReviewerState(TypedDict):
     node_id: str
     expert_report: dict
     mode: str  # "code_level" | "framework_dependency" | "dependency_mitigation" | "systemic"
+    # Ledger id from dispatch_reviewers; the base router advances it on every
+    # terminal route so the run log tracks reviewer fan-out.
+    progress_id: str
     # Number of LLM invocations in the tool loop. Bounds the loop so a model
     # that never submits a verdict ends gracefully via the fallback node.
     iterations: Annotated[int, operator.add]

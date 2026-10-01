@@ -13,7 +13,7 @@ import credential_finder
 import settings
 import tools
 from llms import fast_llm, smart_llm
-from run_stats import _record_stat, as_dicts
+from run_stats import _record_stat, _start_agent_progress, as_dicts
 from schemas import VALIDATOR_AGENT
 from state import MasterState, ReviewerState, ValidatorState
 from stage_reviewer import _primary_node, _reviewer_mode_for
@@ -159,12 +159,15 @@ def route_validator_feedback(state: MasterState):
     if not flagged:
         return "integration_audit_dispatch"
 
+    progress_id = _start_agent_progress(len(flagged))
+
     commands = []
     for record in flagged:
         payload = ReviewerState(
             node_id=_primary_node(record),
             expert_report=record,
             mode=_reviewer_mode_for(record),
+            progress_id=progress_id,
             iterations=0,
             vulnerabilities=[],
             messages=[]
@@ -173,7 +176,8 @@ def route_validator_feedback(state: MasterState):
 
     logging.info(
         f"Validator requested more context for {len(commands)} vulnerability(ies); "
-        f"dispatching reviewer feedback re-reviews."
+        f"dispatching reviewer feedback re-reviews: 0/{len(flagged)} complete, "
+        f"{len(flagged)} remaining."
     )
     _record_stat("reviewer_feedback_reviews", len(commands))
     return commands
