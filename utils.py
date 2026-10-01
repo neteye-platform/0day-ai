@@ -362,7 +362,6 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
     status_priority = {
         "hypothesis": 0,
         "review_error": 1,
-        "unreachable": 1,
         "confirmed": 2,
         # "chained" ranks above "confirmed" (auditor proved the record joins a
         # multi-step exploit) but below "exploitable" (a validator PoC outranks
