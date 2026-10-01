@@ -3,14 +3,16 @@ import logging
 import argparse
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
+from langgraph.types import RetryPolicy
 
 import tools
 from nodes import preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, reviewer_agent_node, ask_reviewer_for_tool, dispatch_all_tasks, dispatch_reviewers, dispatch_validators, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
 from state import MasterState, ReviewerState, ValidatorState
+from schemas import ReviewerOutput, ValidatorOutput
 
 
 def compile_reviewer():
-    reviewer_workflow = StateGraph(ReviewerState)
+    reviewer_workflow = StateGraph(ReviewerState, output_schema=ReviewerOutput)
     reviewer_workflow.add_node("reviewer_agent", reviewer_agent_node)
     reviewer_workflow.add_node("ask_reviewer_for_tool", ask_reviewer_for_tool)
     reviewer_workflow.add_node("reviewer_tools", ToolNode([
@@ -43,17 +45,32 @@ def compile_reviewer():
 
 
 def compile_validator():
-    validator_workflow = StateGraph(ValidatorState)
+    validator_workflow = StateGraph(ValidatorState, output_schema=ValidatorOutput)
     validator_workflow.add_node("validator_agent", validator_agent_node)
     validator_workflow.add_node("ask_validator_for_tool", ask_validator_for_tool)
     validator_workflow.add_node("validator_tools", ToolNode([
         tools.send_http_request,
-        tools.mark_validation_complete,
-        tools.take_notes
+        tools.list_files,
+        tools.read_file,
+        tools.mark_validation_complete
     ]))
     validator_workflow.add_edge(START, "validator_agent")
-    validator_workflow.add_conditional_edges("validator_agent", validator_router)
-    validator_workflow.add_edge("validator_tools", "validator_agent")
+    validator_workflow.add_conditional_edges(
+        "validator_agent",
+        validator_router,
+        {
+            "validator_tools": "validator_tools",
+            "ask_validator_for_tool": "ask_validator_for_tool"
+        }
+    )
+    validator_workflow.add_conditional_edges(
+        "validator_tools",
+        validator_router,
+        {
+            "validator_agent": "validator_agent",
+            "__end__": END
+        }
+    )
     validator_workflow.add_edge("ask_validator_for_tool", "validator_agent")
     compiled_validator_agent = validator_workflow.compile()
 
@@ -68,8 +85,8 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("cve_analyzer", cve_analyzer_node)
     workflow.add_node("aggregate_demands", aggregate_demands_node)
     workflow.add_node("contract_verifier", contract_verifier_node)
-    workflow.add_node("reviewer_agent", compile_reviewer())
-    workflow.add_node("validator_agent", compile_validator())
+    workflow.add_node("reviewer_agent", compiled_reviewer_agent)
+    workflow.add_node("validator_agent", compiled_validator_agent)
     workflow.add_node("synchronization", synchronization_node)
 
     workflow.add_edge(START, "preprocessor")
@@ -79,7 +96,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_edge("explorer_agent", "aggregate_demands")
     workflow.add_edge("cve_analyzer", "aggregate_demands")
 
-    workflow.add_conditional_edges("aggregate_demands", dispatch_verifiers, ["contract_verifier", "synchronization"])
+    workflow.add_conditional_edges("aggregate_demands", dispatch_verifiers, ["contract_verifier", "synchronization", END])
     workflow.add_edge("contract_verifier", "synchronization")
     workflow.add_conditional_edges("synchronization", dispatch_reviewers, ["reviewer_agent", END])
     workflow.add_conditional_edges("reviewer_agent", dispatch_validators, ["validator_agent", END])

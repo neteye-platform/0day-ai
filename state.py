@@ -2,7 +2,8 @@ import operator
 from pathlib import Path
 from typing import TypedDict, Any, Annotated
 from langgraph.graph.message import add_messages
-from schemas import AnalysisNote, ExpertTask, ValidationResult, VulnerabilityEvaluation
+from schemas import AnalysisNote, ExpertTask, ValidationResult, VulnerabilityEvaluation, VulnerabilityRecord
+from utils import merge_vulnerabilities
 
 
 class MasterState(TypedDict):
@@ -10,11 +11,12 @@ class MasterState(TypedDict):
     app_summary: str
     known_vulns: list[dict]
     expert_tasks: list[ExpertTask]
+
     notes: Annotated[list[AnalysisNote], operator.add]
     cve_demands: Annotated[list[dict], operator.add]
     grouped_demands: dict
-    vulnerability_hypothesis: Annotated[list[dict], operator.add]
-    confirmed_vulnerabilities: Annotated[list[ValidationResult], operator.add]
+
+    vulnerabilities: Annotated[list[VulnerabilityRecord], merge_vulnerabilities]
 
 class ExplorerState(TypedDict):
     node_id: str
@@ -31,15 +33,12 @@ class VerifierState(TypedDict):
 
 class ReviewerState(TypedDict):
     node_id: str
-    expert_report: list[dict]
+    expert_report: dict
     messages: Annotated[list, add_messages]
-    filtered_reports: Annotated[list[VulnerabilityEvaluation], operator.add]
 
 class ValidatorState(TypedDict):
     report_to_test: dict # The specific vulnerability to validate
     sandbox_url: str     # The endpoint/IP of the sandbox
     messages: Annotated[list, add_messages]
-    confirmed_vulnerabilities: Annotated[list[ValidationResult], operator.add]
     cookies: dict
-    notes: Annotated[list[str], operator.add]
 
