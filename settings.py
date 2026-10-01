@@ -68,7 +68,7 @@ reviewer_compaction_min_compressible_tokens = 4000
 reviewer_hard_reserved = 8192
 
 # Tool-loop guards for the compiled integration-auditor subgraph. The auditor
-# decides whether a `requires_chaining` vulnerability combines with other
+# decides whether a `requires_integration` vulnerability combines with other
 # confirmed findings; if it never calls submit_integration_audit within this
 # many LLM rounds, the loop terminates via the fallback node.
 integration_auditor_max_iterations = 20

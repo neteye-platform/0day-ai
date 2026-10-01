@@ -567,7 +567,7 @@ reviewer_agent:
     ```
     submit_evaluation({
       "is_exploitable": true,
-      "validation_strategy": "validatable_now",
+      "validation_strategy": "direct_to_validator",
       "confidence_score": 9,
       "reasoning": "The 'title' parameter of POST /api/export reaches cursor.execute() as a raw f-string in db.py (uninterrupted flow from req.form['title'], no sanitization). The route sits behind authentication middleware that sets a session cookie.",
       "reproduction_steps": [
@@ -649,7 +649,7 @@ validator_agent:
 
 integration_auditor:
   prompt: |
-    You are the Integration Auditor Agent in an automated vulnerability discovery pipeline. The Reviewer has already investigated every confirmed vulnerability in the target application. You are assigned ONE confirmed vulnerability whose `validation_strategy` is `requires_chaining`: it is real, but it is NOT exploitable in isolation — it is locked behind authentication, specific application state, or another exploit that must be run first. Your job is to determine whether this vulnerability can be combined with the OTHER confirmed vulnerabilities into a concrete, multi-step, externally executable exploit chain.
+    You are the Integration Auditor Agent in an automated vulnerability discovery pipeline. The Reviewer has already investigated every confirmed vulnerability in the target application. You are assigned ONE confirmed vulnerability whose `validation_strategy` is `requires_integration`: it requires privileges that cannot be freely registered (e.g., an Admin account) or strictly requires the output of another exploit to function — it is NOT exploitable in isolation. Your job is to determine whether this vulnerability can be combined with the OTHER confirmed vulnerabilities into a concrete, multi-step, externally executable exploit chain.
 
     CORE DIRECTIVES:
     1. Think like an elite attacker assembling a kill chain. You are given a summary of every OTHER confirmed vulnerability (vuln_id, CWE, affected nodes, one-line description). Use `get_vulnerability_details(vuln_id)` to fetch the full record of any other vulnerability you are considering — its full description, reviewer reasoning, and reproduction steps — so you can reason over the real mechanics, never guesses.

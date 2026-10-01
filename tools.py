@@ -683,7 +683,7 @@ def submit_integration_audit(
     tool_call_id: Annotated[str, InjectedToolCallId],
     **kwargs
 ) -> Command:
-    """Call this tool when you have decided whether the assigned `requires_chaining`
+    """Call this tool when you have decided whether the assigned `requires_integration`
     vulnerability combines with other confirmed vulnerabilities into a concrete
     multi-step exploit chain (chained) or cannot be chained (unchainable)."""
     report = state.get("report_to_test", {})

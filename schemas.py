@@ -168,13 +168,16 @@ class VulnerabilityRecord(BaseModel):
             "state carried from earlier steps) because the Validator cannot read source code."
         ),
     )
-    validation_strategy: Optional[Literal["validatable_now", "requires_chaining", "static_finding_only"]] = Field(
+    validation_strategy: Optional[Literal["direct_to_validator", "requires_integration", "static_finding_only"]] = Field(
         default=None,
         description=(
-            "Determines graph routing. 'direct_to_validator': The Validator can test this using "
-            "public endpoints or basic self-registration. 'requires_integration': The exploit "
-            "requires a pre-existing admin state, cross-user interaction, or chaining multiple "
-            "vulnerabilities. 'static_only': real in source but with no network-reachable path, "
+            "Determines graph routing. 'direct_to_validator': Use this if the vulnerability can "
+            "be triggered directly OR if its only prerequisites are freely attainable via public "
+            "endpoints (e.g., open self-registration, standard login). The Validator agent can "
+            "handle basic account creation. 'requires_integration': Use this ONLY if the "
+            "vulnerability requires privileges that cannot be freely registered (e.g., requires "
+            "an Admin account), or if it strictly requires the output of another exploit to "
+            "function. 'static_finding_only': real in source but with no network-reachable path, "
             "so it is accepted as static evidence into the final report without Validator testing."
         ),
     )
@@ -188,7 +191,7 @@ class VulnerabilityRecord(BaseModel):
         default=None,
         description=(
             "The Integration Auditor's reasoning for the `chained`/`unchainable` "
-            "verdict on a `requires_chaining` record."
+            "verdict on a `requires_integration` record."
         ),
     )
     chained_with: Optional[list[str]] = Field(
@@ -514,7 +517,7 @@ class EvaluationToolInput(BaseModel):
     is_exploitable: bool = Field(
         description="True if the vulnerability has a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by mitigations, implemented by the application."
     )
-    validation_strategy: Optional[Literal["validatable_now", "requires_chaining", "static_finding_only"]] = Field(
+    validation_strategy: Optional[Literal["direct_to_validator", "requires_integration", "static_finding_only"]] = Field(
         default=None,
         description=(
             "How this finding must be handled downstream, chosen from the triage rules.\n"
@@ -522,10 +525,13 @@ class EvaluationToolInput(BaseModel):
             "false positives (is_exploitable false).\n"
             "'static_finding_only' — 100% real in the source but has NO network-reachable "
             "exploit path (e.g. plaintext passwords stored in the DB).\n"
-            "'validatable_now' — a known external trigger exists (e.g. XSS, SQL injection).\n"
-            "'requires_chaining' — the vulnerability is real but NOT exploitable in "
-            "isolation: it is locked behind authentication, specific application state, "
-            "or another exploit that must be chained first."
+            "'direct_to_validator' — use this if the vulnerability can be triggered directly "
+            "OR if its only prerequisites are freely attainable via public endpoints (e.g., "
+            "open self-registration, standard login). The Validator agent can handle basic "
+            "account creation.\n"
+            "'requires_integration' — use this ONLY if the vulnerability requires privileges "
+            "that cannot be freely registered (e.g., requires an Admin account), or if it "
+            "strictly requires the output of another exploit to function."
         )
     )
     reasoning: str = Field(description="Brief technical explanation for the decision.")
@@ -550,7 +556,7 @@ class EvaluationToolInput(BaseModel):
         if self.is_exploitable and not self.validation_strategy:
             raise ValueError(
                 "validation_strategy is required when is_exploitable is true. "
-                "Pick one of 'validatable_now', 'requires_chaining', 'static_finding_only'. "
+                "Pick one of 'direct_to_validator', 'requires_integration', 'static_finding_only'. "
                 "Leave it unset only for false positives."
             )
         return self
