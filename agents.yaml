@@ -225,6 +225,11 @@ expert_agents:
         }
       ]
     }
+  batch_prompt: |
+    VULNERABILITY ATTRIBUTION RULE:
+    You are evaluating a batch of one or more code nodes. You MUST assign vulnerabilities ONLY to the specific node ID where the flawed logic resides.
+    - If you see a parent skeleton node with [Body omitted] markers, do not attribute vulnerabilities from the omitted bodies to the skeleton's ID.
+    - If a child function is provided raw without its parent file, assume all necessary imports and global variables are securely defined elsewhere. Do not report missing imports.
   WebSurfaceAuditor:
     prompt: You are an expert in HTTP abstractions, routing, middleware gates, and input contexts.
   LogicFlowAuditor:

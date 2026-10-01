@@ -134,6 +134,8 @@ communities_to_analyze = None # [32, 33, 54, 61]
 # When True, the explorer dispatches multiple small nodes sharing a file in a
 # single batch. Set to False to force one dispatch per node (no batching).
 explorer_batching_enabled = True
+# Maximum combined code size (in chars) for a batched explorer dispatch.
+explorer_batch_char_threshold = 10000
 
 # Max expert roles assigned per community (top-K by heuristic score). Reduces
 # duplicate explorer scans of the same nodes by multiple expert roles.
