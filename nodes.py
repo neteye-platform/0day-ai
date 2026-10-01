@@ -1315,9 +1315,17 @@ def aggregate_demands_node(state: MasterState):
 def dispatch_verifiers(state: MasterState):
     grouped_demands = state.get("grouped_demands", {})
 
-    # If no demands were found across the whole codebase, skip straight to the end
+    # No app-level demands to verify, but pending hypotheses (explorer
+    # findings, upgrade-only CVE hypotheses) may still await review. Only END
+    # when there is nothing at all; otherwise fall through to synchronization
+    # so dispatch_reviewers adjudicates them (contract_verifier is correctly
+    # skipped — there are no demands to verify).
     if not grouped_demands:
-        return END
+        pending = [
+            v.get("status") if isinstance(v, dict) else v.model_dump().get("status")
+            for v in state.get("vulnerabilities", [])
+        ]
+        return "synchronization" if "hypothesis" in pending else END
 
     commands: list[Send] = []
     progress_id = uuid.uuid4().hex
