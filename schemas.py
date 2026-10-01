@@ -32,6 +32,7 @@ cwes = {
     # --- SPECIFIC ACCESS CONTROL (Flat Tier) ---
     "CWE-862": "Missing Authorization",
     "CWE-863": "Incorrect Authorization",
+    "CWE-915": "Improperly Controlled Modification of Dynamically-Determined Object Attributes (Mass Assignment)",
     "CWE-639": "Authorization Bypass Through User-Controlled Key (IDOR)",
     "CWE-306": "Missing Authentication for Critical Function",
     # --- STATE & SESSION (Web / API) ---
@@ -66,12 +67,14 @@ SYSTEMIC_CWES = {
     "CWE-352",  # Cross-Site Request Forgery (CSRF)
     "CWE-384",  # Session Fixation
     "CWE-840",  # Business Logic Errors
+    "CWE-915",  # Improperly Controlled Modification of Dynamically-Determined Object Attributes (Mass Assignment)
 }
 
 CWE_KEYS = Literal[
     "CWE-119", "CWE-416", "CWE-476", "CWE-190", "CWE-362", "CWE-89",
     "CWE-78", "CWE-79", "CWE-94", "CWE-918", "CWE-862", "CWE-863",
-    "CWE-639", "CWE-306", "CWE-352", "CWE-384", "CWE-200", "CWE-319",
+    "CWE-915", "CWE-639", "CWE-306", "CWE-352", "CWE-384", "CWE-200",
+    "CWE-319",
     "CWE-327", "CWE-502", "CWE-22", "CWE-434", "CWE-770", "CWE-284",
     "CWE-20", "CWE-840", "OTHER_UNCATEGORIZED"
 ]
@@ -459,7 +462,7 @@ class Hypothesis(BaseModel):
         default=None,
         description=(
             "REQUIRED when cwe is a systemic/architectural class (CWE-327, CWE-319, "
-            "CWE-306, CWE-200, CWE-352, CWE-384, CWE-840): a SHORT canonical name of "
+            "CWE-306, CWE-200, CWE-352, CWE-384, CWE-840, CWE-915): a SHORT canonical name of "
             "at most six lowercase words identifying the insecure pattern, e.g. "
             "'plaintext password storage', 'no csrf token validation', 'weak tls ciphers'. "
             "Use the EXACT SAME label for every occurrence of the same pattern, so findings "
