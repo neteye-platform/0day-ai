@@ -21,6 +21,7 @@ import settings
 import tools
 import browser_tools
 import attacker_tools
+import credential_finder
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState, IntegrationAuditorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, INTEGRATION_AUDITOR_AGENT, EDGE_TRAVERSAL_AGENT, REPORTER_AGENT, ReporterOutput, cwes, EdgeTraversalOutput
 from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, is_path_excluded, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, scan_codebase_for_keywords, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, cache_validator, cache_integration_auditor, cache_reporter, reviewer_cache_key, is_feedback_review, cvss_v3_base_score, cvss_severity_label
@@ -2705,9 +2706,14 @@ class ValidatorAgent(ToolLoopAgent):
                 f"peer nodes are omitted because not relevant).\n"
                 f"{'\n\n'.join(code_sections)}"
             )
+        # Inject the pre-configured sandbox credentials (discovered during
+        # preprocessing) so the validator can authenticate when the exploit
+        # requires a logged-in or privileged session. Empty when none found.
+        auth_block = credential_finder.authentication_block()
         human_msg = HumanMessage(content=(
             f"Target Sandbox: {state['sandbox_url']}\n\n"
-            f"Vulnerability to Prove:\n{formatted_report}"
+            + (f"{auth_block}\n\n" if auth_block else "")
+            + f"Vulnerability to Prove:\n{formatted_report}"
         ))
         messages = [sys_msg, human_msg]
         response = llm_with_tools.invoke(messages)
@@ -2775,9 +2781,11 @@ class ValidatorAgent(ToolLoopAgent):
         # Save to cache so subsequent runs skip the (doomed) tool-calling loop.
         cache_validator(dict(state.get("report_to_test", {})), state.get("peer_payloads"), updated_vuln)
 
-        # Close any headless-browser sessions this validator opened (same
-        # per-agent cleanup the terminal tool performs).
+        # Close any headless-browser sessions and remove the dedicated attacker
+        # container this validator opened (same per-agent cleanup the terminal
+        # tool performs).
         browser_tools.manager.close_agent_sessions(state.get("agent_id"))
+        attacker_tools.manager.close_agent_sessions(state.get("agent_id"))
 
         return Command(
             update={
