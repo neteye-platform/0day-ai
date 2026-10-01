@@ -16,6 +16,14 @@ from langgraph.graph.message import add_messages
 import tools
 from utils import *
 
+import warnings
+warnings.filterwarnings("ignore", message=".*allowed_objects.*")
+
+from langchain_core.globals import set_llm_cache
+from langchain_community.cache import SQLiteCache
+
+set_llm_cache(SQLiteCache(database_path=".langchain_cache.db"))
+
 # ==========================================
 # State
 # ==========================================
@@ -213,6 +221,11 @@ def expert_agent_node(state: ExpertState) -> dict:
         messages = [sys_msg, human_msg, response]
     else:
         messages = state["messages"]
+
+        # Strip dynamically generated IDs for cache
+        for msg in messages:
+            msg.id = None
+
         response = llm_with_tools.invoke(messages)
         messages = [response]
 
@@ -341,8 +354,6 @@ if __name__ == "__main__":
     )
 
     try:
-        # Run the async stream and capture the returned final state
-        # final_state = asyncio.run(run_stream(app, initial_state))
         if "-v" in sys.argv:
             final_state = run_stream(app, initial_state)
         elif "-vv" in sys.argv:
