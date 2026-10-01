@@ -23,6 +23,7 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import Command
 
 import settings
+from run_stats import _log_agent_completion, as_dict
 from utils import estimate_message_tokens
 
 
@@ -272,6 +273,22 @@ class ToolLoopAgent:
         t = self.terminal_tool
         return [t] if isinstance(t, str) else list(t)
 
+    def _log_progress_completion(self, state, note: str = "") -> None:
+        """Advance the dispatch's progress ledger on a terminal route; no-op
+        for agents without a `progress_label`. The status of the resolved
+        record (when one is already in the channel) enriches the log line."""
+        if not self.progress_label:
+            return
+        detail = self._subject(state)
+        records = state.get("vulnerabilities") or []
+        if records:
+            detail += f", status={as_dict(records[-1]).get('status', 'unknown')}"
+        if note:
+            detail += f", {note}"
+        _log_agent_completion(
+            state.get("progress_id", ""), self.progress_label, detail
+        )
+
     # -- per-agent hooks ------------------------------------------------------
 
     def bind_tools(self, state):
@@ -280,6 +297,10 @@ class ToolLoopAgent:
 
     # Verdict label used in the base pre_agent's cache-hit log line.
     cache_hit_label: str = "Agent"
+    # Opt-in fan-out progress label: when set, the router advances the
+    # dispatch's progress ledger (state["progress_id"]) on every terminal
+    # route, logging "<label> progress: n/N complete ..." completion lines.
+    progress_label: str = ""
 
     def cached_verdict(self, state) -> dict | None:
         """Cached verdict record for this state, or None (base: never cached)."""
@@ -491,6 +512,7 @@ class ToolLoopAgent:
         messages = state["messages"]
 
         if self.pre_router(state):
+            self._log_progress_completion(state, "no LLM turn")
             return "__end__"
 
         # Hard loop guard: if the model never submits a verdict, terminate
@@ -500,6 +522,7 @@ class ToolLoopAgent:
                 f"{self.name} on {self._subject(state)} exceeded "
                 f"{self._max_iterations} iterations without a verdict; falling back."
             )
+            self._log_progress_completion(state, "iterations capped")
             return self.fallback_node_name
 
         last_message = messages[-1]
@@ -514,6 +537,7 @@ class ToolLoopAgent:
             # With parallel tool calls the model may submit a final evaluation
             # alongside other reads; end if any tool in the latest batch did.
             if self.tool_batch_done(state):
+                self._log_progress_completion(state)
                 return "__end__"
             return self.agent_node_name
 

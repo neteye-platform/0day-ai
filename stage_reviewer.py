@@ -9,7 +9,7 @@ import settings
 import tools
 from dedup import cluster_vulnerabilities
 from llms import fast_llm, reviewer_llm
-from run_stats import _record_stat, as_dicts, get_embedder
+from run_stats import _record_stat, _start_agent_progress, as_dicts, get_embedder
 from schemas import REVIEWER_AGENT
 from stage_edge_traversal import CROSS_BOUNDARY_VULN_TYPES
 from state import MasterState, ReviewerState
@@ -106,12 +106,20 @@ def dispatch_reviewers(state: MasterState):
         disk_cache_dir=settings.cache_dir / "hypothesis_embeddings",
     )
 
+    progress_id = _start_agent_progress(len(hypotheses))
+    logging.info(
+        "Starting reviewer pass: 0/%d complete, %d remaining.",
+        len(hypotheses),
+        len(hypotheses),
+    )
+
     commands = []
     for hypothesis in hypotheses:
         payload = ReviewerState(
             node_id=_primary_node(hypothesis),
             expert_report=hypothesis,
             mode=_reviewer_mode_for(hypothesis),
+            progress_id=progress_id,
             iterations=0,
             vulnerabilities=[],
             messages=[]
@@ -167,6 +175,7 @@ class ReviewerAgent(ToolLoopAgent):
 
     terminal_tool = "submit_evaluation"
     cache_hit_label = "Reviewer"
+    progress_label = "Reviewer"
 
     def bind_tools(self, state):
         mode = state.get("mode", "code_level")
