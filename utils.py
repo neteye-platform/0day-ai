@@ -918,15 +918,51 @@ def _resolver_indexes() -> dict:
     return _RESOLVE_INDEX_CACHE
 
 
+def _class_ids_for_hint(idx: dict, class_key: str) -> list:
+    """Container ids a textual class/module hint points at (label or file stem)."""
+    if not class_key:
+        return []
+    return list(dict.fromkeys(
+        idx["class_by_label"].get(class_key, []) + idx["by_stem"].get(class_key, [])
+    ))
+
+
+def _ancestor_closure(idx: dict, container_ids) -> list:
+    """Bounded transitive ancestors (inherits/extends/implements/mixes_in) of
+    the given container ids, BFS order, start nodes excluded."""
+    frontier = [cid for cid in container_ids if cid]
+    visited, out = set(frontier), []
+    for _ in range(8):
+        nxt = []
+        for cid in frontier:
+            for pcid in idx["parent_of"].get(cid, []):
+                if pcid in visited:
+                    continue
+                visited.add(pcid)
+                out.append(pcid)
+                nxt.append(pcid)
+        if not nxt:
+            break
+        frontier = nxt
+    return out
+
+
+def _caller_container(idx: dict, caller_node_id):
+    """The class node a member (or container) node id belongs to."""
+    if not caller_node_id:
+        return None
+    return idx["member_of"].get(caller_node_id) or (
+        caller_node_id if caller_node_id in idx["members"] else None
+    )
+
+
 def _inherited_member(idx: dict, class_key: str, member_key: str):
     """BFS the container inheritance closure for ``member_key``. Covers members
     that the hint-class merely inherits (``CommonDBTM::addStandardTab``
     defined on CommonGLPI)."""
     if not class_key or not member_key:
         return None
-    frontier = list(dict.fromkeys(
-        idx["class_by_label"].get(class_key, []) + idx["by_stem"].get(class_key, [])
-    ))
+    frontier = _class_ids_for_hint(idx, class_key)
     visited = set()
     for _ in range(8):  # bounded ancestor walk
         nxt = []
@@ -977,8 +1013,10 @@ def resolve_node_id(module, symbol, caller_node_id=None):
 
     ``caller_node_id`` enables caller-scoped resolution: a module of
     ``parent``/``self``/``static``/``this``/``$this`` maps to the caller's own
-    container (parents via inherits/extends/implements/mixes_in edges), which
-    used to be dropped outright. Without any module/class hint the lookup is
+    container (``parent`` = direct parents, ``self``/``static`` = the whole
+    bounded ancestor closure, mirroring PHP's own ``self::`` lookup through
+    inherits/extends/implements/mixes_in edges), which used to be dropped
+    outright. Without any module/class hint the lookup is
     GLOBAL-EXACT ONLY (unique normalized label); ambiguous bare method names
     (e.g. ``getFromDB``: 61 classes) deliberately miss instead of misrouting a
     security demand to a random class."""
@@ -996,14 +1034,15 @@ def resolve_node_id(module, symbol, caller_node_id=None):
     # Caller-scoped pronouns: parent::/self::/static::/$this-> resolve inside
     # the calling member's container (or its direct parents).
     if caller_node_id and lower_mod in _PRONOUN_MODULES:
-        container = idx["member_of"].get(caller_node_id) or (
-            caller_node_id if caller_node_id in idx["members"] else None
-        )
+        container = _caller_container(idx, caller_node_id)
         if container:
             scope = (
-                idx["parent_of"].get(container, [])
+                list(idx["parent_of"].get(container, []))
                 if lower_mod == "parent"
-                else [container]
+                # self/static/this resolve like PHP: own class first, then the
+                # inheritance chain (canView defined on CommonGLPI, called as
+                # self::canView() from a deep subclass member).
+                else [container, *_ancestor_closure(idx, [container])]
             )
             base = _norm_node_label(symbol)
             for cid in scope:
@@ -1077,6 +1116,19 @@ def resolve_node_id(module, symbol, caller_node_id=None):
         if mid:
             _record_stat("demand_nodes_resolved_fallback")
             return mid
+        # The hint may instead name an ANCESTOR of the caller while the method
+        # is defined on the caller's own class (the explorer attributed a
+        # self::/static:: call to the parent it is inherited through, e.g.
+        # Group_User's members tagged as CommonDBRelation::X): retry inside
+        # the caller's container before failing.
+        if caller_node_id and (caller_cls := _caller_container(idx, caller_node_id)):
+            ancestor_ids = _ancestor_closure(idx, [caller_cls])
+            if set(_class_ids_for_hint(idx, lower_class or base_module_name)) & set(ancestor_ids):
+                for cid in (caller_cls, *ancestor_ids):
+                    mid = idx["members"].get(cid, {}).get(lower_symbol_member)
+                    if mid:
+                        _record_stat("demand_nodes_resolved_fallback")
+                        return mid
     else:
         # No hint at all: global exact match only. When the label is shared by
         # several nodes, a bare call resolves to the function-style label node
