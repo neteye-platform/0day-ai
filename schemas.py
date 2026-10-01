@@ -178,14 +178,11 @@ class VulnerabilityRecord(BaseModel):
     validation_strategy: Optional[Literal["direct_to_validator", "requires_integration", "static_finding_only"]] = Field(
         default=None,
         description=(
-            "Determines graph routing. 'direct_to_validator': Use this if the vulnerability can "
-            "be triggered directly OR if its only prerequisites are freely attainable via public "
-            "endpoints (e.g., open self-registration, standard login). The Validator agent can "
-            "handle basic account creation. 'requires_integration': Use this ONLY if the "
-            "vulnerability requires privileges that cannot be freely registered (e.g., requires "
-            "an Admin account), or if it strictly requires the output of another exploit to "
-            "function. 'static_finding_only': real in source but with no network-reachable path, "
-            "so it is accepted as static evidence into the final report without Validator testing."
+            "Determines graph routing. 'direct_to_validator': Triggerable directly, or the "
+            "only barrier is authentication the Validator may already be provisioned for and "
+            "will attempt. 'requires_integration': Requires privileges the Validator cannot "
+            "obtain, or the output of another exploit. 'static_finding_only': real in source "
+            "but no network-reachable path."
         ),
     )
 
@@ -536,8 +533,8 @@ class EvaluationToolInput(BaseModel):
         default=None,
         description=(
             "REQUIRED when is_exploitable is true (pick exactly one). Leave unset for false positives.\n"
-            "- 'direct_to_validator': Triggerable directly OR prerequisites are freely attainable (e.g., open registration, standard login).\n"
-            "- 'requires_integration': Demands unregisterable privileges (e.g., Admin) OR the output of another confirmed exploit.\n"
+            "- 'direct_to_validator': Triggerable directly, or the only barrier is authentication the Validator may already be provisioned for and will attempt. Do NOT search for credentials — judge reachability only.\n"
+            "- 'requires_integration': Demands privileges the Validator cannot obtain OR the output of another confirmed exploit.\n"
             "- 'static_finding_only': 100% real in source code but NO network-reachable exploit path (e.g., plaintext DB passwords)."
         )
     )
@@ -665,7 +662,7 @@ class EdgeTraversalFinding(BaseModel):
         description="Explicit description of the semantic mismatch across the boundary (e.g., 'Node A strips the user auth token before enqueuing the task; Node B assumes every incoming queue task is pre-authorized')."
     )
     validation_strategy: Literal["direct_to_validator", "requires_integration", "static_finding_only"] = Field(
-        description="'requires_integration' for multi-step logic gaps that depend on another exploit output or unregisterable privileges; 'direct_to_validator' for infrastructure/parsing discrepancies reproducible over HTTP; 'static_finding_only' for real-in-source mismatches with no network-reachable path."
+        description="'requires_integration' for multi-step logic gaps that depend on another exploit output or privileges the Validator cannot obtain; 'direct_to_validator' for infrastructure/parsing discrepancies reproducible over HTTP; 'static_finding_only' for real-in-source mismatches with no network-reachable path."
     )
 
     @field_validator('affected_nodes')
