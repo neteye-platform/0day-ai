@@ -1509,18 +1509,46 @@ def _contract_verifier_node(state: VerifierState) -> dict:
         else:
             formatted_demands.append(f"- [ID: {source}] {desc}")
 
-    demands_string = "\n".join(formatted_demands)
+    # Chunked LLM invocation: the verifier emits one evaluation per demand, so
+    # output size scales with the demand count and a hub node (200+ demands)
+    # truncates a single call at fast_max_completion_tokens (finish_reason:
+    # length). Split the formatted demands into batches, evaluate each in its
+    # own structured call against the same target code, and merge the
+    # evaluations in order — every demand still gets exactly one evaluation.
+    # Each batch is cached separately, so a re-run or a task-level retry only
+    # pays for the batches that did not complete.
+    batch_size = settings.verifier_max_demands_per_call
+    batch_starts = range(0, len(formatted_demands), batch_size)
 
-    # LLM Invocation
     sys_msg = SystemMessage(content=f"{VERIFIER_AGENT['prompt']}")
-    human_msg = HumanMessage(content=f"```python\n{target_code}\n```\n\nSecurity Demands:\n{demands_string}")
-
     structured_llm = fast_llm.with_structured_output(VerifierOutput, method="json_schema", strict=True)
-    response = structured_llm.invoke([sys_msg, human_msg])
-    response = response if isinstance(response, dict) else response.model_dump()
+
+    evaluations = []
+    for b_idx in batch_starts:
+        batch = demands[b_idx : b_idx + batch_size]
+        batch_hash = hashlib.md5(json.dumps(batch, sort_keys=True).encode()).hexdigest()
+        batch_cache_file = (
+            settings.cache_dir
+            / "contract_verifier"
+            / f"{target_node_id}_batch{b_idx}_{batch_hash}.json"
+        )
+        batch_evals = None
+        cached_batch = cache(batch_cache_file, "read")
+        if cached_batch and isinstance(cached_batch.get("evaluations"), list):
+            batch_evals = cached_batch["evaluations"]
+        if batch_evals is None:
+            batch_demands_string = "\n".join(formatted_demands[b_idx : b_idx + batch_size])
+            human_msg = HumanMessage(
+                content=f"```python\n{target_code}\n```\n\nSecurity Demands:\n{batch_demands_string}"
+            )
+            response = structured_llm.invoke([sys_msg, human_msg])
+            response = response if isinstance(response, dict) else response.model_dump()
+            batch_evals = response.get("evaluations") or []
+            cache(batch_cache_file, "write", {"evaluations": batch_evals})
+        evaluations.extend(batch_evals)
 
     new_vulnerabilities = []
-    for eval in response.get("evaluations", []):
+    for eval in evaluations:
         # DELEGATED, OUT_OF_SCOPE, and MET will be safely ignored
         if eval.get("status") == "FAILED":
             # Retrieve the clean, original description from Python memory

@@ -119,6 +119,16 @@ integration_auditor_compaction_tail_turns = 1
 integration_auditor_compaction_min_compressible_tokens = 4000
 integration_auditor_hard_reserved = 8192
 
+# Contract verifier: max demands packed into ONE structured LLM call. The
+# verifier emits one DemandEvaluation per demand (status + reasoning + CWE), so
+# output tokens scale linearly with a node's demand count and any single-call
+# budget eventually truncates (openai.LengthFinishReasonError killed a run on
+# GLPI's TemplateRenderer::display with 225 downstream demands). Demands are
+# chunked into batches of this size, each cached separately, so a call's output
+# stays well under fast_max_completion_tokens (measured ~73-90 tokens per
+# evaluation; 40 x worst-case ~300 tokens still fits comfortably).
+verifier_max_demands_per_call = 40
+
 # Headless-browser toolset (browser_tools.py) for the validator. One shared
 # Firefox process serves all concurrent validators; each session_id gets an
 # isolated BrowserContext. browser_executable = None uses Playwright's own
