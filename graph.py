@@ -7,6 +7,7 @@ from langgraph.types import RetryPolicy
 
 import tools
 from nodes import preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, reviewer_agent_node, ask_reviewer_for_tool, dispatch_all_tasks, dispatch_reviewers, dispatch_validators, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
+from reachability import reachability_filter_node
 from state import MasterState, ReviewerState, ValidatorState
 from schemas import ReviewerOutput, ValidatorOutput
 
@@ -90,6 +91,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("reviewer_agent", compiled_reviewer_agent)
     workflow.add_node("validator_agent", compiled_validator_agent)
     workflow.add_node("synchronization", synchronization_node)
+    workflow.add_node("reachability_filter", reachability_filter_node)
     # workflow.add_node("reviewer_sync", synchronization_node)
 
     workflow.add_edge(START, "preprocessor")
@@ -101,7 +103,8 @@ def build_graph(checkpointer=None, interrupt_before=None):
 
     workflow.add_conditional_edges("aggregate_demands", dispatch_verifiers, ["contract_verifier", "synchronization", END])
     workflow.add_edge("contract_verifier", "synchronization")
-    workflow.add_conditional_edges("synchronization", dispatch_reviewers, ["reviewer_agent", END])
+    workflow.add_edge("synchronization", "reachability_filter")
+    workflow.add_conditional_edges("reachability_filter", dispatch_reviewers, ["reviewer_agent", END])
     # workflow.add_edge("reviewer_agent", "reviewer_sync")
     workflow.add_conditional_edges("reviewer_agent", dispatch_validators, ["validator_agent", END])
     workflow.add_edge("validator_agent", END)

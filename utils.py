@@ -142,9 +142,10 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
 
     status_priority = {
         "hypothesis": 0,
-        "confirmed": 1,
-        "false_positive": 2,
-        "proven": 3
+        "unreachable": 1,
+        "confirmed": 2,
+        "false_positive": 3,
+        "proven": 4
     }
 
     # Process new incoming updates
