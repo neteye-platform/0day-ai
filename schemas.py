@@ -513,43 +513,33 @@ class VerifierOutput(BaseModel):
 # ==========================================
 
 class EvaluationToolInput(BaseModel):
-    reasoning: str = Field(description="Brief technical explanation for the decision.")
-    is_vulnerable: bool = Field(
-        description="True if the specific node contains a defect, unsafe configuration, or lacks mitigation, regardless of whether it can currently be reached from the outside."
+    reasoning: str = Field(
+        description="Brief technical explanation for the decision."
+    )
+    mitigation_bypass: Optional[str] = Field(
+        description="Detailed description of how the security measures can be bypassed or how the application logic can be abused to exploit the vulnerability."
+        # description="True if the node contains a defect, unsafe configuration, lacks mitigation, or if the implemented safeguards can be bypassed, regardless of external reachability."
     )
     is_exploitable: bool = Field(
-        description="True if the vulnerability has a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by mitigations, implemented by the application."
+        description="True if there is a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by application mitigations."
     )
     validation_strategy: Optional[Literal["direct_to_validator", "requires_integration", "static_finding_only"]] = Field(
         default=None,
         description=(
-            "How this finding must be handled downstream, chosen from the triage rules.\n"
-            "REQUIRED when is_exploitable is true (pick exactly one); leave unset for "
-            "false positives (is_exploitable false).\n"
-            "'static_finding_only' — 100% real in the source but has NO network-reachable "
-            "exploit path (e.g. plaintext passwords stored in the DB).\n"
-            "'direct_to_validator' — use this if the vulnerability can be triggered directly "
-            "OR if its only prerequisites are freely attainable via public endpoints (e.g., "
-            "open self-registration, standard login). The Validator agent can handle basic "
-            "account creation.\n"
-            "'requires_integration' — use this ONLY if the vulnerability requires privileges "
-            "that cannot be freely registered (e.g., requires an Admin account), or if it "
-            "strictly requires the output of another exploit to function."
+            "REQUIRED when is_exploitable is true (pick exactly one). Leave unset for false positives.\n"
+            "- 'direct_to_validator': Triggerable directly OR prerequisites are freely attainable (e.g., open registration, standard login).\n"
+            "- 'requires_integration': Demands unregisterable privileges (e.g., Admin) OR the output of another confirmed exploit.\n"
+            "- 'static_finding_only': 100% real in source code but NO network-reachable exploit path (e.g., plaintext DB passwords)."
         )
     )
-    reproduction_steps: list[str] = Field(
+    reproduction_steps: Optional[list[str]] = Field(
         default_factory=list,
         description=(
-            "Chronological, numbered sequence of exact external actions required to "
-            "trigger and prove the vulnerability, e.g. '1. Authenticate by POSTing valid "
-            "credentials to /api/login (fields: username, password) and capture the session "
-            "cookie.', '2. Send POST /api/export with JSON body {\"title\":\"<payload>\"} "
-            "while carrying the session cookie.', '3. Confirm the reflected payload in the "
-            "response body.'. The downstream Validator CANNOT read source code, so every "
-            "step must be self-sufficient and executable over HTTP alone: state the HTTP "
-            "method, path, required parameters/headers/body, and any session state carried "
-            "from earlier steps. Fill this when is_exploitable is true; leave empty for "
-            "false positives."
+            "REQUIRED when is_exploitable is true. Leave unset for false positives.\n"
+            "Chronological, self-sufficient external actions required to trigger the vulnerability over HTTP. "
+            "The downstream Validator cannot read source code. You MUST state exact HTTP methods, paths, parameters, headers, and carried session state. "
+            "Example: '1. POST credentials to /api/login and capture cookie. 2. POST /api/export with JSON {\"title\":\"<payload>\"} using cookie.' "
+            "Leave empty for false positives."
         )
     )
 
