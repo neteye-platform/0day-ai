@@ -15,14 +15,12 @@ Design / lifecycle
   the container is started on the default bridge network under a pinned name.
   A stale container of the same name is replaced; after that the running box is
   reused without any build cost.
-- BRIDGE + TARGET REWRITE: the sandbox is published on all host interfaces and
-  is reachable from both the host and the attacker container at the docker bridge
+- BRIDGE + TARGET: the sandbox is published on all host interfaces and is
+  reachable from both the host and the attacker container at the docker bridge
   gateway (e.g. 172.17.0.1). The preprocessor sets ``sandbox_url`` to that gateway
-  URL for every validator path, so ``run_command`` no longer needs a different
-  address. ``shell_target`` still derives the gateway host from ``sandbox_url``
-  (idempotent: it already is the gateway) and every ``run_command`` result echoes
-  it as a ``SHELL TARGET`` header, identical to the ``sandbox_url`` the other
-  tools use.
+  URL for every validator path, so ``run_command`` shares one target address with
+  the HTTP/browser tools, and every ``run_command`` result echoes it as a
+  ``SHELL TARGET`` header.
 - FAIL OPEN: if docker is absent, the daemon is down, the image cannot be
   built, or the container cannot start, the tools report "attacker container
   unavailable" and the validator continues with its HTTP/browser tools.
@@ -39,21 +37,13 @@ import subprocess
 import threading
 from pathlib import Path
 from typing import Annotated
-from urllib.parse import urlparse
 
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
 import settings
-from utils import docker_bridge_gateway
 
 logger = logging.getLogger(__name__)
-
-ATTACKER_TOOL_NAMES = {
-    "run_command",
-    "write_attacker_file",
-    "read_attacker_file",
-}
 
 _REPO_ROOT = Path(__file__).resolve().parent
 ATTACKER_DIR = _REPO_ROOT / "attacker"
@@ -68,7 +58,6 @@ class AttackerManager:
 
     def __init__(self):
         self._container_name = None
-        self._gateway = None
         self._disabled = False
         self._disabled_reason = None
         self._boot_lock = threading.Lock()
@@ -133,12 +122,6 @@ class AttackerManager:
                 return None
 
             self._container_name = name
-            self._gateway = docker_bridge_gateway()
-            if self._gateway is None:
-                logger.warning(
-                    "Could not discover the docker bridge gateway; commands still "
-                    "run but run_command will not print a reachable SHELL TARGET."
-                )
             return name
 
     def _disable(self, reason: str):
@@ -250,34 +233,6 @@ class AttackerManager:
             return False
         logger.info("Started attacker container '%s' from image %s.", name, image)
         return True
-
-    # -- target rewrite ---------------------------------------------------------
-
-    def shell_target(self, state) -> str | None:
-        """Return the sandbox URL reachable from the attacker box.
-
-        ``sandbox_url`` is already the docker bridge gateway URL (e.g.
-        ``http://172.17.0.1:<port>``); inside the bridge-networked attacker
-        container the host is at ``self._gateway``. This rewrites the host to
-        ``self._gateway`` (idempotent when ``sandbox_url`` already uses it) and
-        returns ``http://<gateway>:<port>``, or None when no reachable target is
-        known.
-        """
-        if not self._gateway:
-            return None
-        sandbox_url = (
-            (state or {}).get("sandbox_url") if isinstance(state, dict) else None
-        )
-        if not sandbox_url:
-            return None
-        try:
-            netloc = urlparse(sandbox_url).netloc
-        except Exception:
-            return None
-        host, sep, port = netloc.rpartition(":")
-        if not sep or not port.isdigit():
-            return None
-        return f"http://{self._gateway}:{port}"
 
 
 manager = AttackerManager()

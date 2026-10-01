@@ -172,7 +172,6 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
     return {
         "known_vulns": clean_vulns,
         "sandbox_url": sandbox_data["sandbox_url"] if sandbox_data else None,
-        "container_name": sandbox_data["container_name"] if sandbox_data else None,
     }
 
 # ==========================================
@@ -1886,7 +1885,6 @@ def dispatch_validators(state: MasterState):
         payload = ValidatorState(
             report_to_test=evaluation,
             sandbox_url=state.get("sandbox_url"),
-            container_name=state.get("container_name"),
             messages=[],
             iterations=0,
             vulnerabilities=[],
@@ -2123,7 +2121,6 @@ def route_integration_audit(state: MasterState):
         payload = ValidatorState(
             report_to_test=record,
             sandbox_url=state.get("sandbox_url"),
-            container_name=state.get("container_name"),
             messages=[],
             iterations=0,
             vulnerabilities=[],

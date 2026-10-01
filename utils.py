@@ -10,7 +10,7 @@ import json
 import tarfile
 import time
 import requests
-from typing import Any, Optional
+from typing import Optional
 from langchain_core.messages import AnyMessage
 from schemas import VulnerabilityRecord
 import settings
@@ -426,31 +426,6 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
             vuln_map[vid] = update
 
     return list(vuln_map.values())
-
-
-def extract_subgraph(G: nx.DiGraph, target_communities: list) -> nx.DiGraph:
-    """
-    Creates a subgraph containing only the nodes in the target communities,
-    plus a 1-hop perimeter of incoming/outgoing connections.
-    """
-    target_nodes = set()
-
-    # Find all nodes belonging to the assigned communities
-    for node_id, data in G.nodes(data=True):
-        if str(data.get('community')) in target_communities:
-            target_nodes.add(node_id)
-
-    # Include 1-hop neighbors to provide boundary context
-    perimeter_nodes = set(target_nodes)
-    for node in target_nodes:
-        # Add nodes that call into our target community
-        perimeter_nodes.update(G.predecessors(node))
-        # Add nodes that our target community calls
-        perimeter_nodes.update(G.successors(node))
-
-    # Create and return the isolated subgraph
-    subgraph = G.subgraph(perimeter_nodes).copy()
-    return subgraph
 
 
 def estimate_message_tokens(messages: list[AnyMessage]) -> int:

@@ -8,12 +8,10 @@ from bs4 import BeautifulSoup
 from langgraph.prebuilt import InjectedState
 from langchain_core.tools import tool, InjectedToolCallId
 from langgraph.types import Command
-import docker
-from docker.errors import NotFound, APIError
 import re
 import networkx as nx
 
-from schemas import EvaluationToolInput, AnalysisNote, PackageCheck, ValidationToolInput, AskForContextInput, IntegrationAuditInput, VulnerabilityDetailsInput, cwes
+from schemas import EvaluationToolInput, ValidationToolInput, AskForContextInput, IntegrationAuditInput, VulnerabilityDetailsInput, cwes
 from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer, reviewer_cache_key
 from languages import MANIFEST_NAMES
 import settings
@@ -386,44 +384,6 @@ def find_in_container(keyword: str, is_regex: bool = False) -> str:
         "read_container_artifact(file_path='<slug>/rootfs/<path>').\n"
         + "\n".join(matches)
     )
-
-
-@tool
-def check_package_vulnerability(packages: list[PackageCheck]) -> list:
-    """
-    Use this tool immediately whenever you parse a dependency manifest (like
-    package.json or requirements.txt) to check for known vulnerabilities.
-    """
-    output = []
-    for pkg in packages:
-        query = {"package": {"name": pkg.name}, "version": pkg.version}
-        response = requests.post("https://api.osv.dev/v1/query", json=query)
-        data = json.loads(response.text)
-        vulns = data.get("vulns", [])
-
-        if not vulns:
-            output.append(f"[OK] {pkg.name}@{pkg.version}: No vulnerabilities found.")
-            continue
-
-        pkg_out = f"\n\n{pkg.name}\n"
-        for vuln in vulns:
-            details = vuln.get("details")
-            if not details:
-                continue
-            pkg_out += f"  ID: {vuln.get('id', 'Unknown')}"
-            pkg_out += f"  Aliases: {', '.join(vuln.get('aliases', []))}"
-            pkg_out += f"  Details: {vuln.get('details', '')}"
-            pkg_out += f"  Severity: {', '.join([s.get('score') for s in vuln.get('severity', [])])}"
-
-        return output
-
-    return []
-
-
-@tool
-def mark_task_complete(summary: str = "") -> dict:
-    """Call this tool ONLY when you have analyzed EVERY single node assigned to you and are ready to finish."""
-    return {"audit_status": "completed", "summary": summary}
 
 
 @tool(args_schema=EvaluationToolInput)
@@ -978,83 +938,6 @@ def get_path(source_node: str, target_node: str) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"Error traversing graph: {str(e)}"
-
-
-@tool
-def list_files(path: str = ".", state: Annotated[dict, InjectedState] = {}) -> str:
-    """
-    Lists files and directories in the specified path within the sandbox container.
-    CRITICAL INSTRUCTION: Use this tool ONLY to verify the success of an exploit.
-    DO NOT use this tool for initial reconnaissance, to read the source code, 
-    or to understand the application structure. You already have all the context you need.
-
-    Args:
-        path (str): The directory path to inspect inside the container. Defaults to the current working directory.
-
-    Returns:
-        str: The raw output of the `ls -la` command, or an error message if the path doesn't exist.
-    """
-    container_name = state.get("container_name")
-    if not container_name:
-        return "Error: No sandbox container is configured. Ensure the preprocessor started the sandbox."
-
-    try:
-        client = docker.from_env()
-        container = client.containers.get(container_name)
-
-        # Execute the 'ls -la' command inside the container
-        exit_code, output = container.exec_run(["ls", "-la", path])
-        if not isinstance(output, bytes):
-            return f"Error: Expected bytes, got {type(output).__name__}"
-
-        decoded_output = output.decode("utf-8")
-
-        if exit_code != 0:
-            return f"Error listing files at '{path}':\n{decoded_output}"
-
-        return decoded_output
-
-    except NotFound:
-        return f"Error: Container '{container_name}' not found. Ensure the sandbox is running."
-    except Exception as e:
-        return f"An unexpected error occurred: {str(e)}"
-
-
-@tool
-def read_sandbox_file(path: str, state: Annotated[dict, InjectedState] = {}) -> str:
-    """
-    Reads the content of a file from the sandbox container.
-    CRITICAL INSTRUCTION: Use this tool ONLY to verify the success of an exploit.
-    DO NOT use this tool for initial reconnaissance, to read the source code, 
-    or to understand the application structure. You already have all the context you need.
-
-    Args:
-        path: The absolute or relative path to the file inside the sandbox.
-    """
-    container_name = state.get("container_name")
-    if not container_name:
-        return "Error: No sandbox container is configured. Ensure the preprocessor started the sandbox."
-
-    try:
-        client = docker.from_env()
-        container = client.containers.get(container_name)
-
-        exit_code, output = container.exec_run(["cat", path])
-        if not isinstance(output, bytes):
-            return f"Error: Expected bytes, got {type(output).__name__}"
-
-        if exit_code == 0:
-            return output.decode('utf-8')
-        else:
-            error_msg = output.decode('utf-8').strip()
-            return f"Error reading file '{path}': {error_msg} (Exit code: {exit_code})"
-
-    except NotFound:
-        return f"Error: The container '{container_name}' could not be found."
-    except APIError as e:
-        return f"Error: Docker API issue occurred: {str(e)}"
-    except Exception as e:
-        return f"Error: An unexpected error occurred: {str(e)}"
 
 
 @tool
