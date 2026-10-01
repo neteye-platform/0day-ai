@@ -1,33 +1,39 @@
 import operator
+from pathlib import Path
 from typing import TypedDict, Any, Annotated
 from langgraph.graph.message import add_messages
-from schemas import ExpertTask, ValidationResult, VulnerabilityEvaluation
+from schemas import AnalysisNote, ExpertTask, ValidationResult, VulnerabilityEvaluation
 
 
 class MasterState(TypedDict):
-    graph_path: str
+    graph: dict[str, Any]
     app_summary: str
-    communities_map: dict[str, list[str]] # Maps community ID to list of node IDs
+    known_vulns: list[dict]
     expert_tasks: list[ExpertTask]
-    vulnerability_reports: Annotated[list[dict[str, Any]], operator.add] # Aggregated findings
-    filtered_reports: Annotated[list[VulnerabilityEvaluation], operator.add]
+    notes: Annotated[list[AnalysisNote], operator.add]
+    cve_demands: Annotated[list[dict], operator.add]
+    grouped_demands: dict
+    vulnerability_hypothesis: Annotated[list[dict], operator.add]
     confirmed_vulnerabilities: Annotated[list[ValidationResult], operator.add]
-    manager_message: Any
 
-class ExpertState(TypedDict):
-    task: ExpertTask
-    subgraph_nodes: list[str]
-    unprocessed_nodes: list[str]
-    messages: Annotated[list, add_messages] # Tracks the conversation and tool calls
-    vulnerability_reports: Annotated[list[dict[str, Any]], operator.add]
-    notes: Annotated[list[dict], operator.add]
+class ExplorerState(TypedDict):
+    node_id: str
+    role: str
+    task_description: str
+
+class CVEAnalyzerState(TypedDict):
+    cve: dict
+
+class VerifierState(TypedDict):
+    target_node_id: str
+    target_code: str
+    incoming_demands: list[dict] # List of assumptions about one node
 
 class ReviewerState(TypedDict):
-    report_id: str
+    node_id: str
     expert_report: list[dict]
     messages: Annotated[list, add_messages]
     filtered_reports: Annotated[list[VulnerabilityEvaluation], operator.add]
-    notes: Annotated[list[str], operator.add]
 
 class ValidatorState(TypedDict):
     report_to_test: dict # The specific vulnerability to validate
