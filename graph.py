@@ -175,7 +175,7 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_conditional_edges("validator_agent", route_validator_feedback, ["reviewer_agent", END])
 
     app = workflow.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)
-    app = app.with_config({"max_concurrency": settings.simple_agents_concurrency})
+    app = app.with_config({"max_concurrency": settings.agents_concurrency})
 
     return app
 
