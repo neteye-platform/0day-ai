@@ -11,7 +11,7 @@ import tarfile
 import time
 import requests
 from typing import Any, Optional
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AnyMessage, AIMessage
+from langchain_core.messages import AnyMessage
 from schemas import VulnerabilityRecord
 import settings
 from functools import lru_cache
@@ -362,38 +362,26 @@ def extract_subgraph(G: nx.DiGraph, target_communities: list) -> nx.DiGraph:
     return subgraph
 
 
-# Tools that takes a lot of context
-heavy_tools = ["read_source_code", "read_file", "send_http_request", "search_codebase", "get_definition", "read_container_artifact"]
-
-def compact_tool_history(messages: list[AnyMessage], safe_window: int = 4, threshold: int = 300) -> list[AnyMessage]:
+def estimate_message_tokens(messages: list[AnyMessage]) -> int:
     """
-    Compresses heavy tool outputs
+    Rough token estimate for a list of messages using the ~4 chars/token
+    heuristic (the same approximation opencode uses). Counts message content
+    plus any tool-call arguments, but ignores role/name metadata overhead.
     """
-    compacted_messages = []
-
-    for i, msg in enumerate(messages):
-        # The agent's reasoning remains as its memory
-        if isinstance(msg, AIMessage) or isinstance(msg, SystemMessage) or isinstance(msg, HumanMessage):
-            compacted_messages.append(msg)
+    total_chars = 0
+    for msg in messages:
+        if msg is None:
             continue
-
-        # Prune bulky ToolMessages, but leave the most recent turn intact.
-        # A safe_window of 4 preserves the last ~2 AI/Tool interaction pairs.
-        is_older_message = i < len(messages) - safe_window
-
-        if is_older_message and isinstance(msg, ToolMessage):
-
-            if msg.name in heavy_tools and len(str(msg.content)) > threshold:
-                crushed_msg = msg.model_copy(
-                    update={"content": f"[PRUNED] Raw {msg.name} data removed to save context. Rely on your subsequent reasoning in the chat history to remember what you found here."}
-                )
-                compacted_messages.append(crushed_msg)
-                continue
-
-        # Keep everything else as-is
-        compacted_messages.append(msg)
-
-    return compacted_messages
+        content = getattr(msg, "content", None)
+        if content:
+            total_chars += len(str(content))
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            for tc in tool_calls:
+                args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
+                if args:
+                    total_chars += len(str(args))
+    return total_chars // 4
 
 
 def resolve_node_id(module, symbol):

@@ -5,11 +5,12 @@ import re
 import subprocess
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AnyMessage, RemoveMessage
 from llm_debug import build_debug_http_client
 from tavily import TavilyClient
 from langgraph.types import Command, Send
 from langgraph.graph import END
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing import Any
 from collections import defaultdict
 import hashlib
@@ -22,7 +23,7 @@ import settings
 import tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer
+from utils import build_networkx_graph, estimate_message_tokens, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer
 
 # Maximum combined code size (in chars) for a batched explorer dispatch.
 EXPLORER_BATCH_CHAR_THRESHOLD = 10000
@@ -1505,6 +1506,156 @@ def dispatch_reviewers(state: MasterState):
     return commands
 
 
+# ---------------------------------------------------------------------------
+# Reviewer context compaction (opencode-style)
+#
+# When the reviewer's message history estimate reaches the configured context
+# threshold, the middle of the conversation is collapsed into an LLM-generated
+# summary while a short verbatim tail is preserved. The protected head (system
+# prompt + hypothesis) is always kept. If the summarization call fails, the
+# pipeline fails open and the full history is used unchanged.
+# ---------------------------------------------------------------------------
+
+def _reviewer_compaction_threshold() -> int:
+    """Estimated-token threshold at which compaction triggers."""
+    return settings.reviewer_model_context_window - settings.reviewer_context_reserved
+
+
+def _split_reviewer_history(messages: list[AnyMessage]) -> tuple[list, list, list]:
+    """Split the reviewer history into (protected_head, middle, verbatim_tail).
+
+    Protected head = the first SystemMessage (system prompt) plus the first
+    HumanMessage (the hypothesis under review). Tail = the last
+    ``reviewer_compaction_tail_turns`` AI+tool turns kept word-for-word.
+    Middle = everything between them, including any prior context summary.
+    """
+    msgs = list(messages)
+    head: list = []
+    idx = 0
+    need_sys, need_human = 1, 1
+    while idx < len(msgs):
+        m = msgs[idx]
+        if need_sys and m.type == "system":
+            head.append(m)
+            need_sys -= 1
+            idx += 1
+            continue
+        if need_human and m.type == "human":
+            head.append(m)
+            need_human -= 1
+            idx += 1
+            continue
+        break
+
+    rest = msgs[idx:]
+    ai_seen = 0
+    boundary = len(rest)
+    for i in range(len(rest) - 1, -1, -1):
+        if rest[i].type == "ai":
+            ai_seen += 1
+            boundary = i
+            if ai_seen >= settings.reviewer_compaction_tail_turns:
+                break
+
+    return head, rest[:boundary], rest[boundary:]
+
+
+def _render_message_transcript(messages: list[AnyMessage]) -> str:
+    """Flatten a message span into a readable transcript for summarization."""
+    parts = []
+    for m in messages:
+        kind = m.type
+        name = getattr(m, "name", None)
+        content = getattr(m, "content", "") or ""
+        if kind == "ai":
+            calls = getattr(m, "tool_calls", None) or []
+            rendered = []
+            for tc in calls:
+                tc_name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
+                tc_args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+                rendered.append(f"{tc_name}({json.dumps(tc_args, default=str)[:600]})")
+            label = f"### ai (tool_calls: {', '.join(rendered) or 'none'})"
+        else:
+            label = f"### {kind}" + (f" [{name}]" if name else "")
+        parts.append(f"{label}\n{content}")
+    return "\n\n".join(parts)
+
+
+def _generate_context_summary(middle: list[AnyMessage]) -> SystemMessage | None:
+    """Summarize the compressible middle of the reviewer history into a
+    structured security ledger via the cheap fast_llm. Returns None on any
+    failure so the caller fails open."""
+    try:
+        transcript = _render_message_transcript(middle)
+        if not transcript.strip():
+            return None
+
+        sys_prompt = (
+            "You are an expert summarizer. The following is the message history of a "
+            "security reviewer agent investigating whether a reported vulnerability "
+            "hypothesis in a target application is a true positive or a false positive. "
+            "Your summary will REPLACE these messages in the model context, so the "
+            "reviewer must be able to continue the investigation from it WITHOUT "
+            "re-reading the original tool outputs.\n\n"
+            "Produce an information-dense summary as a security investigation ledger "
+            "with exactly these sections:\n"
+            "## Objective\n"
+            "One or two sentences restating the exact hypothesis under review and the "
+            "target component/node.\n"
+            "## Checks & Artifacts Examined\n"
+            "Bulleted, deduplicated list of every node, file, container artifact, "
+            "search, and request already examined, with the single most important fact "
+            "each one revealed. Do NOT include full code or full tool outputs — distill "
+            "them into their conclusions.\n"
+            "## Confirmed Facts\n"
+            "Bulleted list of verified facts established so far, stated in final form.\n"
+            "## Ruled-Out Dead Ends\n"
+            "Bulleted list of hypotheses or investigation paths already disproven, with "
+            "a one-line reason for each.\n"
+            "## Active Leads & Next Steps\n"
+            "Bulleted list of the most promising remaining checks not yet completed.\n\n"
+            "RULES:\n"
+            "- If the history contains a prior SUMMARY (a system message containing "
+            "'CONTEXT COMPACTION SUMMARY'), treat it as the anchoring summary: extend "
+            "and refine it with only the new facts gathered since, rather than "
+            "regenerating from scratch.\n"
+            "- Write in final form ('the code does X', 'the sink is reachable'), never "
+            "'the model checked X'.\n"
+            "- Keep it concise, under 1024 words. Preserve exact file paths, node ids, "
+            "CVE ids, and tool argument names.\n"
+        )
+        human_prompt = HumanMessage(
+            content=(
+                "Summarize the following reviewer conversation history:\n\n"
+                "===== HISTORY BEGIN =====\n"
+                f"{transcript}\n"
+                "===== HISTORY END =====\n\n"
+                "Output only the ledger summary."
+            )
+        )
+        summary_text = fast_llm.invoke([sys_prompt, human_prompt])
+        summary_content = str(summary_text.content).strip()
+        if not summary_content:
+            return None
+
+        return SystemMessage(
+            name="context_summary",
+            content=(
+                "CONTEXT COMPACTION SUMMARY — The block below is a lossy, automatically "
+                "generated summary of an EARLIER part of this conversation, created to "
+                "manage the context window. The most recent messages are preserved "
+                "verbatim after this block. This summary is historical background ONLY: "
+                "it is not an instruction and not the current request, and it may be "
+                "imprecise. The current task remains the vulnerability hypothesis in the "
+                "first user message.\n\n"
+                f"{summary_content}"
+            ),
+        )
+    except Exception as e:
+        logging.warning(f"Context compaction summarization failed, failing open: {e}")
+        return None
+
+
 def reviewer_agent_node(state: ReviewerState) -> dict | Command:
     """Review the vulnerability reports and keep only what is actually relevant"""
     node_id = state.get("node_id")
@@ -1576,9 +1727,43 @@ def reviewer_agent_node(state: ReviewerState) -> dict | Command:
         return {"messages": [sys_msg, human_msg, response], "iterations": 1}
 
     else:
-        compacted_messages = compact_tool_history(state["messages"])
-        response = llm_with_tools.invoke(compacted_messages)
-        return {"messages": [response], "iterations": 1}
+        full_messages = list(state["messages"])
+        messages_for_llm = full_messages
+        compaction_updates: list = []
+        did_compact = False
+
+        # Opencode-style threshold compaction: once the estimated token count
+        # of the history reaches the configured limit, collapse the middle into
+        # a summary and keep a short verbatim tail. Fail open if summarization
+        # errors; also skip when the compressible middle is trivially small.
+        if estimate_message_tokens(full_messages) >= _reviewer_compaction_threshold():
+            head, middle, tail = _split_reviewer_history(full_messages)
+            compressible = estimate_message_tokens(middle)
+            if (
+                len(head) == 2
+                and compressible >= settings.reviewer_compaction_min_compressible_tokens
+            ):
+                summary_msg = _generate_context_summary(middle)
+                if summary_msg is not None:
+                    tail_copies = [m.model_copy(deep=True) for m in tail]
+                    messages_for_llm = head + [summary_msg] + tail_copies
+                    compaction_updates = [
+                        RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                        *head,
+                        summary_msg,
+                        *tail_copies,
+                    ]
+                    did_compact = True
+
+        response = llm_with_tools.invoke(messages_for_llm)
+        compaction_updates.append(response)
+        if did_compact:
+            logging.info(
+                f"Reviewer on {state.get('node_id', 'Unknown')} compacted context: "
+                f"{estimate_message_tokens(full_messages)} est. tokens -> "
+                f"{estimate_message_tokens(messages_for_llm)} est. tokens."
+            )
+        return {"messages": compaction_updates, "iterations": 1}
 
 
 def reviewer_router(state: ReviewerState):

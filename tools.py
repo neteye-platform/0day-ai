@@ -19,14 +19,13 @@ import settings
 
 
 @tool
-def read_source_code(node_id: str, reason_for_reading: str, current_state: str, state: Annotated[dict, InjectedState]) -> str:
+def read_source_code(node_id: str, reason_for_reading: str, state: Annotated[dict, InjectedState]) -> str:
     """
     Fetches the source code for a given Node ID.
 
     Args:
         node_id (str): The exact ID of the node to read (e.g., 'src_main_query_db').
         reason_for_reading (str): Explain exactly why you need to read THIS specific node next, and how you expect it to connect to your current knowledge.
-        current_state (str): A detailed summary of the your current state and the outcome of your previous command.
     """
     messages = state.get("messages", [])
     for msg in messages[:-1]:
@@ -103,7 +102,7 @@ def _read_lines_range(file_path: str, target: Path, start_line: int,
 
 
 @tool
-def read_file(file_path: str, thought: str, current_state: str, start_line: int = 1, end_line: int | None = None) -> str:
+def read_file(file_path: str, start_line: int = 1, end_line: int | None = None) -> str:
     """
     Reads a specific line range of a file from the application directory by path.
     Use this for files that are NOT in the application graph (e.g., Dockerfile, config files, templates).
@@ -114,8 +113,6 @@ def read_file(file_path: str, thought: str, current_state: str, start_line: int 
         file_path (str): Path to the file, relative to the application root (e.g., 'Dockerfile', 'config/settings.py').
         start_line (int): First line to read, 1-indexed and inclusive. Defaults to 1.
         end_line (int): Last line to read, 1-indexed and inclusive. Defaults to the end of the file (or the 150-line cap).
-        thought (str): Explain explicitly why you need to read this file and what you expect to find in it.
-        current_state (str): A detailed summary of the your current state and the outcome of your previous command.
     """
     app_dir = Path(settings.app_path).resolve()
     target = (app_dir / file_path).resolve()
@@ -138,7 +135,7 @@ CONTAINER_ARTIFACT_MAX_SUMMARY_FILES = 300
 
 
 @tool
-def list_container_artifacts(thought: str, current_state: str) -> str:
+def list_container_artifacts() -> str:
     """
     Lists the config/build artifacts extracted from the BUILT container image(s)
     during pre-processing, plus image metadata (WORKDIR, ENTRYPOINT, CMD, EXPOSE,
@@ -150,9 +147,7 @@ def list_container_artifacts(thought: str, current_state: str) -> str:
     script, or credentials baked into the image ENV) — without touching the
     live sandbox.
 
-    Args:
-        thought (str): Explain explicitly what runtime configuration you need to verify and how it connects to the vulnerability you are investigating.
-        current_state (str): A detailed summary of your current state and the outcome of your previous command.
+    This tool takes no arguments.
     """
     artifacts_root = get_container_artifacts_root().resolve()
 
@@ -255,7 +250,7 @@ def list_container_artifacts(thought: str, current_state: str) -> str:
 
 
 @tool
-def read_container_artifact(file_path: str, thought: str, current_state: str, start_line: int = 1, end_line: int | None = None) -> str:
+def read_container_artifact(file_path: str, start_line: int = 1, end_line: int | None = None) -> str:
     """
     Reads a specific line range of a file extracted from the BUILT container
     image snapshot. Use this to inspect effective runtime configuration that is
@@ -272,8 +267,6 @@ def read_container_artifact(file_path: str, thought: str, current_state: str, st
             one image was snapshotted you may omit the '<slug>/' prefix.
         start_line (int): First line to read, 1-indexed and inclusive. Defaults to 1.
         end_line (int): Last line to read, 1-indexed and inclusive. Defaults to the end of the file (or the 150-line cap).
-        thought (str): Explain explicitly why you need to read this artifact and what you expect to find in it.
-        current_state (str): A detailed summary of your current state and the outcome of your previous command.
     """
     artifacts_root = get_container_artifacts_root().resolve()
 
@@ -534,7 +527,7 @@ def mark_validation_complete(
 
 
 @tool
-def search_codebase(keyword: str, current_state: str, state: Annotated[dict, InjectedState], thought: str, regex: bool = True) -> str:
+def search_codebase(keyword: str, state: Annotated[dict, InjectedState], regex: bool = True) -> str:
     """
     Searches the entire application codebase for a specific string or regular expression. 
     Use this to find where specific libraries, functions, variables, or class instantiations are used. 
@@ -542,8 +535,6 @@ def search_codebase(keyword: str, current_state: str, state: Annotated[dict, Inj
     Args:
         keyword (str): The string or pattern to search in the codebase.
         regex (bool): Set to True if the keyword parameter is a regular expression, False otherwise (default = True).
-        thought (str): Explain explicitly why you are running this search and what specific vulnerability path you are tracking.
-        current_state (str): A detailed summary of the your current state and the outcome of your previous command.
 
     Returns:
         str: List of nodes with a match and the matched line of code.
@@ -616,7 +607,7 @@ def search_codebase(keyword: str, current_state: str, state: Annotated[dict, Inj
 
 
 @tool
-def get_node_connections(node_id: str, thought: str, current_state: str) -> str:
+def get_node_connections(node_id: str) -> str:
     """
     Returns the neighbors of a node in the application graph.
     Use this to identify which functions call the current node (callers)
@@ -624,8 +615,6 @@ def get_node_connections(node_id: str, thought: str, current_state: str) -> str:
 
     Args:
         node_id (str): The identifier of the node in the graph.
-        thought (str): Explain explicitly why examining the neighbors or data-flow edges of this node is necessary for your investigation.
-        current_state (str): A detailed summary of the your current state and the outcome of your previous command.
     """
     try:
         G = build_networkx_graph(settings.graph)
@@ -724,15 +713,13 @@ def read_sandbox_file(path: str, state: Annotated[dict, InjectedState] = {}) -> 
 
 
 @tool
-def get_definition(symbol_name: str, thought: str, current_state: str) -> str:
+def get_definition(symbol_name: str) -> str:
     """
     Retrieves the exact source code for a specific function or class method.
     If investigating a class method, format the input as ClassName::methodName.
 
     Args:
         symbol_name (str): The function or method name.
-        thought (str): Explain explicitly why you are looking up this symbol and how it helps verify your hypothesis.
-        current_state (str): A detailed summary of the your current state and the outcome of your previous command.
     """
     index_file_path = Path(settings.app_path) / ".ast_symbol_index.json"
     symbol_index = get_cached_symbol_index(index_file_path)
