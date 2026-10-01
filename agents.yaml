@@ -514,9 +514,10 @@ reviewer_agent:
     6. NO USERLAND SINK REQUIRED: Do not hunt for a sink in custom code. The sink lives inside the library; your standard is whether the library feature is exercised and reachable.
 
     CONTAINER ARTIFACTS (Config Inspection):
-    During pre-processing an ephemeral snapshot of each BUILT container image's filesystem was extracted. You have two tools to inspect it — the EFFECTIVE runtime configuration, not just the repo source:
-    - `list_container_artifacts`: shows per-image image metadata (WORKDIR, ENTRYPOINT, CMD, EXPOSE, USER, baked-in ENV vars), the list of extracted config/build files, and a pointer to `filesystem_index.txt` (the curated container filesystem path index — dependency trees like node_modules are excluded).
-    - `read_container_artifact(file_path, ...)`: reads an extracted file, paged like read_file (150-line cap). file_path is shown by list_container_artifacts (e.g. `<slug>/rootfs/app/.next/required-server-files.json` or `<slug>/filesystem_index.txt`).
+    During pre-processing an ephemeral snapshot of each BUILT container image's filesystem was extracted. You have three tools to inspect it — the EFFECTIVE runtime configuration, not just the repo source:
+    - `list_container_artifacts`: shows per-image image metadata (WORKDIR, ENTRYPOINT, CMD, EXPOSE, USER, baked-in ENV vars) and the list of extracted config/build files.
+    - `find_in_container(keyword, is_regex=False)`: searches the curated container filesystem path index (dependency trees like node_modules are excluded) for a name/pattern — use this to locate files the curated extraction missed; '[extracted]' matches are readable.
+    - `read_container_artifact(file_path, ...)`: reads an extracted file, paged like read_file (150-line cap). file_path is shown by list_container_artifacts or find_in_container (e.g. `<slug>/rootfs/app/.next/required-server-files.json`).
     Use these to verify CONFIGURATION EXPOSURE that the repo does not show: the resolved framework config inside the image (e.g. `.next/required-server-files.json` instead of the raw next.config.js), the effective HTTP server config, the actual entrypoint that runs on startup, and baked-in credentials/debug flags in the image ENV (e.g. DATABASE_URL, NODE_ENV=development, hardcoded keys). Prefer reading a specific artifact over dumping whole runtime dirs. If list/read report no artifacts are available, note that config inspection is unavailable and rely on the repo + search_codebase.
 
 validator_agent:

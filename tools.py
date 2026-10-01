@@ -132,6 +132,8 @@ def read_file(file_path: str, start_line: int = 1, end_line: int | None = None) 
 # Maximum number of lines read_container_artifact will return in a single call.
 CONTAINER_ARTIFACT_MAX_LINES = 150
 CONTAINER_ARTIFACT_MAX_SUMMARY_FILES = 300
+# Maximum number of paths find_in_container returns per call.
+CONTAINER_ARTIFACT_MAX_SEARCH_MATCHES = 200
 
 
 @tool
@@ -139,13 +141,14 @@ def list_container_artifacts() -> str:
     """
     Lists the config/build artifacts extracted from the BUILT container image(s)
     during pre-processing, plus image metadata (WORKDIR, ENTRYPOINT, CMD, EXPOSE,
-    USER, baked-in ENV vars) and a pointer to the full filesystem index.
+    USER, baked-in ENV vars).
 
     Use this to inspect the EFFECTIVE runtime configuration of the target as it
     exists inside the container (e.g. the resolved Next.js config in
     .next/required-server-files.json, an nginx server config, an entrypoint
     script, or credentials baked into the image ENV) — without touching the
-    live sandbox.
+    live sandbox. To locate files NOT extracted here (by name or pattern), use
+    find_in_container.
 
     This tool takes no arguments.
     """
@@ -220,25 +223,6 @@ def list_container_artifacts() -> str:
         if len(extracted) > CONTAINER_ARTIFACT_MAX_SUMMARY_FILES:
             lines.append(f"    ... [{len(extracted) - CONTAINER_ARTIFACT_MAX_SUMMARY_FILES} more] ...")
 
-        # Pointer to the filesystem index. The entry count comes from the
-        # summary written at extraction time so we never re-read a potentially
-        # large file just to count its lines.
-        index_file = image_dir / "filesystem_index.txt"
-        if index_file.is_file():
-            count = summary.get("index_entries")
-            if count is None:
-                try:
-                    count = max(0, sum(1 for _ in index_file.open(encoding="utf-8")) - 1)
-                except OSError:
-                    count = 0
-            suffix = " (truncated)" if summary.get("index_truncated") else ""
-            lines.append(
-                f"  Filesystem index: {slug}/filesystem_index.txt "
-                f"({count} entries{suffix}). Read it with read_container_artifact "
-                f"to find files the curated patterns did not extract (dependency "
-                f"trees like node_modules are excluded)."
-            )
-
         sections.append("\n".join(lines))
 
     return (
@@ -263,7 +247,7 @@ def read_container_artifact(file_path: str, start_line: int = 1, end_line: int |
     Args:
         file_path (str): Path relative to the artifacts root, as shown by
             list_container_artifacts (e.g. 'vulnscan-web_reactoops_latest/rootfs/app/.next/required-server-files.json'
-            or 'vulnscan-web_reactoops_latest/filesystem_index.txt'). When only
+            or 'vulnscan-web_reactoops_latest/rootfs/bin/sh'). When only
             one image was snapshotted you may omit the '<slug>/' prefix.
         start_line (int): First line to read, 1-indexed and inclusive. Defaults to 1.
         end_line (int): Last line to read, 1-indexed and inclusive. Defaults to the end of the file (or the 150-line cap).
@@ -304,6 +288,96 @@ def read_container_artifact(file_path: str, start_line: int = 1, end_line: int |
         file_path, target, start_line, end_line,
         CONTAINER_ARTIFACT_MAX_LINES,
         kind="Artifact", header_path=rel, continuation="read_container_artifact",
+    )
+
+
+@tool
+def find_in_container(keyword: str, is_regex: bool = False) -> str:
+    """
+    Searches the BUILT container image filesystem index for paths matching a
+    keyword (substring) or regular expression. Use this to locate config files,
+    binaries, scripts, or data files that were NOT extracted by the curated
+    artifact patterns (e.g. a nonstandard server config, a helper script, or a
+    credential/key file baked into the image).
+
+    The index is the curated container filesystem path list produced at image
+    snapshot time; dependency install trees (node_modules/vendor) and VCS
+    metadata are excluded. Only 'extracted' matches are readable with
+    read_container_artifact.
+
+    Args:
+        keyword (str): The string or regular expression pattern to match against
+            container filesystem paths (e.g. 'nginx', 'private.key', 'entrypoint').
+        is_regex (bool): Set to True if keyword is a regular expression,
+            False (default) for a literal substring search. When True you can
+            search multiple keywords at once with an alternation regex like
+            'nginx|apache|traefik'.
+    """
+    artifacts_root = get_container_artifacts_root().resolve()
+
+    if not artifacts_root.exists() or not any(p.is_dir() for p in artifacts_root.iterdir()):
+        return (
+            "No container artifacts are available. The preprocessor did not "
+            "build/snapshot any container image for this target (no Dockerfile/"
+            "compose found, the build failed, or docker is unavailable)."
+        )
+
+    prefix = ""
+    try:
+        pat = re.compile(keyword) if is_regex else re.compile(re.escape(keyword))
+    except re.error as e:
+        prefix = (
+            f"NOTE: {keyword!r} was an invalid regular expression ({e}); "
+            f"searched as a literal string instead.\n"
+        )
+        pat = re.compile(re.escape(keyword))
+
+    matches = []
+
+    for image_dir in sorted(p for p in artifacts_root.iterdir() if p.is_dir()):
+        if not image_dir.is_dir():
+            continue
+        slug = image_dir.name
+        index_file = image_dir / "filesystem_index.txt"
+        if not index_file.is_file():
+            continue
+        rootfs_dir = image_dir / "rootfs"
+        try:
+            with open(index_file, "r", encoding="utf-8") as f:
+                index_lines = f.read().splitlines()
+        except (OSError, UnicodeDecodeError) as e:
+            logging.info(f"Failed to read index for '{slug}': {e}")
+            continue
+
+        for line in index_lines:
+            # Skip the header (and any malformed line): entries are
+            # "type\tsize\tpath".
+            parts = line.split("\t")
+            if len(parts) != 3 or parts[0] == "#":
+                continue
+            _type, _size, path = parts
+            if pat.search(path):
+                extracted = (rootfs_dir / path).is_file()
+                matches.append(
+                    f"{slug} | {_type}\t{_size}\t{path}\t"
+                    f"{'[extracted]' if extracted else '[not extracted]'}"
+                )
+                if len(matches) >= CONTAINER_ARTIFACT_MAX_SEARCH_MATCHES:
+                    matches.append(
+                        f"... [Truncated: found more than "
+                        f"{CONTAINER_ARTIFACT_MAX_SEARCH_MATCHES} matches] ..."
+                    )
+                    return prefix + "\n".join(matches)
+
+    if not matches:
+        return f"{prefix}No matches for '{keyword}' in the container filesystem index."
+
+    return (
+        prefix
+        + "CONTAINER FILESYSTEM MATCHES (type, size, path, extracted status)\n"
+        + "Read an '[extracted]' match with read_container_artifact, e.g. "
+        "read_container_artifact(file_path='<slug>/rootfs/<path>').\n"
+        + "\n".join(matches)
     )
 
 
@@ -534,7 +608,7 @@ def search_codebase(keyword: str, state: Annotated[dict, InjectedState], regex: 
 
     Args:
         keyword (str): The string or pattern to search in the codebase.
-        regex (bool): Set to True if the keyword parameter is a regular expression, False otherwise (default = True).
+        regex (bool): Set to True if the keyword parameter is a regular expression, False otherwise (default = True). When True you can search multiple keywords at once with an alternation regex like 'auth|login|token'.
 
     Returns:
         str: List of nodes with a match and the matched line of code.
