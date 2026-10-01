@@ -1,10 +1,3 @@
-"""Aggregate-demands stage: route explorer/CVE demands to target nodes.
-
-Pure Python (no LLM) except the optional embedding dedup: explorer notes become
-upstream/downstream demands routed to callers/callees, CVE analyses become
-cve_assumption demands or upgrade-only hypotheses, then near-duplicates are
-merged before the contract-verifier fan-out."""
-
 import logging
 import re
 from collections import defaultdict
@@ -110,14 +103,17 @@ def _note_demands(dict_note: dict) -> list[dict]:
 _TARGET_ARGS_RE = re.compile(r'\(.*?\)')
 
 
-def _route_downstream(demand: dict, current_node_id: str, graph_data: dict, grouped_demands: defaultdict) -> None:
+def _clean_target(target_str: str) -> str:
+    """STRIP LLM HALLUCINATIONS: drop backticks, parenthesized arguments."""
+    return _TARGET_ARGS_RE.sub('', target_str or '').replace('`', '').strip()
+
+
+def _route_downstream(demand: dict, current_node_id: str, grouped_demands: defaultdict) -> None:
     """Route a downstream demand to its resolved target node (callee)."""
     target_str = demand.get("target", "")
     desc = demand.get("description")
 
-    # STRIP LLM HALLUCINATIONS: Remove backticks, parentheses, and arguments
-    clean_target = _TARGET_ARGS_RE.sub('', target_str).replace('`', '').strip()
-    module, symbol = parse_call_target(clean_target)
+    module, symbol = parse_call_target(_clean_target(target_str))
 
     target_node_id, miss = resolve_node_id(module, symbol, caller_node_id=current_node_id)
     if target_node_id:
@@ -252,6 +248,28 @@ def _caller_invokes_symbol(caller_id: str, symbol: str, code_memo: dict,
     return bool(pattern_memo[symbol].search(code_memo[caller_id]))
 
 
+def _parse_call_shape(target_str: str) -> tuple[str, str | None]:
+    """Split a RAW upstream target into ``(module, symbol)``; ``symbol`` is
+    ``None`` for bare / variable-reference targets. Detection must run on the
+    raw string: args-stripping erases the parens the call shapes are keyed on."""
+    head = (target_str or "").replace("`", "").strip().split("->")[-1].strip()
+    module, symbol = "", None
+    if "::" in head.split("(", 1)[0]:
+        module, symbol = head.split("::", 1)
+    elif "(" in head:
+        call_head = head.split("(", 1)[0].strip()
+        if "." in call_head:
+            module, symbol = call_head.rsplit(".", 1)
+        else:
+            module, symbol = "", call_head
+    symbol = symbol.strip().split("(", 1)[0].strip() if symbol else None
+    module = module.strip() if module else ""
+    if symbol and symbol.startswith("$"):
+        # Variable / context reference (e.g. `Session::$current`), not a call.
+        symbol = None
+    return module, symbol
+
+
 def _route_upstream(demand: dict, current_node_id: str, callers_map: dict, grouped_demands: defaultdict,
                     node_map: dict | None = None, sub_nodes_index: dict | None = None,
                     code_memo: dict | None = None, pattern_memo: dict | None = None,
@@ -272,24 +290,8 @@ def _route_upstream(demand: dict, current_node_id: str, callers_map: dict, group
 
     callers = callers_map.get(current_node_id, [])
 
-    # Detection runs on the RAW target: args-stripping erases the parens the
-    # dot/bare call shapes are keyed on.
-    clean_target = _TARGET_ARGS_RE.sub('', target_str or '').replace('`', '').strip()
-    head = (target_str or "").replace("`", "").strip().split("->")[-1].strip()
-    module, symbol = "", None
-    if "::" in head.split("(", 1)[0]:
-        module, symbol = head.split("::", 1)
-    elif "(" in head:
-        call_head = head.split("(", 1)[0].strip()
-        if "." in call_head:
-            module, symbol = call_head.rsplit(".", 1)
-        else:
-            module, symbol = "", call_head
-    symbol = symbol.strip().split("(", 1)[0].strip() if symbol else None
-    module = module.strip() if module else ""
-    if symbol and symbol.startswith("$"):
-        # Variable / context reference (e.g. `Session::$current`), not a call.
-        symbol = None
+    clean_target = _clean_target(target_str)
+    module, symbol = _parse_call_shape(target_str)
 
     if not symbol:
         receivers = callers
@@ -377,12 +379,11 @@ def _route_upstream(demand: dict, current_node_id: str, callers_map: dict, group
 
 
 def _route_explorer_notes(notes: list, graph_data: dict, callers_map: dict, grouped_demands: defaultdict,
-                          node_map: dict | None = None, sub_nodes_index: dict | None = None) -> list[dict]:
-    """Process explorer notes into grouped demands. Returns the updated notes.
+                          node_map: dict | None = None, sub_nodes_index: dict | None = None) -> None:
+    """Route every explorer note's demands into ``grouped_demands``.
 
     The per-run memos bound the member-scoped lookups: caller code folded at
     most once per node, one regex compiled per symbol."""
-    updated_notes = []
     code_memo: dict = {}
     pattern_memo: dict = {}
     # Container bare-target scoping: member index + lazy signature/property scans.
@@ -401,17 +402,13 @@ def _route_explorer_notes(notes: list, graph_data: dict, callers_map: dict, grou
         for demand in _note_demands(dict_note):
             direction = demand.get("direction")
             if direction == "downstream":
-                _route_downstream(demand, current_node_id, graph_data, grouped_demands)
+                _route_downstream(demand, current_node_id, grouped_demands)
             elif direction == "upstream":
                 _route_upstream(demand, current_node_id, callers_map, grouped_demands,
                                 node_map, sub_nodes_index, code_memo, pattern_memo,
                                 container_members, param_memo, prop_memo)
             else:
                 logging.warning(f"[{current_node_id}] UNKNOWN DIRECTION: '{direction}'. Demand dropped.")
-
-        updated_notes.append(dict_note)
-
-    return updated_notes
 
 
 def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: defaultdict,
@@ -434,7 +431,6 @@ def _process_cve_demands(cves: list, node_imports_map: dict, grouped_demands: de
     for record in cves:
         target_import = record.get("import_namespace", "")
         source_cve = record.get("source_cve", "unknown")
-        package = record.get("package", "unknown")
         fix_category = record.get("fix_category", "application_mitigation")
 
         if fix_category == "upgrade_only":
@@ -541,8 +537,6 @@ def filter_cve_demands_by_keywords(cves: list[dict]) -> list[dict]:
     all_keywords = sorted({
         kw for r in keyword_cves for kw in (r.get("required_keywords") or [])
     })
-    if not all_keywords:
-        return cves
 
     present_keywords, scanned_bytes = scan_codebase_for_keywords(all_keywords)
     if scanned_bytes == 0:
@@ -553,7 +547,7 @@ def filter_cve_demands_by_keywords(cves: list[dict]) -> list[dict]:
         return cves
 
     kept: list[dict] = []
-    dropped: list[dict] = []
+    n_dropped = 0
 
     for record in cves:
         source_cve = record.get("source_cve", record.get("id", "unknown"))
@@ -575,11 +569,11 @@ def filter_cve_demands_by_keywords(cves: list[dict]) -> list[dict]:
             logging.info(
                 f"[CVE KEYWORD DROP] {source_cve}: none of {keywords} found in code files — dropped."
             )
-            dropped.append(record)
+            n_dropped += 1
 
     logging.info(
         f"CVE keyword filter: kept {len(kept)}/{len(cves)} record(s), "
-        f"dropped {len(dropped)} before downstream LLM stages."
+        f"dropped {n_dropped} before downstream LLM stages."
     )
     return kept
 
@@ -603,7 +597,7 @@ def _dedupe_enriched_cve_demands(cves: list[dict]) -> list[dict]:
 
 def aggregate_demands_node(state: MasterState):
     """AND-join barrier output: convert all notes + CVE records into grouped
-    demands, upgrade-only hypotheses and the merge-ready notes."""
+    demands and upgrade-only hypotheses."""
     grouped_demands = defaultdict(list)
     try:
         graph_data = get_cached_graph_data(settings.graph)
@@ -616,9 +610,7 @@ def aggregate_demands_node(state: MasterState):
         notes = state.get("notes", [])
         cves = _dedupe_enriched_cve_demands(state.get("cve_demands", []))
 
-        # Upgrade-only records are exempt from the keyword pre-filter: their
-        # hypotheses live on synthetic dependency nodes and are adjudicated by
-        # the dependency reviewer via container artifacts, not app source.
+        # upgrade_only records are exempt from the keyword pre-filter (synthetic dependency nodes).
         upgrade_only = [r for r in cves if r.get("fix_category") == "upgrade_only"]
         cves = filter_cve_demands_by_keywords(
             [r for r in cves if r.get("fix_category") != "upgrade_only"]
@@ -629,8 +621,8 @@ def aggregate_demands_node(state: MasterState):
             f"({len(upgrade_only)} upgrade-only exempted from the keyword pre-filter)."
         )
 
-        updated_notes = _route_explorer_notes(notes, graph_data, callers_map, grouped_demands,
-                                              node_map, sub_nodes_index)
+        _route_explorer_notes(notes, graph_data, callers_map, grouped_demands,
+                              node_map, sub_nodes_index)
 
         cve_hypotheses = _process_cve_demands(cves, node_imports_map, grouped_demands, node_map, sub_nodes_index)
         logging.info(f"Emitted {len(cve_hypotheses)} upgrade-only CVE hypothesis(es) directly into the vulnerabilities channel.")
@@ -656,8 +648,8 @@ def aggregate_demands_node(state: MasterState):
 
         return {
             "grouped_demands": dict(grouped_demands),
-            # `notes` is an operator.add-reduced channel: returning
-            # updated_notes would re-append the notes just consumed.
+            # `notes` is an operator.add-reduced channel: re-emitting the
+            # consumed notes would duplicate them.
             "notes": [],
             "vulnerabilities": cve_hypotheses,
         }

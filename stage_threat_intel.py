@@ -1,5 +1,3 @@
-"""Threat Intel stage: one-shot Tavily enrichment for CVEs missing exploit mechanics."""
-
 import json
 import logging
 import os
@@ -12,7 +10,7 @@ import settings
 from llms import fast_llm, invoke_structured_capped
 from run_stats import _log_agent_completion, _record_stat, _start_agent_progress
 from schemas import THREAT_INTEL_AGENT, CVEAnalysis
-from stage_cve import _backfill_osv_cwe_ids, _finalize_cve_analysis
+from stage_cve import _backfill_osv_cwe_ids, _finalize_cve_analysis, cve_descriptions, osv_enrichment_lines
 from state import MasterState, ThreatIntelState
 from utils import cache, is_high_severity
 
@@ -27,7 +25,7 @@ def _analysis_needs_threat_intel(cve: dict, analysis: dict | None) -> bool:
         return True
     if analysis is None:
         return True
-    if "required_keywords" in analysis and not analysis.get("required_keywords"):
+    if "required_keywords" in analysis and not analysis["required_keywords"]:
         return True
     trigger_keys = {"trigger_condition", "attacker_request_primitive"}
     if trigger_keys & analysis.keys() and not any(analysis.get(key) for key in trigger_keys):
@@ -125,16 +123,8 @@ def _threat_intel_node(state: ThreatIntelState) -> dict:
         logging.warning(f"{cve_id}: Tavily search failed; keeping analyzer output: {exc}")
         return {"cve_demands": [prior] if prior else []}
 
-    descriptions = cve.get("descriptions") or ([cve.get("details")] if cve.get("details") else [])
-    enrichment = []
-    if cve.get("fixed_version"):
-        enrichment.append(f"Fixed version: {cve['fixed_version']}")
-    if cve.get("cwe_ids"):
-        enrichment.append(f"OSV CWE classifications: {', '.join(cve['cwe_ids'])}")
-    if cve.get("severity_label"):
-        enrichment.append(f"OSV severity: {cve['severity_label']}")
-    if cve.get("cvss_vector"):
-        enrichment.append(f"OSV CVSS vector: {cve['cvss_vector']}")
+    descriptions = cve_descriptions(cve)
+    enrichment = osv_enrichment_lines(cve)
     human_msg = HumanMessage(content=(
         f"Analyze and complete this CVE using the external threat intelligence.\n\n"
         f"CVE ID: {cve_id}\nPackage: {package_name}\n"
@@ -150,7 +140,7 @@ def _threat_intel_node(state: ThreatIntelState) -> dict:
         structured_llm, [sys_msg, human_msg], f"Threat Intel {cve_id}"
     )
     if response is None:
-        # Fail-open to the prior analyzer output (same path as an invalid response).
+        # Fail open to the prior analyzer output.
         _record_stat("threat_intel_skipped_output_cap")
         logging.warning(f"{cve_id}: Threat Intel hit the output cap; keeping prior output.")
         return {"cve_demands": [prior] if prior else []}
@@ -165,9 +155,9 @@ def _threat_intel_node(state: ThreatIntelState) -> dict:
 
 
 def threat_intel_node(state: ThreatIntelState) -> dict:
-    """Graph node wrapper: no-op fires the barrier, else enrich + progress."""
+    """Graph node wrapper: the no-op task fires the barrier with no external
+    calls; otherwise enrich and advance the progress ledger."""
     if not state.get("cve"):
-        # No-op task: fires the aggregate_demands join barrier. No external calls.
         return {}
     result = _threat_intel_node(state)
     cve = state.get("cve", {})

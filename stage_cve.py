@@ -1,5 +1,3 @@
-"""CVE analyzer stage: per-CVE classification (application_mitigation vs upgrade_only)."""
-
 import logging
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -16,9 +14,8 @@ from utils import cache
 def dispatch_cve_analyzers(state: MasterState):
     """Reads the deduplicated SCA results and dispatches tasks to the CVE Analyzer."""
     commands: list[Send] = []
-    progress_id = _start_agent_progress(len(state.get("known_vulns", [])))
-
     known_vulns = state.get("known_vulns", [])
+    progress_id = _start_agent_progress(len(known_vulns))
 
     for cve_record in known_vulns:
         payload = CVEAnalyzerState(
@@ -27,9 +24,7 @@ def dispatch_cve_analyzers(state: MasterState):
         )
         commands.append(Send("cve_analyzer", payload))
 
-    # The aggregate_demands join barrier requires the cve_analyzer chain to
-    # fire even with zero SCA findings; emit a no-op task otherwise (it flows
-    # through threat_intel_gate so the barrier sees a threat_intel write too).
+    # No-op task keeps the aggregate_demands AND-join barrier satisfiable with zero SCA findings.
     if not commands:
         commands.append(Send("cve_analyzer", CVEAnalyzerState(cve={}, progress_id="")))
 
@@ -48,24 +43,16 @@ def _normalize_cwe_ids(value) -> list[str]:
     seen = set()
     normalized = []
     for entry in entries:
-        if not isinstance(entry, str):
-            continue
-        cwe = entry.strip()
-        if not cwe:
-            continue
-        if cwe in seen:
-            continue
-        seen.add(cwe)
-        normalized.append(cwe)
+        cwe = entry.strip() if isinstance(entry, str) else ""
+        if cwe and cwe not in seen:
+            seen.add(cwe)
+            normalized.append(cwe)
     return normalized
 
 
 def _backfill_osv_cwe_ids(cached: dict, cve: dict) -> dict:
-    """Patch deterministic OSV CWEs into a cached analyzer output.
-
-    The CVE/threat-intel caches are keyed by CVE id only, so records written
-    before `cwe_ids` existed go stale; merge the current OSV value in without
-    re-running the LLM."""
+    """Merge current OSV CWEs into a cached analyzer output: the
+    CVE/threat-intel caches are keyed by CVE id only and never auto-bust."""
     if not isinstance(cached, dict):
         return cached
     cached = dict(cached)
@@ -96,12 +83,34 @@ def _finalize_cve_analysis(dict_analysis: dict, cve: dict, *, enriched_by: str |
     dict_analysis["source_cve"] = cve_id
     dict_analysis["package"] = cve.get("package") or "unknown"
     dict_analysis["fixed_version"] = cve.get("fixed_version")
-    # Deterministic: always attach the OSV-suggested CWEs, regardless of what
-    # the model emitted (runs post-LLM for both analyzer and Threat Intel).
+    # Override model-emitted CWEs with the deterministic OSV ones (post-LLM for analyzer and Threat Intel).
     dict_analysis["cwe_ids"] = _normalize_cwe_ids(cve.get("cwe_ids"))
     if enriched_by:
         dict_analysis["enriched_by"] = enriched_by
     return dict_analysis
+
+
+def cve_descriptions(cve: dict) -> list:
+    """Up to 3 distinct descriptions from the preprocessor; `details` for legacy records."""
+    descriptions = cve.get("descriptions")
+    if not descriptions:
+        details = cve.get("details")
+        descriptions = [details] if details else []
+    return descriptions
+
+
+def osv_enrichment_lines(cve: dict) -> list[str]:
+    """Deterministic OSV enrichment lines shared by the CVE analyzer and Threat Intel prompts."""
+    lines = []
+    if cve.get("fixed_version"):
+        lines.append(f"Fixed version: {cve['fixed_version']}")
+    if cve.get("cwe_ids"):
+        lines.append(f"OSV CWE classifications: {', '.join(cve['cwe_ids'])}")
+    if cve.get("severity_label"):
+        lines.append(f"OSV severity: {cve['severity_label']}")
+    if cve.get("cvss_vector"):
+        lines.append(f"OSV CVSS vector: {cve['cvss_vector']}")
+    return lines
 
 
 def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
@@ -111,14 +120,9 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     package_name = cve.get("package") or "unknown"
     cve_id = cve.get("id", "UNKNOWN-CVE")
     if not cve:
-        # No-op task: fires the cve_analyzer -> threat_intel_gate chain so the
-        # aggregate_demands join barrier sees a threat_intel write without SCA.
+        # No-op task: fires the cve_analyzer -> threat_intel_gate chain for the aggregate_demands barrier.
         return {}
-    # Up to 3 distinct descriptions from the preprocessor; `details` for legacy records.
-    descriptions = cve.get("descriptions")
-    if not descriptions:
-        details = cve.get("details")
-        descriptions = [details] if details else []
+    descriptions = cve_descriptions(cve)
     if not descriptions:
         # Without descriptions the LLM would just hallucinate
         logging.warning(f"{cve_id}: no descriptions provided")
@@ -130,23 +134,14 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     if cached_demand:
         return {"cve_demands": [_backfill_osv_cwe_ids(cached_demand, cve)]}
 
-    sys_msg = SystemMessage(content=(
-        f"{CVE_ANALYZER_AGENT['prompt']}\n\n"
-    ))
+    sys_msg = SystemMessage(content=CVE_ANALYZER_AGENT["prompt"] + "\n\n")
 
+    osv_lines = osv_enrichment_lines(cve)
     enrichment = ""
-    fixed_version = cve.get("fixed_version")
-    if fixed_version:
-        enrichment += f"\nFixed version: {fixed_version}\n"
-    cwe_ids = cve.get("cwe_ids") or []
-    if cwe_ids:
-        enrichment += f"OSV CWE classifications: {', '.join(cwe_ids)}\n"
-    if cve.get("severity_label"):
-        enrichment += f"OSV severity: {cve['severity_label']}\n"
-    if cve.get("cvss_vector"):
-        enrichment += f"OSV CVSS vector: {cve['cvss_vector']}\n"
-    if enrichment:
-        enrichment = f"\n--- OSV ENRICHMENT ---\n{enrichment}"
+    if osv_lines:
+        # Prompt-byte quirk retained: a present fixed-version line starts with a newline.
+        lead = "\n" if cve.get("fixed_version") else ""
+        enrichment = f"\n--- OSV ENRICHMENT ---\n{lead}{''.join(f'{line}\n' for line in osv_lines)}"
 
     desc_block = "\n".join(
         f"Description {i + 1}: {d}\n"

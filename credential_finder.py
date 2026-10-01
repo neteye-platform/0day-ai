@@ -1,26 +1,11 @@
-"""Credential-finder preprocessing agent.
+"""Credential-finder preprocessing agent (runs after container build/sandbox).
 
-Runs in the pre-processing phase, AFTER the container image has been built,
-started (sandbox) and snapshotted into container artifacts. It hunts for
-pre-configured credentials (default login accounts, database passwords, API
-keys, baked-in secrets) across three sources:
-
-- docker/compose definitions and env files in the target repo
-  (``docker-compose.yml`` ``environment:`` / ``env_file:``, ``.env``,
-  ``Dockerfile`` ``ENV``/``ARG``);
-- application source/seed/SQL files (``password_hash('<lit>')`` seeds, SQL
-  ``CREATE USER ... IDENTIFIED BY`` statements, credential-key assignments);
-- the built container image artifacts (``image_metadata.json`` ``Env`` vars
-  and credential-bearing files under the extracted ``rootfs/``).
-
-Discovery is fully deterministic (regex / YAML / env parsing). When
-``settings.credential_finder_use_llm`` is true, ONE structured LLM call
-normalizes the raw candidates into a deduplicated, labeled
-``CredentialList``; on any failure it fails open to the raw candidates.
-
-The final list is written to ``<target_app>/.cache/credentials.json`` for
-downstream consumers (validator agents). Importing this module never touches
-docker or the network; the LLM is constructed lazily at call time.
+Finds pre-configured credentials in repo env/compose/Dockerfile definitions,
+application source/seed/SQL, and extracted container-image artifacts.
+Discovery is deterministic; with ``settings.credential_finder_use_llm`` one
+structured ``llms.fast_llm`` call normalizes the candidates, failing open to
+the raw list. Result goes to ``<target_app>/.cache/credentials.json`` for
+validator agents. Importing this module never touches docker or the network.
 """
 
 from pathlib import Path
@@ -34,6 +19,7 @@ import yaml
 
 import settings
 import utils
+from llms import fast_llm
 from utils import COMPOSE_FILENAMES, is_path_excluded, get_container_artifacts_root, safe_cache_filename
 
 logger = logging.getLogger(__name__)
@@ -42,9 +28,7 @@ logger = logging.getLogger(__name__)
 # Regexes
 # ---------------------------------------------------------------------------
 
-# Keys that look like they hold a secret (password/secret/token/api key...).
-# Token-based so words like `tokenizer` / `password_expiration_delay` /
-# `csrf_token` are NOT treated as secret-bearing.
+# Token test so `tokenizer` / `password_expiration_delay` / `csrf_token` do not match.
 _SECRET_WORDS = {
     "password", "passwd", "pwd", "passphrase", "pass", "secret",
     "apikey", "apisecret", "auth",
@@ -145,7 +129,7 @@ def _is_placeholder(value: str) -> bool:
     v = value.strip()
     if not v:
         return True
-    if _BOOLISH.intersection({v.lower()}):
+    if v.lower() in _BOOLISH:
         return True
     if len(v) > 200 or len(v) < 2:
         return True
@@ -171,7 +155,6 @@ def _candidates_from_pairs(
 ) -> list[dict]:
     """Turn ``(key, value)`` env-style pairs into raw candidates, pairing each
     secret with a sibling ``*_USER`` value in the same namespace."""
-    by_namespace: dict[str, dict[str, str]] = {}
     users: dict[str, str] = {}
     secrets: dict[str, list[dict]] = {}
 
@@ -182,7 +165,6 @@ def _candidates_from_pairs(
             users.setdefault(ns, value)
         elif any(upper.endswith(s) for s in _SECRET_SUFFIXES):
             secrets.setdefault(ns, []).append({"key": key, "value": value})
-        by_namespace.setdefault(ns, {})[key] = value
 
     for key, value in key_values:
         _entry(key, value)
@@ -204,9 +186,8 @@ def _candidates_from_pairs(
 
 
 def _looks_literal(value: str) -> bool:
-    """Credentials must look like concrete literal values: short, printable,
-    and free of shell/function syntax (``$(...)``, PHP concat, escaped quotes)
-    that would mark them as code or command substitution rather than data."""
+    """Only concrete literals count: reject shell/function syntax (``$(...)``,
+    quotes, concat) that marks a value as code or substitution."""
     v = str(value)
     if len(v) < 2 or len(v) > 200:
         return False
@@ -243,7 +224,7 @@ def _file_size_ok(path: Path) -> bool:
         return False
 
 
-def _windows(path: Path, line: str, lineno: int) -> str:
+def _windows(path: Path, lineno: int) -> str:
     """A single display line: relative path, optional line number, trimmed."""
     rel = str(path.relative_to(settings.app_path)) if path.is_relative_to(settings.app_path) else str(path)
     return f"{rel}:{lineno}" if lineno else rel
@@ -282,7 +263,7 @@ def _collect_env_files() -> list[dict]:
         if not path.is_file():
             continue
         name = path.name
-        if name != ".env" and not name.endswith(".env") and not (".env." in name):
+        if not name.endswith(".env") and ".env." not in name:
             continue
         if is_path_excluded(str(path)):
             continue
@@ -306,10 +287,8 @@ def _resolve_compose_value(value: Any, env: dict[str, str]) -> Any:
 
 
 def _collect_compose() -> list[dict]:
-    """Parse compose files: ``services.*.environment`` + ``env_file``. Compose
-    takes precedence in the same shape as the repo walk uses (first compose
-    found by find_container_builds), but we scan every compose file present so
-    overrides are not missed."""
+    """Parse compose files: ``services.*.environment`` + ``env_file``. Every
+    compose file present is scanned so overrides are not missed."""
     candidates = []
     env = {}
     for env_path in sorted(settings.app_path.rglob(".env")):
@@ -395,7 +374,7 @@ def _collect_dockerfiles() -> list[dict]:
                     continue
                 _add(
                     candidates,
-                    source=_windows(path, line, lineno),
+                    source=_windows(path, lineno),
                     key=key,
                     username=None,
                     secret=_unquote(val),
@@ -436,10 +415,9 @@ def _collect_sql(path: Path, allow_excluded: bool = False) -> list[dict]:
             stmt = re.sub(r"(?m)^\s*(?:--|#).*$", "", head)
             for hit in _sql_candidates_from_statement(stmt, source):
                 if not _is_placeholder(hit["pass"]):
-                    hit["source"] = f"{source}:{lineno}"
                     _add(
                         candidates,
-                        source=hit["source"],
+                        source=f"{source}:{lineno}",
                         key=None,
                         username=hit["user"],
                         secret=hit["pass"],
@@ -514,7 +492,7 @@ def _collect_source() -> list[dict]:
                                 break
                     _add(
                         candidates,
-                        source=_windows(path, line, lineno),
+                        source=_windows(path, lineno),
                         key=None,
                         username=username,
                         secret=literal,
@@ -526,7 +504,7 @@ def _collect_source() -> list[dict]:
                         continue
                     _add(
                         candidates,
-                        source=_windows(path, line, lineno),
+                        source=_windows(path, lineno),
                         key=m.group("key"),
                         username=None,
                         secret=m.group("val"),
@@ -540,14 +518,12 @@ def _collect_source() -> list[dict]:
                         continue
                     _add(
                         candidates,
-                        source=_windows(path, line, lineno),
+                        source=_windows(path, lineno),
                         key=key,
                         username=None,
                         secret=val,
                     )
-        except UnicodeDecodeError:
-            continue
-        except OSError:
+        except (UnicodeDecodeError, OSError):
             continue
     return candidates
 
@@ -635,14 +611,9 @@ def _raw_to_record(c: dict) -> dict:
         kind = "api_key"
     elif username:
         kind = "login"
-    elif re.search(r"(?i)password|passwd|pwd", key):
-        kind = "secret"
     else:
         kind = "secret"
-    service = (
-        key
-        or (username or "credential")
-    )
+    service = key or username or "credential"
     notes = f"found in {c.get('source')}" + (f" ({c.get('scope')})" if c.get("scope") else "")
     return {
         "service": service,
@@ -676,7 +647,6 @@ def _llm_normalize(candidates: list[dict]) -> Optional[list[dict]]:
     """One structured LLM call to label/dedupe raw candidates into records.
     Returns None (and logs) on any failure so the caller fails open."""
     try:
-        from langchain_openai import ChatOpenAI
         from langchain_core.messages import SystemMessage, HumanMessage
         from schemas import CREDENTIAL_FINDER_AGENT, CredentialList
 
@@ -686,16 +656,7 @@ def _llm_normalize(candidates: list[dict]) -> Optional[list[dict]]:
             f"RAW CREDENTIAL CANDIDATES ({len(candidates)} total, up to "
             f"{_MAX_CANDIDATES_TO_LLM} shown):\n{_render_candidates(candidates)}"
         ))
-        llm = ChatOpenAI(
-            base_url=settings.llm_base_url,
-            model=settings.llm_model,
-            api_key=settings.llm_api_key,
-            stream_usage=True,
-            temperature=0.2,
-            max_completion_tokens=settings.llm_max_completion_tokens,
-            reasoning_effort="none",
-        )
-        structured = llm.with_structured_output(CredentialList, method="json_schema", strict=True)
+        structured = fast_llm.with_structured_output(CredentialList, method="json_schema", strict=True)
         result = structured.invoke([sys_msg, human_msg])
         result = result if isinstance(result, dict) else result.model_dump()
         records = []
@@ -728,13 +689,9 @@ def _write_credentials(records: list[dict]) -> None:
 
 
 def load_credentials() -> list[dict]:
-    """Read the persisted pre-configured credentials (fail open to ``[]``).
-
-    Returns the records written by ``_write_credentials`` (``service``, ``kind``,
-    ``username``, ``secret``, ``source``, ``notes``), filtered to entries that
-    actually carry a non-empty secret. Missing/corrupt file or disabled finder
-    yields an empty list so downstream prompt injection is a no-op.
-    """
+    """Read persisted credential records (``service``, ``kind``, ``username``,
+    ``secret``, ``source``, ``notes``) with a non-empty secret; missing or
+    corrupt file yields ``[]`` (fail open)."""
     target = settings.cache_dir / "credentials.json"
     try:
         data = json.loads(target.read_text(encoding="utf-8"))

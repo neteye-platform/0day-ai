@@ -9,9 +9,14 @@ import settings
 import tools
 from dedup import cluster_vulnerabilities
 from llms import fast_llm, reviewer_llm
-from run_stats import _record_stat, _start_agent_progress, as_dicts, get_embedder
+from run_stats import (
+    _record_stat,
+    _start_agent_progress,
+    affected_nodes_label,
+    as_dicts,
+    get_embedder,
+)
 from schemas import REVIEWER_AGENT
-from stage_edge_traversal import CROSS_BOUNDARY_VULN_TYPES
 from state import MasterState, ReviewerState
 from tool_loop import CompactionConfig, ToolLoopAgent
 from utils import (
@@ -53,6 +58,21 @@ CROSS_BOUNDARY_REVIEWER_TOOLS = [
     tools.submit_evaluation,
 ]
 
+# Non-default tracks only; code_level/dependency_mitigation/systemic share the
+# source-reading default below.
+_MODE_TOOLS = {
+    "framework_dependency": FRAMEWORK_DEPENDENCY_REVIEWER_TOOLS,
+    "cross_boundary": CROSS_BOUNDARY_REVIEWER_TOOLS,
+}
+
+# Composite-vulnerability classes emitted by the Edge Traversal stage, routed
+# to the cross_boundary track.
+CROSS_BOUNDARY_VULN_TYPES = {
+    "cross_boundary_contract_mismatch",
+    "differential_parsing",
+    "confused_deputy",
+}
+
 
 def _reviewer_mode_for(hypothesis: dict) -> str:
     """Route a hypothesis to its reviewer track: 'framework_dependency',
@@ -76,13 +96,25 @@ def _primary_node(record: dict, default: str = "Unknown") -> str:
     return affected[0] if affected else default
 
 
+def build_reviewer_payload(record: dict, progress_id: str) -> ReviewerState:
+    return ReviewerState(
+        node_id=_primary_node(record),
+        expert_report=record,
+        mode=_reviewer_mode_for(record),
+        progress_id=progress_id,
+        iterations=0,
+        vulnerabilities=[],
+        messages=[]
+    )
+
+
 def dispatch_reviewers(state: MasterState):
     """Groups reports and dispatches parallel reviewer threads using the Send API."""
     all_vulns = as_dicts(state.get("vulnerabilities", []))
     hypotheses = [v for v in all_vulns if v.get("status") == "hypothesis"]
 
     if not hypotheses:
-        logging.warning(f"No vulnerabilities hypotheses to dispatch.")
+        logging.warning("No vulnerabilities hypotheses to dispatch.")
         # Advance straight to the reporter-dispatch barrier: it writes an empty
         # report rather than silently ENDing (reviewer/validator phases skipped).
         return "reporter_dispatch"
@@ -115,16 +147,7 @@ def dispatch_reviewers(state: MasterState):
 
     commands = []
     for hypothesis in hypotheses:
-        payload = ReviewerState(
-            node_id=_primary_node(hypothesis),
-            expert_report=hypothesis,
-            mode=_reviewer_mode_for(hypothesis),
-            progress_id=progress_id,
-            iterations=0,
-            vulnerabilities=[],
-            messages=[]
-        )
-        commands.append(Send("reviewer_agent", payload))
+        commands.append(Send("reviewer_agent", build_reviewer_payload(hypothesis, progress_id)))
 
     logging.info(f"Dispatching {len(commands)} reviewers.")
     _record_stat("reviewer_hypotheses", len(commands))
@@ -178,25 +201,16 @@ class ReviewerAgent(ToolLoopAgent):
     progress_label = "Reviewer"
 
     def bind_tools(self, state):
-        mode = state.get("mode", "code_level")
-        if mode == "framework_dependency":
-            reviewer_tools = FRAMEWORK_DEPENDENCY_REVIEWER_TOOLS
-        elif mode == "cross_boundary":
-            reviewer_tools = CROSS_BOUNDARY_REVIEWER_TOOLS
-        else:
-            # code_level, dependency_mitigation, systemic all trace first-party
-            # code and share the source-reading toolset.
-            reviewer_tools = CODE_LEVEL_REVIEWER_TOOLS
+        reviewer_tools = _MODE_TOOLS.get(state.get("mode", "code_level"), CODE_LEVEL_REVIEWER_TOOLS)
         return reviewer_llm.bind_tools(
             reviewer_tools,
             parallel_tool_calls=True
         )
 
     def cached_verdict(self, state):
-        # Feedback re-reviews are never served from cache: the same round-N
-        # flagged record is re-dispatched verbatim on checkpoint replay, so a
-        # content-hash cache would collapse each genuine re-answer into the
-        # earlier verdict without an LLM turn.
+        # Feedback re-reviews bypass the cache: checkpoint replays re-dispatch
+        # the byte-identical round-N report, which would collapse into the
+        # earlier verdict (see utils.is_feedback_review).
         report = state.get("expert_report", {})
         if is_feedback_review(report):
             return None
@@ -215,8 +229,7 @@ class ReviewerAgent(ToolLoopAgent):
         report = state.get("expert_report", {})
         node_id = state.get("node_id")
 
-        affected = [n for n in (report.get("affected_nodes") or []) if n]
-        affected_str = ", ".join(affected) if affected else node_id
+        affected_str = affected_nodes_label(report, node_id)
         formatted_vuln = (
             f"Target: {node_id}\n"
             f"Affected Nodes: {affected_str}\n\n"
@@ -265,8 +278,7 @@ class ReviewerAgent(ToolLoopAgent):
     def fallback(self, state) -> Command:
         """Resolve a review that hit the iteration cap without a verdict:
         review_error (never silently confirmed or discarded)."""
-        report = dict(state.get("expert_report", {}))
-
+        report = state.get("expert_report", {})
         updated_vuln = dict(report)
         updated_vuln["status"] = "review_error"
         updated_vuln["reviewer_reasoning"] = (

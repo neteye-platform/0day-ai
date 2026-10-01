@@ -18,9 +18,12 @@ embeddings; see settings.py):
   * Fixed-representative (non-chaining) clustering prevents A~B~C over-merges.
   * Merged records keep the seed's vuln_id, union affected_nodes, and fold in
     child descriptions, so no information is lost.
-  * Embeddings (local Ollama) are batched and disk-cached per (model, text),
-    so re-runs are free.
-  * Fails open: any embedding error leaves only the exact-identity pre-merge.
+  * Embeddings (local Ollama) are batched and disk-cached per (model, text)
+    incrementally, so re-runs — and interrupted or budget-truncated ones —
+    only pay for unseen texts.
+  * Fails open: any embedding error (including the bounded single-text
+    fallback exceeding its wall-clock budget) leaves only the exact-identity
+    pre-merge.
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ import json
 import logging
 import math
 import re
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -53,10 +57,13 @@ _DEFAULT_CWE = "OTHER_UNCATEGORIZED"
 class Embeddings:
     """Thin wrapper around a local Ollama embeddings endpoint with per-text caching."""
 
-    def __init__(self, base_url: str, model: str, timeout: int = 60):
+    def __init__(self, base_url: str, model: str, timeout: int = 60,
+                 budget_sec: float = 300.0):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
+        # Wall-clock ceiling for embed_batch incl. the single-text fallback.
+        self.budget_sec = budget_sec
         self._cache: dict[str, list[float]] = {}
 
     @staticmethod
@@ -92,22 +99,30 @@ class Embeddings:
         self._cache[key] = vec
         return vec
 
-    # Chunk /api/embed requests: one monolithic multi-thousand request can
-    # stall the server (and the pipeline) past any useful timeout. Chunks are
-    # fetched CONCURRENTLY (HTTP wait releases the GIL); a large cold dedup is
-    # otherwise a serial chain of chunk round-trips. Workers stay small so a
-    # local Ollama never sees a request stampede.
-    BATCH_CHUNK = 128
-    PARALLEL_CHUNKS = 8
+    # Chunks stay small: a local Ollama serves one ~2048-token slot, so a
+    # 128-text batch can never fit the context and only burns the request
+    # timeout (empirically: every chunk 400'd after exactly 60s on GLPI).
+    BATCH_CHUNK = 16
+    PARALLEL_CHUNKS = 4
+    FALLBACK_PROGRESS_EVERY = 50
 
-    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    def embed_batch(
+        self,
+        texts: list[str],
+        on_result=None,
+    ) -> list[list[float]]:
         """Embed many texts, using Ollama's batch endpoint when available.
 
-        Tries ``/api/embed`` in concurrent chunks and falls back to sequential
-        single-text ``embed()`` calls on older servers. The per-text cache is
-        consulted and filled either way, so repeated runs only pay for unseen
-        texts. Results are written back at the original index, so the returned
-        order is identical to sequential fetching.
+        Tries ``/api/embed`` in concurrent chunks and on the FIRST failure
+        cancels every queued chunk and falls back to sequential single-text
+        ``embed()`` calls. The fallback is bounded by ``self.budget_sec`` for
+        the whole call and raises on expiry so callers fail open (their
+        exact-identity pre-merge) instead of grinding silently for hours.
+        Every text that succeeds is cached and reported through ``on_result``
+        immediately, so an interrupted run resumes from disk instead of
+        re-paying the whole embedding pass. The per-text cache is consulted
+        and filled either way. Results are written back at the original index,
+        so the returned order is identical to sequential fetching.
         """
         results: list[list[float] | None] = [None] * len(texts)
         missing: list[tuple[int, str]] = []
@@ -117,10 +132,19 @@ class Embeddings:
                 results[i] = cached
             else:
                 missing.append((i, t))
-        chunks = [
-            missing[s:s + self.BATCH_CHUNK]
-            for s in range(0, len(missing), self.BATCH_CHUNK)
-        ]
+        if not missing:
+            return results
+
+        deadline = time.monotonic() + self.budget_sec
+
+        def _publish(i: int, t: str, vec: list[float]) -> None:
+            results[i] = vec
+            self._cache[self._key(t)] = vec
+            if on_result is not None:
+                try:
+                    on_result(t, vec)
+                except Exception:  # disk-cache write errors are mere misses
+                    pass
 
         def _fetch(chunk: list[tuple[int, str]]) -> list[list[float]]:
             resp = requests.post(
@@ -136,25 +160,50 @@ class Embeddings:
                 )
             return vecs
 
+        chunks = [
+            missing[s:s + self.BATCH_CHUNK]
+            for s in range(0, len(missing), self.BATCH_CHUNK)
+        ]
+        pool = ThreadPoolExecutor(
+            max_workers=min(len(chunks), self.PARALLEL_CHUNKS) or 1,
+            thread_name_prefix="embed",
+        )
         try:
-            with ThreadPoolExecutor(
-                max_workers=min(len(chunks), self.PARALLEL_CHUNKS) or 1,
-                thread_name_prefix="embed",
-            ) as pool:
-                futures = {pool.submit(_fetch, chunk): chunk for chunk in chunks}
+            futures = {pool.submit(_fetch, chunk): chunk for chunk in chunks}
+            try:
                 for fut in as_completed(futures):
-                    # Raises on failure -> the one-by-one fallback below.
+                    # Raises on failure -> cancel + one-by-one fallback below.
                     vecs = fut.result()
                     for (i, t), vec in zip(futures[fut], vecs):
-                        self._cache[self._key(t)] = vec
-                        results[i] = vec
-        except Exception:
-            # Older Ollama without /api/embed (or transient error): one-by-one
-            # fallback for whatever the chunks didn't fill, raising on real
-            # unavailability so callers fail open.
-            for i, t in missing:
-                if results[i] is None:
-                    results[i] = self.embed(t)
+                        _publish(i, t, vec)
+                return results
+            except Exception as batch_err:
+                # Cancel every QUEUED chunk instead of letting the pool join
+                # dozens of doomed per-chunk timeouts (a running one still
+                # costs <= timeout), then fall back one-by-one.
+                log.warning(
+                    "Embeddings: /api/embed batch failed (%s); falling back to "
+                    "single-text embedding of %d remaining text(s).",
+                    batch_err, sum(1 for r in results if r is None),
+                )
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+        # Bounded, audible fallback; already-embedded texts are cached, so a
+        # budget raise is cheap for the next attempt.
+        todo = [(i, t) for i, t in missing if results[i] is None]
+        for done, (i, t) in enumerate(todo):
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"embeddings fallback exceeded its {self.budget_sec:.0f}s "
+                    f"budget after {done}/{len(todo)} single-text embeds"
+                )
+            if done and done % self.FALLBACK_PROGRESS_EVERY == 0:
+                log.info(
+                    "Embeddings: single-text fallback at %d/%d texts.",
+                    done, len(todo),
+                )
+            _publish(i, t, self.embed(t))
         return results
 
 
@@ -499,28 +548,34 @@ def _embed_with_disk_cache(
 ) -> list[list[float]]:
     """``embed_batch`` with an optional per-text on-disk cache keyed by
     (model, text) hash, so re-runs with unchanged notes never re-pay the
-    embedding pass. Cache read/write errors are treated as misses."""
+    embedding pass. Vectors hit disk incrementally (via on_result) as they
+    arrive, so an interrupted pass resumes the remainder. Cache read/write
+    errors are treated as misses."""
     if not disk_cache_dir:
         return embedder.embed_batch(texts)
     cache_dir = Path(disk_cache_dir)
     results: list[list[float] | None] = [None] * len(texts)
-    missing: list[tuple[int, str, Path]] = []
+    missing: list[tuple[int, str]] = []
     model = embedder.model
+
+    def _cache_path(t: str) -> Path:
+        return cache_dir / f"{hashlib.sha256(f'{model}:{t}'.encode('utf-8')).hexdigest()}.json"
+
     for i, t in enumerate(texts):
-        f = cache_dir / f"{hashlib.sha256(f'{model}:{t}'.encode('utf-8')).hexdigest()}.json"
         try:
-            results[i] = json.loads(f.read_text())["embedding"]
+            results[i] = json.loads(_cache_path(t).read_text())["embedding"]
             continue
         except Exception:
-            missing.append((i, t, f))
+            missing.append((i, t))
     if missing:
-        vecs = embedder.embed_batch([t for _, t, _ in missing])
-        for (i, t, f), vec in zip(missing, vecs):
+        def _cache_one(t: str, vec: list[float]) -> None:
             try:
                 cache_dir.mkdir(parents=True, exist_ok=True)
-                f.write_text(json.dumps({"embedding": vec}))
+                _cache_path(t).write_text(json.dumps({"embedding": vec}))
             except Exception:
                 pass
+        vecs = embedder.embed_batch([t for _, t in missing], on_result=_cache_one)
+        for (i, _t), vec in zip(missing, vecs):
             results[i] = vec
     return results
 

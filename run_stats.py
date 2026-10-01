@@ -127,6 +127,7 @@ def get_embedder(gate: bool, warn_prefix: str, exact_mode_note: str):
         settings.embeddings_base_url,
         settings.embeddings_model,
         settings.embeddings_timeout,
+        budget_sec=settings.embeddings_fallback_budget_sec,
     )
     if embedder.available():
         return embedder
@@ -139,9 +140,26 @@ def get_embedder(gate: bool, warn_prefix: str, exact_mode_note: str):
     return None
 
 
+def affected_nodes_label(report: dict, fallback: str) -> str:
+    """Comma-joined non-empty affected_nodes of a record, else `fallback`."""
+    affected = [n for n in (report.get("affected_nodes") or []) if n]
+    return ", ".join(affected) if affected else fallback
+
+
 _STEP_NUM_RE = re.compile(r'^\s*\d+[\.\)]\s+')
 
 
 def strip_step_numbering(step) -> str:
     """Drop any leading 'N.' / 'N)' the reviewer embedded, so steps never double-number."""
     return _STEP_NUM_RE.sub('', str(step))
+
+
+def steps_block(steps, strip_numbering: bool = False) -> str:
+    """Numbered reproduction-steps block for agent prompts, shared by validator/auditor."""
+    return (
+        "\n".join(
+            f"  {i}. {strip_step_numbering(s) if strip_numbering else s}"
+            for i, s in enumerate(steps, 1)
+        )
+        if steps else "  None provided by reviewer"
+    )

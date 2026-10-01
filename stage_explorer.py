@@ -1,5 +1,3 @@
-"""Explorer stage: per-node/batch code analysis fan-out and note extraction."""
-
 import logging
 from collections import defaultdict
 
@@ -76,7 +74,7 @@ def dispatch_explorers(state: MasterState):
     for node_id, attr in G.nodes(data=True):
         nodes_by_community[str(attr.get("community"))].append(node_id)
 
-    # Phase 1: decide dispatches (batch -> task) before registering progress,
+    # Decide dispatches (batch -> task) before registering progress,
     # so the ledger total is exact.
     dispatches: list[tuple[list[str], str, str]] = []
 
@@ -173,14 +171,6 @@ def dispatch_explorers(state: MasterState):
     return commands
 
 
-def _log_explorer_completion(state: ExplorerState) -> None:
-    _log_agent_completion(
-        state.get("progress_id", ""),
-        "Explorer",
-        f"role={state.get('role', 'unknown')}, nodes={', '.join(state.get('node_ids', []))}",
-    )
-
-
 def _extract_hypotheses(node_id: str, raw_hypotheses: list) -> list[dict]:
     """Turn an explorer note's `vulns` entries into standard hypotheses."""
     return [{
@@ -207,8 +197,19 @@ def expert_explorer_node(state: ExplorerState) -> dict:
     else:
         result = _explore_batch(node_ids, role_name)
 
-    _log_explorer_completion(state)
+    _log_agent_completion(
+        state.get("progress_id", ""),
+        "Explorer",
+        f"role={state.get('role', 'unknown')}, nodes={', '.join(state.get('node_ids', []))}",
+    )
     return result
+
+
+def _explorer_system_message(role_name: str, batch: bool = False) -> SystemMessage:
+    parts = [EXPERT_AGENTS["explorer_prompt"], EXPERT_AGENTS[role_name]["prompt"]]
+    if batch:
+        parts.append(EXPERT_AGENTS["batch_prompt"])
+    return SystemMessage(content="\n\n".join(parts))
 
 
 def _explore_single(node_id: str, role_name: str) -> dict:
@@ -219,10 +220,7 @@ def _explore_single(node_id: str, role_name: str) -> dict:
 
     source_code = get_node_code(node_id)
 
-    sys_msg = SystemMessage(content=(
-        f"{EXPERT_AGENTS['explorer_prompt']}\n\n"
-        f"{EXPERT_AGENTS[role_name]['prompt']}"
-    ))
+    sys_msg = _explorer_system_message(role_name)
 
     graph_data = get_cached_graph_data(settings.graph)
     target_node = get_node_map(settings.graph).get(node_id, {})
@@ -252,8 +250,7 @@ def _explore_single(node_id: str, role_name: str) -> dict:
         explorer_llm, [sys_msg, human_msg], f"Explorer single-node {node_id}"
     )
     if note is None:
-        # Output cap exhausted: degrade to an empty note (uncached, so a later
-        # run re-attempts this node) instead of crashing the whole fan-out.
+        # Output cap exhausted: empty note, left uncached so a later run re-attempts.
         _record_stat("explorer_nodes_skipped_output_cap")
         return {"notes": [], "vulnerabilities": []}
 
@@ -281,11 +278,7 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
 
     graph_data = get_cached_graph_data(settings.graph)
 
-    sys_msg = SystemMessage(content=(
-        f"{EXPERT_AGENTS['explorer_prompt']}\n\n"
-        f"{EXPERT_AGENTS[role_name]['prompt']}\n\n"
-        f"{EXPERT_AGENTS['batch_prompt']}"
-    ))
+    sys_msg = _explorer_system_message(role_name, batch=True)
 
     node_map = get_node_map(settings.graph)
     sections = []
@@ -325,8 +318,7 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
         explorer_llm, [sys_msg, human_msg], f"Explorer batch of {len(node_ids)} nodes"
     )
     if result is None:
-        # Output cap exhausted for the whole batch (uncached, so a later run
-        # re-attempts these nodes) instead of crashing the whole fan-out.
+        # Output cap exhausted for the batch; uncached so a later run re-attempts.
         _record_stat("explorer_nodes_skipped_output_cap", len(node_ids))
         return {"notes": [], "vulnerabilities": []}
 
