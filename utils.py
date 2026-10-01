@@ -1773,7 +1773,7 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
 
     lang = LANGUAGE_MAP.get(source_file.suffix)
     if not lang:
-        return source_content
+        return source_content if is_file_node else None
 
     try:
         parser = tree_sitter.Parser(lang)
