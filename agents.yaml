@@ -123,19 +123,24 @@ expert_agents:
 
     CRITICAL PARADIGM: ISOLATED FACT EXTRACTION
     1. BUSINESS INTERFACES (Sources & Sinks): You must strictly identify data crossing the boundary of this snippet.
-       - Label as `source` if the snippet receives external data (e.g., HTTP parameters, uploaded files, CLI args).
-       - Label as `sink` if the snippet performs a dangerous operation with data (e.g., database execution, file writing, subprocess spawning).
-    2. UPSTREAM ASSUMPTIONS (Data State Demands): For this specific snippet to execute safely, what MUST be true about the data entering it? Leave empty if there are no security-related upstream assumptions.
-    CRITICAL: Focus on the required state of the data, not where or who validates it. NEVER use phrases like "The caller must" or "Before invoking this function". Instead, use outcome-based phrasing (e.g., "The job_id must be validated against the active user session," "The file_path must be sanitized against traversal").
-    3. DOWNSTREAM ASSUMPTIONS (Demands on the Callee): When this snippet delegates business logic to an external/unseen function, what MUST that function do securely? Explicitly note that this snippet relies on the callee for safety (e.g., "This route delegates authorization; the callee 'delete_document' MUST enforce that the doc_id belongs to the active user session").
-    4. LOCAL VULNERABILITY HYPOTHESES (Visible Dangers): Create a `vulnerability_hypothesis` ONLY if a flaw is explicitly visible in the current snippet (e.g., raw SQL formatting, plaintext secrets).
+        - Label as `source` if the snippet receives external or ambient request data (e.g., HTTP parameters, raw URIs/paths, request headers, cookies, uploaded files, CLI args).
+        - Label as `sink` if the snippet performs:
+            a. An OPERATIONAL SINK: A dangerous side effect with data (e.g., database query execution, file writing/deletion, command/process execution, code evaluation, HTML reflection).
+            b. A DECISION SINK: A security or routing determination (e.g., returning a boolean, role, or context classification) derived from untrusted input that callers rely on for execution mode, authentication, or authorization boundaries (CWE-807).
+    2. UPSTREAM ASSUMPTIONS (Data State Demands): For this specific snippet to execute safely, what MUST be true about the data entering it (whether passed via arguments or ambient global state)? Leave empty if there are no security-related upstream assumptions.
+        CRITICAL: Focus on the required state of the data, not where or who validates it. NEVER use phrases like "The caller must" or "Before invoking this function". Instead, use outcome-based phrasing (e.g., "The job_id must be validated against the active user session," "The file_path must be sanitized against traversal").
+    3. DOWNSTREAM ASSUMPTIONS (Demands on the Callee): When this snippet delegates business logic, verification, or context checks to an external/unseen function, what MUST that function do securely? Explicitly note that this snippet relies on the callee for safety (e.g., "This route delegates authorization; the callee 'delete_document' MUST enforce that the doc_id belongs to the active user session").
+    4. LOCAL VULNERABILITY HYPOTHESES (Visible Dangers): Create a `vulnerability_hypothesis` ONLY if a flaw is explicitly visible in the current snippet (e.g., raw SQL formatting, plaintext secrets, or a defective decision predicate).
 
     NOISE REDUCTION RULES (STRICTLY ENFORCED):
-    1. WRAPPERS VS. ENTRY POINTS: If a snippet receives data via function parameters and passes it to a sink, DO NOT flag a vulnerability. Instead, create an `upstream` demand for the caller. A `vulnerability_hypothesis` MUST ONLY be created if the ingestion of untrusted data (e.g., fetching an HTTP parameter, reading an external file) AND the dangerous sink are BOTH explicitly visible in the same snippet.
-    2. PARAMETERIZED SINKS: Do not flag sinks that use structurally safe, parameterized data passing (e.g., passing OS commands as an array/list of arguments, using bound variables in SQL). Only flag explicit dangerous patterns, such as string concatenation, interpolation, or explicitly enabling unsafe execution flags (e.g., shell mode).
-    3. THIRD-PARTY LIBRARIES: Do not attempt to guess or hallucinate zero-days or known CVEs inside third-party dependencies. Assume imported libraries function securely unless the snippet explicitly implements an insecure configuration (e.g., disabling TLS verification, disabling CSRF protections). 
-    4. TYPE & FRAMEWORK SAFETY: Do not flag path traversals, overflows, or injections on data that is strongly typed (e.g., standard UUIDs, integers) or defined by internal framework constants, unless you explicitly see the snippet unsafely casting untrusted strings into those types.
-    5. SYSTEMIC PATTERNS: For vulnerability classes that are architectural rather than localized to one function (broken cryptography CWE-327, cleartext transmission CWE-319, missing authentication CWE-306, sensitive data exposure CWE-200, CSRF CWE-352, session fixation CWE-384, business logic CWE-840), you MUST fill the hypothesis `pattern_label` field with a SHORT canonical name of at most six lowercase words shared by every occurrence of the pattern (e.g., "plaintext password storage", "no csrf token validation", "weak tls ciphers"). Keep `component` as your normal detailed explanation; the pipeline groups findings sharing the same pattern_label into a single review. Leave pattern_label null for all other CWEs.
+    1. WRAPPERS VS. ENTRY POINTS: If a snippet receives data via function parameters and passes it to an operational sink, DO NOT flag a vulnerability. Instead, create an `upstream` demand for the caller. A `vulnerability_hypothesis` MUST ONLY be created if the ingestion of untrusted data (e.g., fetching an HTTP parameter, reading raw request metadata, accessing ambient request state) AND the sink (operational sink OR defective decision sink) are BOTH explicitly visible in the same snippet.
+    2. PREDICATE & PARSER INTEGRITY: If a snippet inspects structured or composite ambient data (e.g., full URIs, paths, headers) to determine an execution context, client identity, or privilege state:
+        - If it relies on partial or loose matching (e.g., substring searches, unanchored matching) where untrusted client inputs (such as query parameters or injected headers) can spoof the decision, flag this as a localized flaw (CWE-807 or CWE-20).
+        - Do not treat boolean conversion or string-inspection operators as sanitizers if the resulting boolean controls an access or context decision.
+    3. PARAMETERIZED SINKS: Do not flag sinks that use structurally safe, parameterized data passing (e.g., passing OS commands as an array/list of arguments, using bound variables in SQL). Only flag explicit dangerous patterns, such as string concatenation, interpolation, or explicitly enabling unsafe execution flags (e.g., shell mode).
+    4. THIRD-PARTY LIBRARIES: Do not attempt to guess or hallucinate zero-days or known CVEs inside third-party dependencies. Assume imported libraries function securely unless the snippet explicitly implements an insecure configuration (e.g., disabling TLS verification, disabling CSRF protections).
+    5. TYPE & FRAMEWORK SAFETY: Do not flag path traversals, overflows, or injections on data that is strongly typed (e.g., standard UUIDs, integers) or defined by internal framework constants, unless you explicitly see the snippet unsafely casting untrusted strings into those types.
+    6. SYSTEMIC PATTERNS: For vulnerability classes that are architectural rather than localized to one function (broken cryptography CWE-327, cleartext transmission CWE-319, missing authentication CWE-306, sensitive data exposure CWE-200, CSRF CWE-352, session fixation CWE-384, business logic CWE-840), you MUST fill the hypothesis `pattern_label` field with a SHORT canonical name of at most six lowercase words shared by every occurrence of the pattern (e.g., "plaintext password storage", "no csrf token validation", "weak tls ciphers"). Keep `component` as your normal detailed explanation; the pipeline groups findings sharing the same pattern_label into a single review. Leave pattern_label null for all other CWEs.
 
     ALLOWED CWE LIST:
     CWE-20: Improper Input Validation
@@ -148,6 +153,7 @@ expert_agents:
     CWE-190: Integer Overflow
     CWE-200: Information Disclosure
     CWE-284: Improper Access Control
+    CWE-287: Improper Authentication
     CWE-306: Missing Authentication
     CWE-319: Cleartext Transmission
     CWE-327: Risky Cryptography
@@ -160,6 +166,7 @@ expert_agents:
     CWE-502: Deserialization of Untrusted Data
     CWE-639: Authorization Bypass (IDOR)
     CWE-770: Allocation Without Limits
+    CWE-807: Reliance on Untrusted Inputs in a Security Decision
     CWE-840: Business Logic Errors
     CWE-862: Missing Authorization
     CWE-863: Incorrect Authorization
@@ -200,10 +207,12 @@ expert_agents:
           "target": "paymentService::processPayment",
           "description": "Must enforce authorization checks to ensure the current session is allowed to process a payment."
         }
-      ]
+        ],
+      "vulns": []
     }
 
     Input Snippet:
+
     ```python
     @app.route('/download')
     def download_config():
@@ -232,6 +241,34 @@ expert_agents:
         }
       ]
     }
+
+    Input Snippet:
+
+    ```python
+    def is_admin_request():
+        # Check execution context from request URI
+        uri = request.environ.get('REQUEST_URI', '')
+        if '/admin' in uri:
+            return True
+        return False
+    ```
+
+    Expected Output:
+    {
+      "sources": [
+        "request.environ.get('REQUEST_URI')"
+      ],
+      "sinks": [
+        "return (decision predicate)"
+      ],
+      "vulns": [
+        {
+          "cwe": "CWE-807",
+          "component": "The function determines administrative context using a loose substring check on the full REQUEST_URI. Because REQUEST_URI includes user-controlled query strings and parameters, an unprivileged user can force this predicate to return True by appending '?/admin' to any request."
+        }
+      ]
+    }
+
   batch_prompt: |
     VULNERABILITY ATTRIBUTION RULE:
     You are evaluating a batch of one or more code nodes. You MUST assign vulnerabilities ONLY to the specific node ID where the flawed logic resides.
@@ -316,12 +353,14 @@ cve_analyzer:
     - CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes (Mass Assignment)
     - CWE-639: Authorization Bypass Through User-Controlled Key (IDOR)
     - CWE-306: Missing Authentication for Critical Function
+    - CWE-287: Improper Authentication
     - CWE-352: Cross-Site Request Forgery (CSRF)
     - CWE-384: Session Fixation
     - CWE-200: Exposure of Sensitive Information to an Unauthorized Actor
     - CWE-319: Cleartext Transmission of Sensitive Information
     - CWE-327: Use of a Broken or Risky Cryptographic Algorithm
     - CWE-502: Deserialization of Untrusted Data
+    - CWE-807: Reliance on Untrusted Inputs in a Security Decision
     - CWE-22: Path Traversal
     - CWE-434: Unrestricted Upload of File with Dangerous Type
     - CWE-770: Allocation of Resources Without Limits or Throttling
@@ -432,12 +471,14 @@ contract_verifier_agent:
     - CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes (Mass Assignment)
     - CWE-639: Authorization Bypass Through User-Controlled Key (IDOR)
     - CWE-306: Missing Authentication for Critical Function
+    - CWE-287: Improper Authentication
     - CWE-352: Cross-Site Request Forgery (CSRF)
     - CWE-384: Session Fixation
     - CWE-200: Exposure of Sensitive Information to an Unauthorized Actor
     - CWE-319: Cleartext Transmission of Sensitive Information
     - CWE-327: Use of a Broken or Risky Cryptographic Algorithm
     - CWE-502: Deserialization of Untrusted Data
+    - CWE-807: Reliance on Untrusted Inputs in a Security Decision
     - CWE-22: Path Traversal
     - CWE-434: Unrestricted Upload of File with Dangerous Type
     - CWE-770: Allocation of Resources Without Limits or Throttling
