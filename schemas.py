@@ -433,7 +433,10 @@ class ReviewerOutput(BaseModel):
     vulnerabilities: list[VulnerabilityEvaluation]
 
 class ValidatorOutput(BaseModel):
-    reports: list[ValidationResult]
+    # Constrained to vulnerabilities only: validator subgraphs must not echo their
+    # input fields (sandbox_url etc.) back to MasterState — concurrent writes to
+    # those scalars raised "Can receive only one value per step" at checkpoint time.
+    vulnerabilities: list[VulnerabilityRecord]
 
 class ValidationResult(BaseModel):
     # report_id: str = Field(description="The ID/title of the vulnerability being tested.")
