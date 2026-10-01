@@ -1,4 +1,17 @@
 from pathlib import Path
+import logging
+import os
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+
+_REQUIRED_KEYS = ("OPENAI_API_KEY", "TAVILY_API_KEY", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
+_missing = [k for k in _REQUIRED_KEYS if not os.environ.get(k)]
+if _missing:
+    logging.getLogger(__name__).warning(
+        ".env loaded but missing required keys: %s", ", ".join(_missing)
+    )
+
 
 app_path = Path("../apps/glpi-11.0.7-clean")
 
