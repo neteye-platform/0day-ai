@@ -729,6 +729,65 @@ def _write_credentials(records: list[dict]) -> None:
         logger.error("Credential finder: failed to write %s: %s", target, e)
 
 
+def load_credentials() -> list[dict]:
+    """Read the persisted pre-configured credentials (fail open to ``[]``).
+
+    Returns the records written by ``_write_credentials`` (``service``, ``kind``,
+    ``username``, ``secret``, ``source``, ``notes``), filtered to entries that
+    actually carry a non-empty secret. Missing/corrupt file or disabled finder
+    yields an empty list so downstream prompt injection is a no-op.
+    """
+    target = settings.cache_dir / "credentials.json"
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [
+        r for r in data
+        if isinstance(r, dict) and str(r.get("secret") or "").strip()
+    ]
+
+
+def authentication_block() -> str:
+    """Render the validator prompt's ``TARGET AUTHENTICATION`` block.
+
+    Returns an empty string when no credentials are available (finder disabled,
+    found nothing, or the file is missing/corrupt). Otherwise renders one bullet
+    per credential: ``username``/``password`` when an account name is known,
+    else the bare secret (api key / session cookie / db password), each with the
+    record's ``notes`` appended when present.
+    """
+    records = load_credentials()
+    if not records:
+        return ""
+
+    lines = []
+    for record in records:
+        service = str(
+            record.get("service") or record.get("username") or "credential"
+        ).strip()
+        username = str(record.get("username") or "").strip()
+        secret = str(record.get("secret") or "").strip()
+        notes = str(record.get("notes") or "").strip()
+
+        if username:
+            line = f'- {service}: username="{username}", password="{secret}"'
+        else:
+            line = f'- {service}: "{secret}"'
+        if notes:
+            line += f"  — {notes}"
+        lines.append(line)
+
+    return (
+        "TARGET AUTHENTICATION:\n"
+        "Use the following sandbox credentials/sessions when authenticated "
+        "access is required:\n"
+        + "\n".join(lines)
+    )
+
+
 def _llm_cache(candidates: list[dict]) -> tuple[Optional[list[dict]], bool]:
     """Read (or write) the LLM normalization cache keyed on the raw
     candidates. Returns ``(records, was_cached)``."""

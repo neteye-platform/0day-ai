@@ -628,9 +628,9 @@ def send_http_request(
     - params: Optional query parameters for the URL.
     - data: Form fields sent as 'application/x-www-form-urlencoded' (e.g., {'username': 'u', 'password': 'p'}).
     - json_data: Structured payload serialized automatically as 'application/json'.
-    - files: Files for multipart/form-data upload. Paths inside the attacker
-             workdir (default /work, i.e. files created with write_attacker_file)
-             are read from inside the attacker container; all other paths are
+    - files: Files for multipart/form-data upload. Paths inside your isolated
+             attacker workdir (/work, i.e. files created with write_attacker_file)
+             are read from inside your attacker container; all other paths are
              read from the host.
              Format: {'field_name': '/path/to/file'}
              Or with metadata: {'field_name': ('custom_filename.png', '/path/to/file', 'image/png')}
@@ -715,7 +715,7 @@ def send_http_request(
             uploads = {}
             for field, spec in files.items():
                 path = spec if isinstance(spec, (str, Path)) else spec[1]
-                container_bytes = attacker_tools.read_attacker_file_bytes(str(path))
+                container_bytes = attacker_tools.read_attacker_file_bytes(str(path), state)
                 if container_bytes is not None:
                     if isinstance(spec, (str, Path)):
                         uploads[field] = (
@@ -848,9 +848,11 @@ def mark_validation_complete(
     # Save to cache so subsequent runs skip the tool-calling loop.
     cache_validator(report, state.get("peer_payloads"), updated_vuln)
 
-    # Close this validator's headless-browser sessions (per-agent, never
-    # touching other concurrently running validators' sessions).
+    # Close this validator's headless-browser sessions and remove its dedicated
+    # attacker container (per-agent, never touching other concurrently running
+    # validators).
     browser_tools.manager.close_agent_sessions(state.get("agent_id"))
+    attacker_tools.manager.close_agent_sessions(state.get("agent_id"))
 
     tool_msg = ToolMessage(
         content="Validation complete. Ending validation phase.",
@@ -902,9 +904,11 @@ def ask_for_context(
     # same round-0 report re-triggers the reviewer feedback loop exactly).
     cache_validator(report, state.get("peer_payloads"), updated_vuln)
 
-    # Close this validator's headless-browser sessions (per-agent, never
-    # touching other concurrently running validators' sessions).
+    # Close this validator's headless-browser sessions and remove its dedicated
+    # attacker container (per-agent, never touching other concurrently running
+    # validators).
     browser_tools.manager.close_agent_sessions(state.get("agent_id"))
+    attacker_tools.manager.close_agent_sessions(state.get("agent_id"))
 
     tool_msg = ToolMessage(
         content=(

@@ -10,11 +10,15 @@ Design / lifecycle
 ------------------
 - LAZY provisioning: importing this module never touches docker. Nothing is
   pulled, built, or started unless a validator actually calls a shell tool for
-  the first time. The shared image is built once (the Dockerfile content is
-  md5-stamped in ``attacker/.build.hash``, mirroring utils.build_images) and
-  the container is started on the default bridge network under a pinned name.
-  A stale container of the same name is replaced; after that the running box is
-  reused without any build cost.
+  the first time. The image is built once and shared (the Dockerfile content is
+  md5-stamped in ``attacker/.build.hash``, mirroring utils.build_images), but
+  EVERY validator gets its OWN container - named
+  ``<attacker_container_name>-<agent_id>`` and running on the default bridge
+  network - with its own host-backed bind mount at the container's ``/work``
+  (host side ``<target_app>/.cache/validator/<agent_id>``). PoC files therefore
+  never leak between validators nor accumulate across runs. A stale container
+  of the same name is replaced; afterwards the running box is reused with zero
+  build cost until the validator tears it down.
 - BRIDGE + TARGET: the sandbox is published on all host interfaces and is
   reachable from both the host and the attacker container at the docker bridge
   gateway (e.g. 172.17.0.1). The preprocessor sets ``sandbox_url`` to that gateway
@@ -54,13 +58,23 @@ ATTACKER_FILEREAD_MAX_BYTES = 1_000_000
 
 
 class AttackerManager:
-    """Thread-safe owner of the shared attacker container (lazy boot)."""
+    """Thread-safe owner of the per-validator attacker containers (lazy boot).
+
+    The Kali image is built once and shared by every validator, but each
+    validator gets its OWN container named ``<attacker_container_name>-<agent_id>``
+    with a host-backed bind mount at the container's ``/work``
+    (``<target_app>/.cache/validator/<agent_id>``). Containers are created on
+    the first shell-tool call of a validator and removed when that validator
+    finishes (terminal tools / loop fallback).
+    """
 
     def __init__(self):
-        self._container_name = None
+        self._containers: dict[str, str] = {}
+        self._lock = threading.RLock()
+        self._boot_lock = threading.Lock()
+        self._image = None
         self._disabled = False
         self._disabled_reason = None
-        self._boot_lock = threading.Lock()
 
     # -- availability ------------------------------------------------------
 
@@ -86,43 +100,79 @@ class AttackerManager:
             f"({reason}). The HTTP/browser validation tools remain available."
         )
 
+    # -- per-agent identity ---------------------------------------------------
+
+    @staticmethod
+    def _agent_id(state) -> str:
+        return (state.get("agent_id") if isinstance(state, dict) else None) or "default"
+
+    @staticmethod
+    def _container_name_for(agent_id: str) -> str:
+        base = getattr(settings, "attacker_container_name", "vulnscan-kali-attacker")
+        return f"{base}-{agent_id}"
+
+    @staticmethod
+    def _host_workdir_for(agent_id: str) -> Path:
+        """Host directory bind-mounted at this validator's container /work."""
+        return settings.cache_dir / "validator" / agent_id
+
     # -- lazy provisioning ---------------------------------------------------
 
-    def ensure(self) -> str | None:
-        """Ensure the attacker container exists and is running; return its name.
+    def ensure(self, state) -> str | None:
+        """Ensure THIS validator's attacker container exists and is running.
 
-        Idempotent and thread-safe. Returns the pinned container name or None
-        (fail open) with ``_disabled``/``_disabled_reason`` set. Only the first
-        caller performs the build/start work.
+        Idempotent and thread-safe. Returns the container name or None (fail
+        open) with ``_disabled``/``_disabled_reason`` set. The shared image is
+        built at most once; the per-agent container is started lazily on the
+        first shell-tool call and reused until ``close_agent_sessions``.
         """
         if self._blocked():
             return None
-        # Fast path: already provisioned and running.
-        if self._container_name is not None and self._running(self._container_name):
-            return self._container_name
 
-        with self._boot_lock:
-            if self._disabled:
-                return None
-            if self._container_name is not None and self._running(self._container_name):
-                return self._container_name
+        agent_id = self._agent_id(state)
+        name = self._container_name_for(agent_id)
 
-            if not self._docker_available():
-                self._disable("docker is not installed or the daemon is not running")
-                return None
+        # Fast path: this agent's container is already up.
+        with self._lock:
+            if self._containers.get(agent_id) == name and self._running(name):
+                return name
 
-            image = getattr(settings, "attacker_image_tag", "vulnscan-kali-attacker:latest")
-            name = getattr(settings, "attacker_container_name", "vulnscan-kali-attacker")
+        if not self._ensure_image():
+            return None
 
-            if not self._build_image(image):
-                self._disable(f"image '{image}' could not be built")
-                return None
-            if not self._start_container(image, name):
+        with self._lock:
+            if self._running(name):
+                self._containers[agent_id] = name
+                return name
+            if not self._start_container(
+                self._image, name, self._host_workdir_for(agent_id)
+            ):
                 self._disable(f"container '{name}' could not be started")
                 return None
-
-            self._container_name = name
+            self._containers[agent_id] = name
             return name
+
+    def close_agent_sessions(self, agent_id: str | None) -> None:
+        """Stop and remove this validator's attacker container (fail open).
+
+        Called from the validator's terminal tools and loop fallback so
+        per-validator containers do not accumulate across the run.
+        """
+        agent_id = agent_id or "default"
+        with self._lock:
+            name = self._containers.pop(agent_id, None)
+        if not name:
+            return
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", name],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            logger.info("Removed attacker container '%s'.", name)
+        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+            pass
 
     def _disable(self, reason: str):
         self._disabled = True
@@ -166,6 +216,23 @@ class AttackerManager:
             pass
         return digest.hexdigest()
 
+    def _ensure_image(self) -> bool:
+        """Build the shared attacker image at most once (thread-safe)."""
+        if self._image is not None:
+            return True
+        with self._boot_lock:
+            if self._image is not None:
+                return True
+            if not self._docker_available():
+                self._disable("docker is not installed or the daemon is not running")
+                return False
+            image = getattr(settings, "attacker_image_tag", "vulnscan-kali-attacker:latest")
+            if not self._build_image(image):
+                self._disable(f"image '{image}' could not be built")
+                return False
+            self._image = image
+            return True
+
     def _build_image(self, image: str) -> bool:
         digest = self._dockerfile_hash()
         stamp = ATTACKER_DIR / ".build.hash"
@@ -197,17 +264,27 @@ class AttackerManager:
             pass
         return True
 
-    # -- container start + gateway discovery -----------------------------------
+    # -- container start -------------------------------------------------------
 
     @staticmethod
-    def _start_container(image: str, name: str) -> bool:
-        # Replace any stale container holding the pinned name.
+    def _start_container(image: str, name: str, host_dir: Path) -> bool:
+        # Replace any stale container holding this pinned name.
         try:
             subprocess.run(
                 ["docker", "rm", "-f", name], capture_output=True, text=True, timeout=30
             )
         except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
             pass
+        # Bind-mount this validator's own host directory at the container's
+        # workdir, so PoC files never leak between validators nor accumulate
+        # across runs. Docker does not create subdirs of a bind mount, so the
+        # host directory must exist before `docker run`.
+        mount_target = getattr(settings, "attacker_workdir", "/work")
+        try:
+            host_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("Could not create attacker workdir %s: %s", host_dir, e)
+            return False
         try:
             run = subprocess.run(
                 [
@@ -219,6 +296,7 @@ class AttackerManager:
                     # The container stays namespaced and unprivileged - ALL
                     # applies inside its own namespaces only.
                     "--cap-add", "ALL",
+                    "-v", f"{host_dir.resolve()}:{mount_target}",
                     image, "sleep", "infinity",
                 ],
                 capture_output=True,
@@ -231,7 +309,10 @@ class AttackerManager:
         if run.returncode != 0:
             logger.warning("Attacker container start failed: %s", run.stderr.strip())
             return False
-        logger.info("Started attacker container '%s' from image %s.", name, image)
+        logger.info(
+            "Started attacker container '%s' from image %s (workdir %s -> %s).",
+            name, image, host_dir, mount_target,
+        )
         return True
 
 
@@ -310,16 +391,19 @@ def run_command(
     The sandbox application is published on all host interfaces and is reachable
     from inside the attacker container through the IP address of the ``sandbox_url``
 
+    You have your OWN isolated /work directory: files you create persist across
+    your calls but are never shared with other validators.
+
     Args:
         command (str): The shell command to run, e.g.
             "curl -sS -v http://<SHELL TARGET>/api/export?title=OR+1=1" or
             "nmap -sV -p- <SHELL TARGET host>".
-        workdir (str): Directory to run the command in inside the container.
-            Defaults to /work
+        workdir (str): Directory to run the command in inside your container.
+            Defaults to /work (your own isolated workdir).
         timeout (int): Max seconds for this command (default and hard cap come
             from settings.attacker_command_timeout).
     """
-    name = manager.ensure()
+    name = manager.ensure(state)
     if not name:
         return manager.unavailable_msg()
 
@@ -342,20 +426,25 @@ def run_command(
 
 
 @tool
-def write_attacker_file(file_path: str, content: str, mode: str = "0600") -> str:
+def write_attacker_file(
+    file_path: str,
+    content: str,
+    state: Annotated[dict, InjectedState],
+    mode: str = "0600",
+) -> str:
     """
-    Writes text into a file INSIDE the Kali attacker container, confined to the
-    attacker workdir. Use this to draft a PoC script (e.g. main.py) before
+    Writes text into a file INSIDE the Kali attacker container, confined to your
+    own isolated workdir. Use this to draft a PoC script (e.g. main.py) before
     running it with run_command, or to save payload lists for fuzzing. The file
     can be read back with read_attacker_file.
 
     Args:
-        file_path (str): Path relative to the attacker workdir (e.g.
+        file_path (str): Path relative to your workdir (e.g.
             'pocs/exploit.py'; subdirectories are created automatically).
         content (str): The full text to write (UTF-8).
         mode (str): Octal permission bits, e.g. '0600' or '0755' for scripts.
     """
-    name = manager.ensure()
+    name = manager.ensure(state)
     if not name:
         return manager.unavailable_msg()
     target = _contains_workdir(file_path)
@@ -390,23 +479,26 @@ def write_attacker_file(file_path: str, content: str, mode: str = "0600") -> str
 
 @tool
 def read_attacker_file(
-    file_path: str, start_line: int = 1, end_line: int | None = None
+    file_path: str,
+    state: Annotated[dict, InjectedState],
+    start_line: int = 1,
+    end_line: int | None = None,
 ) -> str:
     """
     Reads a line range of a file inside the Kali attacker container, confined
-    to the attacker workdir and capped like the source reader at 150 lines per
-    call. Use this to inspect a saved PoC script or read back captured evidence
-    that run_command produced (e.g. a written request/response file) to include
-    in poc_payload / execution_logs.
+    to your own isolated workdir and capped like the source reader at 150 lines
+    per call. Use this to inspect a saved PoC script or read back captured
+    evidence that run_command produced (e.g. a written request/response file) to
+    include in poc_payload / execution_logs.
 
     Args:
-        file_path (str): Path relative to the attacker workdir (e.g.
+        file_path (str): Path relative to your workdir (e.g.
             'pocs/exploit.py').
         start_line (int): First line to read, 1-indexed and inclusive.
         end_line (int): Last line to read, 1-indexed and inclusive. Defaults to
             the end of the file (or the 150-line cap).
     """
-    name = manager.ensure()
+    name = manager.ensure(state)
     if not name:
         return manager.unavailable_msg()
     target = _contains_workdir(file_path)
@@ -479,17 +571,19 @@ def read_attacker_file(
 # those bytes out of the container so a PoC payload can be uploaded via
 # files=... even though the request itself is issued from the host.
 
-def read_attacker_file_bytes(file_path: str) -> bytes | None:
-    """Read a whole file from the attacker container as raw bytes, or None.
+def read_attacker_file_bytes(file_path: str, state=None) -> bytes | None:
+    """Read a whole file from THIS validator's attacker container as raw bytes, or None.
 
     Only paths confined to the attacker workdir are considered (non-workdir paths
-    never touch docker and keep the lazy-provisioning contract). Returns None when
-    the attacker container is unavailable or the file cannot be read.
+    never touch docker and keep the lazy-provisioning contract). ``state``
+    identifies the calling validator so the correct per-agent container is read.
+    Returns None when the attacker container is unavailable or the file cannot
+    be read.
     """
     target = _contains_workdir(file_path)
     if target is None:
         return None
-    name = manager.ensure()
+    name = manager.ensure(state)
     if not name:
         return None
     try:
