@@ -5,12 +5,11 @@ import re
 import subprocess
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AnyMessage, RemoveMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 from llm_debug import build_debug_http_client
 from tavily import TavilyClient
 from langgraph.types import Command, Send
 from langgraph.graph import END
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing import Any
 from collections import defaultdict
 import hashlib
@@ -23,7 +22,8 @@ import settings
 import tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, estimate_message_tokens, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer
+from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer
+from tool_loop import CompactionConfig, ToolLoopAgent
 
 # Maximum combined code size (in chars) for a batched explorer dispatch.
 EXPLORER_BATCH_CHAR_THRESHOLD = 10000
@@ -1454,7 +1454,6 @@ CODE_LEVEL_REVIEWER_TOOLS = [
 ]
 FRAMEWORK_DEPENDENCY_REVIEWER_TOOLS = [
     tools.read_file,
-    tools.get_node_connections,
     tools.search_codebase,
     tools.list_container_artifacts,
     tools.find_in_container,
@@ -1507,189 +1506,124 @@ def dispatch_reviewers(state: MasterState):
     return commands
 
 
-# ---------------------------------------------------------------------------
-# Reviewer context compaction (opencode-style)
-#
-# When the reviewer's message history estimate reaches the configured context
-# threshold, the middle of the conversation is collapsed into an LLM-generated
-# summary while a short verbatim tail is preserved. The protected head (system
-# prompt + hypothesis) is always kept. If the summarization call fails, the
-# pipeline fails open and the full history is used unchanged.
-# ---------------------------------------------------------------------------
+# Each agent's ledger format only differs in the system prompt; the summary
+# rendering itself is shared. The generic compaction machinery (CompactionConfig,
+# ToolLoopAgent, history splitting/transcript rendering, and the summary
+# generator) lives in tool_loop.py; these constants carry the exact per-agent
+# prompt text so the ledger flavor is a property of the agent, not a separate
+# function.
+REVIEWER_SUMMARY_LEDGER = (
+    "You are an expert summarizer. The following is the message history of a "
+    "security reviewer agent investigating whether a reported vulnerability "
+    "hypothesis in a target application is a true positive or a false positive. "
+    "Your summary will REPLACE these messages in the model context, so the "
+    "reviewer must be able to continue the investigation from it WITHOUT "
+    "re-reading the original tool outputs.\n\n"
+    "Produce an information-dense summary as a security investigation ledger "
+    "with exactly these sections:\n"
+    "## Objective\n"
+    "One or two sentences restating the exact hypothesis under review and the "
+    "target component/node.\n"
+    "## Checks & Artifacts Examined\n"
+    "Bulleted, deduplicated list of every node, file, container artifact, "
+    "search, and request already examined, with the single most important fact "
+    "each one revealed. Do NOT include full code or full tool outputs — distill "
+    "them into their conclusions.\n"
+    "## Confirmed Facts\n"
+    "Bulleted list of verified facts established so far, stated in final form.\n"
+    "## Ruled-Out Dead Ends\n"
+    "Bulleted list of hypotheses or investigation paths already disproven, with "
+    "a one-line reason for each.\n"
+    "## Active Leads & Next Steps\n"
+    "Bulleted list of the most promising remaining checks not yet completed.\n\n"
+    "RULES:\n"
+    "- If the history contains a prior SUMMARY (a system message containing "
+    "'CONTEXT COMPACTION SUMMARY'), treat it as the anchoring summary: extend "
+    "and refine it with only the new facts gathered since, rather than "
+    "regenerating from scratch.\n"
+    "- Write in final form ('the code does X', 'the sink is reachable'), never "
+    "'the model checked X'.\n"
+    "- Keep it concise, under 1024 words. Preserve exact file paths, node ids, "
+    "CVE ids, and tool argument names.\n"
+)
 
-def _reviewer_compaction_threshold() -> int:
-    """Estimated-token threshold at which compaction triggers."""
-    return settings.reviewer_model_context_window - settings.reviewer_context_reserved
+VALIDATOR_SUMMARY_LEDGER = (
+    "You are an expert summarizer. The following is the message history of a "
+    "security validator agent attempting to prove or refute a reported "
+    "vulnerability hypothesis against a live sandbox application via HTTP "
+    "requests. Your summary will REPLACE these messages in the model context, "
+    "so the validator must be able to continue the proof from it WITHOUT "
+    "re-reading the original HTTP responses or tool arguments.\n\n"
+    "Produce an information-dense summary as a security validation ledger "
+    "with exactly these sections:\n"
+    "## Objective\n"
+    "One or two sentences restating the exact vulnerability hypothesis under "
+    "proof, its entry point URL, HTTP method, and required parameters.\n"
+    "## Requests Performed\n"
+    "Bulleted list of every HTTP request already sent (method, path, params, "
+    "auth state), with the single most important fact each response revealed. "
+    "Do NOT include full request/response bodies — distill them into "
+    "conclusions (status codes, key values echoed, observable mitigations).\n"
+    "## Confirmed Facts\n"
+    "Bulleted list of verified facts established so far (e.g. endpoint reachable "
+    "without auth, parameter reflected in response, validation present), stated "
+    "in final form.\n"
+    "## Ruled-Out Dead Ends\n"
+    "Bulleted list of hypotheses or attack paths already disproven, with a "
+    "one-line reason for each.\n"
+    "## Active Leads & Next Steps\n"
+    "Bulleted list of the most promising remaining checks not yet completed.\n\n"
+    "RULES:\n"
+    "- If the history contains a prior SUMMARY (a system message containing "
+    "'CONTEXT COMPACTION SUMMARY'), treat it as the anchoring summary: extend "
+    "and refine it with only the new facts gathered since, rather than "
+    "regenerating from scratch.\n"
+    "- Write in final form ('POST succeeded', 'the sink is reachable', 'auth "
+    "was required'), never 'the model checked X'.\n"
+    "- Keep it concise, under 1024 words. Preserve exact paths, parameter "
+    "names, status codes, and any cookies that were set.\n"
+)
 
 
-def _split_reviewer_history(messages: list[AnyMessage]) -> tuple[list, list, list]:
-    """Split the reviewer history into (protected_head, middle, verbatim_tail).
+class ReviewerAgent(ToolLoopAgent):
+    """Reviewer track: mode-dependent toolsets, cache-hit Command, and the
+    trailing-batch submit_evaluation end condition."""
 
-    Protected head = the first SystemMessage (system prompt) plus the first
-    HumanMessage (the hypothesis under review). Tail = the last
-    ``reviewer_compaction_tail_turns`` AI+tool turns kept word-for-word.
-    Middle = everything between them, including any prior context summary.
-    """
-    msgs = list(messages)
-    head: list = []
-    idx = 0
-    need_sys, need_human = 1, 1
-    while idx < len(msgs):
-        m = msgs[idx]
-        if need_sys and m.type == "system":
-            head.append(m)
-            need_sys -= 1
-            idx += 1
-            continue
-        if need_human and m.type == "human":
-            head.append(m)
-            need_human -= 1
-            idx += 1
-            continue
-        break
+    terminal_tool = "submit_evaluation"
 
-    rest = msgs[idx:]
-    ai_seen = 0
-    boundary = len(rest)
-    for i in range(len(rest) - 1, -1, -1):
-        if rest[i].type == "ai":
-            ai_seen += 1
-            boundary = i
-            if ai_seen >= settings.reviewer_compaction_tail_turns:
-                break
-
-    return head, rest[:boundary], rest[boundary:]
-
-
-def _render_message_transcript(messages: list[AnyMessage]) -> str:
-    """Flatten a message span into a readable transcript for summarization."""
-    parts = []
-    for m in messages:
-        kind = m.type
-        name = getattr(m, "name", None)
-        content = getattr(m, "content", "") or ""
-        if kind == "ai":
-            calls = getattr(m, "tool_calls", None) or []
-            rendered = []
-            for tc in calls:
-                tc_name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
-                tc_args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
-                rendered.append(f"{tc_name}({json.dumps(tc_args, default=str)[:600]})")
-            label = f"### ai (tool_calls: {', '.join(rendered) or 'none'})"
+    def bind_tools(self, state):
+        mode = state.get("mode", "code_level")
+        if mode == "framework_dependency":
+            reviewer_tools = FRAMEWORK_DEPENDENCY_REVIEWER_TOOLS
         else:
-            label = f"### {kind}" + (f" [{name}]" if name else "")
-        parts.append(f"{label}\n{content}")
-    return "\n\n".join(parts)
-
-
-def _generate_context_summary(middle: list[AnyMessage]) -> SystemMessage | None:
-    """Summarize the compressible middle of the reviewer history into a
-    structured security ledger via the cheap fast_llm. Returns None on any
-    failure so the caller fails open."""
-    try:
-        transcript = _render_message_transcript(middle)
-        if not transcript.strip():
-            return None
-
-        sys_prompt = (
-            "You are an expert summarizer. The following is the message history of a "
-            "security reviewer agent investigating whether a reported vulnerability "
-            "hypothesis in a target application is a true positive or a false positive. "
-            "Your summary will REPLACE these messages in the model context, so the "
-            "reviewer must be able to continue the investigation from it WITHOUT "
-            "re-reading the original tool outputs.\n\n"
-            "Produce an information-dense summary as a security investigation ledger "
-            "with exactly these sections:\n"
-            "## Objective\n"
-            "One or two sentences restating the exact hypothesis under review and the "
-            "target component/node.\n"
-            "## Checks & Artifacts Examined\n"
-            "Bulleted, deduplicated list of every node, file, container artifact, "
-            "search, and request already examined, with the single most important fact "
-            "each one revealed. Do NOT include full code or full tool outputs — distill "
-            "them into their conclusions.\n"
-            "## Confirmed Facts\n"
-            "Bulleted list of verified facts established so far, stated in final form.\n"
-            "## Ruled-Out Dead Ends\n"
-            "Bulleted list of hypotheses or investigation paths already disproven, with "
-            "a one-line reason for each.\n"
-            "## Active Leads & Next Steps\n"
-            "Bulleted list of the most promising remaining checks not yet completed.\n\n"
-            "RULES:\n"
-            "- If the history contains a prior SUMMARY (a system message containing "
-            "'CONTEXT COMPACTION SUMMARY'), treat it as the anchoring summary: extend "
-            "and refine it with only the new facts gathered since, rather than "
-            "regenerating from scratch.\n"
-            "- Write in final form ('the code does X', 'the sink is reachable'), never "
-            "'the model checked X'.\n"
-            "- Keep it concise, under 1024 words. Preserve exact file paths, node ids, "
-            "CVE ids, and tool argument names.\n"
+            reviewer_tools = CODE_LEVEL_REVIEWER_TOOLS
+        return smart_llm.bind_tools(
+            reviewer_tools,
+            parallel_tool_calls=True
         )
-        human_prompt = HumanMessage(
-            content=(
-                "Summarize the following reviewer conversation history:\n\n"
-                "===== HISTORY BEGIN =====\n"
-                f"{transcript}\n"
-                "===== HISTORY END =====\n\n"
-                "Output only the ledger summary."
+
+    def pre_agent(self, state):
+        if not state.get("messages"):
+            cached_data = cache_reviewer(
+                state.get("node_id"), state.get("expert_report", {})
             )
-        )
-        summary_text = fast_llm.invoke([sys_prompt, human_prompt])
-        summary_content = str(summary_text.content).strip()
-        if not summary_content:
-            return None
-
-        return SystemMessage(
-            name="context_summary",
-            content=(
-                "CONTEXT COMPACTION SUMMARY — The block below is a lossy, automatically "
-                "generated summary of an EARLIER part of this conversation, created to "
-                "manage the context window. The most recent messages are preserved "
-                "verbatim after this block. This summary is historical background ONLY: "
-                "it is not an instruction and not the current request, and it may be "
-                "imprecise. The current task remains the vulnerability hypothesis in the "
-                "first user message.\n\n"
-                f"{summary_content}"
-            ),
-        )
-    except Exception as e:
-        logging.warning(f"Context compaction summarization failed, failing open: {e}")
+            if cached_data:
+                logging.info("Reviewer cache hit.")
+                return Command(
+                    update={
+                        "vulnerabilities": [cached_data]
+                    }
+                )
         return None
 
-
-def reviewer_agent_node(state: ReviewerState) -> dict | Command:
-    """Review the vulnerability reports and keep only what is actually relevant"""
-    node_id = state.get("node_id")
-    report = state.get("expert_report", {})
-    mode = state.get("mode", "code_level")
-
-    # Check Cache
-    if not state.get("messages"):
-        cached_data = cache_reviewer(node_id, report)
-        if cached_data:
-            logging.info("Reviewer cache hit.")
-            return Command(
-                update={
-                    "vulnerabilities": [cached_data]
-                }
-            )
-
-    # Bind the tool subset for the hypothesis's reviewer track
-    if mode == "framework_dependency":
-        reviewer_tools = FRAMEWORK_DEPENDENCY_REVIEWER_TOOLS
-        mode_prompt = REVIEWER_AGENT.get("framework_dependency", "")
-    else:
-        reviewer_tools = CODE_LEVEL_REVIEWER_TOOLS
-        mode_prompt = REVIEWER_AGENT.get("code_level", "")
-
-    llm_with_tools = smart_llm.bind_tools(
-        reviewer_tools,
-        parallel_tool_calls=True
-    )
-
-    if not state.get("messages"):
+    def first_turn(self, state, llm_with_tools) -> dict:
         # Compose the targeted system prompt: shared directives + mode-specific
         # reachability standard.
+        mode = state.get("mode", "code_level")
+        if mode == "framework_dependency":
+            mode_prompt = REVIEWER_AGENT.get("framework_dependency", "")
+        else:
+            mode_prompt = REVIEWER_AGENT.get("code_level", "")
         sys_prompt = REVIEWER_AGENT.get('prompt', '')
         if mode_prompt:
             sys_prompt = f"{sys_prompt}\n\n{mode_prompt}"
@@ -1727,125 +1661,46 @@ def reviewer_agent_node(state: ReviewerState) -> dict | Command:
         response = llm_with_tools.invoke([sys_msg, human_msg])
         return {"messages": [sys_msg, human_msg, response], "iterations": 1}
 
-    else:
-        full_messages = list(state["messages"])
-        messages_for_llm = full_messages
-        compaction_updates: list = []
-        did_compact = False
+    def pre_router(self, state) -> bool:
+        return len(state["messages"]) == 0 and state.get("vulnerabilities")
 
-        # Opencode-style threshold compaction: once the estimated token count
-        # of the history reaches the configured limit, collapse the middle into
-        # a summary and keep a short verbatim tail. Fail open if summarization
-        # errors; also skip when the compressible middle is trivially small.
-        if estimate_message_tokens(full_messages) >= _reviewer_compaction_threshold():
-            head, middle, tail = _split_reviewer_history(full_messages)
-            compressible = estimate_message_tokens(middle)
-            if (
-                len(head) == 2
-                and compressible >= settings.reviewer_compaction_min_compressible_tokens
-            ):
-                summary_msg = _generate_context_summary(middle)
-                if summary_msg is not None:
-                    tail_copies = [m.model_copy(deep=True) for m in tail]
-                    messages_for_llm = head + [summary_msg] + tail_copies
-                    compaction_updates = [
-                        RemoveMessage(id=REMOVE_ALL_MESSAGES),
-                        *head,
-                        summary_msg,
-                        *tail_copies,
-                    ]
-                    did_compact = True
+    def fallback(self, state) -> Command:
+        """Resolve a review that hit the iteration cap without a submit_evaluation
+        verdict. Mirrors submit_evaluation's output shape so the record flows
+        through the standard reviewer output/cache path, but marks it review_error
+        instead of silently confirming or discarding it."""
+        report = dict(state.get("expert_report", {}))
+        node_id = state.get("node_id", "Unknown")
 
-        current_turn = state.get("iterations", 0) + 1
-        if current_turn >= settings.reviewer_countdown_start:
-            warning_msg = HumanMessage(content=(
-                f"System Warning: You are on turn {current_turn} of "
-                f"{settings.reviewer_max_iterations}. You must call submit_evaluation "
-                f"in your next turn based on the best available evidence, or the system "
-                f"will forcefully terminate this task."
-            ))
-            messages_for_llm = list(messages_for_llm) + [warning_msg]
-            compaction_updates.append(warning_msg)
-
-        response = llm_with_tools.invoke(messages_for_llm)
-        compaction_updates.append(response)
-        if did_compact:
-            logging.info(
-                f"Reviewer on {state.get('node_id', 'Unknown')} compacted context: "
-                f"{estimate_message_tokens(full_messages)} est. tokens -> "
-                f"{estimate_message_tokens(messages_for_llm)} est. tokens."
-            )
-        return {"messages": compaction_updates, "iterations": 1}
-
-
-def reviewer_router(state: ReviewerState):
-    """Routes based on the tool called by the reviewer LLM."""
-    messages = state["messages"]
-    if len(messages) == 0 and state.get("vulnerabilities"):
-        return "__end__"
-
-    # Hard loop guard: if the model never submits a verdict, terminate
-    # gracefully instead of spinning until the recursion limit.
-    if state.get("iterations", 0) >= settings.reviewer_max_iterations:
-        logging.warning(
-            f"Reviewer on {state.get('node_id', 'Unknown')} exceeded "
-            f"{settings.reviewer_max_iterations} iterations without a verdict; falling back."
+        updated_vuln = dict(report)
+        updated_vuln["status"] = "review_error"
+        updated_vuln["reviewer_reasoning"] = (
+            f"Review terminated after {state.get('iterations', 0)} tool-loop iterations "
+            f"without a submit_evaluation verdict (loop budget exceeded)."
         )
-        return "reviewer_fallback"
 
-    last_message = state["messages"][-1]
+        cache_reviewer(node_id, report, updated_vuln)
 
-    if last_message.type == "ai":
-        if last_message.tool_calls:
-            return "reviewer_tools"
-        # The LLM failed to call a tool
-        return "ask_reviewer_for_tool"
-
-    elif last_message.type == "tool":
-        # With parallel tool calls the model may submit a final evaluation
-        # alongside other reads; end if any tool in the latest batch submitted.
-        for msg in reversed(state["messages"]):
-            if msg.type != "tool":
-                break
-            if getattr(msg, "name", "") == "submit_evaluation":
-                return "__end__"
-        return "reviewer_agent"
-
-    # The LLM failed to call a tool
-    return "ask_reviewer_for_tool"
+        return Command(
+            update={
+                "vulnerabilities": [updated_vuln],
+            }
+        )
 
 
-def reviewer_fallback_node(state: ReviewerState) -> Command:
-    """Resolve a review that hit the iteration cap without a submit_evaluation
-    verdict. Mirrors submit_evaluation's output shape so the record flows
-    through the standard reviewer output/cache path, but marks it review_error
-    instead of silently confirming or discarding it."""
-    report = dict(state.get("expert_report", {}))
-    node_id = state.get("node_id", "Unknown")
+reviewer_agent = ReviewerAgent(
+    name="reviewer",
+    settings_prefix="reviewer",
+    compaction=CompactionConfig(prefix="reviewer"),
+    summary_ledger=REVIEWER_SUMMARY_LEDGER,
+    summary_llm=fast_llm,
+)
 
-    updated_vuln = dict(report)
-    updated_vuln["status"] = "review_error"
-    updated_vuln["reviewer_reasoning"] = (
-        f"Review terminated after {state.get('iterations', 0)} tool-loop iterations "
-        f"without a submit_evaluation verdict (loop budget exceeded)."
-    )
-
-    cache_reviewer(node_id, report, updated_vuln)
-
-    return Command(
-        update={
-            "vulnerabilities": [updated_vuln],
-        }
-    )
-
-
-def ask_reviewer_for_tool(state: ReviewerState):
-    """Fallback node to force the LLM to use a tool."""
-    message = HumanMessage(content=(
-        f"You did not invoke any tools. Keep your reasoning brief and emit a tool call "
-        f"in this same response. You must use a tool to proceed."
-    ))
-    return {"messages": [message]}
+# Module-level graph node callables (kept so graph.py's imports stay untouched).
+reviewer_agent_node = reviewer_agent.agent
+reviewer_router = reviewer_agent.router
+reviewer_fallback_node = reviewer_agent.fallback
+ask_reviewer_for_tool = reviewer_agent.ask
 
 # ==========================================
 # Validator agent
@@ -1882,16 +1737,24 @@ def dispatch_validators(state: MasterState):
     return commands
 
 
-def validator_agent_node(state: ValidatorState) -> dict:
-    llm_with_tools = smart_llm.bind_tools([
-        tools.send_http_request,
-        # tools.list_files,
-        # tools.read_sandbox_file,
-        tools.mark_validation_complete
-    ])
-    current_cookies = state.get("cookies", {})
+class ValidatorAgent(ToolLoopAgent):
+    """Validator track: fixed HTTP-proof toolset, live cookie tracking, and a
+    single-terminal-tool end condition."""
 
-    if not state.get("messages"):
+    terminal_tool = "mark_validation_complete"
+
+    def _subject(self, state) -> str:
+        return state.get("report_to_test", {}).get("node_id", "Unknown")
+
+    def bind_tools(self, state):
+        return smart_llm.bind_tools([
+            tools.send_http_request,
+            # tools.list_files,
+            # tools.read_sandbox_file,
+            tools.mark_validation_complete
+        ])
+
+    def first_turn(self, state, llm_with_tools) -> dict:
         sys_msg = SystemMessage(content=VALIDATOR_AGENT.get('prompt'))
         # Build a structured string for the LLM
         report = state['report_to_test']
@@ -1918,8 +1781,11 @@ def validator_agent_node(state: ValidatorState) -> dict:
         messages = [sys_msg, human_msg]
         response = llm_with_tools.invoke(messages)
         return {"messages": [sys_msg, human_msg, response], "iterations": 1}
-    else:
-        # Update cookies from the recent history
+
+    def session_state(self, state) -> dict:
+        # Update cookies from the recent history (scans the raw, pre-compaction
+        # history so compacted cookie-bearing responses are not missed).
+        current_cookies = dict(state.get("cookies", {}))
         for msg in reversed(state["messages"]):
             if getattr(msg, "type", "") == "ai":
                 break
@@ -1927,80 +1793,45 @@ def validator_agent_node(state: ValidatorState) -> dict:
                 if hasattr(msg, "artifact") and msg.artifact:
                     # Merge the new cookies into the current state
                     current_cookies.update(msg.artifact)
+        return {"cookies": current_cookies}
 
-        current_turn = state.get("iterations", 0) + 1
-        messages_for_llm = list(state["messages"])
-        extra_updates: list = []
-        if current_turn >= settings.validator_countdown_start:
-            warning_msg = HumanMessage(content=(
-                f"System Warning: You are on turn {current_turn} of "
-                f"{settings.validator_max_iterations}. You must call mark_validation_complete "
-                f"in your next turn based on the best available evidence, or the system "
-                f"will forcefully terminate this task."
-            ))
-            messages_for_llm.append(warning_msg)
-            extra_updates.append(warning_msg)
+    def tool_batch_done(self, state) -> bool:
+        last_message = state["messages"][-1]
+        return getattr(last_message, "name", "") == "mark_validation_complete"
 
-        response = llm_with_tools.invoke(messages_for_llm)
-        extra_updates.append(response)
-        return {"messages": extra_updates, "cookies": current_cookies, "iterations": 1}
+    def fallback(self, state) -> Command:
+        """Resolve a validation that hit the iteration cap without a
+        mark_validation_complete verdict. Keeps the reviewer's "confirmed" status
+        (it was never proven exploitable, and was never proven a false positive)
+        and records the timeout in the execution logs."""
+        updated_vuln = dict(state.get("report_to_test", {}))
 
-
-def validator_router(state: ValidatorState):
-    last_message = state["messages"][-1]
-
-    # Hard loop guard: if the validator never calls mark_validation_complete,
-    # stop gracefully instead of spinning until the recursion limit. The
-    # record keeps its "confirmed" status (see validator_fallback_node).
-    if state.get("iterations", 0) >= settings.validator_max_iterations:
-        logging.warning(
-            f"Validator on {state.get('report_to_test', {}).get('node_id', 'Unknown')} "
-            f"exceeded {settings.validator_max_iterations} iterations without a verdict; falling back."
+        timeout_note = (
+            f"[validation timeout] No verdict after {state.get('iterations', 0)} "
+            f"tool-loop iterations; result on this vulnerability is unproven."
         )
-        return "validator_fallback"
+        existing_logs = updated_vuln.get("execution_logs") or ""
+        updated_vuln["execution_logs"] = (
+            f"{existing_logs}\n{timeout_note}" if existing_logs else timeout_note
+        )
 
-    if last_message.type == "ai":
-        if last_message.tool_calls:
-            return "validator_tools"
-        # The LLM failed to call a tool
-        return "ask_validator_for_tool"
-
-    elif last_message.type == "tool":
-        if getattr(last_message, "name", "") == "mark_validation_complete":
-            return "__end__"
-        return "validator_agent"
-
-    # The LLM failed to call a tool
-    return "ask_validator_for_tool"
+        return Command(
+            update={
+                "vulnerabilities": [updated_vuln],
+            }
+        )
 
 
-def validator_fallback_node(state: ValidatorState) -> Command:
-    """Resolve a validation that hit the iteration cap without a
-    mark_validation_complete verdict. Keeps the reviewer's "confirmed" status
-    (it was never proven exploitable, and was never proven a false positive)
-    and records the timeout in the execution logs."""
-    updated_vuln = dict(state.get("report_to_test", {}))
+validator_agent = ValidatorAgent(
+    name="validator",
+    settings_prefix="validator",
+    compaction=CompactionConfig(prefix="validator"),
+    summary_ledger=VALIDATOR_SUMMARY_LEDGER,
+    summary_llm=fast_llm,
+)
 
-    timeout_note = (
-        f"[validation timeout] No verdict after {state.get('iterations', 0)} "
-        f"tool-loop iterations; result on this vulnerability is unproven."
-    )
-    existing_logs = updated_vuln.get("execution_logs") or ""
-    updated_vuln["execution_logs"] = (
-        f"{existing_logs}\n{timeout_note}" if existing_logs else timeout_note
-    )
-
-    return Command(
-        update={
-            "vulnerabilities": [updated_vuln],
-        }
-    )
-
-
-def ask_validator_for_tool(state: ValidatorState):
-    """Fallback node to force the LLM to use a tool."""
-    message = HumanMessage(content=(
-        f"You did not invoke any tools. Keep your reasoning brief and emit a tool call "
-        f"in this same response. You must use a tool to proceed."
-    ))
-    return {"messages": [message]}
+# Module-level graph node callables (kept so graph.py's imports stay untouched).
+validator_agent_node = validator_agent.agent
+validator_router = validator_agent.router
+validator_fallback_node = validator_agent.fallback
+ask_validator_for_tool = validator_agent.ask

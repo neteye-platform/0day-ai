@@ -364,9 +364,12 @@ def extract_subgraph(G: nx.DiGraph, target_communities: list) -> nx.DiGraph:
 
 def estimate_message_tokens(messages: list[AnyMessage]) -> int:
     """
-    Rough token estimate for a list of messages using the ~4 chars/token
-    heuristic (the same approximation opencode uses). Counts message content
-    plus any tool-call arguments, but ignores role/name metadata overhead.
+    Conservative token estimate for a list of messages using a ~2 chars/token
+    heuristic. Counts message content plus any tool-call arguments, but ignores
+    role/name metadata overhead. Deliberately over-estimates for code-heavy
+    histories (e.g. deepseek-v4-flash tokenizes dense code far above the 4
+    chars/token prose heuristic) so context compaction never races the model's
+    hard input limit.
     """
     total_chars = 0
     for msg in messages:
@@ -381,7 +384,7 @@ def estimate_message_tokens(messages: list[AnyMessage]) -> int:
                 args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
                 if args:
                     total_chars += len(str(args))
-    return total_chars // 4
+    return total_chars // 2
 
 
 def resolve_node_id(module, symbol):

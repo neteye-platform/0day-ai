@@ -25,7 +25,7 @@ reviewer_max_iterations = 12
 # before the iterations cap.
 COUNTDOWN_LEAD_TURNS = 4
 reviewer_countdown_start = max(1, reviewer_max_iterations - COUNTDOWN_LEAD_TURNS)
-validator_max_iterations = 15
+validator_max_iterations = 150
 # Same derivation for the validator track ("mark_validation_complete in your
 # next turn or be terminated").
 validator_countdown_start = max(1, validator_max_iterations - COUNTDOWN_LEAD_TURNS)
@@ -34,14 +34,36 @@ validator_countdown_start = max(1, validator_max_iterations - COUNTDOWN_LEAD_TUR
 # of the reviewer's message history reaches model_context_window minus
 # context_reserved, the middle of the conversation is collapsed into a prior
 # LLM-generated summary and the most recent verbatim tail is preserved. Token
-# estimates use the ~4 chars/token heuristic (utils.estimate_message_tokens).
+# estimates use the conservative ~2 chars/token heuristic
+# (utils.estimate_message_tokens), so the estimate intentionally exceeds the
+# model's real token count for code-heavy tool histories.
 reviewer_model_context_window = 131072
-reviewer_context_reserved = 20000
+reviewer_context_reserved = 24000
 # Number of most-recent AI+tool interaction turns kept verbatim after compaction.
-reviewer_compaction_tail_turns = 2
+reviewer_compaction_tail_turns = 1
 # Do not compact unless the compressible middle is worth at least this many
 # estimated tokens (avoids thrashing on tiny histories).
-reviewer_compaction_min_compressible_tokens = 8000
+reviewer_compaction_min_compressible_tokens = 4000
+# Hard safety margin: if the estimated token count still approaches the model
+# window even after the soft-threshold compaction was skipped, the reviewer
+# node force-truncates before invoking the LLM so it can never overflow the
+# model's maximum context length.
+reviewer_hard_reserved = 8192
+
+# Validator context compaction: same mechanism as the reviewer, applied to the
+# validator's HTTP-proving loop. HTTP responses from send_http_request can grow
+# without bound over long validation sessions, so the same soft-threshold
+# compaction plus hard safety cap keep the history under the model window.
+validator_model_context_window = 131072
+validator_context_reserved = 24000
+# Number of most-recent AI+tool interaction turns kept verbatim after compaction.
+validator_compaction_tail_turns = 1
+# Do not compact unless the compressible middle is worth at least this many
+# estimated tokens (avoids thrashing on tiny histories).
+validator_compaction_min_compressible_tokens = 4000
+# Hard safety margin: force-truncate before invoking the LLM if the estimate
+# approaches the model window even after soft-threshold compaction was skipped.
+validator_hard_reserved = 8192
 
 
 graph = app_path / "graphify-out" / "graph.json"
