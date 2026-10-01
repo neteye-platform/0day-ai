@@ -69,18 +69,19 @@ def get_cached_graph_data(graph_path: Path):
         for node in graph_data.get("nodes", [])
         if node.get("id") and _is_manifest_node(node)
     }
-    if not dropped_ids:
-        return graph_data
+    if dropped_ids:
+        filtered = {
+            "nodes": [
+                node for node in graph_data.get("nodes", [])
+                if node.get("id") not in dropped_ids
+            ],
+        }
+        filtered["links"] = _strip_links_to_dropped(graph_data, dropped_ids)
+        graph_data = filtered
 
-    filtered = {
-        "nodes": [
-            node for node in graph_data.get("nodes", [])
-            if node.get("id") not in dropped_ids
-        ],
-        "links": [],
-    }
-    filtered["links"] = _strip_links_to_dropped(graph_data, dropped_ids)
-    return filtered
+    if getattr(settings, "repair_call_edges", False):
+        _repair_call_edges(graph_data)
+    return graph_data
 
 
 # Per-run memoization for the aggregate_demands pass only. Everything here is
@@ -90,6 +91,116 @@ def get_cached_graph_data(graph_path: Path):
 # tree-sitter trees are always transient.
 AGGREGATE_MEMO_ALIASES: dict[tuple[str, str], Optional[set[str]]] = {}
 AGGREGATE_MEMO_FOLDED: dict[str, Optional[str]] = {}
+
+# Leading dot excludes top-level functions so file nodes are not containers.
+_MEMBER_LABEL_RE = re.compile(r"^\.([A-Za-z_]\w*)\(\)$")
+_CALL_SITE_RE = re.compile(
+    r"(?P<recv>\$this|[A-Za-z_]\w*)\s*(?P<op>::|->|\.)\s*(?P<meth>[A-Za-z_]\w*)\s*\("
+)
+
+
+def _repair_call_edges(graph_data: dict) -> None:
+    """Retarget ``calls`` edges graphify mis-bound to a class container.
+
+    The correct member is recovered from the edge's own call line (one regex
+    pass, no parser): one match retargets, several fan out, none keeps the
+    original edge. In memory only — node ids never change, caches never bust.
+    """
+    nodes = {
+        n["id"]: n
+        for n in graph_data.get("nodes", [])
+        if n.get("id")
+    }
+    members: dict[str, dict[str, str]] = {}
+    for nid, node in nodes.items():
+        match = _MEMBER_LABEL_RE.match(node.get("label") or "")
+        if not match:
+            continue
+        # Member id == f"{container}_{method.lower()}"; strip the exact name.
+        mname = match.group(1).lower()
+        if not nid.endswith("_" + mname):
+            continue
+        parent_id = nid[: len(nid) - len(mname) - 1]
+        parent = nodes.get(parent_id)
+        if (
+            not parent
+            or parent_id == nid
+            or parent.get("source_file") != node.get("source_file")
+            or _MEMBER_LABEL_RE.match(parent.get("label") or "")
+        ):
+            continue
+        members.setdefault(parent_id, {})[match.group(1).lower()] = nid
+    if not members:
+        return
+
+    links = graph_data.setdefault("links", [])
+    known_pairs = {(e.get("source"), e.get("target")) for e in links}
+    line_cache: dict[str, list[str]] = {}
+    remapped = fanned = kept = 0
+
+    for idx in range(len(links)):
+        edge = links[idx]
+        if edge.get("relation") != "calls":
+            continue
+        container_id = edge.get("target")
+        member_map = members.get(container_id or "")
+        if not member_map:
+            continue
+        source_file = edge.get("source_file")
+        loc = edge.get("source_location") or ""
+        if not source_file or not loc.startswith("L"):
+            kept += 1
+            continue
+        lines = line_cache.get(source_file)
+        if lines is None:
+            lines = (read_file_text(source_file) or "").splitlines()
+            line_cache[source_file] = lines
+        try:
+            line_no = int(loc[1:]) - 1
+        except ValueError:
+            kept += 1
+            continue
+        if not 0 <= line_no < len(lines):
+            kept += 1
+            continue
+
+        container_label = (nodes.get(container_id) or {}).get("label") or ""
+        hits: set[str] = set()
+        for call in _CALL_SITE_RE.finditer(lines[line_no]):
+            recv = call["recv"].lstrip("$").lower()
+            if not (
+                call["meth"].lower() in member_map
+                and (
+                    recv == container_label.lower()
+                    or (call["op"] == "::" and recv in {"self", "static", "parent"})
+                    or (call["op"] == "->" and recv in {"this", "self"})
+                )
+            ):
+                continue
+            hits.add(member_map[call["meth"].lower()])
+        if not hits:
+            kept += 1
+            continue
+
+        ordered = sorted(hits)
+        # Dedup per target so a known sibling never blocks the other's fan-out.
+        new_targets = [t for t in ordered if (edge.get("source"), t) not in known_pairs]
+        if not new_targets:
+            kept += 1
+            continue
+        edge["target"] = new_targets[0]
+        edge["repaired_from"] = container_id
+        known_pairs.add((edge.get("source"), new_targets[0]))
+        remapped += 1
+        for extra in new_targets[1:]:
+            links.append({**edge, "target": extra})
+            known_pairs.add((edge.get("source"), extra))
+            fanned += 1
+
+    logging.info(
+        f"call-edge repair: {remapped} retargeted to member nodes, "
+        f"{fanned} fanned out (multi-member lines), {kept} left verbatim."
+    )
 
 
 def clear_aggregate_caches() -> None:

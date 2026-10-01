@@ -1107,30 +1107,277 @@ def _route_downstream(demand: dict, current_node_id: str, graph_data: dict, grou
         logging.warning(f"[{current_node_id}] DOWNSTREAM DROP: Could not resolve '{module}' / '{symbol}' (Original: {target_str})")
 
 
-def _route_upstream(demand: dict, current_node_id: str, callers_map: dict, grouped_demands: defaultdict) -> None:
-    """Route an upstream demand to every caller of the current node."""
+_TARGET_ARGS_RE = re.compile(r'\(.*?\)')
+
+_CLASS_PROP_WINDOW_LINES = 400
+# Requires the `$` so type segments (`private ?string $name`) cannot masquerade as names.
+_CLASS_PROP_DECL_RE = re.compile(
+    r"\b(?:public|protected|private|var)\b[^;{(=]*\$([A-Za-z_]\w*)"
+)
+_MEMBER_PARAM_RE = re.compile(r"\$([A-Za-z_]\w*)")
+
+
+def _build_container_members(graph_data: dict) -> dict[str, dict[str, str]]:
+    """``container_id -> {method_name_lower: member_node_id}`` for class-like nodes.
+
+    Same id-derivation as ``utils._repair_call_edges``.
+    """
+    from utils import _MEMBER_LABEL_RE
+    nodes = {n["id"]: n for n in graph_data.get("nodes", []) if n.get("id")}
+    members: dict[str, dict[str, str]] = {}
+    for nid, node in nodes.items():
+        match = _MEMBER_LABEL_RE.match(node.get("label") or "")
+        if not match:
+            continue
+        mname = match.group(1).lower()
+        if not nid.endswith("_" + mname):
+            continue
+        base = nid[: len(nid) - len(mname) - 1]
+        parent = nodes.get(base)
+        if (
+            not parent
+            or parent.get("source_file") != node.get("source_file")
+            or _MEMBER_LABEL_RE.match(parent.get("label") or "")
+        ):
+            continue
+        members.setdefault(base, {})[mname] = nid
+    return members
+
+
+def _member_param_names(member_id: str, node_map: dict, memo: dict) -> set | None:
+    """Lowercased ``$names`` in a member's signature; ``None`` if unreadable."""
+    if member_id in memo:
+        return memo[member_id]
+    node = node_map.get(member_id) or {}
+    src = node.get("source_file")
+    loc = str(node.get("source_location") or "")
+    names: set | None = None
+    if src and loc.startswith("L") and loc[1:].isdigit():
+        lines = (read_file_text(src) or "").splitlines()
+        start = int(loc[1:]) - 1
+        if 0 <= start < len(lines):
+            # Cut at `{` or `;`: abstract decls have no brace and would bleed.
+            chunk = re.split(r"[{;]", "\n".join(lines[start:start + 12]), 1)[0]
+            names = {m.lower() for m in _MEMBER_PARAM_RE.findall(chunk)}
+    memo[member_id] = names
+    return names
+
+
+def _class_property_names(container_id: str, node_map: dict, memo: dict) -> set | None:
+    """Lowercased class property names; ``None`` if the source is unreadable."""
+    if container_id in memo:
+        return memo[container_id]
+    node = node_map.get(container_id) or {}
+    src = node.get("source_file")
+    loc = str(node.get("source_location") or "")
+    props: set | None = None
+    if src and loc.startswith("L") and loc[1:].isdigit():
+        lines = (read_file_text(src) or "").splitlines()
+        start = int(loc[1:]) - 1
+        props = set()
+        for line in lines[start:start + _CLASS_PROP_WINDOW_LINES]:
+            if re.search(r"\bfunction\s", line):
+                break
+            props.update(name.lower() for name in _CLASS_PROP_DECL_RE.findall(line))
+    memo[container_id] = props
+    return props
+
+
+def _scope_bare_container_demand(current_node_id: str, target_str: str,
+                                 container_members: dict, node_map: dict,
+                                 param_memo: dict, prop_memo: dict,
+                                 callers_map: dict, callers: list):
+    """Scope a bare-target demand emitted by a CONTAINER node.
+
+    ``None`` = keep the class-wide broadcast (not a container / unreadable,
+    fail open); a list = qualifying callers (empty -> drop; property target ->
+    all callers, since the constructor caller owns field population).
+    """
+    member_map = container_members.get(current_node_id)
+    if not member_map:
+        return None
+    name = re.split(r"[:.]|\->", (target_str or "").strip())[-1].lstrip("$").lower()
+    if not name:
+        return None
+    hit_members: list[str] = []
+    unreadable = False
+    for member_id in member_map.values():
+        pnames = _member_param_names(member_id, node_map, param_memo)
+        if pnames is None:
+            unreadable = True
+        elif name in pnames:
+            hit_members.append(member_id)
+    if hit_members:
+        receivers: list[str] = []
+        for member_id in hit_members:
+            receivers.extend(callers_map.get(member_id, []))
+        if not receivers and not getattr(settings, "repair_call_edges", False):
+            # Repair off: an empty member-caller set is a graph artifact.
+            return list(callers)
+        return sorted(set(receivers))
+    if unreadable:
+        return None
+    props = _class_property_names(current_node_id, node_map, prop_memo)
+    if props is None or name in props:
+        return list(callers)  # property (or unscannable class body): class-wide
+    # Defensive: `saveNew($items)` reaching the bare path names a member.
+    call_like = re.match(r"[a-z_][a-z0-9_]*(?=\s*\()", name)
+    if call_like and call_like.group(0) in member_map:
+        return sorted(set(callers_map.get(member_map[call_like.group(0)], [])))
+    return []  # declared nowhere on the class: no addressee, drop
+
+
+def _caller_invokes_symbol(caller_id: str, symbol: str, code_memo: dict,
+                           pattern_memo: dict, node_map: dict | None,
+                           sub_nodes_index: dict | None) -> bool:
+    """True when the caller's own source text contains a call to ``symbol``
+    (``symbol(`` with word boundaries, so ``show`` never matches ``showForm(``).
+
+    The container's call edge proves the caller touches *some* member; this
+    proves it touches *this* one.
+    """
+    if caller_id not in code_memo:
+        code_memo[caller_id] = get_node_code(
+            caller_id, node_map=node_map, sub_nodes_index=sub_nodes_index
+        ) or ""
+    if symbol not in pattern_memo:
+        pattern_memo[symbol] = re.compile(rf"(?<![\w$\\]){re.escape(symbol)}\s*\(")
+    return bool(pattern_memo[symbol].search(code_memo[caller_id]))
+
+
+def _route_upstream(demand: dict, current_node_id: str, callers_map: dict, grouped_demands: defaultdict,
+                    node_map: dict | None = None, sub_nodes_index: dict | None = None,
+                    code_memo: dict | None = None, pattern_memo: dict | None = None,
+                    container_members: dict | None = None, param_memo: dict | None = None,
+                    prop_memo: dict | None = None) -> None:
+    """Route an upstream demand to the callers responsible for its target.
+
+    Bare targets (``$id``) fan out to all callers of the emitting node, except
+    on class containers where they scope to the member declaring that parameter
+    (see ``_scope_bare_container_demand``). Call-shaped targets
+    (``Class::method($arg)``, ``fn($arg)``) contract one member and reach only
+    callers that invoke it (precise edges, else a call-site text check); a
+    demand with no qualifying caller is dropped.
+    """
     target_str = demand.get("target", "")
     desc = demand.get("description")
 
     callers = callers_map.get(current_node_id, [])
-    if callers:
-        for caller_id in callers:
-            grouped_demands[caller_id].append({
-                "source": current_node_id,
-                "type": "explorer_upstream_assumption",
-                "description": desc,
-                "parameter_name": target_str
-            })
+
+    # Detection runs on the RAW target: args-stripping erases the parens the
+    # dot/bare call shapes are keyed on.
+    clean_target = _TARGET_ARGS_RE.sub('', target_str or '').replace('`', '').strip()
+    head = (target_str or "").replace("`", "").strip().split("->")[-1].strip()
+    module, symbol = "", None
+    if "::" in head.split("(", 1)[0]:
+        module, symbol = head.split("::", 1)
+    elif "(" in head:
+        call_head = head.split("(", 1)[0].strip()
+        if "." in call_head:
+            module, symbol = call_head.rsplit(".", 1)
+        else:
+            module, symbol = "", call_head
+    symbol = symbol.strip().split("(", 1)[0].strip() if symbol else None
+    module = module.strip() if module else ""
+    if symbol and symbol.startswith("$"):
+        # Variable / context reference (e.g. `Session::$current`), not a call.
+        symbol = None
+
+    if not symbol:
+        receivers = callers
+        if container_members:
+            scoped = _scope_bare_container_demand(
+                current_node_id, target_str, container_members, node_map or {},
+                param_memo if param_memo is not None else {},
+                prop_memo if prop_memo is not None else {},
+                callers_map, callers)
+            if scoped is not None:
+                if not scoped:
+                    if callers:
+                        logging.info(
+                            f"[{current_node_id}] UPSTREAM SCOPE DROP: bare target "
+                            f"'{target_str}' resolves to no qualifying caller of the "
+                            f"container (of {len(callers)} class caller(s)) — "
+                            f"demand dropped: {str(desc)[:120] if desc else ''}"
+                        )
+                    return
+                receivers = scoped
+        if receivers:
+            for caller_id in receivers:
+                grouped_demands[caller_id].append({
+                    "source": current_node_id,
+                    "type": "explorer_upstream_assumption",
+                    "description": desc,
+                    "parameter_name": target_str
+                })
+        else:
+            # Expected for methods with no in-graph caller (private helpers,
+            # entrypoints); with the calls-only caller map this fires for every
+            # never-called method, so it must not be a warning.
+            logging.debug(f"[{current_node_id}] UPSTREAM DROP: No callers found in graph for this node.")
+        return
+
+    current_node = (node_map or {}).get(current_node_id) or {}
+    current_label = str(current_node.get("label", "")).rstrip("()").lower()
+    if current_label == symbol.lower() or current_label.endswith("::" + symbol.lower()):
+        # The target names the analyzed node itself: its caller edges are
+        # already member-precise — plain broadcast, no text filter needed.
+        qualified = list(callers)
     else:
-        # Expected for methods with no in-graph caller (private helpers,
-        # entrypoints); with the calls-only caller map this fires for every
-        # never-called method, so it must not be a warning.
-        logging.debug(f"[{current_node_id}] UPSTREAM DROP: No callers found in graph for this node.")
+        if not module and container_members and symbol.lower() in container_members.get(current_node_id, {}):
+            # Bare member call on a container: deliver via the member's edges.
+            qualified = list(callers_map.get(container_members[current_node_id][symbol.lower()], []))
+        else:
+            resolved = resolve_node_id(module, symbol)
+            precise_callers = []
+            if resolved and resolved != current_node_id:
+                resolved_node = (node_map or {}).get(resolved) or {}
+                if resolved_node.get("source_file") == current_node.get("source_file"):
+                    precise_callers = callers_map.get(resolved, [])
+            if precise_callers:
+                qualified = list(precise_callers)
+            else:
+                qualified = [
+                    caller_id for caller_id in callers
+                    if _caller_invokes_symbol(caller_id, symbol, code_memo, pattern_memo,
+                                              node_map, sub_nodes_index)
+                ]
+
+    if not qualified:
+        # A member contract no caller of this node actually exercises has no
+        # addressee: drop it instead of burning one verifier evaluation (and
+        # one guaranteed OUT_OF_SCOPE) per unrelated caller.
+        logging.info(
+            f"[{current_node_id}] UPSTREAM SCOPE DROP: no caller invokes '{clean_target}' "
+            f"(of {len(callers)} caller(s)) — demand dropped: {str(desc)[:120] if desc else ''}"
+        )
+        return
+
+    for caller_id in qualified:
+        grouped_demands[caller_id].append({
+            "source": current_node_id,
+            "type": "explorer_upstream_assumption",
+            "description": desc,
+            "parameter_name": target_str
+        })
 
 
-def _route_explorer_notes(notes: list, graph_data: dict, callers_map: dict, grouped_demands: defaultdict) -> list[dict]:
+def _route_explorer_notes(notes: list, graph_data: dict, callers_map: dict, grouped_demands: defaultdict,
+                          node_map: dict | None = None, sub_nodes_index: dict | None = None) -> list[dict]:
     """Process explorer notes into grouped demands. Returns the updated notes."""
     updated_notes = []
+    # Per-run memos shared by every member-scoped upstream demand: caller code
+    # is folded at most once per node, and one regex is compiled per symbol.
+    code_memo: dict = {}
+    pattern_memo: dict = {}
+    # Container bare-target scoping: member index + lazy signature/property scans.
+    container_members = (
+        _build_container_members(graph_data)
+        if getattr(settings, "container_demands_scope_to_members", False)
+        else None
+    )
+    param_memo: dict = {}
+    prop_memo: dict = {}
 
     for note in notes:
         dict_note = note if isinstance(note, dict) else note.model_dump()
@@ -1141,7 +1388,9 @@ def _route_explorer_notes(notes: list, graph_data: dict, callers_map: dict, grou
             if direction == "downstream":
                 _route_downstream(demand, current_node_id, graph_data, grouped_demands)
             elif direction == "upstream":
-                _route_upstream(demand, current_node_id, callers_map, grouped_demands)
+                _route_upstream(demand, current_node_id, callers_map, grouped_demands,
+                                node_map, sub_nodes_index, code_memo, pattern_memo,
+                                container_members, param_memo, prop_memo)
             else:
                 logging.warning(f"[{current_node_id}] UNKNOWN DIRECTION: '{direction}'. Demand dropped.")
 
@@ -1386,7 +1635,8 @@ def aggregate_demands_node(state: MasterState):
         )
 
         # Process Explorer Notes
-        updated_notes = _route_explorer_notes(notes, graph_data, callers_map, grouped_demands)
+        updated_notes = _route_explorer_notes(notes, graph_data, callers_map, grouped_demands,
+                                              node_map, sub_nodes_index)
 
         # Process CVE Analyzer Outputs (demands + upgrade-only hypotheses)
         cve_hypotheses = _process_cve_demands(cves, node_imports_map, grouped_demands, node_map, sub_nodes_index)
@@ -1492,6 +1742,45 @@ def dispatch_verifiers(state: MasterState):
     return commands
 
 
+_DISPLAY_NODES: dict | None = None
+_NODE_DISPLAY_MEMO: dict[str, str] = {}
+
+
+def _node_display_name(node_id: str) -> str:
+    """Human-readable node label for prompt prose (members as
+    ``Class::method()``, fallback to the raw id). Never a matching key.
+    """
+    if not node_id:
+        return node_id
+    if node_id in _NODE_DISPLAY_MEMO:
+        return _NODE_DISPLAY_MEMO[node_id]
+    global _DISPLAY_NODES
+    if _DISPLAY_NODES is None:
+        _DISPLAY_NODES = {
+            n["id"]: n
+            for n in get_cached_graph_data(settings.graph).get("nodes", [])
+            if n.get("id")
+        }
+    node = _DISPLAY_NODES.get(node_id)
+    name = node_id
+    if node:
+        label = node.get("label") or ""
+        if label.startswith(".") and label.endswith("()"):
+            mname = label[1:-2]
+            if node_id.endswith("_" + mname.lower()):
+                parent = _DISPLAY_NODES.get(node_id[: len(node_id) - len(mname) - 1])
+                if parent and parent.get("source_file") == node.get("source_file"):
+                    name = f"{parent.get('label', '')}::{mname}()"
+                else:
+                    name = f"{mname}()"
+            else:
+                name = mname
+        else:
+            name = label or node_id
+    _NODE_DISPLAY_MEMO[node_id] = name
+    return name
+
+
 def _contract_verifier_node(state: VerifierState) -> dict:
     target_node_id = state.get("target_node_id")
     target_code = state.get("target_code")
@@ -1530,7 +1819,7 @@ def _contract_verifier_node(state: VerifierState) -> dict:
         if dtype == "explorer_upstream_assumption":
             param = d.get("parameter_name", "unknown")
             formatted_demands.append(
-                f"- [ID: {param}] [DEMAND FROM CALLEE] You call '{source}'. It demands: '{desc}'"
+                f"- [ID: {param}] [DEMAND FROM CALLEE] You call '{_node_display_name(source)}'. It demands: '{desc}'"
             )
         elif dtype == "cve_assumption":
             suggested_cwes = _normalize_cwe_ids(d.get("cwe_ids"))

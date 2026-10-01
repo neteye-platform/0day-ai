@@ -20,9 +20,20 @@ app_path = Path("../apps/glpi-11.0.7-clean")
 graph = app_path / "graphify-out" / "graph.json"
 cache_dir = app_path / ".cache"
 
+# Repairs graphify's `Class::method()` -> CLASS-node binding: at graph load
+# (in memory only) each such `calls` edge is re-anchored to the member node
+# parsed from the edge's own call line; unresolvable parses keep it verbatim.
+repair_call_edges = True
+
+# Scopes bare-target demands (`$input`, `input`) emitted by class CONTAINER
+# nodes to the callers of the member(s) whose signature declares that
+# parameter; property names stay class-wide, undeclared names drop. Needs
+# repair_call_edges (falls back to the plain broadcast without it).
+container_demands_scope_to_members = True
+
 # None = all
-communities_to_analyze = None
-#communities_to_analyze = [3, 104] # [32, 33, 54, 61]
+# communities_to_analyze = None
+communities_to_analyze = [0, 1, 2, 5, 110]
 
 # Path patterns (relative to app root) skipped before analysis and blocked from
 # reviewer file reads; globs and bare dir names supported.
@@ -53,7 +64,7 @@ llm_max_completion_tokens = 16384
 
 # =============================== Agents ==================================
 
-agents_concurrency = 1
+agents_concurrency = 2
 
 # Reviewer/validator loop caps: if the terminal tool isn't called within this many
 # LLM rounds, the loop ends via the fallback node instead of hitting the recursion
