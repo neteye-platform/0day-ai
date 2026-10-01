@@ -267,23 +267,31 @@ cve_analyzer:
     - For framework/middleware flaws: Identify the specific HTTP request primitive or routing behavior (e.g., "A crafted Transfer-Encoding header").
     If the CVE description is too vague, DO NOT guess—leave it empty.
 
-    CRITICAL RULE 3: Conditional Demands for Optional Features (application_mitigation only)
-    If a vulnerability only triggers when a specific optional feature, function, or configuration is used, you MUST frame the demand conditionally. Format it as: "IF the application uses [Feature/Function], it MUST [Mitigation]. IF [Feature] is not present, this demand is satisfied." Only use the phrase "the absence of explicit mitigation is a failure" AFTER establishing the IF condition.
+    CRITICAL RULE 3: Conditional Demands vs. Default Features (application_mitigation only)
+    - OPTIONAL FEATURES: If a vulnerability only triggers when an optional feature is *explicitly enabled* by the developer, you MUST frame the demand conditionally. Format it as: "IF the application explicitly enables [Feature], it MUST [Mitigation]. IF [Feature] is not present, this demand is satisfied."
+    - DEFAULT FEATURES (EXCEPTION): If the feature is enabled by *default* (inferred via Rule 4), do NOT use the conditional escape clause. You MUST frame it as a strict requirement on the public API (e.g., "When using [Public API], the vulnerable [Internal Component] is active by default. The application MUST explicitly disable it by...").
 
-    CRITICAL RULE 4: Strict Routing Metadata
+    CRITICAL RULE 4: Map Internal Flaws to Public APIs
+    Often, a CVE describes a flaw in an internal class, preprocessor, or dependency (e.g., `InternalMultipartParser`), but the application code uses a high-level public API that wraps it (e.g., `app.use(fileUpload)`). You MUST bridge this gap:
+    - Write the `security_assumption` based on the public API the developer *actually calls*.
+    - INFER DEFAULTS FROM DESCRIPTIONS AND WORKAROUNDS: If the CVE description implies the vulnerable behavior is standard, or if the workaround instructs the user to *disable* a component or set a flag to `False` (e.g., `parseNested: false` or `enable_caching = False`), you MUST assume that component is active by default.
+    - In this case frame the demand as a strict requirement on the public API: "When using [Public API], the vulnerable [Internal Component] is active by default. The application MUST explicitly disable it by..."
+
+    CRITICAL RULE 5: Strict Routing Metadata
     You MUST accurately fill out the routing fields so the demand reaches the correct agent:
     - `import_namespace`: The exact string used in import statements (e.g., "yaml"). Required for BOTH fix categories — it is used to locate usage sites of the package in application code.
 
-    CRITICAL RULE 5 (upgrade_only only): Vulnerability Hypotheses
+    CRITICAL RULE 6 (upgrade_only only): Vulnerability Hypotheses
     When fix_category is "upgrade_only", fill the `hypothesis` object instead of `security_assumption`:
     - `cwe`: classify using ONLY the ALLOWED CWE LIST below. If OSV CWE classifications are provided in the input, prefer them.
     - `description`: Written for a Reviewer agent. State: the CVE ID, the exact flaw inside the library, and the trigger. DO NOT mention package version numbers.
     - `framework_exposure_mechanism`: Describe how the framework exposes the vulnerability. **ANTI-USERLAND RULE:** For framework/middleware flaws (Next.js, Spring, Express), you MUST assume the framework exposes the sink globally or by default. NEVER imply the developer must write specific code to trigger it. Use framework-centric framing (e.g., "The framework globally intercepts specific headers on all routes").
 
-    CRITICAL RULE 6 (BOTH fix categories): Machine-Readable Trigger Keywords (`required_keywords`)
-    Populate `required_keywords` for EVERY CVE, in BOTH fix categories. This list feeds a deterministic pre-filter: if NONE of the keywords is found in the application's code files, the CVE is dropped without any further LLM review (no contract verifier, no reviewer). A single present keyword is enough to keep the CVE.
-    - Extract concrete, verbatim code-level triggers that MUST exist in application source for the vulnerability to be triggerable: dotted function/method calls (e.g. 'yaml.load', 'jwt.verify', 'app.run'), option/flag/config names (e.g. 'parseNested', 'remotePatterns', 'serverActions'), import paths or directives (e.g. 'next/image', '/_next/image', 'allowedDevOrigins'), or distinctive usage snippets.
-    - Keep the list SHORT (typically 1-5 keywords). Do NOT include generic terms such as 'import', 'request', 'file', 'input', 'user', 'data', 'function', or 'config' alone — they match almost everything and defeat the filter. The bare import namespace alone (e.g. 'yaml') may be included ONLY when the package has no finer-grained trigger; prefer a dotted call/option over the bare namespace.
+    CRITICAL RULE 7 (BOTH fix categories): Machine-Readable Trigger Keywords (`required_keywords`)
+    Populate `required_keywords` for EVERY CVE, in BOTH fix categories. This list feeds a deterministic pre-filter: if NONE of the keywords is found in the application's code files, the CVE is dropped.
+    - Extract concrete, verbatim code-level triggers that MUST exist in application source.
+    - PUBLIC API IMPERATIVE: If the CVE details an internal vulnerable component, you MUST include the high-level public APIs, wrapper classes, or standard framework entry points that a developer would actually write to reach that internal code (e.g., include `requests.get` or `Session`, not just the underlying `urllib3.ConnectionPool`).
+    - Keep the list SHORT (typically 1-5 keywords). Do NOT include generic terms like 'import', 'request', 'file', 'input', 'user', 'data', 'function', or 'config'.
 
     ALLOWED CWE LIST
     You must classify vulnerabilities using ONLY the following CWEs. If none fit, use "OTHER_UNCATEGORIZED":
@@ -481,6 +489,26 @@ contract_verifier_agent:
         "status": "OUT_OF_SCOPE",
         "reasoning": "The snippet is a localized route that reads the session, but setting global Cache-Control headers for session management is an architectural framework concern. It is out of scope for this individual route handler.",
         "cwe_id": null
+        }
+      ]
+    }
+
+    EXAMPLE 5: FAILED (Implicit Default in Wrapped API)
+    Code Snippet:
+    ```javascript
+    const fileUpload = require('express-fileupload');
+    app.use(fileUpload());
+    ```
+    Demand: [ID: demand5] IF the application uses express-fileupload, it MUST explicitly disable the vulnerable `parseNested` feature by passing `{ parseNested: false }` during initialization, as it may be enabled by default. IF it is explicitly disabled, this demand is satisfied.
+
+    Expected Output:
+    {
+      "evaluations": [
+        {
+          "demand_id": "demand5",
+          "status": "FAILED",
+          "reasoning": "The code initializes `fileUpload()` on line 2 without passing any configuration options. Because it does not explicitly disable the `parseNested` feature as required by the demand, the vulnerable default must be assumed active.",
+          "cwe_id": "CWE-94"
         }
       ]
     }
