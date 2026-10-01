@@ -144,6 +144,32 @@ attacker_command_timeout = 60
 attacker_build_timeout = 3600
 attacker_output_max_chars = 8000
 
+## ---- Edge Traversal agent ----
+
+# Detects composite vulnerabilities arising from interactions between
+# individually-benign components (trust-boundary crossings). Runs as a single
+# synchronous node after the contract-verifier superstep; findings are emitted
+# as standard hypotheses into the `vulnerabilities` channel and adjudicated by
+# the reviewer's `cross_boundary` track.
+edge_traversal_enabled = True
+# Edges are grouped by boundary category into homogeneous batches of this many
+# related crossings; one structured LLM call is spent per batch.
+edge_traversal_batch_size = 8
+# Cap on total batched dispatches per run (a mid/large repo exposes only a
+# handful of proxy ingress points, queue topologies, and network listeners).
+edge_traversal_max_batches = 12
+# Deterministic extraction toggles (all on by default).
+edge_traversal_direct_enabled = True     # cross-community AST calls/references
+edge_traversal_queue_enabled = True      # task/event dispatch -> worker entry
+edge_traversal_http_enabled = True       # HTTP client call -> route entry
+edge_traversal_infra_enabled = True      # reverse-proxy config -> app route
+# Only traverse edges that touch at least one node carrying an explorer
+# interface note (exit/ingress profile). Keeps the candidate set scoped to the
+# analyzed surface instead of flooding on unexamined cross-community edges.
+edge_traversal_require_note = True
+# Cap on candidate edges per boundary category before batching.
+edge_traversal_max_edges_per_category = 150
+
 ## ---- Threat intel / build ----
 
 # Enrich HIGH/CRITICAL CVEs with external web evidence (Tavily); False runs the

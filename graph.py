@@ -18,7 +18,7 @@ import settings
 import tools
 import browser_tools
 import attacker_tools
-from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, dispatch_integration_audits, integration_auditor_node, integration_auditor_router, integration_auditor_fallback_node, ask_integration_auditor_for_tool, route_integration_audit, route_validator_feedback, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node
+from nodes import bootstrap_node, preprocessor_node, manager_agent_node, expert_explorer_node, cve_analyzer_node, threat_intel_gate_node, threat_intel_node, reviewer_agent_node, ask_reviewer_for_tool, reviewer_fallback_node, dispatch_explorers, dispatch_cve_analyzers, dispatch_threat_intel, dispatch_reviewers, dispatch_validators, dispatch_integration_audits, integration_auditor_node, integration_auditor_router, integration_auditor_fallback_node, ask_integration_auditor_for_tool, route_integration_audit, route_validator_feedback, dispatch_verifiers, reviewer_router, validator_agent_node, ask_validator_for_tool, validator_fallback_node, validator_router, aggregate_demands_node, contract_verifier_node, synchronization_node, edge_traversal_node
 from state import MasterState, ReviewerState, ValidatorState, IntegrationAuditorState
 from schemas import ReviewerOutput, ValidatorOutput
 
@@ -175,6 +175,12 @@ def build_graph(checkpointer=None, interrupt_before=None):
     workflow.add_node("threat_intel", threat_intel_node)
     workflow.add_node("aggregate_demands", aggregate_demands_node)
     workflow.add_node("contract_verifier", contract_verifier_node)
+    # Single synchronous Edge Traversal node: synthesizes trust-boundary edges
+    # from the explorer notes and emits composite hypotheses for the reviewer's
+    # cross_boundary track. Runs on the linear chain after the contract-verifier
+    # barrier (synchronization) and before dispatch_reviewers, so its findings
+    # land in the vulnerabilities channel before review dispatch.
+    workflow.add_node("edge_traversal", edge_traversal_node)
     # The reviewer/validator outer nodes are compiled subgraphs with internal
     # per-message retries; explicitly disable wholesale (subgraph replay)
     # retries here (set_node_defaults would otherwise apply RETRY to them).
@@ -214,7 +220,10 @@ def build_graph(checkpointer=None, interrupt_before=None):
 
     workflow.add_conditional_edges("aggregate_demands", dispatch_verifiers, ["contract_verifier", "synchronization", END])
     workflow.add_edge("contract_verifier", "synchronization")
-    workflow.add_conditional_edges("synchronization", dispatch_reviewers, ["reviewer_agent", END])
+    # Contract-verifier barrier -> Edge Traversal (composite hypotheses are wired
+    # synchronously on this chain, no extra fan-out/join) -> reviewer dispatch.
+    workflow.add_edge("synchronization", "edge_traversal")
+    workflow.add_conditional_edges("edge_traversal", dispatch_reviewers, ["reviewer_agent", END])
     # workflow.add_edge("reviewer_agent", "reviewer_sync")
     # Evaluate dispatch from the barrier (never mid-superstep) so it reads the
     # fully-merged confirmed set before emitting validator/auditor Sends.
