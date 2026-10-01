@@ -399,6 +399,29 @@ def find_in_container(keyword: str, is_regex: bool = False) -> str:
     )
 
 
+def _reject_submission(tool_call_id: str, text: str) -> Command:
+    """Reject a submit_evaluation call with a corrective error ToolMessage.
+
+    A ``status='error'`` tool message never counts as a verdict
+    (ToolLoopAgent.tool_batch_done skips it), so the reviewer loop bounces
+    back to the LLM with the rejection text — exactly how arg-schema
+    rejections already behave. Raising instead would CRASH the pipeline:
+    langgraph >= 1.x's default ToolNode error handling re-raises everything
+    that is not an arg-validation ToolInvocationError."""
+    return Command(
+        update={
+            "messages": [
+                ToolMessage(
+                    content=text,
+                    name="submit_evaluation",
+                    tool_call_id=tool_call_id,
+                    status="error",
+                )
+            ]
+        }
+    )
+
+
 @tool(args_schema=EvaluationToolInput)
 def submit_evaluation(
     state: Annotated[dict, InjectedState],
@@ -409,7 +432,7 @@ def submit_evaluation(
 
     report = state.get("expert_report", {})
 
-    # FP gates (raised errors bounce back as corrective ToolMessages, like the
+    # FP gates (returned as corrective error ToolMessages, like the
     # EvaluationToolInput validators): the taint tracks must enumerate every
     # traced use of the untrusted value; systemic demands one entry per
     # affected node so an exemplar defense cannot dismiss the whole cluster.
@@ -417,7 +440,8 @@ def submit_evaluation(
     concern = (kwargs.get("out_of_scope_concern") or "").strip()
     if not kwargs.get("is_exploitable"):
         if concern:
-            raise ValueError(
+            return _reject_submission(
+                tool_call_id,
                 "false_positive rejected: you reported an observed source-to-sink flow "
                 "(`out_of_scope_concern`) but filed the finding as not exploitable. "
                 "Adjudicate it — rule it out by adding its sites to `untrusted_uses` with "
@@ -427,7 +451,8 @@ def submit_evaluation(
             )
         uses = [u for u in (kwargs.get("untrusted_uses") or []) if str(u).strip()]
         if mode in ("code_level", "dependency_mitigation") and not uses:
-            raise ValueError(
+            return _reject_submission(
+                tool_call_id,
                 "false_positive rejected: `untrusted_uses` must list every site where the "
                 "untrusted value is used in the traced flow (file:line - operation - why it "
                 "cannot reach an execution sink), including derived variables and "
@@ -438,7 +463,8 @@ def submit_evaluation(
         if mode == "systemic":
             n_nodes = len(report.get("affected_nodes") or [])
             if len(uses) < max(1, n_nodes):
-                raise ValueError(
+                return _reject_submission(
+                    tool_call_id,
                     "false_positive rejected: one systemic verdict dismisses every bundled "
                     f"instance, so `untrusted_uses` needs at least one entry per affected "
                     f"node ({n_nodes}) citing that node's blocking defense (file:line). A "
