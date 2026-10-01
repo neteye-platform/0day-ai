@@ -2240,6 +2240,22 @@ class ValidatorAgent(ToolLoopAgent):
             f"--- REPRODUCTION STEPS (from Reviewer, follow in order) ---\n"
             f"{steps_str}"
         )
+        # Attach the source code of every affected node so the validator can
+        # reason about the exact code under test without extra lookups.
+        code_sections = []
+        for node_id in affected:
+            node_source = get_node_code(node_id)
+            if node_source:
+                code_sections.append(
+                    f"Node: {node_id}\n```\n{node_source}\n```"
+                )
+        if code_sections:
+            formatted_report += (
+                f"\n\n--- AFFECTED NODES SOURCE CODE ---\n"
+                f"Source code of nodes affected by the vulnerability (bodies of "
+                f"peer nodes are omitted because not relevant).\n"
+                f"{'\n\n'.join(code_sections)}"
+            )
         human_msg = HumanMessage(content=(
             f"Target Sandbox: {state['sandbox_url']}\n\n"
             f"Vulnerability to Prove:\n{formatted_report}"
