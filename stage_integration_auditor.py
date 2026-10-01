@@ -8,7 +8,7 @@ from langgraph.types import Command, Send
 
 import tools
 from llms import fast_llm, smart_llm
-from run_stats import _record_stat, affected_nodes_label, as_dicts, steps_block
+from run_stats import _record_stat, _start_agent_progress, affected_nodes_label, as_dicts, steps_block
 from schemas import INTEGRATION_AUDITOR_AGENT
 from state import IntegrationAuditorState, MasterState, ValidatorState
 from tool_loop import CompactionConfig, ToolLoopAgent
@@ -259,6 +259,9 @@ def route_integration_audit(state: MasterState):
         return "reporter_dispatch"
 
     by_id = {v.get("vuln_id"): v for v in all_vulns}
+    # Ledger for this validator wave too: chained records log their terminal
+    # validator line (status + turns) like the direct-dispatch ones do.
+    progress_id = _start_agent_progress(len(chained))
     commands = []
     for record in chained:
         peer_ids = record.get("chained_with") or []
@@ -288,6 +291,7 @@ def route_integration_audit(state: MasterState):
             vulnerabilities=[],
             cookies={},
             agent_id=uuid.uuid4().hex,
+            progress_id=progress_id,
         )
         commands.append(Send("validator_agent", payload))
 

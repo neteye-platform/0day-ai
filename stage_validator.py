@@ -42,7 +42,9 @@ def _validation_group_key(record: dict):
     return (record.get("cwe_id") or "", comp)
 
 
-def _validator_payload(state: MasterState, seed: dict, variants: list[dict] | None) -> ValidatorState:
+def _validator_payload(
+    state: MasterState, seed: dict, variants: list[dict] | None, progress_id: str
+) -> ValidatorState:
     return ValidatorState(
         pipeline_run_id=state.get("pipeline_run_id"),
         report_to_test=seed,
@@ -53,6 +55,7 @@ def _validator_payload(state: MasterState, seed: dict, variants: list[dict] | No
         vulnerabilities=[],
         cookies={},
         agent_id=uuid.uuid4().hex,
+        progress_id=progress_id,
     )
 
 
@@ -117,25 +120,36 @@ def dispatch_validators(state: MasterState):
     batched = {k: v for k, v in groups.items() if 1 < len(v) <= settings.validator_variant_max_group}
     shared_ids = {id(r) for members in batched.values() for r in members}
 
-    commands = []
+    payloads: list[tuple[dict, list[dict] | None]] = []
     for members in batched.values():
         seed, variants = members[0], members[1:]
         logging.info(
             f"Sharing one validation run across {len(members)} equivalent "
             f"findings ({[m.get('vuln_id') for m in members]})."
         )
-        commands.append(Send("validator_agent", _validator_payload(state, seed, variants)))
+        payloads.append((seed, variants))
 
     for evaluation in direct:
         if id(evaluation) in shared_ids:
             continue
-        commands.append(Send("validator_agent", _validator_payload(state, evaluation, None)))
+        payloads.append((evaluation, None))
 
-    if not commands:
+    if not payloads:
         # Nothing to validate directly: advance to the integration-audit phase
         # (instead of ENDing) so deferred records still reach the auditor.
         return "integration_audit_dispatch"
 
+    # Ledger id shared by the fan-out: the base router advances it (and logs
+    # turns=) on every validator terminal route.
+    progress_id = _start_agent_progress(len(payloads))
+    commands = [
+        Send("validator_agent", _validator_payload(state, seed, variants, progress_id))
+        for seed, variants in payloads
+    ]
+    logging.info(
+        f"Dispatched validator: 0/{len(payloads)} complete, "
+        f"{len(payloads)} remaining."
+    )
     _record_stat("validator_records", len(commands))
     return commands
 
@@ -222,6 +236,7 @@ class ValidatorAgent(ToolLoopAgent):
 
     terminal_tool = ("ask_for_context", "mark_validation_complete")
     cache_hit_label = "Validator"
+    progress_label = "Validator"
 
     def _subject(self, state) -> str:
         report = state.get("report_to_test", {})
