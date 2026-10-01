@@ -19,7 +19,7 @@ import settings
 import tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, VerifierState, ReviewerState, ValidatorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEDemand, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
-from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning
+from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, deduplicate_cves, cache, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context
 
 # llm = ChatOllama(model="qwen36", temperature=0, reasoning=False, num_ctx=32768)
 # Maximum combined code size (in chars) for a batched explorer dispatch.
@@ -154,8 +154,12 @@ def _pack_node_batches(file_nodes: list[str], threshold: int) -> list[list[str]]
     current: list[str] = []
     current_len = 0
 
+    graph_data = get_cached_graph_data(settings.graph)
+
     for node_id in file_nodes:
-        length = len(get_node_code(node_id) or "")
+        code = get_node_code(node_id) or ""
+        context = format_node_context(graph_data, node_id)
+        length = len(code) + len(context)
         if current and current_len + length > threshold:
             batches.append(current)
             current = []
@@ -272,14 +276,19 @@ def _explore_single(node_id: str, role_name: str) -> dict:
     graph_data = get_cached_graph_data(settings.graph)
     target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), {})
 
+    context = format_node_context(graph_data, node_id)
+    context_block = f"{context}\n\n" if context else ""
+
     if target_node.get("source_file", "").endswith(target_node.get("label", "")):
         user_prompt = (
+            f"{context_block}"
             f"Analyze this entire file skeleton.\n\n"
             f"```python\n{source_code}\n```"
         )
     else:
         label = target_node.get("label", "node")
         user_prompt = (
+            f"{context_block}"
             f"Analyze the specific logic inside '{label}'.\n"
             f"The rest of the file is provided solely as context. "
             f"Do NOT look for vulnerabilities outside of '{label}'.\n\n"
@@ -346,14 +355,19 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
         target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), {})
         source_code = get_node_code(node_id)
         label = target_node.get("label", node_id)
+        context_block = format_node_context(graph_data, node_id)
+        if context_block:
+            context_block += "\n\n"
         if target_node.get("source_file", "").endswith(target_node.get("label", "")):
             sections.append(
                 f"### Node '{node_id}' ({label}) — entire file skeleton\n"
+                f"{context_block}"
                 f"```python\n{source_code}\n```"
             )
         else:
             sections.append(
                 f"### Node '{node_id}' ({label})\n"
+                f"{context_block}"
                 f"Analyze the specific logic inside '{label}'. "
                 f"The rest of the file is provided solely as context; "
                 f"do NOT look for vulnerabilities outside of '{label}'.\n"
