@@ -1707,6 +1707,58 @@ def cache_reviewer(node_id: str, report: dict, updated_vuln: Optional[dict] = No
     return None
 
 
+def cache_validator(report: dict, peer_payloads: Optional[list] = None, updated_vuln: Optional[dict] = None) -> Optional[dict]:
+    """Read (``updated_vuln`` is None) or write a validator outcome cache entry.
+
+    Keyed by (vuln_id, content hash of the report plus the injected
+    ``peer_payloads`` — for a ``chained`` record the validator's verdict depends
+    on the proven peer payloads, which are NOT part of the report itself). The
+    live ``sandbox_url`` is deliberately excluded so results survive across runs
+    despite docker reassigning the port. Shared by ``mark_validation_complete``,
+    ``ask_for_context``, and the loop-fallback path so all three land in the
+    same ``.cache/validator/`` namespace.
+    """
+    vuln_id = (report or {}).get("vuln_id") or "Unknown"
+    peers = sorted(
+        (p for p in (peer_payloads or []) if isinstance(p, dict)),
+        key=lambda p: p.get("vuln_id", ""),
+    )
+    content = {"report": report, "peer_payloads": peers}
+    report_hash = hashlib.md5(json.dumps(content, sort_keys=True).encode()).hexdigest()
+    cache_file = (
+        settings.cache_dir / "validator" / f"{safe_cache_filename(vuln_id)}_{report_hash}.json"
+    )
+    if updated_vuln is None:
+        return cache(cache_file, "read")
+    cache(cache_file, "write", updated_vuln)
+    return None
+
+
+def cache_integration_auditor(report: dict, peers: Optional[list] = None, updated_vuln: Optional[dict] = None) -> Optional[dict]:
+    """Read (``updated_vuln`` is None) or write an integration-auditor outcome cache entry.
+
+    Keyed by (vuln_id, content hash of the report plus the ``confirmed_vulns``
+    peer list the auditor may chain with). Peers are sorted by vuln_id so the
+    hash is order-independent. Shared by ``submit_integration_audit``, the
+    deterministic no-peers ``unchainable`` resolution, and the loop-fallback
+    path so all land in the same ``.cache/integration_auditor/`` namespace.
+    """
+    vuln_id = (report or {}).get("vuln_id") or "Unknown"
+    peers_sorted = sorted(
+        (p for p in (peers or []) if isinstance(p, dict)),
+        key=lambda p: p.get("vuln_id", ""),
+    )
+    content = {"report": report, "confirmed_vulns": peers_sorted}
+    report_hash = hashlib.md5(json.dumps(content, sort_keys=True).encode()).hexdigest()
+    cache_file = (
+        settings.cache_dir / "integration_auditor" / f"{safe_cache_filename(vuln_id)}_{report_hash}.json"
+    )
+    if updated_vuln is None:
+        return cache(cache_file, "read")
+    cache(cache_file, "write", updated_vuln)
+    return None
+
+
 def _extract_namespace_aliases(source_file: str, target_namespace: str) -> Optional[set[str]]:
     """Discover the identifiers aliased from a namespace in the import/use
     statements of ``source_file`` (plus the namespace itself).
