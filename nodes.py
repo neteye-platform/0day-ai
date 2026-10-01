@@ -6,7 +6,6 @@ import subprocess
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.callbacks import BaseCallbackHandler
 from llm_debug import build_debug_http_client
 from tavily import TavilyClient
 from langgraph.types import Command, Send
@@ -25,47 +24,37 @@ from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT
 from utils import build_networkx_graph, compact_tool_history, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity
 
-# fast_llm = ChatOllama(model="gemma4:cloud", temperature=0.2, reasoning=False, num_ctx=32768)
-# smart_llm = ChatOllama(model="gemma4:cloud", temperature=0.6, reasoning=False, num_ctx=32768)
 # Maximum combined code size (in chars) for a batched explorer dispatch.
 EXPLORER_BATCH_CHAR_THRESHOLD = 10000
 
 _agent_progress: dict[str, dict[str, int]] = {}
 _agent_progress_lock = threading.Lock()
 
-class ErrorLoggingCallbackHandler(BaseCallbackHandler):
-    def on_llm_error(self, error: BaseException, **kwargs: Any) -> Any:
-        """Run when LLM errors out completely."""
-
-        # The callback kwargs contain the payloads sent to the LLM
-        payload = kwargs.get('prompts') or kwargs.get('messages')
-
-        # Combine the message into a single formatted block
-        error_message = (
-            "\n" + "="*40 + "\n"
-            "LLM EXHAUSTED ALL RETRIES\n"
-            + "="*40 + "\n"
-            f"REQUEST PAYLOAD:\n{payload}\n\n"
-            f"ERROR DETAILS:\n{error}\n"
-            + "="*40
-        )
-
-        logging.error(error_message)
-
-base_llm = ChatOpenAI(
-    base_url="http://localhost:11434/v1",
-    model="deepseek-v4-flash",
-    stream_usage=True,
-    temperature=0.4,
-    http_client=build_debug_http_client(),
-)
-# NOTE: Retry is handled at the graph level via RetryPolicy on every node
-# (see graph.py build_graph -> set_node_defaults), so no per-call retry wrapper
-# is needed here. This avoids double retry layers on top of the openai client.
-
-fast_llm = base_llm.bind(temperature=0.2, max_completion_tokens=4096, reasoning_effort="none")
-smart_llm = base_llm.bind(temperature=0.8, max_completion_tokens=16384, reasoning_effort="medium")
-
+if settings.llm_provider == "openai":
+    base_llm = ChatOpenAI(
+        base_url=settings.openai_base_url,
+        model=settings.openai_model,
+        stream_usage=True,
+        temperature=0.4,
+        http_client=build_debug_http_client(),
+    )
+    fast_llm = base_llm.bind(temperature=0.2, max_completion_tokens=4096, reasoning_effort="none")
+    smart_llm = base_llm.bind(temperature=0.8, max_completion_tokens=16384, reasoning_effort="medium")
+elif settings.llm_provider == "ollama":
+    base_llm = ChatOllama(
+        model=settings.ollama_model,
+        base_url=settings.ollama_base_url,
+        temperature=0.4,
+        num_ctx=32768,
+    )
+    # num_predict is Ollama's max-tokens equivalent; the OpenAI-only
+    # max_completion_tokens / reasoning_effort kwargs are not passed here.
+    fast_llm = base_llm.bind(temperature=0.2, reasoning=False, num_predict=4096)
+    smart_llm = base_llm.bind(temperature=0.8, reasoning=True, num_predict=16384)
+else:
+    raise ValueError(
+        f"Unknown llm_provider {settings.llm_provider!r}; expected 'openai' or 'ollama'."
+    )
 
 # ==========================================
 # Bootstrap

@@ -1,7 +1,20 @@
 from pathlib import Path
 
-app_path = Path("../apps/glpi-11.0.7-clean")
-# app_path = Path("../apps/web_reactoops")
+app_path = Path("../apps/Toxic")
+
+# LLM provider.
+# "openai" = ChatOpenAI against the internal gateway (needs OPENAI_API_KEY).
+# "ollama" = ChatOllama against a local Ollama server.
+llm_provider = "openai"
+openai_base_url = "http://localhost:11434/v1"
+openai_model = "deepseek-v4-flash"
+ollama_model = "gemma4:cloud"
+ollama_base_url = "http://localhost:11434"
+
+# Concurrency
+simple_agents_concurrency = 1
+
+
 graph = app_path / "graphify-out" / "graph.json"
 cache_dir = app_path / ".cache"
 
@@ -25,6 +38,3 @@ max_experts_per_community = 2
 # build definition (Dockerfile/compose) is unchanged since the last run.
 force_rebuild = False
 
-# Concurrency
-simple_agents_concurrency = 4
-tool_agents_concurrency = 1
