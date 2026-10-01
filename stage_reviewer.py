@@ -21,6 +21,8 @@ from state import MasterState, ReviewerState
 from tool_loop import CompactionConfig, ToolLoopAgent
 from utils import (
     cache_reviewer,
+    format_node_context,
+    get_cached_graph_data,
     get_node_code,
     is_feedback_review,
     reviewer_cache_key,
@@ -96,8 +98,11 @@ def _primary_node(record: dict, default: str = "Unknown") -> str:
     return affected[0] if affected else default
 
 
-def build_reviewer_payload(record: dict, progress_id: str) -> ReviewerState:
+def build_reviewer_payload(
+    record: dict, progress_id: str, pipeline_run_id: str | None = None
+) -> ReviewerState:
     return ReviewerState(
+        pipeline_run_id=pipeline_run_id,
         node_id=_primary_node(record),
         expert_report=record,
         mode=_reviewer_mode_for(record),
@@ -147,7 +152,10 @@ def dispatch_reviewers(state: MasterState):
 
     commands = []
     for hypothesis in hypotheses:
-        commands.append(Send("reviewer_agent", build_reviewer_payload(hypothesis, progress_id)))
+        commands.append(Send(
+            "reviewer_agent",
+            build_reviewer_payload(hypothesis, progress_id, state.get("pipeline_run_id")),
+        ))
 
     logging.info(f"Dispatching {len(commands)} reviewers.")
     _record_stat("reviewer_hypotheses", len(commands))
@@ -265,6 +273,17 @@ class ReviewerAgent(ToolLoopAgent):
                     f"```\n"
                     f"{target_node_source}\n"
                     f"```\n"
+                )
+            # Explorer-style graph-position block (~0.4 KB median): saves the
+            # reviewers' get_node_connections + follow-up lookup turns.
+            node_ctx = format_node_context(
+                get_cached_graph_data(settings.graph), node_id) or ""
+            if len(node_ctx) > 2500:
+                node_ctx = node_ctx[:2500] + "\n... [context truncated: use get_node_connections for the full link list]"
+            if node_ctx:
+                formatted_vuln += (
+                    f"--- TARGET NODE CONTEXT (callers/callees, guards, file:line) ---\n"
+                    f"{node_ctx}\n"
                 )
 
         human_msg = HumanMessage(content=(

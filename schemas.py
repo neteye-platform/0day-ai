@@ -567,17 +567,8 @@ class EvaluationToolInput(BaseModel):
         description="Brief technical explanation for the decision."
     )
     mitigation_bypass: Optional[str] = Field(
-        description="Detailed description of how the security measures can be bypassed or how the application logic can be abused to exploit the vulnerability."
-        # description="True if the node contains a defect, unsafe configuration, lacks mitigation, or if the implemented safeguards can be bypassed, regardless of external reachability."
-    )
-    mitigation: Optional[str] = Field(
         default=None,
-        description=(
-            "REQUIRED when is_exploitable is false: the defense blocking exploitation, cited "
-            "to file + function. A defense must HALT the flow — log/warn-only checks are not "
-            "defenses. Name every user-controllable field reaching the sink and its guard; "
-            "if the list cannot be complete, use is_exploitable=true + `reservations`."
-        ),
+        description="Optionally describe how an attacker bypasses the defenses or can abuse the application logic. Optional — do NOT set it to justify a false positive; the blocking defense goes in `mitigation`."
     )
     untrusted_uses: Optional[list[str]] = Field(
         default=None,
@@ -612,6 +603,15 @@ class EvaluationToolInput(BaseModel):
     )
     is_exploitable: bool = Field(
         description="True if there is a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by application mitigations."
+    )
+    mitigation: Optional[str] = Field(
+        default=None,
+        description=(
+            "REQUIRED when is_exploitable is false: the defense blocking exploitation, cited "
+            "to file + function. A defense must HALT the flow — log/warn-only checks are not "
+            "defenses. Name every user-controllable field reaching the sink and its guard; "
+            "if the list cannot be complete, use is_exploitable=true + `reservations`."
+        ),
     )
     validation_strategy: Optional[Literal["direct_to_validator", "requires_integration", "static_finding_only"]] = Field(
         default=None,

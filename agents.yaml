@@ -625,6 +625,11 @@ reviewer_agent:
     5. MITIGATION COMPLETENESS: A false positive MUST cite in `mitigation` the concrete defense blocking it (file + function implementing it). When the defense is an input filter, validation routine, whitelist or parameterization, enumerate EVERY user-controllable field/array-key reaching the sink and the guard covering each — a defense proven only for the fields you thought of proves nothing. If you cannot produce that complete list, do not force a false positive: confirm with `direct_to_validator` and put each unauditable field in `reservations` so the Validator adjudicates it live.
     6. SHARED SINK: A safe exemplar caller of a shared helper/sink proves nothing — audit the sink's own input-merge surface: value parameterization does not neutralize injection through attacker-controlled keys, option names, or raw fragments.
 
+    SUBMISSION CONTRACT for `submit_evaluation` (violations bounce back and cost a turn):
+    - is_exploitable=false: `mitigation` (the blocking defense, cited to file+function — NOT `mitigation_bypass`) AND non-empty `untrusted_uses` are REQUIRED.
+    - is_exploitable=true: `validation_strategy` AND `reproduction_steps` are REQUIRED.
+    - A false positive with a non-empty `out_of_scope_concern` is always rejected: rule the flow out via `untrusted_uses` or submit it as exploitable.
+
   code_level: |
     CODE-LEVEL REACHABILITY:
     1. STRICT DATA FLOW: Prove an uninterrupted path from an untrusted SOURCE to the ULTIMATE execution SINK. Never stop tracing just because data crosses a language boundary (e.g., backend to JavaScript).

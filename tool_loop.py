@@ -23,7 +23,7 @@ from langchain_core.messages import (
 from langchain_core.runnables import RunnableConfig
 from langchain_core.runnables.config import get_config_list
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
-from langgraph.prebuilt.tool_node import ToolNode, ToolRuntime
+from langgraph.prebuilt.tool_node import ToolInvocationError, ToolNode, ToolRuntime
 from langgraph.types import Command
 
 import settings
@@ -214,6 +214,31 @@ def _generate_agent_context_summary(
     except Exception as e:
         logging.warning(f"Context compaction summarization failed, failing open: {e}")
         return None
+
+
+def concise_tool_error(e: ToolInvocationError) -> str:
+    """Compact ToolNode error handler for argument-validation failures.
+
+    The stock langgraph handler re-injects the ENTIRE rejected arguments dict
+    into the error ToolMessage ("...with kwargs {...}", kilobytes per bounce)
+    and renders custom model-validator failures as an EMPTY error string (the
+    loc-less model errors are dropped by its filtered-errors path), so the
+    loop wastes turns re-reading its own submission instead of fixing the
+    named field. This handler emits only the failing `field: reason` lines
+    from the wrapped pydantic ValidationError. The ToolInvocationError
+    annotation restricts handling to arg-validation errors; every other tool
+    exception keeps the default re-raise behavior.
+    """
+    parts = []
+    for err in e.source.errors():
+        loc = ".".join(str(x) for x in err.get("loc", ()))
+        msg = str(err.get("msg", "invalid value")).removeprefix("ValueError, ")
+        parts.append(f"- `{loc}`: {msg}" if loc else f"- {msg}")
+    detail = "\n".join(parts) or str(e.source)
+    return (
+        f"Error: {e.tool_name} arguments failed validation:\n{detail}\n"
+        "Fix ONLY the listed fields and resubmit."
+    )
 
 
 class SequentialToolNode(ToolNode):

@@ -110,6 +110,87 @@ def _log_agent_completion(progress_id: str, agent_name: str, detail: str) -> Non
     )
 
 
+def gen_run_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def payload_subject(state) -> str:
+    """Best identifying label of a subagent dispatch payload (reviewer node /
+    validator or auditor vuln id), used as LangSmith metadata/tag on the
+    detached trace so runs of one finding are greppable inside the project."""
+    if not isinstance(state, dict):
+        return ""
+    report = state.get("report_to_test") or state.get("expert_report") or {}
+    if isinstance(report, dict) and report.get("vuln_id"):
+        return str(report["vuln_id"])[:120]
+    return str(state.get("node_id") or "")[:120]
+
+
+def langsmith_split_active() -> bool:
+    return bool(settings.langsmith_split_subagents and settings.langsmith_tracing)
+
+
+def langsmith_detached_node(subgraph, agent: str):
+    """Wrap a compiled subgraph so every dispatch runs it as its OWN root
+    trace in its OWN LangSmith project (agent keys: reviewer / validator /
+    integration_auditor). Returns the subgraph untouched when off.
+
+    LangSmith routes a whole callback tree through the single
+    ``LangChainTracer`` instantiated at the root invoke — its project
+    (LANGSMITH_PROJECT) is stamped on every nested run, so a nested
+    ``tracing_context(project_name=...)`` or a config ``project_name`` on the
+    subtree is IGNORED (verified empirically against langsmith 0.10.5 +
+    langchain-core 1.5.4). The one working lever: the parent task hides its
+    config — carrying that tracer — in the ``var_child_runnable_config``
+    contextvar, which an inner ``ensure_config`` seeds callbacks from; briefly
+    clearing it makes the nested invoke build a fresh callback manager whose
+    tracer picks up ``tracing_context(project_name=..., parent=False)`` —
+    a detached root trace in the agent project.
+
+    Correlation rides on the invoke config: ``pipeline_run_id`` + subject land
+    in the metadata of every run of the detached tree (config metadata
+    propagates to child runs), and the ``agent:<name>`` tag comes from the
+    tracing-context tags read by the fresh tracer. The node config's internal
+    ``configurable`` keys (``__pregel_checkpointer``, ``checkpoint_ns``) pass
+    through, so the subgraph still inherits the parent checkpointer; an
+    omitted ``recursion_limit`` falls back to the same langgraph default a
+    subgraph-as-node gets. The detached subtree loses the parent's OTHER
+    callbacks (e.g. a caller-supplied custom tracing handler).
+    """
+    if not langsmith_split_active():
+        return subgraph
+
+    from langsmith.run_helpers import tracing_context
+
+    project = settings.langsmith_split_projects[agent]
+
+    def node(state, config):
+        from langchain_core.runnables.config import var_child_runnable_config
+
+        run_id = state.get("pipeline_run_id") if isinstance(state, dict) else None
+        subject = payload_subject(state)
+        metadata = {"agent": agent}
+        if run_id:
+            metadata["pipeline_run_id"] = run_id
+        if subject:
+            metadata["subject"] = subject
+        bare = {k: v for k, v in (config or {}).items() if k != "callbacks"}
+        bare["metadata"] = {**(config or {}).get("metadata", {}), **metadata}
+        token = var_child_runnable_config.set(None)
+        try:
+            with tracing_context(
+                project_name=project,
+                parent=False,
+                tags=[f"agent:{agent}"],
+            ):
+                return subgraph.invoke(state, bare)
+        finally:
+            var_child_runnable_config.reset(token)
+
+    node.__name__ = f"{agent}_traced"
+    return node
+
+
 def as_dict(record) -> dict:
     """Normalize a graph-state record (dict or pydantic model) to a dict."""
     return record if isinstance(record, dict) else record.model_dump()

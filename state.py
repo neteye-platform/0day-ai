@@ -7,6 +7,11 @@ from utils import merge_vulnerabilities
 
 
 class MasterState(TypedDict):
+    # Minted by bootstrap (resume-safe), copied into every subagent dispatch:
+    # stamped as LangSmith metadata on the main and the project-split subagent
+    # traces so all traces of one pipeline run correlate.
+    pipeline_run_id: str
+
     known_vulns: list[dict]
     expert_tasks: list[ExpertTask]
 
@@ -53,6 +58,8 @@ class VerifierState(TypedDict):
     progress_id: str
 
 class ReviewerState(TypedDict):
+    # LangSmith correlation id inherited from MasterState at dispatch.
+    pipeline_run_id: Optional[str]
     node_id: str
     expert_report: dict
     mode: str  # "code_level" | "framework_dependency" | "dependency_mitigation" | "systemic"
@@ -66,6 +73,8 @@ class ReviewerState(TypedDict):
     messages: Annotated[list, add_messages]
 
 class ValidatorState(TypedDict):
+    # LangSmith correlation id inherited from MasterState at dispatch.
+    pipeline_run_id: Optional[str]
     report_to_test: dict # The specific vulnerability to validate
     sandbox_url: Optional[str]     # The endpoint/IP of the sandbox
     cookies: dict
@@ -90,6 +99,8 @@ class ValidatorState(TypedDict):
     messages: Annotated[list, add_messages]
 
 class IntegrationAuditorState(TypedDict):
+    # LangSmith correlation id inherited from MasterState at dispatch.
+    pipeline_run_id: Optional[str]
     # A single `requires_integration` record to be combined into a multi-step exploit chain.
     report_to_test: dict
     # Full records of all OTHER confirmed vulnerabilities (excludes report_to_test

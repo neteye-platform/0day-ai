@@ -50,6 +50,7 @@ def dispatch_integration_audits(state: MasterState):
             f"({[v.get('vuln_id') for v in others]})."
         )
         payload = IntegrationAuditorState(
+            pipeline_run_id=state.get("pipeline_run_id"),
             report_to_test=evaluation,
             confirmed_vulns=others,
             iterations=0,
@@ -278,6 +279,7 @@ def route_integration_audit(state: MasterState):
                 "execution_logs": peer.get("execution_logs"),
             })
         payload = ValidatorState(
+            pipeline_run_id=state.get("pipeline_run_id"),
             report_to_test=record,
             sandbox_url=state.get("sandbox_url"),
             peer_payloads=peer_payloads,
