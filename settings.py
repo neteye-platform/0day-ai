@@ -50,6 +50,22 @@ reviewer_compaction_min_compressible_tokens = 4000
 # model's maximum context length.
 reviewer_hard_reserved = 8192
 
+# Headless-browser toolset (browser_tools.py) for the validator. One shared
+# Firefox process serves all concurrent validators; each session_id gets an
+# isolated BrowserContext. browser_executable = None uses Playwright's own
+# patched Firefox channel build; set it to a path to point at a custom build.
+browser_enabled = True
+browser_timeout_ms = 30000
+# Bounded per-session console/pageerror/dialog ring buffer: max messages kept,
+# and per-message char cap, and the visible-text cap for browser_navigate output.
+browser_console_max_messages = 60
+browser_console_msg_chars = 500
+browser_describe_max_chars = 6000
+browser_executable = None
+# Idle-TTL safety-net reaper for browsers sessions not closed by the terminal
+# tool (grace-perioded so in-use sessions are never reaped).
+browser_idle_timeout_sec = 600
+
 # Validator context compaction: same mechanism as the reviewer, applied to the
 # validator's HTTP-proving loop. HTTP responses from send_http_request can grow
 # without bound over long validation sessions, so the same soft-threshold
