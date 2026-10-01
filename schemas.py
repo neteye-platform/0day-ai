@@ -16,7 +16,7 @@ with open("agents.yaml", "r") as f:
 
 MANIFEST_NAMES = {
     "package.json", "pyproject.toml", "Pipfile", "setup.py", "setup.cfg",
-    "environment.yml", "conda.yaml", "Gemfile", "composer.json", "pom.xml", 
+    "environment.yml", "conda.yaml", "Gemfile", "composer.json", "pom.xml",
     "build.gradle", "build.gradle.kts", "Cargo.toml", "go.mod", "pubspec.yaml",
     "mix.exs", "Podfile", "Package.swift", "conanfile.txt", "conanfile.py",
     "vcpkg.json", "CMakeLists.txt"
@@ -59,6 +59,14 @@ cwes = {
     "CWE-840": "Business Logic Errors",
     "OTHER_UNCATEGORIZED": "Use ONLY if no other CWE fits"
 }
+
+CWE_KEYS = Literal[
+    "CWE-119", "CWE-416", "CWE-476", "CWE-190", "CWE-362", "CWE-89",
+    "CWE-78", "CWE-79", "CWE-94", "CWE-918", "CWE-862", "CWE-863",
+    "CWE-639", "CWE-306", "CWE-352", "CWE-384", "CWE-200", "CWE-319",
+    "CWE-327", "CWE-502", "CWE-22", "CWE-434", "CWE-770", "CWE-284",
+    "CWE-20", "CWE-840", "OTHER_UNCATEGORIZED"
+]
 
 
 class VulnerabilityRecord(BaseModel):
@@ -131,10 +139,6 @@ class ExpertTask(BaseModel):
         description="Detailed instructions on what specific vulnerability classes, architectural risks, or cross-component interactions to investigate within this subgraph."
     )
 
-class ManagerOutput(BaseModel):
-    strategic_overview: str = Field(description="The manager's brief (max 200 words) reasoning on the app's attack surface.")
-    tasks: List[ExpertTask] = Field(description="List of tasks matching predefined roles.")
-
 class CVEDemand(BaseModel):
     security_assumption: str = Field(
         description="The specific demand or configuration requirement that must be verified in the code to prevent the vulnerability."
@@ -176,41 +180,24 @@ class PackageCheck(BaseModel):
     name: str = Field(description="The name of the package")
     version: str = Field(description="The exact version string")
 
-class SecurityDemand(BaseModel):
-    direction: Literal["upstream", "downstream"] = Field(
-        description="'upstream' (caller must fulfill) or 'downstream' (callee must fulfill)."
-    )
-    target: str = Field(
-        description=(
-            "STRICT FORMATTING REQUIRED for programmatic parsing. "
-            "If direction is 'downstream': Format as 'module::symbol' (e.g., 'app.auth::get_jobs' or 'self::validate'). "
-            "If direction is 'upstream': Format as the exact parameter name (e.g., 'query', 'user_id', or 'context')."
-        )
-    )
-    description: str = Field(
-        description="The exact security contract."
-    )
+class UpstreamDemand(BaseModel):
+    target: str = Field(description="Exact parameter name (e.g., 'query', 'user_id').")
+    description: str = Field(description="The security contract.")
 
-class VulnerabilityHypothesis(BaseModel):
-    cwe_id: str = Field(..., json_schema_extra={"enum": list(cwes.keys())})
-    vulnerable_component: str = Field(
-        description="The exact parameter, state transition, or function call that is flawed."
-    )
+class DownstreamDemand(BaseModel):
+    target: str = Field(description="Format as 'module::symbol' (e.g., 'app.auth::get_jobs').")
+    description: str = Field(description="The security contract.")
+
+class Hypothesis(BaseModel):
+    cwe: CWE_KEYS = Field(description="The matching CWE ID from the provided list.")
+    component: str = Field(description="The exact parameter, state transition, or function call that is flawed.")
 
 class AnalysisNote(BaseModel):
-    #role_in_system: str = Field(..., description="One sentence summarizing the node's purpose.")
-    business_interfaces: list[str] = Field(
-        default_factory=list, 
-        description="List of boundaries. Prefix with [SOURCE] or [SINK] (e.g., '[SOURCE] Kafka consumer'). Leave empty if standard flow."
-    )
-    demands: list[SecurityDemand] = Field(
-        default_factory=list, 
-        description="Upstream and downstream security assumptions."
-    )
-    vulnerability_hypotheses: list[VulnerabilityHypothesis] = Field(
-        default_factory=list,
-        description="Flag localized vulnerabilities visible in this snippet."
-    )
+    sources: list[str] = Field(default_factory=list, description="External data entering this snippet.")
+    sinks: list[str] = Field(default_factory=list, description="Dangerous operations performed with data.")
+    upstream: list[UpstreamDemand] = Field(default_factory=list)
+    downstream: list[DownstreamDemand] = Field(default_factory=list)
+    vulns: list[Hypothesis] = Field(default_factory=list)
 
 class DemandEvaluation(BaseModel):
     demand_id: str = Field(description="The exact ID extracted from the [ID: ...] tag provided in the demand description.")

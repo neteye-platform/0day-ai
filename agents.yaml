@@ -128,6 +128,111 @@ expert_agents:
     2. UPSTREAM ASSUMPTIONS (Demands on the Caller): For this specific snippet to execute safely, what MUST the upstream caller have done before invoking it? Leave empty if there are no security-related upstream assumptions.
     3. DOWNSTREAM ASSUMPTIONS (Demands on the Callee): When this snippet calls an external/unseen function, what MUST that function do securely? Leave empty if there are no security-related downstream assumptions.
     4. LOCAL VULNERABILITY HYPOTHESES (Visible Dangers): Create a `vulnerability_hypothesis` ONLY if a flaw is explicitly visible in the current snippet (e.g., raw SQL formatting, plaintext secrets).
+
+    ALLOWED CWE LIST
+    You must classify vulnerabilities using ONLY the following CWEs. If none fit, use "OTHER_UNCATEGORIZED":
+    - CWE-119: Improper Restriction of Operations within the Bounds of a Memory Buffer
+    - CWE-416: Use After Free
+    - CWE-476: NULL Pointer Dereference
+    - CWE-190: Integer Overflow or Wraparound
+    - CWE-362: Concurrent Execution using Shared Resource with Improper Synchronization (Race Condition)
+    - CWE-89: SQL Injection
+    - CWE-78: OS Command Injection
+    - CWE-79: Cross-Site Scripting (XSS)
+    - CWE-94: Code Injection
+    - CWE-918: Server-Side Request Forgery (SSRF)
+    - CWE-862: Missing Authorization
+    - CWE-863: Incorrect Authorization
+    - CWE-639: Authorization Bypass Through User-Controlled Key (IDOR)
+    - CWE-306: Missing Authentication for Critical Function
+    - CWE-352: Cross-Site Request Forgery (CSRF)
+    - CWE-384: Session Fixation
+    - CWE-200: Exposure of Sensitive Information to an Unauthorized Actor
+    - CWE-319: Cleartext Transmission of Sensitive Information
+    - CWE-327: Use of a Broken or Risky Cryptographic Algorithm
+    - CWE-502: Deserialization of Untrusted Data
+    - CWE-22: Path Traversal
+    - CWE-434: Unrestricted Upload of File with Dangerous Type
+    - CWE-770: Allocation of Resources Without Limits or Throttling
+    - CWE-284: Improper Access Control (Use ONLY if no specific access control CWE fits)
+    - CWE-20: Improper Input Validation (Use ONLY if no specific injection CWE fits)
+    - CWE-840: Business Logic Errors
+    - OTHER_UNCATEGORIZED: Use ONLY if no other CWE fits
+
+    EXAMPLES
+
+    Input Snippet:
+    ```javascript
+    import { processPayment } from './paymentService.js';
+
+    export async function handlePaymentRoute(req, res) {
+        const amount = req.body.amount;
+        const currency = req.body.currency;
+
+        // Delegate to the business logic layer
+        const result = await processPayment(amount, currency);
+
+        res.status(200).json({ success: true, data: result });
+    }
+    ```
+
+    Expected Output:
+    ```json
+    {
+      "sources": [
+        "req.body"
+      ],
+      "sinks": [],
+      "upstream": [
+        {
+          "target": "req",
+          "description": "The request body must be schema-validated by middleware before reaching this route to ensure 'amount' and 'currency' exist and are of the correct type."
+        }
+      ],
+      "downstream": [
+        {
+          "target": "paymentService::processPayment",
+          "description": "Must enforce authorization checks to ensure the current session is allowed to process a payment."
+        }
+      ],
+      "vulns": []
+    }
+    ```
+
+    Input Snippet:
+    ```python
+    def read_user_config(filename: str) -> str:
+        # Read the requested configuration file from disk
+        config_path = "/var/app/configs/" + filename
+
+        with open(config_path, 'r') as f:
+            config_data = f.read()
+
+        return config_data
+    ```
+
+    Expected Output:
+    ```json
+    {
+      "sources": [],
+      "sinks": [
+        "open()"
+      ],
+      "upstream": [
+        {
+          "target": "filename",
+          "description": "Must be strictly sanitized to reject directory traversal sequences (e.g., '../') and null bytes."
+        }
+      ],
+      "downstream": [],
+      "vulns": [
+        {
+          "cwe": "CWE-22",
+          "component": "The 'config_path' variable directly concatenates the 'filename' parameter into a file path, passing it unsanitized to the 'open()' sink, allowing path traversal."
+        }
+      ]
+    }
+    ```
   WebSurfaceAuditor:
     prompt: You are an expert in HTTP abstractions, routing, middleware gates, and input contexts.
   LogicFlowAuditor:

@@ -148,11 +148,16 @@ def send_http_request(
     """
     # WARNING: You can only call this a maximum of 4 times before you must use the `take_notes` tool. Plan your batches accordingly.
 
-    # rejection = enforce_note_taking(state.get("messages", []))
-    # if rejection:
-    #     raise ToolException(rejection)
+    # Build the full URL from the endpoint parameter
+    endpoint = endpoint.strip()
+    if endpoint.startswith(("http://", "https://")):
+        url = endpoint
+    else:
+        if not endpoint.startswith("/"):
+            endpoint = f"/{endpoint}"
+        url = f"{settings.sandbox_url}{endpoint}"
 
-    if not endpoint.startswith(settings.sandbox_url):
+    if not url.startswith(settings.sandbox_url):
         return f"Error: You can only make requests to the sandbox application at {settings.sandbox_url}", {}
 
     session = requests.Session()
@@ -163,7 +168,7 @@ def send_http_request(
     try:
         response = session.request(
             method=method,
-            url=endpoint,
+            url=url,
             headers=headers,
             data=body,
             timeout=5
