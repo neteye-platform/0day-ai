@@ -24,8 +24,9 @@ import browser_tools
 import attacker_tools
 from state import MasterState, ExplorerState, CVEAnalyzerState, ThreatIntelState, VerifierState, ReviewerState, ValidatorState, IntegrationAuditorState
 from schemas import ExpertTask, AnalysisNote, BatchedAnalysisResult, CVEAnalysis, VerifierOutput, MANAGER_AGENT, EXPERT_AGENTS, CVE_ANALYZER_AGENT, THREAT_INTEL_AGENT, VERIFIER_AGENT, REVIEWER_AGENT, VALIDATOR_AGENT, INTEGRATION_AUDITOR_AGENT, cwes
-from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, is_path_excluded, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, load_code_corpus, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, reviewer_cache_key
+from utils import build_networkx_graph, extract_imports, get_cached_graph_data, get_node_code, index_file, run_osv_scanner, run_osv_scanner_image, deduplicate_cves, cache, safe_cache_filename, resolve_node_id, uses_namespace_in_ast, is_node_worth_scanning, is_path_excluded, format_node_context, find_container_builds, build_images, start_sandbox, extract_container_artifacts, scan_codebase_for_keywords, find_unsupported_code_files, read_file_text, clear_aggregate_caches, is_high_severity, cache_reviewer, reviewer_cache_key
 from tool_loop import CompactionConfig, ToolLoopAgent
+from dedup import Embeddings, cluster_vulnerabilities
 
 
 _agent_progress: dict[str, dict[str, int]] = {}
@@ -292,6 +293,9 @@ def dispatch_explorers(state: MasterState):
     Nodes are batched per (community, source_file) so that multiple small nodes
     sharing a file are analyzed in a single explorer dispatch, as long as their
     combined code size stays under settings.explorer_batch_char_threshold characters.
+
+    Skeleton (file-level) nodes are dispatched only when no real sibling of the
+    same file is eligible in the same task, so skeleton-only files are analyzed too.
     """
 
     G = build_networkx_graph(settings.graph)
@@ -306,18 +310,16 @@ def dispatch_explorers(state: MasterState):
         clean_id = task.get("target_community", "").lower().replace("community ", "").strip()
         community_nodes = [n for n, attr in G.nodes(data=True) if str(attr.get("community")) == clean_id]
 
-        # Group eligible nodes by source_file (the batching key within this task).
-        files: dict[str, list[str]] = defaultdict(list)
+        # Eligible-by-file: (node_id, is_skeleton). Skeletons are file/module-level
+        # placeholder nodes; a real sibling's scan already sees the whole file
+        # (module-level code included) as context.
+        eligible: dict[str, list[tuple[str, bool]]] = defaultdict(list)
 
-        # Filter out skeleton nodes, but keep functions, classes, and non-code files
         for node_id in community_nodes:
             node_data = G.nodes[node_id]
-
-            if node_data.get("source_file", "").endswith(node_data.get("label")):
-                # Skip skeletons only if they are not the only node in that file
-                nodes_in_file = [n for n, attr in G.nodes(data=True) if attr.get("source_file") == node_data.get("source_file")]
-                if len(nodes_in_file) <= 1:
-                    continue
+            source_file = node_data.get("source_file", "")
+            label = node_data.get("label") or ""
+            is_skeleton = bool(source_file) and source_file.endswith(label)
 
             # Drop inert nodes (pure types, empty skeletons, flat constants) to save LLM budget
             if not is_node_worth_scanning(node_id):
@@ -327,13 +329,20 @@ def dispatch_explorers(state: MasterState):
 
             # Drop nodes whose source file lives in an excluded path
             # (dependency trees, tests, docs) before spending LLM budget on it.
-            source_file = node_data.get("source_file", "")
             if is_path_excluded(source_file):
                 skipped_nodes += 1
                 logging.debug(f"Skipping excluded-path node {node_id} ({source_file}).")
                 continue
 
-            files[node_data.get("source_file", "")].append(node_id)
+            eligible[source_file].append((node_id, is_skeleton))
+
+        # Drop a skeleton node whose file already has a real (non-skeleton)
+        # eligible sibling in this task — the sibling's batch carries the whole
+        # file as context, so scanning the skeleton too would duplicate coverage.
+        files: dict[str, list[str]] = {}
+        for file_path, nodes in eligible.items():
+            has_real = any(not sk for _, sk in nodes)
+            files[file_path] = [nid for nid, sk in nodes if not (sk and has_real)]
 
         # Pack each file's nodes into batches whose combined code size stays under the threshold,
         # unless batching is disabled, in which case every node is its own dispatch.
@@ -1253,8 +1262,18 @@ def filter_cve_demands_by_keywords(cves: list[dict]) -> list[dict]:
     if not cves:
         return cves
 
-    corpus = load_code_corpus()
-    if not corpus:
+    keyword_cves = [r for r in cves if r.get("required_keywords")]
+    if not keyword_cves:
+        return cves
+
+    all_keywords = sorted({
+        kw for r in keyword_cves for kw in (r.get("required_keywords") or [])
+    })
+    if not all_keywords:
+        return cves
+
+    present_keywords, scanned_bytes = scan_codebase_for_keywords(all_keywords)
+    if scanned_bytes == 0:
         logging.warning(
             "CVE keyword filter: no code files indexed — skipping filter "
             "(all CVE records forwarded)."
@@ -1274,13 +1293,11 @@ def filter_cve_demands_by_keywords(cves: list[dict]) -> list[dict]:
             continue
 
         match = next(
-            ((kw, source_file) for kw in keywords for source_file, content in corpus.items()
-             if kw in content),
+            (kw for kw in keywords if kw in present_keywords),
             None
         )
         if match:
-            keyword, source_file = match
-            logging.debug(f"{source_cve}: keyword '{keyword}' found in '{source_file}' — keeping.")
+            logging.debug(f"{source_cve}: keyword '{match}' present in code — keeping.")
             kept.append(record)
         else:
             logging.info(
@@ -1607,6 +1624,28 @@ def dispatch_reviewers(state: MasterState):
     if not hypotheses:
         logging.warning(f"No vulnerabilities hypotheses to dispatch.")
         return END
+
+    # Semantic dedup before fan-out. Duplicate hypotheses (same real
+    # flaw described differently by different agents) are merged so one reviewer
+    # subgraph adjudicates the pattern once. Fails open: exact-key dedup (safe,
+    # deterministic) always runs; embedding clustering only when Ollama serves
+    # the configured model.
+    embedder = None
+    if settings.semantic_dedup_enabled:
+        _emb = Embeddings(
+            settings.embeddings_base_url,
+            settings.embeddings_model,
+            settings.embeddings_timeout,
+        )
+        if _emb.available():
+            embedder = _emb
+        else:
+            logging.warning(
+                "Semantic dedup: embeddings unavailable (Ollama idle or model %r "
+                "not pulled?); using exact-key dedup only.",
+                settings.embeddings_model,
+            )
+    hypotheses = cluster_vulnerabilities(hypotheses, settings.semantic_dedup_threshold, embedder)
 
     commands = []
     for hypothesis in hypotheses:
