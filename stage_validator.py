@@ -12,7 +12,7 @@ import browser_tools
 import credential_finder
 import settings
 import tools
-from llms import fast_llm, smart_llm
+from llms import fast_llm, validator_llm
 from run_stats import _record_stat, _start_agent_progress, as_dicts
 from schemas import VALIDATOR_AGENT
 from state import MasterState, ReviewerState, ValidatorState
@@ -257,7 +257,7 @@ class ValidatorAgent(ToolLoopAgent):
         # ask_for_context is bound ONLY on the first validation pass.
         if (state.get("report_to_test", {}).get("review_round") or 0) < settings.validator_feedback_max_rounds:
             validator_tools.append(tools.ask_for_context)
-        return smart_llm.bind_tools(validator_tools)
+        return validator_llm.bind_tools(validator_tools)
 
     def cached_verdict(self, state):
         return cache_validator(
@@ -323,6 +323,16 @@ class ValidatorAgent(ToolLoopAgent):
                 f"execution_logs; an exploit failing exactly on a reservation is "
                 f"false-positive evidence.\n"
                 f"{res_str}"
+            )
+        # A flow the Reviewer SAW while tracing that the hypothesis may not name
+        # and the steps may not cover — the Validator must test it as well.
+        concern = report.get("out_of_scope_concern")
+        if concern:
+            formatted_report += (
+                "\n\n--- REVIEWER OUT-OF-SCOPE CONCERN (test it too) ---\n"
+                "Observed source-to-sink flow beyond this record's hypothesis: "
+                "if the steps above do not exercise it, test it in the sandbox and "
+                f"log the outcome with evidence in execution_logs.\n{concern}"
             )
         # Chained records carry the proven poc_payloads of the peers they chain
         # with, so the final exploit reuses real proven primitives.

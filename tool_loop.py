@@ -12,6 +12,7 @@ summary-ledger prompt text.
 
 import json
 import logging
+from typing import Any
 
 from langchain_core.messages import (
     AnyMessage,
@@ -19,7 +20,10 @@ from langchain_core.messages import (
     RemoveMessage,
     SystemMessage,
 )
+from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables.config import get_config_list
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.prebuilt.tool_node import ToolNode, ToolRuntime
 from langgraph.types import Command
 
 import settings
@@ -210,6 +214,97 @@ def _generate_agent_context_summary(
     except Exception as e:
         logging.warning(f"Context compaction summarization failed, failing open: {e}")
         return None
+
+
+class SequentialToolNode(ToolNode):
+    """A ToolNode that executes one response's tool calls SEQUENTIALLY, in the
+    order the model listed them, instead of the stock concurrent fan-out
+    (``executor.map`` / ``asyncio.gather``).
+
+    This is what makes it safe for the validator to batch dependent calls in a
+    single response — the canonical ``write_attacker_file`` immediately followed
+    by a ``run_command`` launching that file — collapsing the write-then-run
+    micro-cycle into one loop turn. All mechanics (input parsing, state/config
+    injection, invalid-tool errors, output combining) are inherited untouched.
+    If the parent's private internals ever drift, the call-preparation fallback
+    degrades to the stock concurrent node rather than breaking the run.
+    """
+
+    def _prepare(self, input: Any, config: RunnableConfig, runtime: Any):
+        tool_calls, input_type = self._parse_input(input)
+        config_list = get_config_list(config, len(tool_calls))
+        tool_runtimes = []
+        for call, cfg in zip(tool_calls, config_list, strict=False):
+            state = self._extract_state(input, cfg)
+            tool_runtimes.append(
+                ToolRuntime(
+                    state=state,
+                    tool_call_id=call["id"],
+                    config=cfg,
+                    context=runtime.context,
+                    store=runtime.store,
+                    stream_writer=runtime.stream_writer,
+                    tools=list(self.tools_by_name.values()),
+                    execution_info=runtime.execution_info,
+                    server_info=runtime.server_info,
+                )
+            )
+        return tool_calls, input_type, tool_runtimes
+
+    def _func(self, input: Any, config: RunnableConfig, runtime: Any) -> Any:
+        try:
+            tool_calls, input_type, tool_runtimes = self._prepare(input, config, runtime)
+        except Exception:
+            logging.warning("SequentialToolNode preparation failed; falling back to the stock concurrent ToolNode.")
+            return super()._func(input, config, runtime)
+        outputs = [
+            self._run_one(call, input_type, tool_runtime)
+            for call, tool_runtime in zip(tool_calls, tool_runtimes, strict=False)
+        ]
+        return self._combine_tool_outputs(outputs, input_type)
+
+    async def _afunc(self, input: Any, config: RunnableConfig, runtime: Any) -> Any:
+        try:
+            tool_calls, input_type, tool_runtimes = self._prepare(input, config, runtime)
+        except Exception:
+            logging.warning("SequentialToolNode preparation failed; falling back to the stock concurrent ToolNode.")
+            return await super()._afunc(input, config, runtime)
+        outputs = []
+        for call, tool_runtime in zip(tool_calls, tool_runtimes, strict=False):
+            outputs.append(await self._arun_one(call, input_type, tool_runtime))
+        return self._combine_tool_outputs(outputs, input_type)
+
+
+def _tool_batch_fingerprint(message: AnyMessage) -> tuple:
+    """Order-insensitive canonical signature of an AI message's tool calls:
+    (name, sorted-key args json) pairs, so a re-issued batch with the tools
+    listed in a different order still matches."""
+    return tuple(sorted(
+        (
+            call["name"] if isinstance(call, dict) else call.name,
+            json.dumps(
+                call["args"] if isinstance(call, dict) else call.args,
+                sort_keys=True,
+                default=str,
+            ),
+        )
+        for call in (getattr(message, "tool_calls", None) or [])
+    ))
+
+
+def _repeats_previous_tool_batch(messages: list[AnyMessage]) -> bool:
+    """True when the two most recent tool-calling AI turns issued IDENTICAL
+    batches — the model is stuck re-running the same call verbatim."""
+    fingerprints = []
+    for msg in reversed(messages):
+        if getattr(msg, "type", "") != "ai":
+            continue
+        if not (getattr(msg, "tool_calls", None) or []):
+            continue
+        fingerprints.append(_tool_batch_fingerprint(msg))
+        if len(fingerprints) == 2:
+            break
+    return len(fingerprints) == 2 and fingerprints[0] == fingerprints[1]
 
 
 class ToolLoopAgent:
@@ -497,6 +592,16 @@ class ToolLoopAgent:
         messages_for_llm, updates, did_compact, _ = self.prepare_history(
             full_messages, subject, current_turn
         )
+        # Hallucination guard: a byte-identical re-run of the previous batch adds
+        # no evidence; nudge the model (transiently — the state history stays
+        # byte-identical) to change the call or conclude.
+        if _repeats_previous_tool_batch(full_messages):
+            terminal_display = " or ".join(self._terminal_names())
+            messages_for_llm = list(messages_for_llm) + [HumanMessage(content=(
+                "System Warning: your last two responses executed EXACTLY the "
+                "same tool calls; that result is already in your history. Reissue "
+                f"the call with changed arguments, or conclude with {terminal_display} now."
+            ))]
         response = llm_with_tools.invoke(messages_for_llm)
         updates.append(response)
         if did_compact:

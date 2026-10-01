@@ -51,6 +51,7 @@ from stage_validator import (
     validator_router,
 )
 from stage_verifier import contract_verifier_node, dispatch_verifiers, synchronization_node
+from tool_loop import SequentialToolNode
 from credential_finder import credential_finder_node
 from state import MasterState, ReviewerState, ValidatorState, IntegrationAuditorState
 from schemas import ReviewerOutput, ValidatorOutput
@@ -110,7 +111,9 @@ def compile_validator():
     validator_workflow.add_node("validator_agent", validator_agent_node, retry_policy=RETRY)
     validator_workflow.add_node("ask_validator_for_tool", ask_validator_for_tool)
     validator_workflow.add_node("validator_fallback", validator_fallback_node)
-    validator_workflow.add_node("validator_tools", ToolNode([
+    # Sequential: the validator batches DEPENDENT calls in one response (write
+    # the PoC file, then run it); same-turn calls must run in listed order.
+    validator_workflow.add_node("validator_tools", SequentialToolNode([
         tools.send_http_request,
         browser_tools.browser_navigate,
         browser_tools.browser_click,
