@@ -1,7 +1,7 @@
 import operator
 from typing import TypedDict, List, Dict, Any, Annotated
 from langgraph.graph.message import add_messages
-from schemas import ExpertTask # Import your Pydantic models here
+from schemas import ExpertTask, ValidationResult
 
 
 class MasterState(TypedDict):
@@ -11,6 +11,7 @@ class MasterState(TypedDict):
     expert_tasks: List[ExpertTask]
     vulnerability_reports: Annotated[List[Dict[str, Any]], operator.add] # Aggregated findings
     filtered_reports: list[dict]
+    confirmed_vulnerabilities: Annotated[List[ValidationResult], operator.add]
     messages: Annotated[list, add_messages]
 
 class ExpertState(TypedDict):
@@ -18,4 +19,9 @@ class ExpertState(TypedDict):
     subgraph_nodes: List[str]
     messages: Annotated[list, add_messages] # Tracks the conversation and tool calls
     vulnerability_reports: Annotated[List[Dict[str, Any]], operator.add]
+
+class ValidatorState(TypedDict):
+    report_to_test: dict # The specific vulnerability to validate
+    sandbox_url: str     # The endpoint/IP of the sandbox
+    messages: Annotated[list, add_messages]
 
