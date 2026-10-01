@@ -14,7 +14,9 @@ from run_stats import _log_agent_completion, _start_agent_progress
 from utils import (
     build_networkx_graph,
     get_cached_graph_data,
+    get_file_nodes_index,
     get_node_code,
+    get_node_map,
     format_node_context,
     is_node_worth_scanning,
     is_path_excluded,
@@ -23,7 +25,8 @@ from utils import (
 )
 
 
-def _pack_node_batches(file_nodes: list[str], threshold: int) -> list[list[str]]:
+def _pack_node_batches(file_nodes: list[str], threshold: int,
+                       node_map: dict, sub_nodes_index: dict) -> list[list[str]]:
     """Greedily pack node ids into batches whose combined code+context size
     stays below `threshold`; an oversized node becomes its own batch."""
     batches: list[list[str]] = []
@@ -33,7 +36,8 @@ def _pack_node_batches(file_nodes: list[str], threshold: int) -> list[list[str]]
     graph_data = get_cached_graph_data(settings.graph)
 
     for node_id in file_nodes:
-        code = get_node_code(node_id) or ""
+        code = get_node_code(node_id, node_map=node_map,
+                             sub_nodes_index=sub_nodes_index) or ""
         context = format_node_context(graph_data, node_id)
         length = len(code) + len(context)
         if current and current_len + length > threshold:
@@ -63,6 +67,14 @@ def dispatch_explorers(state: MasterState):
     batched_batches = 0
     single_batches = 0
 
+    # One-shot per-graph indexes: reused for every task/node below instead of
+    # rescanning all graph nodes per community lookup and per code read.
+    node_map = get_node_map(settings.graph)
+    sub_nodes_index = get_file_nodes_index(settings.graph)
+    nodes_by_community: dict[str, list[str]] = defaultdict(list)
+    for node_id, attr in G.nodes(data=True):
+        nodes_by_community[str(attr.get("community"))].append(node_id)
+
     # Phase 1: decide dispatches (batch -> task) before registering progress,
     # so the ledger total is exact.
     dispatches: list[tuple[list[str], str, str]] = []
@@ -70,7 +82,7 @@ def dispatch_explorers(state: MasterState):
     for task in state["expert_tasks"]:
         task = task if isinstance(task, dict) else task.model_dump()
         clean_id = task.get("target_community", "").lower().replace("community ", "").strip()
-        community_nodes = [n for n, attr in G.nodes(data=True) if str(attr.get("community")) == clean_id]
+        community_nodes = nodes_by_community.get(clean_id, [])
 
         # Eligible-by-file: (node_id, is_skeleton). Skeletons are file/module-level
         # placeholder nodes; a real sibling's scan already sees the whole file.
@@ -106,7 +118,8 @@ def dispatch_explorers(state: MasterState):
 
         for file_path, file_nodes in files.items():
             if settings.explorer_batching_enabled:
-                batches = _pack_node_batches(file_nodes, settings.explorer_batch_char_threshold)
+                batches = _pack_node_batches(file_nodes, settings.explorer_batch_char_threshold,
+                                             node_map, sub_nodes_index)
             else:
                 batches = [[node_id] for node_id in file_nodes]
             for batch in batches:
@@ -211,7 +224,7 @@ def _explore_single(node_id: str, role_name: str) -> dict:
     ))
 
     graph_data = get_cached_graph_data(settings.graph)
-    target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), {})
+    target_node = get_node_map(settings.graph).get(node_id, {})
 
     context = format_node_context(graph_data, node_id)
     context_block = f"{context}\n\n" if context else ""
@@ -266,9 +279,10 @@ def _explore_batch(node_ids: list[str], role_name: str) -> dict:
         f"{EXPERT_AGENTS['batch_prompt']}"
     ))
 
+    node_map = get_node_map(settings.graph)
     sections = []
     for node_id in node_ids:
-        target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), {})
+        target_node = node_map.get(node_id, {})
         source_code = get_node_code(node_id)
         label = target_node.get("label", node_id)
         context_block = format_node_context(graph_data, node_id)

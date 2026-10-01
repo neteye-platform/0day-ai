@@ -30,6 +30,7 @@ import logging
 import math
 import re
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -92,15 +93,21 @@ class Embeddings:
         return vec
 
     # Chunk /api/embed requests: one monolithic multi-thousand request can
-    # stall the server (and the pipeline) past any useful timeout.
+    # stall the server (and the pipeline) past any useful timeout. Chunks are
+    # fetched CONCURRENTLY (HTTP wait releases the GIL); a large cold dedup is
+    # otherwise a serial chain of chunk round-trips. Workers stay small so a
+    # local Ollama never sees a request stampede.
     BATCH_CHUNK = 128
+    PARALLEL_CHUNKS = 8
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Embed many texts, using Ollama's batch endpoint when available.
 
-        Tries ``/api/embed`` in chunks and falls back to sequential single-text
-        ``embed()`` calls on older servers. The per-text cache is consulted and
-        filled either way, so repeated runs only pay for unseen texts.
+        Tries ``/api/embed`` in concurrent chunks and falls back to sequential
+        single-text ``embed()`` calls on older servers. The per-text cache is
+        consulted and filled either way, so repeated runs only pay for unseen
+        texts. Results are written back at the original index, so the returned
+        order is identical to sequential fetching.
         """
         results: list[list[float] | None] = [None] * len(texts)
         missing: list[tuple[int, str]] = []
@@ -110,26 +117,41 @@ class Embeddings:
                 results[i] = cached
             else:
                 missing.append((i, t))
-        try:
-            for start in range(0, len(missing), self.BATCH_CHUNK):
-                chunk = missing[start:start + self.BATCH_CHUNK]
-                resp = requests.post(
-                    f"{self.base_url}/api/embed",
-                    json={"model": self.model, "input": [t for _, t in chunk]},
-                    timeout=self.timeout,
+        chunks = [
+            missing[s:s + self.BATCH_CHUNK]
+            for s in range(0, len(missing), self.BATCH_CHUNK)
+        ]
+
+        def _fetch(chunk: list[tuple[int, str]]) -> list[list[float]]:
+            resp = requests.post(
+                f"{self.base_url}/api/embed",
+                json={"model": self.model, "input": [t for _, t in chunk]},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            vecs = resp.json().get("embeddings") or []
+            if len(vecs) != len(chunk):
+                raise ValueError(
+                    f"batch size mismatch: {len(vecs)} embeddings for {len(chunk)} texts"
                 )
-                resp.raise_for_status()
-                vecs = resp.json().get("embeddings") or []
-                if len(vecs) != len(chunk):
-                    raise ValueError(
-                        f"batch size mismatch: {len(vecs)} embeddings for {len(chunk)} texts"
-                    )
-                for (i, t), vec in zip(chunk, vecs):
-                    self._cache[self._key(t)] = vec
-                    results[i] = vec
+            return vecs
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=min(len(chunks), self.PARALLEL_CHUNKS) or 1,
+                thread_name_prefix="embed",
+            ) as pool:
+                futures = {pool.submit(_fetch, chunk): chunk for chunk in chunks}
+                for fut in as_completed(futures):
+                    # Raises on failure -> the one-by-one fallback below.
+                    vecs = fut.result()
+                    for (i, t), vec in zip(futures[fut], vecs):
+                        self._cache[self._key(t)] = vec
+                        results[i] = vec
         except Exception:
             # Older Ollama without /api/embed (or transient error): one-by-one
-            # fallback, raising on real unavailability so callers fail open.
+            # fallback for whatever the chunks didn't fill, raising on real
+            # unavailability so callers fail open.
             for i, t in missing:
                 if results[i] is None:
                     results[i] = self.embed(t)
@@ -534,8 +556,22 @@ def deduplicate_demands(
     order-sensitive contract-verifier cache keys (md5 of the ordered list, and
     positional batch slices) flip between runs — recomputing the hub nodes'
     biggest prompts every single run.
+
+    Embeddings are fetched with ONE global call over the deduped union of all
+    pending group texts, not one call per target: a demand flood means
+    thousands of targets, and per-target calls serialized thousands of tiny
+    HTTP round-trips (minutes of wall time). Per-group clustering inputs are
+    unchanged (the embedder caches per text), so results are identical. On a
+    global embedding failure every pending group keeps its exact-merged seeds
+    (fail open, as before, but at whole-stage rather than per-target
+    granularity).
     """
     total_in = sum(len(v) for v in grouped_demands.values())
+    # Pass 1: canonical sort + exact-identity merge per target/type; embedding
+    # candidates are collected instead of fetched inline. Each pending entry is
+    # (keep list of the target, seed indices, embedding texts per seed).
+    pending: list[tuple[list[int], list[int], list[str]]] = []
+    targets_with_keeps: list[tuple[object, list[int]]] = []
     for target, demands in grouped_demands.items():
         demands = grouped_demands[target] = sorted(demands, key=_canonical_demand_key)
         if len(demands) <= 1:
@@ -546,6 +582,7 @@ def deduplicate_demands(
             by_type[d.get("type") or ""].append(i)
 
         keep: list[int] = []
+        targets_with_keeps.append((target, keep))
         for dtype, idxs in by_type.items():
             if dtype == "cve_assumption" or len(idxs) == 1:
                 keep.extend(idxs)
@@ -573,22 +610,38 @@ def deduplicate_demands(
             if len(seeds) == 1 or embedder is None:
                 keep.extend(seeds)
                 continue
-            try:
-                texts = [_norm(demands[i].get("description")) for i in seeds]
-                vectors = _embed_with_disk_cache(embedder, texts, disk_cache_dir)
-                clusters = _greedy_cluster_indices(vectors, threshold)
-            except Exception as e:
-                log.warning(
-                    "Demand dedup: embedding failed for target %s; keeping %d "
-                    "exact-unique demands (%s)",
-                    target, len(seeds), e,
-                )
-                keep.extend(seeds)
-                continue
-            keep.extend(seeds[cl[0]] for cl in clusters)
+            pending.append((keep, seeds, [_norm(demands[i].get("description")) for i in seeds]))
 
+    # Pass 2: one global batched embed over the unique texts, then per-group
+    # greedy clustering with the precomputed vectors.
+    vec_map: dict[str, list[float]] = {}
+    if pending and embedder is not None:
+        unique_texts = list(dict.fromkeys(t for _, _, texts in pending for t in texts))
+        try:
+            vectors = _embed_with_disk_cache(embedder, unique_texts, disk_cache_dir)
+            if len(vectors) != len(unique_texts):
+                raise ValueError("embedding count mismatch in demand dedup")
+            vec_map = dict(zip(unique_texts, vectors))
+        except Exception as e:
+            log.warning(
+                "Demand dedup: embedding failed (%s); keeping exact-unique "
+                "demands for %d multi-demand group(s).",
+                e, len(pending),
+            )
+    for keep, seeds, texts in pending:
+        try:
+            clusters = _greedy_cluster_indices([vec_map[t] for t in texts], threshold)
+        except Exception as e:  # missing vector for this group only
+            log.warning(
+                "Demand dedup: keeping %d exact-unique demands (%s)", len(seeds), e
+            )
+            keep.extend(seeds)
+            continue
+        keep.extend(seeds[cl[0]] for cl in clusters)
+
+    for target, keep in targets_with_keeps:
         keep.sort()
-        grouped_demands[target] = [demands[i] for i in keep]
+        grouped_demands[target] = [grouped_demands[target][i] for i in keep]
 
     total_out = sum(len(v) for v in grouped_demands.values())
     if total_out != total_in:

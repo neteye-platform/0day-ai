@@ -36,9 +36,11 @@ artifacts simply contribute no edges, and the caller never sees an exception.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import logging
 import re
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -361,14 +363,21 @@ def _dedupe_routes(entries: list[tuple[str, str, str]]) -> list[tuple[str, str, 
     return out
 
 
-def _queue_virtual_edges(nodes_by_id: dict, note_ids: set, queue_entries: dict) -> list[dict]:
+def _dispatch_surface(nodes_by_id: dict, note_ids: set) -> list[tuple[str, dict]]:
+    """Nodes whose queue/HTTP client call sites are scanned: everything when
+    note-scoping is off, else the noted subset. Computed ONCE and shared by
+    both virtual-edge passes (they walked the identical surface)."""
     require_note = getattr(settings, "edge_traversal_require_note", True)
-    dispatch_surface = [
+    return [
         (node_id, node) for node_id, node in nodes_by_id.items()
         if not require_note or node_id in note_ids
     ]
+
+
+def _queue_virtual_edges(nodes_by_id: dict, note_ids: set, queue_entries: dict,
+                         surface: list[tuple[str, dict]] | None = None) -> list[dict]:
     edges: list[dict] = []
-    for node_id, node in dispatch_surface:
+    for node_id, node in (surface if surface is not None else _dispatch_surface(nodes_by_id, note_ids)):
         code = get_node_code(node_id, raw=True)
         if not code:
             continue
@@ -398,14 +407,10 @@ def _queue_virtual_edges(nodes_by_id: dict, note_ids: set, queue_entries: dict) 
     return edges
 
 
-def _http_virtual_edges(nodes_by_id: dict, note_ids: set, route_entries: list[tuple]) -> list[dict]:
-    require_note = getattr(settings, "edge_traversal_require_note", True)
-    client_surface = [
-        (node_id, node) for node_id, node in nodes_by_id.items()
-        if not require_note or node_id in note_ids
-    ]
+def _http_virtual_edges(nodes_by_id: dict, note_ids: set, route_entries: list[tuple],
+                        surface: list[tuple[str, dict]] | None = None) -> list[dict]:
     edges: list[dict] = []
-    for node_id, node in client_surface:
+    for node_id, node in (surface if surface is not None else _dispatch_surface(nodes_by_id, note_ids)):
         code = get_node_code(node_id, raw=True)
         if not code:
             continue
@@ -543,8 +548,104 @@ def _slug(value: str) -> str:
 # Assembly, dedup, capping, clustering
 # -----------------------------------------------
 
+_EDGE_SYNTHESIS_SETTING_KEYS = (
+    "edge_traversal_direct_enabled", "edge_traversal_queue_enabled",
+    "edge_traversal_http_enabled", "edge_traversal_infra_enabled",
+    "edge_traversal_require_note", "edge_traversal_max_edges_per_category",
+    "scan_exclude_paths", "scan_exclude_defaults", "repair_call_edges",
+)
+
+
+def _artifacts_fingerprint() -> list[str]:
+    """Digest of everything the infra synthesizer reads: each image snapshot's
+    extraction summary plus the (path, size, mtime) of every proxy-config
+    candidate in its rootfs. Cheap (extracted rootfs dirs are curated, small)."""
+    root = get_container_artifacts_root()
+    if not root.exists():
+        return []
+    lines: list[str] = []
+    for image_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        summary = image_dir / "extraction_summary.json"
+        try:
+            lines.append(f"{image_dir.name}:summary:{hashlib.md5(summary.read_bytes()).hexdigest()}")
+        except OSError:
+            lines.append(f"{image_dir.name}:summary:none")
+        rootfs = image_dir / "rootfs"
+        if not rootfs.is_dir():
+            continue
+        for file_path in sorted(rootfs.rglob("*")):
+            if not file_path.is_file():
+                continue
+            if not any(fnmatch.fnmatch(file_path.name, pat) for pat in _PROXY_CONFIG_PATTERNS):
+                continue
+            try:
+                st = file_path.stat()
+                lines.append(f"{file_path.relative_to(rootfs)}:{st.st_size}:{st.st_mtime_ns}")
+            except OSError:
+                lines.append(f"{file_path.relative_to(rootfs)}:stale")
+    return lines
+
+
+def _synthesis_fingerprint(note_map: dict) -> str:
+    """Digest of the deterministic inputs to the edge synthesis: the graph
+    file (identity + mtime + size), the edge-traversal and exclusion settings,
+    the full note map (it gates and annotates edges), and the container-
+    artifact state the infra pass reads. Target source files are read by the
+    queue/HTTP passes but deliberately NOT fingerprinted — they are only
+    meaningful in sync with graph.json (regenerated together by graphify), and
+    this matches the pipeline-wide "source is immutable while its graph is
+    current" cache assumption. A digest match replays byte-identical edges for
+    a given graph; delete the cache directory to force fresh synthesis after
+    editing target sources without re-extracting the graph.
+    """
+    payload: dict = {
+        "app_path": str(settings.app_path),
+        "settings": {k: getattr(settings, k, None) for k in _EDGE_SYNTHESIS_SETTING_KEYS},
+    }
+    try:
+        st = settings.graph.stat()
+        payload["graph"] = [str(settings.graph), st.st_size, st.st_mtime_ns]
+    except OSError:
+        payload["graph"] = str(settings.graph)
+    payload["notes_md5"] = hashlib.md5(
+        json.dumps(note_map or {}, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    payload["artifacts"] = _artifacts_fingerprint()
+    return hashlib.md5(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
 def build_boundary_edges(graph_data: dict, note_map: dict) -> list[dict]:
-    """Assemble the full candidate boundary-edge set (deterministic, no LLM)."""
+    """Assemble the full candidate boundary-edge set (deterministic, no LLM).
+
+    The synthesis is pure (graph + notes + settings + artifacts), so its output
+    is disk-cached under ``.cache/edge_traversal/synthesis_<fingerprint>.json``
+    — previously it was re-paid in full (~minutes on a large repo) on every run
+    and even on checkpoint resumes that re-entered the node. ``graph_data`` is
+    consumed on the miss path only; the fingerprint pins ``settings.graph``, so
+    callers must pass that same process-cached graph (the edge-traversal node
+    does)."""
+    from utils import cache, safe_cache_filename
+
+    fingerprint = _synthesis_fingerprint(note_map)
+    cache_file = settings.cache_dir / "edge_traversal" / safe_cache_filename(f"synthesis_{fingerprint}.json")
+    hit = cache(cache_file, "read")
+    if isinstance(hit, dict) and isinstance(hit.get("edges"), list):
+        edges = hit["edges"]
+        log.info("Edge traversal: reusing cached boundary-edge synthesis: %d edge(s) (%s).",
+                 len(edges), fingerprint[:12])
+        return edges
+
+    started = time.monotonic()
+    edges = _build_boundary_edges(graph_data, note_map)
+    cache(cache_file, "write", {"fingerprint": fingerprint, "edges": edges})
+    log.info("Edge traversal: boundary-edge synthesis done in %.1fs (%d edge(s) after capping); cached.",
+             time.monotonic() - started, len(edges))
+    return edges
+
+
+def _build_boundary_edges(graph_data: dict, note_map: dict) -> list[dict]:
     nodes_by_id = {
         n.get("id"): n for n in graph_data.get("nodes", [])
         if n.get("id") and n.get("file_type") == "code"
@@ -568,13 +669,21 @@ def build_boundary_edges(graph_data: dict, note_map: dict) -> list[dict]:
             len(queue_entries),
         )
 
+    # Queue and HTTP both regex-scan client call sites over the identical
+    # note-scoped node surface; walk it once. (Code extraction stays inside
+    # each pass — the per-file tree parse behind it is memoized in utils.)
+    surface: list[tuple[str, dict]] | None = None
+    if (getattr(settings, "edge_traversal_queue_enabled", True)
+            or getattr(settings, "edge_traversal_http_enabled", True)):
+        surface = _dispatch_surface(nodes_by_id, note_ids)
+
     if getattr(settings, "edge_traversal_queue_enabled", True):
-        queued = _queue_virtual_edges(nodes_by_id, note_ids, queue_entries)
+        queued = _queue_virtual_edges(nodes_by_id, note_ids, queue_entries, surface)
         edges.extend(queued)
         log.info("Edge traversal: %d async-messaging virtual edge(s).", len(queued))
 
     if getattr(settings, "edge_traversal_http_enabled", True):
-        http = _http_virtual_edges(nodes_by_id, note_ids, route_entries)
+        http = _http_virtual_edges(nodes_by_id, note_ids, route_entries, surface)
         edges.extend(http)
         log.info("Edge traversal: %d HTTP virtual edge(s).", len(http))
 
@@ -669,7 +778,6 @@ def summarize_boundary_edges(edges: list[dict]) -> dict[str, int]:
 def boundary_batch_fingerprint(batch: list[dict]) -> str:
     """Stable cache key for a batch: includes the note profiles, labels, files,
     match keys, and transport/artifact text, so any change re-runs the batch."""
-    import hashlib
     payload = json.dumps(batch, sort_keys=True, default=str)
     return hashlib.md5(payload.encode("utf-8")).hexdigest()
 

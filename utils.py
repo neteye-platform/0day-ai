@@ -1,4 +1,4 @@
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime, timezone
 import fnmatch
@@ -101,6 +101,14 @@ def get_cached_graph_data(graph_path: Path):
 # tree-sitter trees are always transient.
 AGGREGATE_MEMO_ALIASES: dict[tuple[str, str], Optional[set[str]]] = {}
 AGGREGATE_MEMO_FOLDED: dict[str, Optional[str]] = {}
+
+# Per-file memo of (masked source bytes, parsed tree-sitter tree), FIFO-bounded.
+# get_node_code sliced a node out of a full-file tree; without this, a file with
+# N nodes was masked + parsed O(N) times per pass (and re-parsed again later by
+# the explorer/reviewer code tools). Files are immutable for the process
+# lifetime (same assumption as the read_file_text cache).
+_FILE_PARSE_MEMO: "OrderedDict[str, tuple[bytes, tree_sitter.Tree]]" = OrderedDict()
+_FILE_PARSE_MEMO_MAX = 256
 
 # Leading dot excludes top-level functions so file nodes are not containers.
 _MEMBER_LABEL_RE = re.compile(r"^\.([A-Za-z_]\w*)\(\)$")
@@ -220,6 +228,118 @@ def clear_aggregate_caches() -> None:
     AGGREGATE_MEMO_ALIASES.clear()
     AGGREGATE_MEMO_FOLDED.clear()
     read_file_text.cache_clear()
+    _FILE_PARSE_MEMO.clear()
+
+
+@lru_cache(maxsize=1)
+def get_node_map(graph_path: Path) -> dict:
+    """``{node id -> node}`` over the process-cached graph.
+
+    Derived once per graph; replaces the per-call linear scans that turned
+    every per-node helper (``get_node_code``, ``is_node_worth_scanning``,
+    ``guard_map_for_node``) into O(all nodes). Same process-lifetime caching
+    assumptions as :func:`get_cached_graph_data`."""
+    return {
+        node["id"]: node
+        for node in get_cached_graph_data(graph_path).get("nodes", [])
+        if node.get("id")
+    }
+
+
+@lru_cache(maxsize=1)
+def get_file_nodes_index(graph_path: Path) -> dict[str, list[tuple[int, str]]]:
+    """``{source_file: [(start_line, node_id), ...]}`` in graph node order.
+
+    The per-file lists preserve the global ``nodes`` list order so consumers
+    (``get_node_code`` sub-node pruning) see the identical sequence the old
+    full-graph scan produced, keeping stable sorts — and outputs — identical.
+    Nodes without a ``source_file`` or with a non-``L<num>`` location are
+    skipped, mirroring the scan it replaces."""
+    index: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    for node in get_cached_graph_data(graph_path).get("nodes", []):
+        source_file = node.get("source_file")
+        location = node.get("source_location")
+        if not source_file or not location:
+            continue
+        try:
+            start_line = int(location.replace("L", ""))
+        except ValueError:
+            continue
+        index[source_file].append((start_line, node.get("id")))
+    return dict(index)
+
+
+@lru_cache(maxsize=1)
+def get_node_links_index(graph_path: Path) -> dict[str, list[tuple[str, dict]]]:
+    """``{node id: [(direction, link dict), ...]}`` in global link order.
+
+    Every link appears under its target as ``"<--"`` and under its source as
+    ``"-->"`` — except a self-link, which the original target-first if/elif
+    recorded once as ``"<--"``. ``format_node_context`` uses this instead of
+    rescanning every link per node."""
+    index: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    for link in get_cached_graph_data(graph_path).get("links", []):
+        target, source = link.get("target"), link.get("source")
+        if target:
+            index[target].append(("<--", link))
+        if source and source != target:
+            index[source].append(("-->", link))
+    return dict(index)
+
+
+def build_networkx_graph(graph_path: Path, allowed_communities: Optional[list[int]] = None) -> nx.DiGraph:
+    """
+    Reads the Graphify JSON output and builds a NetworkX Directed Graph.
+    Optionally filters the graph to only include specific communities.
+
+    The built graph is cached per (path, communities): every caller (manager,
+    explorer dispatch, the reviewer's graph tools) treats it as strictly
+    read-only, and rebuilding the ~40k-node DiGraph per tool call dominated
+    those tools' non-LLM time.
+    """
+    key = tuple(allowed_communities) if allowed_communities is not None else None
+    return _build_networkx_cached(graph_path, key)
+
+
+@lru_cache(maxsize=4)
+def _build_networkx_cached(graph_path: Path, allowed_key: Optional[tuple]) -> nx.DiGraph:
+    allowed_set = set(allowed_key) if allowed_key is not None else None
+    graph_data = get_cached_graph_data(graph_path)
+
+    # Initialize a Directed Graph
+    G = nx.DiGraph()
+
+    # Add Nodes with their attributes (community, type, file_path, etc.)
+    for node in graph_data.get('nodes', []):
+        node_id = node.get('id')
+        if not node_id:
+            continue
+
+        # FILTERING LOGIC: Skip node if it doesn't belong to the allowed communities
+        if allowed_set is not None:
+            community_id = node.get('community')
+            if community_id not in allowed_set:
+                continue
+
+        # Copy all other key-value pairs as node attributes
+        attributes = {k: v for k, v in node.items() if k != 'id'}
+        G.add_node(node_id, **attributes)
+
+    # Add Edges with their attributes (e.g., relationship type like calls/imports)
+    for edge in graph_data.get('links', []):
+        source = edge.get('source')
+        target = edge.get('target')
+        if not source or not target:
+            continue
+
+        # CRITICAL: Only add edges if BOTH nodes survived the community filter.
+        # Otherwise, NetworkX will silently re-create the deleted nodes.
+        if source in G and target in G:
+            # Copy all other key-value pairs as edge attributes
+            attributes = {k: v for k, v in edge.items() if k not in ['source', 'target']}
+            G.add_edge(source, target, **attributes)
+
+    return G
 
 
 @lru_cache(maxsize=8192)
@@ -371,10 +491,7 @@ def guard_map_for_node(node_id: str) -> dict[str, tuple[str, ...]]:
     without a GUARD_SPEC entry yield an empty map. Returns
     {base_name: (context, ...)} with unique contexts in source order.
     """
-    node = next(
-        (n for n in get_cached_graph_data(settings.graph).get("nodes", []) if n.get("id") == node_id),
-        None,
-    )
+    node = get_node_map(settings.graph).get(node_id)
     if not node:
         return {}
     source_file = node.get("source_file")
@@ -436,8 +553,20 @@ def format_node_context(graph_data: dict, node_id: str) -> str:
     from the caller's ('(participates in: $check_mfa)').
     Returns an empty string if the target node is not found.
     """
-    nodes = graph_data.get("nodes", [])
-    node_map = {n.get("id"): n for n in nodes}
+    cached = get_cached_graph_data(settings.graph)
+    if graph_data is cached:
+        # O(1) node lookup + pre-grouped per-node links instead of rebuilding
+        # the node map and rescanning every link for every node.
+        node_map = get_node_map(settings.graph)
+        touched_links = get_node_links_index(settings.graph).get(node_id, ())
+    else:
+        nodes = graph_data.get("nodes", [])
+        node_map = {n.get("id"): n for n in nodes}
+        touched_links = [
+            ("<--", edge) if edge.get("target") == node_id else ("-->", edge)
+            for edge in graph_data.get("links", [])
+            if edge.get("target") == node_id or edge.get("source") == node_id
+        ]
     target_node = node_map.get(node_id)
     if target_node is None:
         return ""
@@ -446,19 +575,12 @@ def format_node_context(graph_data: dict, node_id: str) -> str:
 
     # Collect connections touching this node, resolved to neighbor labels.
     connections = []
-    for edge in graph_data.get("links", []):
-        relation = edge.get("relation")
-        if edge.get("target") == node_id:
-            neighbor = node_map.get(edge.get("source"))
-            arrow = "<--"
-        elif edge.get("source") == node_id:
-            neighbor = node_map.get(edge.get("target"))
-            arrow = "-->"
-        else:
-            continue
-        neighbor_label = neighbor.get("label", edge.get("source") or edge.get("target")) if neighbor else (edge.get("source") or edge.get("target"))
+    for arrow, edge in touched_links:
+        neighbor = node_map.get(edge.get("source") if arrow == "<--" else edge.get("target"))
+        default_label = edge.get("source") or edge.get("target")
+        neighbor_label = neighbor.get("label", default_label) if neighbor else default_label
         neighbor_id = edge.get("source") if arrow == "<--" else edge.get("target")
-        connections.append((arrow, neighbor_id, neighbor_label, relation, str(edge.get("source_location", ""))))
+        connections.append((arrow, neighbor_id, neighbor_label, edge.get("relation"), str(edge.get("source_location", ""))))
 
     # Stable ordering by source line number.
     connections.sort(key=lambda c: c[4])
@@ -492,52 +614,6 @@ def get_cached_symbol_index(index_path: Path) -> list[dict]:
     except FileNotFoundError:
         logging.error(f"AST symbol index not found at '{index_path}'.")
         return []
-
-
-def build_networkx_graph(graph_path: Path, allowed_communities: Optional[list[int]] = None) -> nx.DiGraph:
-    """
-    Reads the Graphify JSON output and builds a NetworkX Directed Graph.
-    Optionally filters the graph to only include specific communities.
-    """
-    graph_data = get_cached_graph_data(graph_path)
-
-    # Initialize a Directed Graph
-    G = nx.DiGraph()
-
-    # Convert list to set for faster lookups
-    allowed_set = set(allowed_communities) if allowed_communities is not None else None
-
-    # Add Nodes with their attributes (community, type, file_path, etc.)
-    for node in graph_data.get('nodes', []):
-        node_id = node.get('id')
-        if not node_id:
-            continue
-
-        # FILTERING LOGIC: Skip node if it doesn't belong to the allowed communities
-        if allowed_set is not None:
-            community_id = node.get('community')
-            if community_id not in allowed_set:
-                continue
-
-        # Copy all other key-value pairs as node attributes
-        attributes = {k: v for k, v in node.items() if k != 'id'}
-        G.add_node(node_id, **attributes)
-
-    # Add Edges with their attributes (e.g., relationship type like 'calls')
-    for edge in graph_data.get('links', []):
-        source = edge.get('source')
-        target = edge.get('target')
-        if not source or not target:
-            continue
-
-        # CRITICAL: Only add edges if BOTH nodes survived the community filter.
-        # Otherwise, NetworkX will silently re-create the deleted nodes.
-        if source in G and target in G:
-            # Copy all other key-value pairs as edge attributes
-            attributes = {k: v for k, v in edge.items() if k not in ['source', 'target']}
-            G.add_edge(source, target, **attributes)
-
-    return G
 
 
 def _merge_affected_nodes(target: dict, *sources: dict) -> None:
@@ -2193,11 +2269,7 @@ def uses_namespace_in_ast(node_id: str, target_namespace: str,
 
     target_node = (node_map or {}).get(node_id)
     if target_node is None:
-        graph = settings.graph
-        graph_data = get_cached_graph_data(graph)
-        if not graph_data:
-            return False
-        target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), None)
+        target_node = get_node_map(settings.graph).get(node_id)
     if not target_node or not target_node.get("source_file"):
         logging.error(f"Node '{node_id}' does not have a valid source file mapped.")
         return False
@@ -2244,12 +2316,12 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
                   node_map: Optional[dict] = None,
                   sub_nodes_index: Optional[dict] = None) -> str | None:
     graph = settings.graph
-    graph_data = get_cached_graph_data(graph)
 
-    # Find the target node (precomputed map when available, else linear scan)
+    # Find the target node (precomputed map when available, else the
+    # process-wide id index).
     target_node = (node_map or {}).get(node_id)
     if target_node is None:
-        target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), None)
+        target_node = get_node_map(graph).get(node_id)
     if not target_node:
         logging.debug(f"Node ID '{node_id}' not found in graph.")
         return None
@@ -2281,8 +2353,6 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
     if source_content is None:
         logging.error(f"Source file '{source_file}' not found on disk or unreadable.")
         return None
-    source_bytes = masked_source_for_parsing(source_content, source_file_path).encode("utf-8")
-
     # Get target start line
     try:
         target_start_line = int(source_location.replace("L", ""))
@@ -2296,8 +2366,17 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
         return source_content if is_file_node else None
 
     try:
-        parser = tree_sitter.Parser(lang)
-        tree = parser.parse(source_bytes)
+        # One mask+parse per file: every node of a file shares the masked bytes
+        # and the tree instead of re-deriving them (see _FILE_PARSE_MEMO).
+        parsed = _FILE_PARSE_MEMO.get(source_file_path)
+        if parsed is None:
+            source_bytes = masked_source_for_parsing(source_content, source_file_path).encode("utf-8")
+            tree = tree_sitter.Parser(lang).parse(source_bytes)
+            _FILE_PARSE_MEMO[source_file_path] = (source_bytes, tree)
+            if len(_FILE_PARSE_MEMO) > _FILE_PARSE_MEMO_MAX:
+                _FILE_PARSE_MEMO.popitem(last=False)
+        else:
+            source_bytes, tree = parsed
 
         grammar = AST_GRAMMAR_MAP.get(source_file.suffix, {})
         body_node_types = grammar.get("body_node", ["block", "compound_statement", "declaration_list", "statement_block", "class_body"])
@@ -2335,23 +2414,12 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
             return source_bytes[target_ast_node.start_byte:target_ast_node.end_byte].decode("utf-8")
 
         # Find all sub-nodes in the graph mapped to this file (precomputed
-        # index when available, otherwise a full graph scan).
-        sub_nodes = []
+        # index when available, otherwise the process-wide file index).
         file_index = (sub_nodes_index or {}).get(source_file_path)
-        if file_index is not None:
-            target_node_id = target_node.get("id")
-            sub_nodes = [(line_, nid) for line_, nid in file_index if nid != target_node_id]
-        else:
-            for n in graph_data.get("nodes", []):
-                if n.get("id") == target_node.get("id"):
-                    continue
-
-                if n.get("source_file") == source_file_path and n.get("source_location"):
-                    try:
-                        n_start_line = int(n["source_location"].replace("L", ""))
-                        sub_nodes.append((n_start_line, n.get("id")))
-                    except ValueError:
-                        continue
+        if file_index is None:
+            file_index = get_file_nodes_index(graph).get(source_file_path, ())
+        target_node_id = target_node.get("id")
+        sub_nodes = [(line_, nid) for line_, nid in file_index if nid != target_node_id]
 
         # Map sub-nodes to their AST bodies and filter based on your new rule
         sub_nodes.sort(key=lambda x: x[0])
@@ -2787,6 +2855,7 @@ def _parse_exclude_patterns(patterns: list[str]) -> tuple[set[str], list[str]]:
     return dirs, globs
 
 
+@lru_cache(maxsize=None)
 def is_path_excluded(source_file: str) -> bool:
     """Return True if ``source_file`` should be skipped during scanning.
 
@@ -2795,7 +2864,10 @@ def is_path_excluded(source_file: str) -> bool:
     fnmatch-matches a configured glob, or its basename fnmatch-matches a
     configured name glob. Honors the built-in defaults unless
     ``settings.scan_exclude_defaults`` is False.
-    """
+
+    Memoized per path: hot inner loops (link scans, dispatch filters) call it
+    once per endpoint, and each call previously paid a ``Path.resolve()``
+    syscall storm. Settings are fixed for the process lifetime."""
     if not source_file:
         return False
 
@@ -2842,8 +2914,7 @@ def is_node_worth_scanning(node_id: str, min_signals: int = 1) -> bool:
     Dependency manifest/lockfile nodes are always dropped: they are already
     handled by the SCA layer (osv-scanner).
     """
-    graph_data = get_cached_graph_data(settings.graph)
-    target_node = next((node for node in graph_data.get("nodes", []) if node.get("id") == node_id), None)
+    target_node = get_node_map(settings.graph).get(node_id)
     if not target_node or not target_node.get("source_file"):
         return False
 
