@@ -1,0 +1,750 @@
+"""Generic bounded-memory tool-loop agent machinery.
+
+Houses the ``ToolLoopAgent`` base class and its supporting helpers (the
+settings-backed compaction budget, history splitting, transcript rendering, and
+ledger summarization) shared by the reviewer, validator and integration
+auditor. Contains nothing agent-specific: the concrete subclasses live in the
+``stage_*`` modules and supply per-agent behavior through the base class's
+overridable hooks (``bind_tools``, ``cached_verdict``, ``first_turn``,
+``session_state``, ``tool_batch_done``, ``fallback``) plus their own
+summary-ledger prompt text.
+"""
+
+import json
+import logging
+from typing import Any
+
+from langchain_core.messages import (
+    AnyMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+)
+from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables.config import get_config_list
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.prebuilt.tool_node import ToolInvocationError, ToolNode, ToolRuntime
+from langgraph.types import Command
+
+import llms
+import settings
+from run_stats import (
+    _log_agent_completion,
+    add_usage,
+    as_dict,
+    extract_llm_usage,
+    record_llm_usage,
+)
+from utils import estimate_message_tokens
+
+logger = logging.getLogger(__name__)
+
+
+class CompactionConfig:
+    """Settings-backed compaction budget, resolved per LLM-registry agent.
+
+    Constructed with the loop's llms registry key (e.g.
+    ``CompactionConfig("reviewer")``): the model window and output budget then
+    follow that agent's effective config (``context_window`` /
+    ``max_completion_tokens``), so routing an agent to a differently-sized
+    model keeps every cap honest. Without an agent key the window and output
+    budget fall back to the global ``settings.model_context_window`` /
+    ``settings.llm_max_completion_tokens``. The shared knobs
+    (``context_reserved``, ``hard_reserved``, …) are always global. All values
+    are re-read live (on every call) so runtime overrides stay effective.
+    """
+
+    __slots__ = ("agent",)
+
+    def __init__(self, agent: str = ""):
+        self.agent = agent
+
+    @property
+    def model_context_window(self) -> int:
+        if self.agent:
+            return llms.get_config(self.agent)["context_window"]
+        return settings.model_context_window
+
+    @property
+    def max_output_tokens(self) -> int:
+        if self.agent:
+            return llms.get_config(self.agent)["max_completion_tokens"]
+        return settings.llm_max_completion_tokens
+
+    def threshold(self) -> int:
+        """Estimated-token threshold at which soft-threshold compaction triggers."""
+        return self.model_context_window - settings.context_reserved
+
+    def hard_cap(self) -> int:
+        """Estimated-token ceiling below which the LLM must never be invoked.
+
+        Reserves both the configured hard margin AND the per-request output
+        budget: the OpenAI-compat gateway rejects any request whose input +
+        requested output exceeds the model window, so the estimated input alone
+        must stay under ``window - output_budget - hard_reserved``.
+        """
+        return (
+            self.model_context_window - self.max_output_tokens - settings.hard_reserved
+        )
+
+    @property
+    def max_response_chars(self) -> int:
+        """Char size above which a single AI/tool message is considered
+        oversized and demoted out of the verbatim tail into the compressible
+        middle (see ``_split_agent_history``). No truncation is applied."""
+        return settings.max_response_chars
+
+    @property
+    def tail_turns(self) -> int:
+        return settings.compaction_tail_turns
+
+    @property
+    def min_compressible(self) -> int:
+        return settings.compaction_min_compressible_tokens
+
+    @property
+    def hard_reserved(self) -> int:
+        return settings.hard_reserved
+
+
+def _split_agent_history(
+    messages: list[AnyMessage], tail_turns: int, max_chars: int = 0
+) -> tuple[list, list, list]:
+    """Split an agent history into (protected_head, middle, verbatim_tail).
+
+    Protected head = the first SystemMessage (system prompt) plus the first
+    HumanMessage (the hypothesis/objective under review). Tail = the last
+    ``tail_turns`` AI+tool turns kept word-for-word. Middle = everything
+    between them, including any prior context summary.
+
+    When ``max_chars`` > 0, any AI/tool message in the prospective tail whose
+    content exceeds it is demoted back into the compressible middle instead of
+    being retained verbatim. Such a pathological single message (e.g. a
+    ~120k-token 'finish_reason: length' dump) can never be summarized away
+    while protected in the tail, and retaining it verbatim would dominate the
+    model window no matter how much of the middle is collapsed — so it is made
+    compressible so the normal middle-compaction absorbs it.
+    """
+    msgs = list(messages)
+    head: list = []
+    idx = 0
+    need_sys, need_human = 1, 1
+    while idx < len(msgs):
+        m = msgs[idx]
+        if need_sys and m.type == "system":
+            head.append(m)
+            need_sys -= 1
+            idx += 1
+            continue
+        if need_human and m.type == "human":
+            head.append(m)
+            need_human -= 1
+            idx += 1
+            continue
+        break
+
+    rest = msgs[idx:]
+    ai_seen = 0
+    boundary = len(rest)
+    for i in range(len(rest) - 1, -1, -1):
+        if rest[i].type == "ai":
+            ai_seen += 1
+            boundary = i
+            if ai_seen >= tail_turns:
+                break
+
+    middle = rest[:boundary]
+    tail = rest[boundary:]
+
+    if max_chars and tail:
+        oversized = [
+            m
+            for m in tail
+            if m.type in ("ai", "tool")
+            and isinstance(getattr(m, "content", ""), str)
+            and len(m.content) > max_chars
+        ]
+        if oversized:
+            oversized_ids = {id(o) for o in oversized}
+            tail = [m for m in tail if id(m) not in oversized_ids]
+            middle = middle + oversized
+
+    return head, middle, tail
+
+
+def _render_message_transcript(messages: list[AnyMessage]) -> str:
+    """Flatten a message span into a readable transcript for summarization."""
+    parts = []
+    for m in messages:
+        kind = m.type
+        name = getattr(m, "name", None)
+        content = getattr(m, "content", "") or ""
+        if kind == "ai":
+            calls = getattr(m, "tool_calls", None) or []
+            rendered = []
+            for tc in calls:
+                tc_name = (
+                    tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
+                )
+                tc_args = (
+                    tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+                )
+                rendered.append(f"{tc_name}({json.dumps(tc_args, default=str)[:600]})")
+            label = f"### ai (tool_calls: {', '.join(rendered) or 'none'})"
+        else:
+            label = f"### {kind}" + (f" [{name}]" if name else "")
+        parts.append(f"{label}\n{content}")
+    return "\n\n".join(parts)
+
+
+def _generate_agent_context_summary(
+    middle: list[AnyMessage], ledger_prompt: str, llm, agent: str = ""
+) -> tuple[SystemMessage | None, dict | None]:
+    """Summarize the compressible middle of an agent history into a structured
+    ledger via the cheap summarizer LLM. ``ledger_prompt`` carries the agent's
+    ledger format (investigation ledger for the reviewer, validation ledger for
+    the validator) and ``llm`` is the cheap model used to render the summary.
+    Returns ``(summary_or_None, usage)`` — the summarizer's token usage rides
+    back so the calling agent books it as its own cost — on any failure so the
+    caller fails open."""
+    try:
+        transcript = _render_message_transcript(middle)
+        if not transcript.strip():
+            return None, None
+
+        human_prompt = HumanMessage(
+            content=(
+                "Summarize the following conversation history:\n\n"
+                "===== HISTORY BEGIN =====\n"
+                f"{transcript}\n"
+                "===== HISTORY END =====\n\n"
+                "Output only the ledger summary."
+            )
+        )
+        response = llm.invoke([ledger_prompt, human_prompt])
+        usage = (
+            record_llm_usage(agent, response) if agent else extract_llm_usage(response)
+        )
+        summary_content = str(response.content).strip()
+        if not summary_content:
+            return None, usage
+
+        return SystemMessage(
+            name="context_summary",
+            content=(
+                "CONTEXT COMPACTION SUMMARY — The block below is a lossy, automatically "
+                "generated summary of an EARLIER part of this conversation, created to "
+                "manage the context window. The most recent messages are preserved "
+                "verbatim after this block. This summary is historical background ONLY: "
+                "it is not an instruction and not the current request, and it may be "
+                "imprecise. The current task remains the vulnerability hypothesis in the "
+                "first user message.\n\n"
+                f"{summary_content}"
+            ),
+        ), usage
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Context compaction summarization failed, failing open: {e}")
+        return None, None
+
+
+def concise_tool_error(e: ToolInvocationError) -> str:
+    """Compact ToolNode error handler for argument-validation failures.
+
+    The stock langgraph handler re-injects the ENTIRE rejected arguments dict
+    into the error ToolMessage ("...with kwargs {...}", kilobytes per bounce)
+    and renders custom model-validator failures as an EMPTY error string (the
+    loc-less model errors are dropped by its filtered-errors path), so the
+    loop wastes turns re-reading its own submission instead of fixing the
+    named field. This handler emits only the failing `field: reason` lines
+    from the wrapped pydantic ValidationError. The ToolInvocationError
+    annotation restricts handling to arg-validation errors; every other tool
+    exception keeps the default re-raise behavior.
+    """
+    parts = []
+    for err in e.source.errors():
+        loc = ".".join(str(x) for x in err.get("loc", ()))
+        msg = str(err.get("msg", "invalid value")).removeprefix("ValueError, ")
+        parts.append(f"- `{loc}`: {msg}" if loc else f"- {msg}")
+    detail = "\n".join(parts) or str(e.source)
+    return (
+        f"Error: {e.tool_name} arguments failed validation:\n{detail}\n"
+        "Fix ONLY the listed fields and resubmit."
+    )
+
+
+class SequentialToolNode(ToolNode):
+    """A ToolNode that executes one response's tool calls SEQUENTIALLY, in the
+    order the model listed them, instead of the stock concurrent fan-out
+    (``executor.map`` / ``asyncio.gather``).
+
+    This is what makes it safe for the validator to batch dependent calls in a
+    single response — the canonical ``write_attacker_file`` immediately followed
+    by a ``run_command`` launching that file — collapsing the write-then-run
+    micro-cycle into one loop turn. All mechanics (input parsing, state/config
+    injection, invalid-tool errors, output combining) are inherited untouched.
+    If the parent's private internals ever drift, the call-preparation fallback
+    degrades to the stock concurrent node rather than breaking the run.
+    """
+
+    def _prepare(self, input: Any, config: RunnableConfig, runtime: Any):
+        tool_calls, input_type = self._parse_input(input)
+        config_list = get_config_list(config, len(tool_calls))
+        tool_runtimes = []
+        for call, cfg in zip(tool_calls, config_list, strict=False):
+            state = self._extract_state(input, cfg)
+            tool_runtimes.append(
+                ToolRuntime(
+                    state=state,
+                    tool_call_id=call["id"],
+                    config=cfg,
+                    context=runtime.context,
+                    store=runtime.store,
+                    stream_writer=runtime.stream_writer,
+                    tools=list(self.tools_by_name.values()),
+                    execution_info=runtime.execution_info,
+                    server_info=runtime.server_info,
+                )
+            )
+        return tool_calls, input_type, tool_runtimes
+
+    def _func(self, input: Any, config: RunnableConfig, runtime: Any) -> Any:
+        try:
+            tool_calls, input_type, tool_runtimes = self._prepare(
+                input, config, runtime
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "SequentialToolNode preparation failed; falling back to the stock concurrent ToolNode."
+            )
+            return super()._func(input, config, runtime)
+        outputs = [
+            self._run_one(call, input_type, tool_runtime)
+            for call, tool_runtime in zip(tool_calls, tool_runtimes, strict=False)
+        ]
+        return self._combine_tool_outputs(outputs, input_type)
+
+    async def _afunc(self, input: Any, config: RunnableConfig, runtime: Any) -> Any:
+        try:
+            tool_calls, input_type, tool_runtimes = self._prepare(
+                input, config, runtime
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "SequentialToolNode preparation failed; falling back to the stock concurrent ToolNode."
+            )
+            return await super()._afunc(input, config, runtime)
+        outputs = []
+        for call, tool_runtime in zip(tool_calls, tool_runtimes, strict=False):
+            outputs.append(await self._arun_one(call, input_type, tool_runtime))
+        return self._combine_tool_outputs(outputs, input_type)
+
+
+def _tool_batch_fingerprint(message: AnyMessage) -> tuple:
+    """Order-insensitive canonical signature of an AI message's tool calls:
+    (name, sorted-key args json) pairs, so a re-issued batch with the tools
+    listed in a different order still matches."""
+    return tuple(
+        sorted(
+            (
+                call["name"] if isinstance(call, dict) else call.name,
+                json.dumps(
+                    call["args"] if isinstance(call, dict) else call.args,
+                    sort_keys=True,
+                    default=str,
+                ),
+            )
+            for call in (getattr(message, "tool_calls", None) or [])
+        )
+    )
+
+
+def _repeats_previous_tool_batch(messages: list[AnyMessage]) -> bool:
+    """True when the two most recent tool-calling AI turns issued IDENTICAL
+    batches — the model is stuck re-running the same call verbatim."""
+    fingerprints = []
+    for msg in reversed(messages):
+        if getattr(msg, "type", "") != "ai":
+            continue
+        if not (getattr(msg, "tool_calls", None) or []):
+            continue
+        fingerprints.append(_tool_batch_fingerprint(msg))
+        if len(fingerprints) == 2:
+            break
+    return len(fingerprints) == 2 and fingerprints[0] == fingerprints[1]
+
+
+class ToolLoopAgent:
+    """A graph-ready, bounded-memory tool-loop agent (node/router/fallback/ask).
+
+    Wraps one LLM-driven investigation loop (the reviewer or the validator) and
+    owns everything generic across both: the tool binding, the context-window
+    management (soft-threshold compaction, hard safety cap, termination
+    countdown), the loop-steering router, the forced-tool ask node, and the
+    iteration-capped fallback. Graph node names are derived from ``name`` so the
+    compiled subgraphs keep their stable string identifiers.
+    """
+
+    state_type: type = dict
+    # A single terminal tool name, or a tuple of them (the validator ends its
+    # loop on either `ask_for_context` or `mark_validation_complete`).
+    terminal_tool: str | tuple[str, ...] = ""
+    ask_message: str = (
+        "You did not invoke any tools. Keep your reasoning brief and emit a tool call "
+        "in this same response. You must use a tool to proceed."
+    )
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        settings_prefix: str,
+        compaction: CompactionConfig,
+        summary_ledger: str,
+        summary_llm,
+        summarizer_compaction: CompactionConfig | None = None,
+    ):
+        self.name = name
+        self.settings_prefix = settings_prefix
+        self.compaction = compaction
+        self.summary_ledger = summary_ledger
+        self.summary_llm = summary_llm
+        # Budget backing the summarizer call itself; must follow the SUMMARY
+        # model's window/output budget (defaults to the loop agent's own).
+        self.summarizer_compaction = summarizer_compaction or compaction
+        # Stable graph node identifiers (must match graph.py's wiring).
+        self.agent_node_name = f"{name}_agent"
+        self.tools_node_name = f"{name}_tools"
+        self.fallback_node_name = f"{name}_fallback"
+        self.ask_node_name = f"ask_{name}_for_tool"
+
+    # -- configuration ------------------------------------------------------
+
+    def _setting(self, name: str) -> int:
+        return getattr(settings, f"{self.settings_prefix}_{name}")
+
+    @property
+    def _max_iterations(self) -> int:
+        return self._setting("max_iterations")
+
+    @property
+    def _countdown_start(self) -> int:
+        return self._setting("countdown_start")
+
+    def _subject(self, state) -> str:
+        """Human-readable investigation subject used in log lines."""
+        return state.get("node_id", "Unknown")
+
+    def _terminal_names(self) -> list[str]:
+        t = self.terminal_tool
+        return [t] if isinstance(t, str) else list(t)
+
+    def _log_progress_completion(self, state, note: str = "") -> None:
+        """Advance the dispatch's progress ledger on a terminal route; no-op
+        for agents without a `progress_label`. Carries the HIT/MISS cache tag
+        (pre_agent writes cache_tag='HIT'; anything else went through the
+        loop) and the resolved record's status to enrich the log line."""
+        if not self.progress_label:
+            return
+        tag = state.get("cache_tag") or "MISS"
+        detail = f"{self._subject(state)}, {tag}"
+        detail += f", turns={state.get('iterations', 0)}"
+        records = state.get("vulnerabilities") or []
+        if records:
+            detail += f", status={as_dict(records[-1]).get('status', 'unknown')}"
+        # A HIT is by definition zero-LLM-turn; the note would be redundant.
+        if note and tag != "HIT":
+            detail += f", {note}"
+        _log_agent_completion(state.get("progress_id", ""), self.progress_label, detail)
+
+    # -- per-agent hooks ------------------------------------------------------
+
+    def bind_tools(self, state):
+        """Return the LLM bound to this agent's tool subset for this state."""
+        raise NotImplementedError
+
+    # Verdict label used in the cache-hit log line for agents WITHOUT a
+    # progress ledger (ledger agents carry HIT on the progress line instead).
+    cache_hit_label: str = "Agent"
+    # Opt-in fan-out progress label: when set, the router advances the
+    # dispatch's progress ledger (state["progress_id"]) on every terminal
+    # route, logging "<label> progress: n/N complete ..." completion lines.
+    progress_label: str = ""
+
+    def cached_verdict(self, state) -> dict | None:
+        """Cached verdict record for this state, or None (base: never cached)."""
+        return None
+
+    def pre_agent(self, state):
+        """Short-circuit the loop with a cached verdict before any LLM turn."""
+        if state.get("messages"):
+            return None
+        cached = self.cached_verdict(state)
+        if cached:
+            if not self.progress_label:
+                logger.info(f"{self.cache_hit_label} cache hit.")
+                return Command(update={"vulnerabilities": [cached]})
+            # Ledger agents get no separate line: the HIT rides on the
+            # progress completion produced by the pre_router terminal route.
+            return Command(update={"vulnerabilities": [cached], "cache_tag": "HIT"})
+        return None
+
+    def first_turn(self, state, llm_with_tools) -> dict:
+        raise NotImplementedError
+
+    def session_state(self, state) -> dict:
+        """Extra state keys gathered from the raw history (e.g. cookies)."""
+        return {}
+
+    def pre_router(self, state) -> bool:
+        """End the loop when a verdict already sits in `vulnerabilities` without
+        any LLM turn (pre_agent cache hit or a deterministic first_turn
+        resolution), so the router never indexes the still-empty `messages`."""
+        return not state.get("messages") and bool(state.get("vulnerabilities"))
+
+    def tool_batch_done(self, state) -> bool:
+        """True when the latest contiguous tool batch contains a successful
+        terminal tool call. Failed (``status='error'``) tool messages — e.g. a
+        ``submit_evaluation`` whose arguments failed schema validation — do NOT
+        count as a verdict: they must bounce back to the agent LLM so it can
+        correct its arguments and retry."""
+        terminal_names = self._terminal_names()
+        for msg in reversed(state["messages"]):
+            if msg.type != "tool":
+                break
+            if getattr(msg, "status", "") == "error":
+                continue
+            if getattr(msg, "name", "") in terminal_names:
+                return True
+        return False
+
+    def fallback(self, state) -> Command:
+        raise NotImplementedError
+
+    # -- memory management ----------------------------------------------------
+
+    def summarize(
+        self, middle: list[AnyMessage]
+    ) -> tuple[SystemMessage | None, dict | None]:
+        # The cheap summarizer is the per-loop summary_llm (get_llm("compaction"))
+        # call with its OWN window and output budget (summarizer_compaction);
+        # its transcript (rendered inside the summary prompt) must fit
+        # summarizer window - summarizer output budget - hard reserved.
+        # The token estimate is deliberately ~2.9x over real prose, so an
+        # over-budget estimate usually means ONE degenerate single message (a
+        # ~100k-token 'finish_reason: length' dump) dominates the middle. Never
+        # give up on the summary: drop the single largest message(s) until the
+        # survivor fits, then run the summarizer on it — dropping a degenerate
+        # dump whole is strictly better than the hard safety cap dropping the
+        # ENTIRE middle. No truncation is applied; if nothing survives we return
+        # None and callers fail open as usual.
+        summarizer_budget = (
+            self.summarizer_compaction.model_context_window
+            - self.summarizer_compaction.max_output_tokens
+            - self.summarizer_compaction.hard_reserved
+        )
+        working = list(middle)
+        if estimate_message_tokens(working) >= summarizer_budget:
+            logger.warning(
+                "middle estimates %d tokens >= summarizer budget %d; dropping "
+                "largest message(s) before summarizing",
+                estimate_message_tokens(working),
+                summarizer_budget,
+            )
+            while working and estimate_message_tokens(working) >= summarizer_budget:
+                idx = max(
+                    range(len(working)),
+                    key=lambda i: estimate_message_tokens([working[i]]),
+                )
+                dropped = working.pop(idx)
+                logger.debug(
+                    "dropped %s message (%d est tokens) from middle before summarizing",
+                    getattr(dropped, "type", "?"),
+                    estimate_message_tokens([dropped]),
+                )
+        return _generate_agent_context_summary(
+            working, self.summary_ledger, self.summary_llm, self.name
+        )
+
+    def prepare_history(self, full_messages, subject: str, current_turn: int):
+        """Apply compaction, the hard safety cap, and the termination countdown
+        to ``full_messages``.
+
+        Returns ``(messages_for_llm, updates, did_compact, hard_capped,
+        compaction_usage)`` — ``compaction_usage`` is the merged token usage
+        of any summarizer calls this pass spent (None when no compaction ran).
+        Fails open: any summarization error leaves the full history intact,
+        subject only to the hard safety cap.
+        """
+        messages_for_llm = full_messages
+        updates: list = []
+        did_compact = False
+        hard_capped = False
+        compaction_usage: dict | None = None
+
+        # Split with oversized-tail demotion only — NO per-message truncation.
+        # A pathological single message (e.g. a ~120k-token 'finish_reason:
+        # length' dump) is moved OUT of the protected verbatim tail and into
+        # the compressible middle, where the threshold compaction below
+        # summarizes the FULL middle (demoted message included). The demoted
+        # message is never pinned verbatim in the tail no matter its size;
+        # summarize() drops the largest message(s) just long enough to fit the
+        # summarizer window, and the hard safety cap is the last-resort ceiling
+        # for the main LLM, so compaction fails open as usual.
+        max_chars = self.compaction.max_response_chars
+        head, middle, tail = _split_agent_history(
+            full_messages, self.compaction.tail_turns, max_chars
+        )
+        messages_for_llm = head + middle + tail
+
+        # Threshold compaction: once the estimated token count of
+        # the history reaches the configured limit, collapse the middle into a
+        # summary and keep a short verbatim tail. Fail open if summarization
+        # errors; also skip when the compressible middle is trivially small.
+        if estimate_message_tokens(messages_for_llm) >= self.compaction.threshold():
+            compressible = estimate_message_tokens(middle)
+            if len(head) == 2 and compressible >= self.compaction.min_compressible:
+                summary_msg, summary_usage = self.summarize(middle)
+                compaction_usage = add_usage(compaction_usage, summary_usage)
+                if summary_msg is not None:
+                    messages_for_llm = head + [summary_msg] + tail
+                    updates = [
+                        RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                        *head,
+                        summary_msg,
+                        *tail,
+                    ]
+                    did_compact = True
+
+        # Hard safety cap: even if the soft-threshold compaction was skipped
+        # (summarization failed or the estimated count never reached it), never
+        # invoke the LLM with an estimated history that approaches the model's
+        # maximum context window. Force-truncate to the protected head plus a
+        # summary (or, failing that, the single most recent verbatim turn).
+        if estimate_message_tokens(messages_for_llm) >= self.compaction.hard_cap():
+            summary_msg, summary_usage = self.summarize(middle)
+            compaction_usage = add_usage(compaction_usage, summary_usage)
+            if summary_msg is not None:
+                forced = head + [summary_msg] + tail
+            else:
+                forced = head + tail[-2:]
+            if estimate_message_tokens(forced) < estimate_message_tokens(
+                messages_for_llm
+            ):
+                messages_for_llm = forced
+                updates = [
+                    RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                    *forced,
+                ]
+                did_compact = True
+                hard_capped = True
+                logger.warning(
+                    f"{self.name} on {subject} hard-capped context "
+                    f"to avoid exceeding the model window."
+                )
+
+        # Termination countdown: once the iteration counter approaches the cap,
+        # push the agent to emit its terminal tool next round.
+        if current_turn >= self._countdown_start:
+            terminal_display = " or ".join(self._terminal_names())
+            warning_msg = HumanMessage(
+                content=(
+                    f"System Warning: You are on turn {current_turn} of "
+                    f"{self._max_iterations}. You must call {terminal_display} in your next "
+                    f"turn based on the best available evidence, or the system will forcefully "
+                    f"terminate this task."
+                )
+            )
+            messages_for_llm = list(messages_for_llm) + [warning_msg]
+            updates.append(warning_msg)
+
+        return messages_for_llm, updates, did_compact, hard_capped, compaction_usage
+
+    # -- graph node callables ---------------------------------------------------
+
+    def agent(self, state) -> dict | Command:
+        """The agent node: cache guard, first-turn build, or memory-managed loop turn."""
+        pre = self.pre_agent(state)
+        if pre is not None:
+            return pre
+
+        llm_with_tools = self.bind_tools(state)
+
+        if not state.get("messages"):
+            return self.first_turn(state, llm_with_tools)
+
+        full_messages = list(state["messages"])
+        subject = self._subject(state)
+        current_turn = state.get("iterations", 0) + 1
+        messages_for_llm, updates, did_compact, _, compaction_usage = (
+            self.prepare_history(full_messages, subject, current_turn)
+        )
+        # Hallucination guard: a byte-identical re-run of the previous batch adds
+        # no evidence; nudge the model (transiently — the state history stays
+        # byte-identical) to change the call or conclude.
+        if _repeats_previous_tool_batch(full_messages):
+            terminal_display = " or ".join(self._terminal_names())
+            messages_for_llm = list(messages_for_llm) + [
+                HumanMessage(
+                    content=(
+                        "System Warning: your last two responses executed EXACTLY the "
+                        "same tool calls; that result is already in your history. Reissue "
+                        f"the call with changed arguments, or conclude with {terminal_display} now."
+                    )
+                )
+            ]
+        response = llm_with_tools.invoke(messages_for_llm)
+        turn_usage = record_llm_usage(self.name, response)
+        updates.append(response)
+        if did_compact:
+            logger.info(
+                f"{self.name} on {subject} compacted context: "
+                f"{estimate_message_tokens(full_messages)} est. tokens -> "
+                f"{estimate_message_tokens(messages_for_llm)} est. tokens."
+            )
+        return {
+            **self.session_state(state),
+            "messages": updates,
+            "iterations": 1,
+            "token_spent": add_usage(turn_usage, compaction_usage),
+        }
+
+    def router(self, state):
+        """Route the loop based on the latest message type and iteration count."""
+        messages = state["messages"]
+
+        if self.pre_router(state):
+            self._log_progress_completion(state, "no LLM turn")
+            return "__end__"
+
+        # Hard loop guard: if the model never submits a verdict, terminate
+        # gracefully instead of spinning until the recursion limit.
+        if state.get("iterations", 0) >= self._max_iterations:
+            logger.warning(
+                f"{self.name} on {self._subject(state)} exceeded "
+                f"{self._max_iterations} iterations without a verdict; falling back."
+            )
+            self._log_progress_completion(state, "iterations capped")
+            return self.fallback_node_name
+
+        last_message = messages[-1]
+
+        if last_message.type == "ai":
+            if last_message.tool_calls:
+                return self.tools_node_name
+            # The LLM failed to call a tool
+            return self.ask_node_name
+
+        elif last_message.type == "tool":
+            # With parallel tool calls the model may submit a final evaluation
+            # alongside other reads; end if any tool in the latest batch did.
+            if self.tool_batch_done(state):
+                self._log_progress_completion(state)
+                return "__end__"
+            return self.agent_node_name
+
+        # The LLM failed to call a tool
+        return self.ask_node_name
+
+    def ask(self, state):
+        """Fallback node to force the LLM to use a tool."""
+        return {"messages": [HumanMessage(content=self.ask_message)]}
