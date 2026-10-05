@@ -9,6 +9,8 @@ from openai import BadRequestError, LengthFinishReasonError
 import settings
 from run_stats import new_usage, record_usage
 
+logger = logging.getLogger(__name__)
+
 # Marker inside the gateway's hard input-limit rejection ("This model's maximum
 # context length is ... tokens"). Unlike the output cap, re-rolling cannot help:
 # every retry resends the identical oversized prompt.
@@ -38,11 +40,7 @@ def get_llm(agent: str) -> ChatOpenAI:
     the get_config merge (config-only keys like context_window excluded)."""
     llm = _INSTANCES.get(agent)
     if llm is None:
-        cfg = {
-            k: v
-            for k, v in get_config(agent).items()
-            if k not in _CONFIG_ONLY_KEYS
-        }
+        cfg = {k: v for k, v in get_config(agent).items() if k not in _CONFIG_ONLY_KEYS}
         llm = ChatOpenAI(stream_usage=True, **cfg)
         _INSTANCES[agent] = llm
     return llm
@@ -61,7 +59,9 @@ class UsageCapture(BaseCallbackHandler):
     def on_llm_end(self, response, **kwargs):
         for generation_list in getattr(response, "generations", []) or []:
             for generation in generation_list:
-                usage = getattr(getattr(generation, "message", None), "usage_metadata", None)
+                usage = getattr(
+                    getattr(generation, "message", None), "usage_metadata", None
+                )
                 if usage:
                     self.usage["calls"] += 1
                     self.usage["input_tokens"] += int(usage.get("input_tokens") or 0)
@@ -103,23 +103,25 @@ def invoke_structured_capped(llm, messages, description: str, agent: str = ""):
     try:
         for attempt in (1, 2):
             try:
-                return llm.invoke(messages, config={"callbacks": [capture]}), capture.usage
+                return llm.invoke(
+                    messages, config={"callbacks": [capture]}
+                ), capture.usage
             except BadRequestError as exc:
                 if _CONTEXT_LENGTH_MARKER not in str(exc):
                     raise
-                logging.error(
+                logger.error(
                     f"{description}: prompt exceeds the model context window; "
                     "skipping this call to keep the run alive."
                 )
                 return None, capture.usage
             except LengthFinishReasonError:
                 if attempt == 2:
-                    logging.error(
+                    logger.error(
                         f"{description}: LLM hit its completion-token output cap twice; "
                         "skipping this call to keep the run alive."
                     )
                     return None, capture.usage
-                logging.warning(
+                logger.warning(
                     f"{description}: output cap reached, retrying the request once."
                 )
     finally:

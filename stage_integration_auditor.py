@@ -9,7 +9,14 @@ from langgraph.types import Command, Send
 import settings
 import tools
 from llms import get_llm
-from run_stats import _record_stat, _start_agent_progress, affected_nodes_label, as_dicts, record_llm_usage, steps_block
+from run_stats import (
+    _record_stat,
+    _start_agent_progress,
+    affected_nodes_label,
+    as_dicts,
+    record_llm_usage,
+    steps_block,
+)
 from schemas import INTEGRATION_AUDITOR_AGENT
 from state import IntegrationAuditorState, MasterState, ValidatorState
 from tool_loop import CompactionConfig, ToolLoopAgent
@@ -22,6 +29,8 @@ from utils import (
     info_once,
     take_dispatch_claim,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def dispatch_integration_audits(state: MasterState):
@@ -54,9 +63,11 @@ def dispatch_integration_audits(state: MasterState):
         # Gate-checked here (dispatch_validators defers both classes before its
         # own gate fires): a below-threshold estimate buys no auditor spend —
         # UNLESS the boundary exception below rescues the record.
-        if cvss_gate_blocks({**v, "validation_strategy": strategy}, settings.validator_min_cvss):
+        if cvss_gate_blocks(
+            {**v, "validation_strategy": strategy}, settings.validator_min_cvss
+        ):
             if boundary_deferred(v, settings.validator_min_cvss):
-                logging.info(
+                logger.info(
                     f"{v.get('vuln_id')} CVSS estimate {v.get('cvss_vector')} below gate "
                     f"threshold {settings.validator_min_cvss} but changes_security_boundary "
                     f"is set — auditing for a boundary-crossing chain."
@@ -67,18 +78,18 @@ def dispatch_integration_audits(state: MasterState):
         elif strategy == "requires_integration":
             pending.append(v)
     for v in gated:
-        logging.info(
+        logger.info(
             f"{v.get('vuln_id')} CVSS estimate {v.get('cvss_vector')} below gate "
             f"threshold {settings.validator_min_cvss} — integration audit skipped, "
             f"will be reported unvalidated."
         )
     for v in audited_once:
-        logging.info(
+        logger.info(
             f"{v.get('vuln_id')} already audited for chaining this scan — not "
             f"re-audited; staying 'confirmed' with its banked audit verdict."
         )
     proven = [v for v in all_vulns if v.get("status") == "exploitable"]
-    logging.info(
+    logger.info(
         f"dispatch_integration_audits sees {len(all_vulns)} records, "
         f"{len(pending)} pending chain audits (requires_integration or "
         f"boundary-deferred), {len(proven)} proven exploitable peer(s)."
@@ -100,7 +111,8 @@ def dispatch_integration_audits(state: MasterState):
     commands = []
     for evaluation in pending:
         claim_key = (
-            evaluation.get("vuln_id") or "", "audit",
+            evaluation.get("vuln_id") or "",
+            "audit",
             evaluation.get("review_round") or 0,
             evaluation.get("patch_round") or 0,
         )
@@ -111,11 +123,8 @@ def dispatch_integration_audits(state: MasterState):
                 f"duplicate dispatch suppressed.",
             )
             continue
-        others = [
-            v for v in proven
-            if v.get("vuln_id") != evaluation.get("vuln_id")
-        ]
-        logging.info(
+        others = [v for v in proven if v.get("vuln_id") != evaluation.get("vuln_id")]
+        logger.info(
             f"Auditing {evaluation.get('vuln_id')}: {len(others)} proven peer(s) "
             f"to chain with "
             f"({[v.get('vuln_id') for v in others]})."
@@ -126,7 +135,7 @@ def dispatch_integration_audits(state: MasterState):
             confirmed_vulns=others,
             iterations=0,
             vulnerabilities=[],
-            messages=[]
+            messages=[],
         )
         commands.append(Send("integration_auditor", payload))
 
@@ -192,12 +201,14 @@ class IntegrationAuditorAgent(ToolLoopAgent):
         return state.get("report_to_test", {}).get("vuln_id", "Unknown")
 
     def bind_tools(self, state):
-        return get_llm("integration_auditor").bind_tools([
-            tools.get_vulnerability_details,
-            tools.get_node_connections,
-            tools.get_path,
-            tools.submit_integration_audit,
-        ])
+        return get_llm("integration_auditor").bind_tools(
+            [
+                tools.get_vulnerability_details,
+                tools.get_node_connections,
+                tools.get_path,
+                tools.submit_integration_audit,
+            ]
+        )
 
     def cached_verdict(self, state):
         return cache_integration_auditor(
@@ -241,20 +252,23 @@ class IntegrationAuditorAgent(ToolLoopAgent):
             for v in peers:
                 peer_nodes = [n for n in (v.get("affected_nodes") or []) if n]
                 payload = v.get("poc_payload")
-                payload_hint = "proven payload available (see details)" if payload else "no proven payload"
+                payload_hint = (
+                    "proven payload available (see details)"
+                    if payload
+                    else "no proven payload"
+                )
                 peer_lines.append(
                     f"- vuln_id={v.get('vuln_id', '?')} | CWE={v.get('cwe_id', '?')} | "
                     f"nodes={', '.join(peer_nodes) or '?'} | {payload_hint} | "
                     f"{_one_line(v.get('description', ''))}"
                 )
             formatted_vuln += (
-                f"\n--- OTHER PROVEN VULNERABILITIES (candidates to chain with) ---\n"
-                f"All of these were validated in the sandbox and are exploitable; their "
-                f"working `poc_payload`s are available. Call "
-                f"`get_vulnerability_details(<vuln_id>)` to fetch the full record "
-                f"(including the proven payload) of any of these before relying on it "
-                f"in a chain:\n"
-                + "\n".join(peer_lines)
+                "\n--- OTHER PROVEN VULNERABILITIES (candidates to chain with) ---\n"
+                "All of these were validated in the sandbox and are exploitable; their "
+                "working `poc_payload`s are available. Call "
+                "`get_vulnerability_details(<vuln_id>)` to fetch the full record "
+                "(including the proven payload) of any of these before relying on it "
+                "in a chain:\n" + "\n".join(peer_lines)
             )
         else:
             # 'chained' is impossible with zero peers: resolve terminal
@@ -263,7 +277,7 @@ class IntegrationAuditorAgent(ToolLoopAgent):
             # 'confirmed' — chaining was its only pass to the sandbox phases,
             # and dropping it to terminal 'unchainable' would silently remove a
             # finding the reporter otherwise ships unvalidated.
-            logging.warning(
+            logger.warning(
                 f"{report.get('vuln_id', 'Unknown')} was deferred to the auditor but "
                 f"arrived with an EMPTY confirmed_vulns peer list; resolving "
                 f"{'back to confirmed' if deferred else 'unchainable'} without "
@@ -297,16 +311,20 @@ class IntegrationAuditorAgent(ToolLoopAgent):
             return Command(update={"vulnerabilities": [record]})
 
         # strip_numbering: our counter must never double-number the reviewer's steps.
-        steps_str = steps_block(report.get("reproduction_steps") or [], strip_numbering=True)
+        steps_str = steps_block(
+            report.get("reproduction_steps") or [], strip_numbering=True
+        )
         formatted_vuln += (
             f"\n--- REVIEWER'S ISOLATED REPRODUCTION STEPS (this record alone) ---\n"
             f"{steps_str}"
         )
 
-        human_msg = HumanMessage(content=(
-            f"Audit the following `requires_integration` vulnerability for a combinable "
-            f"multi-step exploit chain.\n\n{formatted_vuln}"
-        ))
+        human_msg = HumanMessage(
+            content=(
+                f"Audit the following `requires_integration` vulnerability for a combinable "
+                f"multi-step exploit chain.\n\n{formatted_vuln}"
+            )
+        )
 
         response = llm_with_tools.invoke([sys_msg, human_msg])
         return {
@@ -381,8 +399,10 @@ def route_integration_audit(state: MasterState):
         # lands); a genuine re-chain with a different proven peer set (or after
         # a feedback round) still gets its fresh key and dispatches.
         claim_key = (
-            record.get("vuln_id") or "", "chained",
-            record.get("review_round") or 0, tuple(sorted(peer_ids)),
+            record.get("vuln_id") or "",
+            "chained",
+            record.get("review_round") or 0,
+            tuple(sorted(peer_ids)),
         )
         if not take_dispatch_claim(*claim_key):
             info_once(
@@ -395,18 +415,20 @@ def route_integration_audit(state: MasterState):
         for vid in peer_ids:
             peer = by_id.get(vid)
             if not peer:
-                logging.warning(
+                logger.warning(
                     f"Chained record {record.get('vuln_id')} references "
                     f"chained_with vuln '{vid}' not found in state; skipping peer payload."
                 )
                 continue
-            peer_payloads.append({
-                "vuln_id": peer.get("vuln_id"),
-                "cwe_id": peer.get("cwe_id"),
-                "description": peer.get("description"),
-                "poc_payload": peer.get("poc_payload"),
-                "execution_logs": peer.get("execution_logs"),
-            })
+            peer_payloads.append(
+                {
+                    "vuln_id": peer.get("vuln_id"),
+                    "cwe_id": peer.get("cwe_id"),
+                    "description": peer.get("description"),
+                    "poc_payload": peer.get("poc_payload"),
+                    "execution_logs": peer.get("execution_logs"),
+                }
+            )
         payload = ValidatorState(
             pipeline_run_id=state.get("pipeline_run_id"),
             report_to_test=record,
@@ -421,7 +443,7 @@ def route_integration_audit(state: MasterState):
         )
         commands.append(Send("validator_agent", payload))
 
-    logging.info(
+    logger.info(
         f"Integration auditor chained {len(commands)} vulnerability(ies); "
         f"dispatching to the validator for PoC construction."
     )

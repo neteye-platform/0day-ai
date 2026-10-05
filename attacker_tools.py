@@ -85,7 +85,11 @@ class AttackerManager:
     def _docker_available() -> bool:
         try:
             subprocess.run(
-                ["docker", "version"], capture_output=True, text=True, timeout=10
+                ["docker", "version"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
             )
             return True
         except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
@@ -168,6 +172,7 @@ class AttackerManager:
                 ["docker", "rm", "-f", name],
                 capture_output=True,
                 text=True,
+                check=False,
                 timeout=60,
             )
             logger.info("Removed attacker container '%s'.", name)
@@ -186,18 +191,35 @@ class AttackerManager:
         base = getattr(settings, "attacker_container_name", "vulnscan-kali-attacker")
         try:
             found = subprocess.run(
-                ["docker", "ps", "-a", "--filter", f"name={base}-", "--format", "{{.Names}}"],
+                [
+                    "docker",
+                    "ps",
+                    "-a",
+                    "--filter",
+                    f"name={base}-",
+                    "--format",
+                    "{{.Names}}",
+                ],
                 capture_output=True,
                 text=True,
+                check=False,
                 timeout=30,
             )
             names = [n for n in found.stdout.split("\n") if n.strip()]
             for name in names:
                 subprocess.run(
-                    ["docker", "rm", "-f", name], capture_output=True, text=True, timeout=60
+                    ["docker", "rm", "-f", name],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=60,
                 )
             if names:
-                logger.info("Swept %d stale attacker container(s): %s", len(names), ", ".join(names))
+                logger.info(
+                    "Swept %d stale attacker container(s): %s",
+                    len(names),
+                    ", ".join(names),
+                )
         except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
             pass
 
@@ -213,6 +235,7 @@ class AttackerManager:
                 ["docker", "inspect", "-f", "{{.State.Running}}", name],
                 capture_output=True,
                 text=True,
+                check=False,
                 timeout=30,
             )
             return r.returncode == 0 and r.stdout.strip() == "true"
@@ -228,6 +251,7 @@ class AttackerManager:
                 ["docker", "image", "inspect", image],
                 capture_output=True,
                 text=True,
+                check=False,
                 timeout=30,
             )
             return r.returncode == 0
@@ -253,7 +277,9 @@ class AttackerManager:
             if not self._docker_available():
                 self._disable("docker is not installed or the daemon is not running")
                 return False
-            image = getattr(settings, "attacker_image_tag", "vulnscan-kali-attacker:latest")
+            image = getattr(
+                settings, "attacker_image_tag", "vulnscan-kali-attacker:latest"
+            )
             if not self._build_image(image):
                 self._disable(f"image '{image}' could not be built")
                 return False
@@ -274,9 +300,18 @@ class AttackerManager:
 
         try:
             build = subprocess.run(
-                ["docker", "build", "-t", image, "-f", str(ATTACKER_DOCKERFILE), str(ATTACKER_DIR)],
+                [
+                    "docker",
+                    "build",
+                    "-t",
+                    image,
+                    "-f",
+                    str(ATTACKER_DOCKERFILE),
+                    str(ATTACKER_DIR),
+                ],
                 capture_output=True,
                 text=True,
+                check=False,
                 timeout=int(getattr(settings, "attacker_build_timeout", 3600)),
             )
         except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
@@ -298,7 +333,11 @@ class AttackerManager:
         # Replace any stale container holding this pinned name.
         try:
             subprocess.run(
-                ["docker", "rm", "-f", name], capture_output=True, text=True, timeout=30
+                ["docker", "rm", "-f", name],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
             )
         except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
             pass
@@ -321,19 +360,28 @@ class AttackerManager:
         try:
             run = subprocess.run(
                 [
-                    "docker", "run", "-d", "--name", name,
+                    "docker",
+                    "run",
+                    "-d",
+                    "--name",
+                    name,
                     # Full capability set: on SELinux-enforcing hosts Docker's
                     # default caps make nmap's kernel-level scans fail to even
                     # exec ("Operation not permitted"), and many pentest tools
                     # (raw sockets, pcap, ptrace) need more than the defaults.
                     # The container stays namespaced and unprivileged - ALL
                     # applies inside its own namespaces only.
-                    "--cap-add", "ALL",
-                    "-v", f"{host_dir.resolve()}:{mount_target}:z",
-                    image, "sleep", "infinity",
+                    "--cap-add",
+                    "ALL",
+                    "-v",
+                    f"{host_dir.resolve()}:{mount_target}:z",
+                    image,
+                    "sleep",
+                    "infinity",
                 ],
                 capture_output=True,
                 text=True,
+                check=False,
                 timeout=60,
             )
         except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
@@ -344,7 +392,10 @@ class AttackerManager:
             return False
         logger.info(
             "Started attacker container '%s' from image %s (workdir %s -> %s).",
-            name, image, host_dir, mount_target,
+            name,
+            image,
+            host_dir,
+            mount_target,
         )
         return True
 
@@ -353,6 +404,7 @@ manager = AttackerManager()
 
 
 # -- executor -------------------------------------------------------------------
+
 
 def _contains_workdir(path: str) -> Path | None:
     """Resolve an attacker-side path and confine it to the workdir tree."""
@@ -368,14 +420,21 @@ def _contains_workdir(path: str) -> Path | None:
     return None
 
 
-def _exec_input(name: str, argv: list[str], *, input_bytes: bytes | None = None,
-                timeout: int, max_chars: int) -> tuple[int, str, bool]:
+def _exec_input(
+    name: str,
+    argv: list[str],
+    *,
+    input_bytes: bytes | None = None,
+    timeout: int,
+    max_chars: int,
+) -> tuple[int, str, bool]:
     """Run ``docker exec`` in the attacker container; return (exit_code, out, truncated)."""
     try:
         result = subprocess.run(
             argv,
             input=input_bytes,
             capture_output=True,
+            check=False,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
@@ -390,7 +449,7 @@ def _exec_input(name: str, argv: list[str], *, input_bytes: bytes | None = None,
     def _decode(data) -> str:
         try:
             return data.decode("utf-8", errors="replace")
-        except Exception:
+        except (AttributeError, UnicodeDecodeError):
             return ""
 
     stdout = _decode(result.stdout)
@@ -401,7 +460,7 @@ def _exec_input(name: str, argv: list[str], *, input_bytes: bytes | None = None,
     truncated = False
     if len(out) > max_chars:
         out = out[:max_chars]
-        out += "\n\n... [OUTPUT TRUNCATED at {} chars] ...".format(max_chars)
+        out += f"\n\n... [OUTPUT TRUNCATED at {max_chars} chars] ..."
         truncated = True
     return result.returncode, out, truncated
 
@@ -420,6 +479,9 @@ def run_command(
     etc.). Use this to actively probe the sandbox with real tools, run or debug
     a PoC, or retrieve evidence that HTTP/browser tools cannot (e.g. raw TCP,
     TLS fingerprinting, payload fuzzing).
+
+    Commands run as user 'kali'. Passwordless sudo is available if elevated
+    privileges are required.
 
     The sandbox application is published on all host interfaces and is reachable
     from inside the attacker container through the IP address of the ``sandbox_url``
@@ -441,7 +503,9 @@ def run_command(
         return manager.unavailable_msg()
 
     eff_timeout = int(timeout or getattr(settings, "attacker_command_timeout", 60))
-    eff_timeout = min(eff_timeout, int(getattr(settings, "attacker_command_timeout", 60)))
+    eff_timeout = min(
+        eff_timeout, int(getattr(settings, "attacker_command_timeout", 60))
+    )
     max_chars = int(getattr(settings, "attacker_output_max_chars", 8000))
 
     cwd = (workdir or str(Path(getattr(settings, "attacker_workdir", "/work")))).strip()
@@ -494,11 +558,8 @@ def write_attacker_file(
         timeout=30,
         max_chars=2000,
     )
-    write_cmd = (
-        f"cat > {shlex.quote(target_s)} && "
-        f"chmod {mode} {shlex.quote(target_s)}"
-    )
-    exit_code, out, truncated = _exec_input(
+    write_cmd = f"cat > {shlex.quote(target_s)} && chmod {mode} {shlex.quote(target_s)}"
+    exit_code, out, _truncated = _exec_input(
         name,
         ["docker", "exec", "-i", name, "/bin/bash", "-lc", write_cmd],
         input_bytes=content.encode("utf-8", errors="replace"),
@@ -545,6 +606,7 @@ def read_attacker_file(
         result = subprocess.run(
             ["docker", "exec", name, "cat", target_s],
             capture_output=True,
+            check=False,
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
@@ -565,8 +627,7 @@ def read_attacker_file(
         return f"Attacker file '{file_path}' is empty (0 lines)."
 
     requested_start = start_line
-    if start_line < 1:
-        start_line = 1
+    start_line = max(start_line, 1)
     if start_line > total:
         return (
             f"Error: start_line {requested_start} is beyond the end of "
@@ -585,7 +646,8 @@ def read_attacker_file(
         truncated = True
 
     body = "".join(
-        f"{i:>6}: {line}" for i, line in enumerate(lines[start_line - 1:end], start_line)
+        f"{i:>6}: {line}"
+        for i, line in enumerate(lines[start_line - 1 : end], start_line)
     )
     header = f"Attacker file: {target_s} (lines {start_line}-{end} of {total})\n"
     if truncated:
@@ -603,6 +665,7 @@ def read_attacker_file(
 # INSIDE the attacker container under the workdir. This lets the HTTP tool read
 # those bytes out of the container so a PoC payload can be uploaded via
 # files=... even though the request itself is issued from the host.
+
 
 def read_attacker_file_bytes(file_path: str, state=None) -> bytes | None:
     """Read a whole file from THIS validator's attacker container as raw bytes, or None.
@@ -623,6 +686,7 @@ def read_attacker_file_bytes(file_path: str, state=None) -> bytes | None:
         result = subprocess.run(
             ["docker", "exec", name, "cat", str(target)],
             capture_output=True,
+            check=False,
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):

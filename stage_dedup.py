@@ -15,18 +15,26 @@ import hashlib
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
 
-from dedup import cluster_vulnerabilities
 from langchain_core.messages import HumanMessage, SystemMessage
 
-import settings
 import llms
+import settings
+from dedup import cluster_vulnerabilities
 from llms import get_llm, invoke_structured_capped
-from run_stats import _record_stat, as_dict, as_dicts, get_embedder, raise_if_stopping, take_cached_usage
+from run_stats import (
+    _record_stat,
+    as_dict,
+    as_dicts,
+    get_embedder,
+    raise_if_stopping,
+    take_cached_usage,
+)
 from schemas import DEDUP_AGENT, DedupAgentOutput, cwes
 from state import MasterState
 from utils import cache, get_cached_graph_data, safe_cache_filename
+
+logger = logging.getLogger(__name__)
 
 # One hypothesis per CVE is canonical fact (the CVE analyzer emits exactly one);
 # merging two distinct CVEs would silently drop one from the report.
@@ -116,12 +124,18 @@ def build_groups(records: list[dict], file_map: dict[str, str]) -> list[dict]:
         if len(members) <= settings.dedup_agent_group_max:
             buckets = [("", members)]
         else:
-            ordered = sorted(members, key=lambda r: (_dir_key(r, file_map, _FULL_DEPTH), str(r.get("vuln_id"))))
+            ordered = sorted(
+                members,
+                key=lambda r: (
+                    _dir_key(r, file_map, _FULL_DEPTH),
+                    str(r.get("vuln_id")),
+                ),
+            )
             per = -(-len(ordered) // -(-len(ordered) // cap))  # ceil(n / ceil(n/cap))
             buckets = [
                 (
-                    _bucket_label(ordered[i:i + per], file_map),
-                    sorted(ordered[i:i + per], key=lambda r: str(r.get("vuln_id"))),
+                    _bucket_label(ordered[i : i + per], file_map),
+                    sorted(ordered[i : i + per], key=lambda r: str(r.get("vuln_id"))),
                 )
                 for i in range(0, len(ordered), per)
             ]
@@ -181,21 +195,27 @@ def _group_fingerprint(group: dict) -> str:
             for record in group["records"]
         ],
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 def _run_group(group: dict, idx: int, total: int) -> list[dict]:
     digest = _group_fingerprint(group)
-    cache_file = settings.cache_dir / "dedup_agent" / safe_cache_filename(f"{digest}.json")
+    cache_file = (
+        settings.cache_dir / "dedup_agent" / safe_cache_filename(f"{digest}.json")
+    )
     try:
         cached = cache(cache_file, "read")
         if cached is not None:
             take_cached_usage("dedup_agent", cached)
-            logging.debug("Dedup agent cache hit for group %d/%d.", idx, total)
+            logger.debug("Dedup agent cache hit for group %d/%d.", idx, total)
             return [cl for cl in (cached.get("clusters") or []) if isinstance(cl, dict)]
 
         known = {str(record.get("vuln_id")) for record in group["records"]}
-        structured_llm = get_llm("dedup_agent").with_structured_output(DedupAgentOutput, method="json_schema", strict=True)
+        structured_llm = get_llm("dedup_agent").with_structured_output(
+            DedupAgentOutput, method="json_schema", strict=True
+        )
         output, usage = invoke_structured_capped(
             structured_llm,
             [
@@ -214,29 +234,42 @@ def _run_group(group: dict, idx: int, total: int) -> list[dict]:
         clusters: list[dict] = []
         for cluster in output.get("clusters") or []:
             c = as_dict(cluster)
-            members = sorted({str(m) for m in (c.get("member_vuln_ids") or []) if str(m) in known})
+            members = sorted(
+                {str(m) for m in (c.get("member_vuln_ids") or []) if str(m) in known}
+            )
             if len(members) >= 2:
-                clusters.append({
-                    "cwe_id": group["cwe_id"],
-                    "bucket": group["bucket"],
-                    "members": members,
-                    "reason": str(c.get("reason") or ""),
-                })
-    except Exception as e:
+                clusters.append(
+                    {
+                        "cwe_id": group["cwe_id"],
+                        "bucket": group["bucket"],
+                        "members": members,
+                        "reason": str(c.get("reason") or ""),
+                    }
+                )
+    except Exception as e:  # noqa: BLE001
         # Fail open: invoke_structured_capped only absorbs output-cap/context
         # errors; anything else (gateway down, parse failure, cache I/O) must
         # not kill the node — this group dispatches un-deduplicated. Uncached:
         # the next run re-attempts it.
-        logging.warning(
+        logger.warning(
             "Dedup agent group %d/%d (%s) failed (%s); dispatching its %d record(s) un-deduplicated.",
-            idx, total, group["cwe_id"], e, len(group["records"]),
+            idx,
+            total,
+            group["cwe_id"],
+            e,
+            len(group["records"]),
         )
         _record_stat("dedup_agent_groups_skipped_errors")
         return []
     cache(cache_file, "write", {"clusters": clusters, "token_usage": usage})
-    logging.info(
+    logger.info(
         "Dedup agent group %d/%d (%s · %s, %d records): %d duplicate cluster(s).",
-        idx, total, group["cwe_id"], group["bucket"] or "all", len(group["records"]), len(clusters),
+        idx,
+        total,
+        group["cwe_id"],
+        group["bucket"] or "all",
+        len(group["records"]),
+        len(clusters),
     )
     return clusters
 
@@ -249,11 +282,12 @@ def dedup_agent_node(state: MasterState) -> dict:
     embedding collapse and applies them. Touches no records itself."""
     raise_if_stopping()
     if not getattr(settings, "dedup_agent_enabled", True):
-        logging.info("Dedup agent disabled via settings.dedup_agent_enabled=False.")
+        logger.info("Dedup agent disabled via settings.dedup_agent_enabled=False.")
         return {}
 
     all_hypotheses = [
-        v for v in as_dicts(state.get("vulnerabilities", []))
+        v
+        for v in as_dicts(state.get("vulnerabilities", []))
         if v.get("status") == "hypothesis"
     ]
     # Cheap layer first: the deterministic embedding merge collapses
@@ -263,18 +297,25 @@ def dedup_agent_node(state: MasterState) -> dict:
     collapsed = embedding_dedup(all_hypotheses)
     dropped = len(all_hypotheses) - len(collapsed)
     hypotheses = [
-        v for v in collapsed
+        v
+        for v in collapsed
         if v.get("vulnerability_type") != _PASSTHROUGH_TYPE and v.get("vuln_id")
     ]
     groups = build_groups(hypotheses, _node_file_map())
     if not groups:
-        logging.info("Dedup agent: nothing to cluster (%d hypothesis record(s)).", len(hypotheses))
+        logger.info(
+            "Dedup agent: nothing to cluster (%d hypothesis record(s)).",
+            len(hypotheses),
+        )
         return {"hypothesis_clusters": []}
 
     total = len(groups)
-    logging.info(
+    logger.info(
         "Dedup agent: %d record(s), %d collapsed by embedding pass -> %d group(s) (group > %d records packs by source dir).",
-        len(hypotheses), dropped, total, settings.dedup_agent_group_max,
+        len(hypotheses),
+        dropped,
+        total,
+        settings.dedup_agent_group_max,
     )
     if total <= 1:
         results = [_run_group(group, 1, total) for group in groups]
@@ -283,11 +324,17 @@ def dedup_agent_node(state: MasterState) -> dict:
             max_workers=min(total, max(1, int(settings.dedup_agent_parallel))),
             thread_name_prefix="dedup-agent",
         ) as pool:
-            results = list(pool.map(_run_group, groups, range(1, total + 1), [total] * total))
+            results = list(
+                pool.map(_run_group, groups, range(1, total + 1), [total] * total)
+            )
 
     clusters = [cluster for result in results for cluster in result]
     _record_stat("dedup_agent_groups", total)
-    logging.info("Dedup agent finished: %d duplicate cluster(s) across %d group(s).", len(clusters), total)
+    logger.info(
+        "Dedup agent finished: %d duplicate cluster(s) across %d group(s).",
+        len(clusters),
+        total,
+    )
     return {"hypothesis_clusters": clusters}
 
 
@@ -319,14 +366,14 @@ def _cluster_reason(clusters: list[dict], bucket: list[str]) -> str:
 def _split_by_cve(members: list[str], by_id: dict[str, dict]) -> list[list[str]]:
     """Hard guardrail the model prompt also forbids: records naming different
     CVEs are distinct findings and must never share a cluster."""
-    buckets: dict[Optional[str], list[str]] = {}
+    buckets: dict[str | None, list[str]] = {}
     for vuln_id in members:
         buckets.setdefault(by_id[vuln_id].get("source_cve"), []).append(vuln_id)
     return list(buckets.values())
 
 
 def apply_agent_clusters(
-    hypotheses: list[dict], clusters: Optional[list[dict]]
+    hypotheses: list[dict], clusters: list[dict] | None
 ) -> tuple[list[dict], int]:
     """Materialize the dedup agent's equivalence classes on the (already
     embedding-clustered) dispatch list. Overlapping proposed clusters are
@@ -350,7 +397,9 @@ def apply_agent_clusters(
         return x
 
     for cluster in clusters:
-        members = sorted({str(m) for m in (cluster or {}).get("members") or [] if str(m) in by_id})
+        members = sorted(
+            {str(m) for m in (cluster or {}).get("members") or [] if str(m) in by_id}
+        )
         for other in members[1:]:
             root_a, root_b = find(members[0]), find(other)
             if root_a != root_b:
@@ -381,9 +430,10 @@ def apply_agent_clusters(
             updated["agent_merged_from"] = [v for v in bucket if v != canonical]
             updates[canonical] = updated
             drop.update(updated["agent_merged_from"])
-            logging.info(
+            logger.info(
                 "Dedup agent merge: %s absorbs %s (%s)",
-                canonical, ", ".join(updated["agent_merged_from"]),
+                canonical,
+                ", ".join(updated["agent_merged_from"]),
                 _cluster_reason(clusters, bucket)[:160],
             )
 

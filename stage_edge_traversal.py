@@ -6,18 +6,20 @@ from concurrent.futures import ThreadPoolExecutor
 from langchain_core.messages import HumanMessage, SystemMessage
 
 import settings
+from boundary_edges import (
+    boundary_batch_fingerprint,
+    build_boundary_edges,
+    cluster_boundary_edges,
+    render_batch_prompt,
+    summarize_boundary_edges,
+)
 from llms import get_llm, invoke_structured_capped
 from run_stats import _record_stat, as_dict, raise_if_stopping, take_cached_usage
 from schemas import EDGE_TRAVERSAL_AGENT, EdgeTraversalOutput
 from state import MasterState
-from boundary_edges import (
-    build_boundary_edges,
-    cluster_boundary_edges,
-    render_batch_prompt,
-    boundary_batch_fingerprint,
-    summarize_boundary_edges,
-)
 from utils import cache, get_cached_graph_data, safe_cache_filename
+
+logger = logging.getLogger(__name__)
 
 # Independent batch LLM calls run concurrently; results are reassembled in
 # dispatch order, so emitted hypotheses and downstream cache keys are unchanged.
@@ -27,18 +29,22 @@ _PARALLEL_BATCHES = 12
 def _run_batches_in_order(batches: list[list[dict]]) -> list[dict]:
     total = len(batches)
     if total <= 1:
-        results = [_run_edge_traversal_batch(b, i, total) for i, b in enumerate(batches, 1)]
+        results = [
+            _run_edge_traversal_batch(b, i, total) for i, b in enumerate(batches, 1)
+        ]
     else:
         with ThreadPoolExecutor(
             max_workers=min(total, _PARALLEL_BATCHES),
             thread_name_prefix="edge-traversal",
         ) as pool:
-            results = list(pool.map(
-                _run_edge_traversal_batch,
-                batches,
-                range(1, total + 1),
-                [total] * total,
-            ))
+            results = list(
+                pool.map(
+                    _run_edge_traversal_batch,
+                    batches,
+                    range(1, total + 1),
+                    [total] * total,
+                )
+            )
     return [h for r in results for h in r]
 
 
@@ -49,7 +55,9 @@ def edge_traversal_node(state: MasterState):
     reviewer's `cross_boundary` track."""
     raise_if_stopping()
     if not getattr(settings, "edge_traversal_enabled", True):
-        logging.info("Edge Traversal disabled via settings.edge_traversal_enabled=False.")
+        logger.info(
+            "Edge Traversal disabled via settings.edge_traversal_enabled=False."
+        )
         return {}
 
     note_map = {
@@ -62,11 +70,11 @@ def edge_traversal_node(state: MasterState):
 
     edges = build_boundary_edges(graph_data, note_map)
     if not edges:
-        logging.info("Edge Traversal: no boundary edges to analyze.")
+        logger.info("Edge Traversal: no boundary edges to analyze.")
         return {}
 
     batches = cluster_boundary_edges(edges)
-    logging.info(
+    logger.info(
         "Edge Traversal: %d boundary edge(s) across %d batch(es) (%s).",
         len(edges),
         len(batches),
@@ -75,7 +83,7 @@ def edge_traversal_node(state: MasterState):
 
     hypotheses = _run_batches_in_order(batches)
 
-    logging.info(
+    logger.info(
         "Edge Traversal finished: %d composite hypothesis(es) from %d batch(es).",
         len(hypotheses),
         len(batches),
@@ -86,20 +94,27 @@ def edge_traversal_node(state: MasterState):
 def _run_edge_traversal_batch(batch: list[dict], idx: int, total: int) -> list[dict]:
     # Cached on the serialized batch (edges + note profiles + artifacts).
     digest = boundary_batch_fingerprint(batch)
-    cache_file = settings.cache_dir / "edge_traversal" / safe_cache_filename(f"{digest}.json")
+    cache_file = (
+        settings.cache_dir / "edge_traversal" / safe_cache_filename(f"{digest}.json")
+    )
     cached = cache(cache_file, "read")
     if cached:
         take_cached_usage("edge_traversal", cached)
-        logging.debug("Edge Traversal cache hit for batch %d/%d.", idx, total)
+        logger.debug("Edge Traversal cache hit for batch %d/%d.", idx, total)
         return (cached.get("hypotheses") or []) if isinstance(cached, dict) else []
 
     prompt = render_batch_prompt(batch)
     sys_msg = SystemMessage(content=EDGE_TRAVERSAL_AGENT.get("prompt", ""))
     human_msg = HumanMessage(content=prompt)
 
-    structured_llm = get_llm("edge_traversal").with_structured_output(EdgeTraversalOutput, method="json_schema", strict=True)
+    structured_llm = get_llm("edge_traversal").with_structured_output(
+        EdgeTraversalOutput, method="json_schema", strict=True
+    )
     output, usage = invoke_structured_capped(
-        structured_llm, [sys_msg, human_msg], f"Edge Traversal batch {idx}/{total}", "edge_traversal"
+        structured_llm,
+        [sys_msg, human_msg],
+        f"Edge Traversal batch {idx}/{total}",
+        "edge_traversal",
     )
     if output is None:
         # Uncached on purpose: the next run re-attempts this batch.
@@ -110,7 +125,7 @@ def _run_edge_traversal_batch(batch: list[dict], idx: int, total: int) -> list[d
     # Assertions are invariant/pruning evidence, not findings.
     for assertion in output.get("assertions") or []:
         a = as_dict(assertion)
-        logging.info(
+        logger.info(
             "Edge Traversal invariant (batch %d): %s -> %s satisfied=%s — %s",
             idx,
             a.get("source_node", "?"),
@@ -119,9 +134,11 @@ def _run_edge_traversal_batch(batch: list[dict], idx: int, total: int) -> list[d
             str(a.get("reasoning"))[:200],
         )
 
-    hypotheses = [_edge_traversal_finding_to_record(f) for f in (output.get("findings") or [])]
+    hypotheses = [
+        _edge_traversal_finding_to_record(f) for f in (output.get("findings") or [])
+    ]
     cache(cache_file, "write", {"hypotheses": hypotheses, "token_usage": usage})
-    logging.info(
+    logger.info(
         "Edge Traversal batch %d/%d: %d hypothesis(es).",
         idx,
         total,
@@ -142,5 +159,6 @@ def _edge_traversal_finding_to_record(finding) -> dict:
         "vulnerability_type": vuln_type,
         "validation_strategy": f.get("validation_strategy"),
         # Stable per-(pair, type) anchor: distinct boundary edges never collide.
-        "vulnerable_component": f"edge:{vuln_type}" + (":" + "->".join(nodes) if nodes else ""),
+        "vulnerable_component": f"edge:{vuln_type}"
+        + (":" + "->".join(nodes) if nodes else ""),
     }

@@ -5,27 +5,35 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Send
 
 import settings
-from llms import get_llm
-from llms import invoke_structured_capped
+from llms import get_llm, invoke_structured_capped
+from run_stats import (
+    _log_agent_completion,
+    _record_stat,
+    _start_agent_progress,
+    raise_if_stopping,
+    take_cached_usage,
+)
 from schemas import EXPERT_AGENTS, AnalysisNote, BatchedAnalysisResult
 from state import ExplorerState, MasterState
-from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping, take_cached_usage
 from utils import (
     build_networkx_graph,
+    cache,
+    format_node_context,
     get_cached_graph_data,
     get_file_nodes_index,
     get_node_code,
     get_node_map,
-    format_node_context,
     is_node_worth_scanning,
     is_path_excluded,
     safe_cache_filename,
-    cache,
 )
 
+logger = logging.getLogger(__name__)
 
-def _pack_node_batches(file_nodes: list[str], threshold: int,
-                       node_map: dict, sub_nodes_index: dict) -> list[list[str]]:
+
+def _pack_node_batches(
+    file_nodes: list[str], threshold: int, node_map: dict, sub_nodes_index: dict
+) -> list[list[str]]:
     """Greedily pack node ids into batches whose combined code+context size
     stays below `threshold`; an oversized node becomes its own batch (it is
     then skipped by the explorer_max_prompt_chars guard in _explore_single/
@@ -37,8 +45,10 @@ def _pack_node_batches(file_nodes: list[str], threshold: int,
     graph_data = get_cached_graph_data(settings.graph)
 
     for node_id in file_nodes:
-        code = get_node_code(node_id, node_map=node_map,
-                             sub_nodes_index=sub_nodes_index) or ""
+        code = (
+            get_node_code(node_id, node_map=node_map, sub_nodes_index=sub_nodes_index)
+            or ""
+        )
         context = format_node_context(graph_data, node_id)
         length = len(code) + len(context)
         if current and current_len + length > threshold:
@@ -82,7 +92,9 @@ def dispatch_explorers(state: MasterState):
 
     for task in state["expert_tasks"]:
         task = task if isinstance(task, dict) else task.model_dump()
-        clean_id = task.get("target_community", "").lower().replace("community ", "").strip()
+        clean_id = (
+            task.get("target_community", "").lower().replace("community ", "").strip()
+        )
         community_nodes = nodes_by_community.get(clean_id, [])
 
         # Eligible-by-file: (node_id, is_skeleton). Skeletons are file/module-level
@@ -98,14 +110,14 @@ def dispatch_explorers(state: MasterState):
             # Drop inert nodes (pure types, empty skeletons, flat constants) to save LLM budget
             if not is_node_worth_scanning(node_id):
                 skipped_nodes += 1
-                logging.debug(f"Skipping inert node {node_id} (no executable signals).")
+                logger.debug(f"Skipping inert node {node_id} (no executable signals).")
                 continue
 
             # Drop nodes whose source file lives in an excluded path
             # (dependency trees, tests, docs) before spending LLM budget on it.
             if is_path_excluded(source_file):
                 skipped_nodes += 1
-                logging.debug(f"Skipping excluded-path node {node_id} ({source_file}).")
+                logger.debug(f"Skipping excluded-path node {node_id} ({source_file}).")
                 continue
 
             eligible[source_file].append((node_id, is_skeleton))
@@ -119,8 +131,12 @@ def dispatch_explorers(state: MasterState):
 
         for file_path, file_nodes in files.items():
             if settings.explorer_batching_enabled:
-                batches = _pack_node_batches(file_nodes, settings.explorer_batch_char_threshold,
-                                             node_map, sub_nodes_index)
+                batches = _pack_node_batches(
+                    file_nodes,
+                    settings.explorer_batch_char_threshold,
+                    node_map,
+                    sub_nodes_index,
+                )
             else:
                 batches = [[node_id] for node_id in file_nodes]
             for batch in batches:
@@ -128,19 +144,21 @@ def dispatch_explorers(state: MasterState):
                     batched_batches += 1
                 else:
                     single_batches += 1
-                logging.debug(
+                logger.debug(
                     f"Dispatching explorer {task.get('agent_role', '')} on batch "
                     f"{batch} (from {file_path})."
                 )
-                dispatches.append((
-                    batch,
-                    task.get("agent_role", ""),
-                    task.get("task_description", ""),
-                ))
+                dispatches.append(
+                    (
+                        batch,
+                        task.get("agent_role", ""),
+                        task.get("task_description", ""),
+                    )
+                )
 
     progress_id = _start_agent_progress(len(dispatches))
 
-    logging.info(
+    logger.info(
         "Starting explorer scan: 0/%d complete, %d remaining "
         "(%d multi-node batches, %d single-node), skipped %d inert nodes.",
         len(dispatches),
@@ -151,24 +169,32 @@ def dispatch_explorers(state: MasterState):
     )
 
     commands = [
-        Send("explorer_agent", ExplorerState(
-            node_ids=batch,
-            role=role,
-            task_description=task_description,
-            progress_id=progress_id,
-        ))
+        Send(
+            "explorer_agent",
+            ExplorerState(
+                node_ids=batch,
+                role=role,
+                task_description=task_description,
+                progress_id=progress_id,
+            ),
+        )
         for batch, role, task_description in dispatches
     ]
 
     # The aggregate_demands join barrier requires explorer_agent to fire even
     # when nothing was dispatchable; emit a no-op task otherwise.
     if not commands:
-        commands.append(Send("explorer_agent", ExplorerState(
-            node_ids=[],
-            role="explorer",
-            task_description="",
-            progress_id="",
-        )))
+        commands.append(
+            Send(
+                "explorer_agent",
+                ExplorerState(
+                    node_ids=[],
+                    role="explorer",
+                    task_description="",
+                    progress_id="",
+                ),
+            )
+        )
 
     return commands
 
@@ -177,13 +203,16 @@ def _extract_hypotheses(node_id: str, raw_hypotheses: list) -> list[dict]:
     """Turn an explorer note's `vulns` entries into standard hypotheses.
     Notes cached from an older schema whose hypotheses carry no `description`
     fall back to the bare `component` label."""
-    return [{
-        "affected_nodes": [node_id],
-        "cwe_id": hyp.get("cwe", "OTHER_UNCATEGORIZED"),
-        "description": hyp.get("description") or hyp.get("component", ""),
-        "vulnerable_component": hyp.get("pattern_label") or None,
-        "status": "hypothesis",
-    } for hyp in raw_hypotheses]
+    return [
+        {
+            "affected_nodes": [node_id],
+            "cwe_id": hyp.get("cwe", "OTHER_UNCATEGORIZED"),
+            "description": hyp.get("description") or hyp.get("component", ""),
+            "vulnerable_component": hyp.get("pattern_label") or None,
+            "status": "hypothesis",
+        }
+        for hyp in raw_hypotheses
+    ]
 
 
 def expert_explorer_node(state: ExplorerState) -> dict:
@@ -219,7 +248,11 @@ def _explorer_system_message(role_name: str, batch: bool = False) -> SystemMessa
 
 
 def _explore_single(node_id: str, role_name: str) -> tuple[dict, bool]:
-    cache_file = settings.cache_dir / "notes" / safe_cache_filename(f"{node_id}-{role_name}.json")
+    cache_file = (
+        settings.cache_dir
+        / "notes"
+        / safe_cache_filename(f"{node_id}-{role_name}.json")
+    )
     cached_note = cache(cache_file, "read")
     if cached_note:
         take_cached_usage("explorer", cached_note)
@@ -237,7 +270,7 @@ def _explore_single(node_id: str, role_name: str) -> tuple[dict, bool]:
 
     prompt_size = len(source_code or "") + len(context)
     if prompt_size > settings.explorer_max_prompt_chars:
-        logging.warning(
+        logger.warning(
             f"Skipping oversized explorer node {node_id}: prompt would be "
             f"{prompt_size} chars > explorer_max_prompt_chars "
             f"{settings.explorer_max_prompt_chars}; explorer prompts get no "
@@ -263,9 +296,14 @@ def _explore_single(node_id: str, role_name: str) -> tuple[dict, bool]:
         )
     human_msg = HumanMessage(content=user_prompt)
 
-    explorer_llm = get_llm("explorer").with_structured_output(AnalysisNote, method="json_schema", strict=True)
+    explorer_llm = get_llm("explorer").with_structured_output(
+        AnalysisNote, method="json_schema", strict=True
+    )
     note, usage = invoke_structured_capped(
-        explorer_llm, [sys_msg, human_msg], f"Explorer single-node {node_id}", "explorer"
+        explorer_llm,
+        [sys_msg, human_msg],
+        f"Explorer single-node {node_id}",
+        "explorer",
     )
     if note is None:
         # Output cap exhausted: empty note, left uncached so a later run re-attempts.
@@ -278,22 +316,27 @@ def _explore_single(node_id: str, role_name: str) -> tuple[dict, bool]:
     # 'vulns' is kept in dict_note for later consumers (aggregate edge notes).
     extracted_vulns = _extract_hypotheses(node_id, dict_note.get("vulns", []))
 
-    cache(cache_file, "write", {
-        "notes": [dict_note],
-        "vulnerabilities": extracted_vulns,
-        "token_usage": usage,
-    })
+    cache(
+        cache_file,
+        "write",
+        {
+            "notes": [dict_note],
+            "vulnerabilities": extracted_vulns,
+            "token_usage": usage,
+        },
+    )
 
-    return {
-        "notes": [dict_note],
-        "vulnerabilities": extracted_vulns
-    }, False
+    return {"notes": [dict_note], "vulnerabilities": extracted_vulns}, False
 
 
 def _explore_batch(node_ids: list[str], role_name: str) -> tuple[dict, bool]:
     # Deterministic cache key: sorted node ids joined by '__'
     batch_key = "__".join(sorted(node_ids))
-    cache_file = settings.cache_dir / "notes" / safe_cache_filename(f"batch-{batch_key}-{role_name}.json")
+    cache_file = (
+        settings.cache_dir
+        / "notes"
+        / safe_cache_filename(f"batch-{batch_key}-{role_name}.json")
+    )
     cached_note = cache(cache_file, "read")
     if cached_note:
         take_cached_usage("explorer", cached_note)
@@ -313,10 +356,13 @@ def _explore_batch(node_ids: list[str], role_name: str) -> tuple[dict, bool]:
         context_block = format_node_context(graph_data, node_id)
         if context_block:
             context_block += "\n\n"
-        if len(source_code or "") + len(context_block) > settings.explorer_max_prompt_chars:
+        if (
+            len(source_code or "") + len(context_block)
+            > settings.explorer_max_prompt_chars
+        ):
             # Same guard as the single-node path: no compaction here, and the
             # batch packer lets an oversized node ride solo past its threshold.
-            logging.warning(
+            logger.warning(
                 f"Skipping oversized explorer node {node_id} in batch: "
                 f"{len(source_code or '') + len(context_block)} chars > "
                 f"explorer_max_prompt_chars {settings.explorer_max_prompt_chars}."
@@ -352,9 +398,14 @@ def _explore_batch(node_ids: list[str], role_name: str) -> tuple[dict, bool]:
     )
     human_msg = HumanMessage(content=user_prompt)
 
-    explorer_llm = get_llm("explorer").with_structured_output(BatchedAnalysisResult, method="json_schema", strict=True)
+    explorer_llm = get_llm("explorer").with_structured_output(
+        BatchedAnalysisResult, method="json_schema", strict=True
+    )
     result, usage = invoke_structured_capped(
-        explorer_llm, [sys_msg, human_msg], f"Explorer batch of {len(node_ids)} nodes", "explorer"
+        explorer_llm,
+        [sys_msg, human_msg],
+        f"Explorer batch of {len(node_ids)} nodes",
+        "explorer",
     )
     if result is None:
         # Output cap exhausted for the batch; uncached so a later run re-attempts.
@@ -376,13 +427,14 @@ def _explore_batch(node_ids: list[str], role_name: str) -> tuple[dict, bool]:
         extracted_vulns.extend(_extract_hypotheses(node_id, dict_note.get("vulns", [])))
         notes.append(dict_note)
 
-    cache(cache_file, "write", {
-        "notes": notes,
-        "vulnerabilities": extracted_vulns,
-        "token_usage": usage,
-    })
+    cache(
+        cache_file,
+        "write",
+        {
+            "notes": notes,
+            "vulnerabilities": extracted_vulns,
+            "token_usage": usage,
+        },
+    )
 
-    return {
-        "notes": notes,
-        "vulnerabilities": extracted_vulns
-    }, False
+    return {"notes": notes, "vulnerabilities": extracted_vulns}, False

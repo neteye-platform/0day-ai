@@ -5,10 +5,18 @@ from langgraph.types import Send
 
 import settings
 from llms import get_llm, invoke_structured_capped
-from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping, take_cached_usage
+from run_stats import (
+    _log_agent_completion,
+    _record_stat,
+    _start_agent_progress,
+    raise_if_stopping,
+    take_cached_usage,
+)
 from schemas import CVE_ANALYZER_AGENT, CVEAnalysis
 from state import CVEAnalyzerState, MasterState
 from utils import cache
+
+logger = logging.getLogger(__name__)
 
 
 def dispatch_cve_analyzers(state: MasterState):
@@ -28,7 +36,7 @@ def dispatch_cve_analyzers(state: MasterState):
     if not commands:
         commands.append(Send("cve_analyzer", CVEAnalyzerState(cve={}, progress_id="")))
 
-    logging.info(
+    logger.info(
         "Starting CVE analyzer scan: 0/%d complete, %d remaining.",
         len(commands),
         len(commands),
@@ -39,7 +47,11 @@ def dispatch_cve_analyzers(state: MasterState):
 def _normalize_cwe_ids(value) -> list[str]:
     """Normalize an OSV `cwe_ids` value (list or bare string): strip, drop
     empties/non-strings, de-duplicate preserving order."""
-    entries = value if isinstance(value, list) else ([value] if isinstance(value, str) else [])
+    entries = (
+        value
+        if isinstance(value, list)
+        else ([value] if isinstance(value, str) else [])
+    )
     seen = set()
     normalized = []
     for entry in entries:
@@ -61,25 +73,35 @@ def _backfill_osv_cwe_ids(cached: dict, cve: dict) -> dict:
     return cached
 
 
-def _finalize_cve_analysis(dict_analysis: dict, cve: dict, *, enriched_by: str | None = None) -> dict | None:
+def _finalize_cve_analysis(
+    dict_analysis: dict, cve: dict, *, enriched_by: str | None = None
+) -> dict | None:
     """Apply deterministic CVE output guards and attach routing metadata."""
     cve_id = cve.get("id", "UNKNOWN-CVE")
     fix_category = dict_analysis.get("fix_category")
-    if fix_category == "application_mitigation" and not dict_analysis.get("security_assumption"):
-        logging.warning(f"{cve_id}: classified as application_mitigation but no security_assumption. Dropping.")
+    if fix_category == "application_mitigation" and not dict_analysis.get(
+        "security_assumption"
+    ):
+        logger.warning(
+            f"{cve_id}: classified as application_mitigation but no security_assumption. Dropping."
+        )
         return None
     if fix_category == "upgrade_only" and not dict_analysis.get("hypothesis"):
-        logging.warning(f"{cve_id}: classified as upgrade_only but no hypothesis. Dropping.")
+        logger.warning(
+            f"{cve_id}: classified as upgrade_only but no hypothesis. Dropping."
+        )
         return None
     if fix_category not in ("application_mitigation", "upgrade_only"):
-        logging.warning(f"{cve_id}: invalid fix_category '{fix_category}'. Dropping.")
+        logger.warning(f"{cve_id}: invalid fix_category '{fix_category}'. Dropping.")
         return None
 
-    dict_analysis["required_keywords"] = list(dict.fromkeys(
-        kw.strip()
-        for kw in (dict_analysis.get("required_keywords") or [])
-        if kw and kw.strip()
-    ))
+    dict_analysis["required_keywords"] = list(
+        dict.fromkeys(
+            kw.strip()
+            for kw in (dict_analysis.get("required_keywords") or [])
+            if kw and kw.strip()
+        )
+    )
     dict_analysis["source_cve"] = cve_id
     dict_analysis["package"] = cve.get("package") or "unknown"
     dict_analysis["fixed_version"] = cve.get("fixed_version")
@@ -126,7 +148,7 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     descriptions = cve_descriptions(cve)
     if not descriptions:
         # Without descriptions the LLM would just hallucinate
-        logging.warning(f"{cve_id}: no descriptions provided")
+        logger.warning(f"{cve_id}: no descriptions provided")
         return {"cve_demands": []}
 
     # Cache keyed by CVE id only (no content hash).
@@ -146,18 +168,21 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
         enrichment = f"\n--- OSV ENRICHMENT ---\n{lead}{''.join(f'{line}\n' for line in osv_lines)}"
 
     desc_block = "\n".join(
-        f"Description {i + 1}: {d}\n"
-        for i, d in enumerate(descriptions)
+        f"Description {i + 1}: {d}\n" for i, d in enumerate(descriptions)
     )
 
-    human_msg = HumanMessage(content=(
-        f"Analyze this CVE affecting the package '{package_name}':\n\n"
-        f"CVE ID: {cve_id}\n"
-        f"{desc_block}"
-        f"{enrichment}"
-    ))
+    human_msg = HumanMessage(
+        content=(
+            f"Analyze this CVE affecting the package '{package_name}':\n\n"
+            f"CVE ID: {cve_id}\n"
+            f"{desc_block}"
+            f"{enrichment}"
+        )
+    )
 
-    cve_analyzer_llm = get_llm("cve_analyzer").with_structured_output(CVEAnalysis, method="json_schema", strict=True)
+    cve_analyzer_llm = get_llm("cve_analyzer").with_structured_output(
+        CVEAnalysis, method="json_schema", strict=True
+    )
     analysis, usage = invoke_structured_capped(
         cve_analyzer_llm, [sys_msg, human_msg], f"CVE analyzer {cve_id}", "cve_analyzer"
     )
@@ -177,9 +202,7 @@ def _cve_analyzer_node(state: CVEAnalyzerState) -> dict:
     # cached-vs-fresh runs disagree on downstream hashes.
     cache(cache_file, "write", {**dict_analysis, "token_usage": usage})
 
-    return {
-        "cve_demands": [dict_analysis]
-    }
+    return {"cve_demands": [dict_analysis]}
 
 
 def cve_analyzer_node(state: CVEAnalyzerState) -> dict:

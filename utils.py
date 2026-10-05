@@ -1,37 +1,52 @@
-from collections import OrderedDict, defaultdict, deque
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from datetime import datetime, timezone
 import fnmatch
+import functools
 import hashlib
+import json
 import logging
 import os
 import re
 import shlex
 import shutil
-from pathlib import Path
-import tree_sitter
 import subprocess
-import networkx as nx
-import json
 import tarfile
 import threading
 import time
+from collections import OrderedDict, defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+
+import networkx as nx
 import requests
-from typing import Optional
+import tree_sitter
 from langchain_core.messages import AnyMessage
+
+import settings
+from languages import (
+    AST_GRAMMAR_MAP,
+    BEHAVIORAL_NODE_TYPES,
+    DEFINITION_TYPES,
+    FRAGMENT_WRAP,
+    GUARD_SPEC,
+    IMPORT_TYPES,
+    LANGUAGE_MAP,
+    MAGIC_METHODS,
+    MANIFEST_NAMES,
+    NAME_NODE_TYPES,
+    PHP_INTERFACE_TYPES,
+    PHP_METHOD_TYPES,
+    PHP_PROPERTY_TYPES,
+    PURE_TYPE_CONSTRUCTS,
+    PURE_TYPE_FORBIDDEN_TYPES,
+    SCAN_SIGNAL_TYPES,
+    SYMBOL_QUERIES,
+    TYPE_ALIAS_NODE_TYPES,
+    guard_usages,
+)
 from run_stats import _record_stat
 from schemas import VulnerabilityRecord
-import settings
-from functools import lru_cache
 
-
-from languages import (
-    LANGUAGE_MAP, AST_GRAMMAR_MAP, SYMBOL_QUERIES, MANIFEST_NAMES, GUARD_SPEC, guard_usages,
-    SCAN_SIGNAL_TYPES, IMPORT_TYPES, DEFINITION_TYPES, NAME_NODE_TYPES, MAGIC_METHODS,
-    PURE_TYPE_CONSTRUCTS, PURE_TYPE_FORBIDDEN_TYPES, BEHAVIORAL_NODE_TYPES,
-    TYPE_ALIAS_NODE_TYPES, PHP_INTERFACE_TYPES, PHP_PROPERTY_TYPES, PHP_METHOD_TYPES,
-    FRAGMENT_WRAP,
-)
+logger = logging.getLogger(__name__)
 
 
 def _is_manifest_node(node: dict) -> bool:
@@ -58,7 +73,7 @@ def _strip_links_to_dropped(graph_data: dict, dropped_ids: set) -> list:
     return links
 
 
-@lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=1)
 def get_cached_graph_data(graph_path: Path):
     """Caches the graph JSON in memory to prevent disk I/O bottlenecks.
 
@@ -71,7 +86,7 @@ def get_cached_graph_data(graph_path: Path):
         with open(graph_path, "r") as f:
             graph_data = json.load(f)
     except FileNotFoundError:
-        logging.error(f"'{graph_path}' not found.")
+        logger.error(f"'{graph_path}' not found.")
         return {}
 
     if not graph_data.get("nodes"):
@@ -85,7 +100,8 @@ def get_cached_graph_data(graph_path: Path):
     if dropped_ids:
         filtered = {
             "nodes": [
-                node for node in graph_data.get("nodes", [])
+                node
+                for node in graph_data.get("nodes", [])
                 if node.get("id") not in dropped_ids
             ],
         }
@@ -102,8 +118,8 @@ def get_cached_graph_data(graph_path: Path):
 # node returns: the reviewer/validator LLM stages never see this memory. Only
 # small extracted results are cached (alias sets, folded-code strings); parsed
 # tree-sitter trees are always transient.
-AGGREGATE_MEMO_ALIASES: dict[tuple[str, str], Optional[set[str]]] = {}
-AGGREGATE_MEMO_FOLDED: dict[str, Optional[str]] = {}
+AGGREGATE_MEMO_ALIASES: dict[tuple[str, str], set[str] | None] = {}
+AGGREGATE_MEMO_FOLDED: dict[str, str | None] = {}
 
 # Per-file memo of (masked source bytes, parsed tree-sitter tree), FIFO-bounded.
 # get_node_code sliced a node out of a full-file tree; without this, a file with
@@ -131,11 +147,7 @@ def _member_map_from_graph(graph_data: dict) -> dict[str, dict[str, str]]:
     ``src_change_change_gettypename``), which is exactly why the edges take
     precedence. Non-method member labels (``#privateField`` accessors) are
     skipped: they are never call targets."""
-    nodes = {
-        n["id"]: n
-        for n in graph_data.get("nodes", [])
-        if n.get("id")
-    }
+    nodes = {n["id"]: n for n in graph_data.get("nodes", []) if n.get("id")}
     members: dict[str, dict[str, str]] = {}
     for edge in graph_data.get("links", []):
         if edge.get("relation") != "method":
@@ -146,7 +158,9 @@ def _member_map_from_graph(graph_data: dict) -> dict[str, dict[str, str]]:
             continue
         match = _MEMBER_LABEL_RE.match(member.get("label") or "")
         if match:
-            members.setdefault(container["id"], {})[match.group(1).lower()] = member["id"]
+            members.setdefault(container["id"], {})[match.group(1).lower()] = member[
+                "id"
+            ]
     for nid, node in nodes.items():
         match = _MEMBER_LABEL_RE.match(node.get("label") or "")
         if not match:
@@ -175,11 +189,7 @@ def _repair_call_edges(graph_data: dict) -> None:
     pass, no parser): one match retargets, several fan out, none keeps the
     original edge. In memory only — node ids never change, caches never bust.
     """
-    nodes = {
-        n["id"]: n
-        for n in graph_data.get("nodes", [])
-        if n.get("id")
-    }
+    nodes = {n["id"]: n for n in graph_data.get("nodes", []) if n.get("id")}
     members = _member_map_from_graph(graph_data)
     if not members:
         return
@@ -248,7 +258,7 @@ def _repair_call_edges(graph_data: dict) -> None:
             known_pairs.add((edge.get("source"), extra))
             fanned += 1
 
-    logging.info(
+    logger.info(
         f"call-edge repair: {remapped} retargeted to member nodes, "
         f"{fanned} fanned out (multi-member lines), {kept} left verbatim."
     )
@@ -264,7 +274,7 @@ def clear_aggregate_caches() -> None:
     _FILE_PARSE_MEMO.clear()
 
 
-@lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=1)
 def get_node_map(graph_path: Path) -> dict:
     """``{node id -> node}`` over the process-cached graph.
 
@@ -279,7 +289,7 @@ def get_node_map(graph_path: Path) -> dict:
     }
 
 
-@lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=1)
 def get_file_nodes_index(graph_path: Path) -> dict[str, list[tuple[int, str]]]:
     """``{source_file: [(start_line, node_id), ...]}`` in graph node order.
 
@@ -302,7 +312,7 @@ def get_file_nodes_index(graph_path: Path) -> dict[str, list[tuple[int, str]]]:
     return dict(index)
 
 
-@lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=1)
 def get_node_links_index(graph_path: Path) -> dict[str, list[tuple[str, dict]]]:
     """``{node id: [(direction, link dict), ...]}`` in global link order.
 
@@ -320,7 +330,9 @@ def get_node_links_index(graph_path: Path) -> dict[str, list[tuple[str, dict]]]:
     return dict(index)
 
 
-def build_networkx_graph(graph_path: Path, allowed_communities: Optional[list[int]] = None) -> nx.DiGraph:
+def build_networkx_graph(
+    graph_path: Path, allowed_communities: list[int] | None = None
+) -> nx.DiGraph:
     """
     Reads the Graphify JSON output and builds a NetworkX Directed Graph.
     Optionally filters the graph to only include specific communities.
@@ -334,8 +346,8 @@ def build_networkx_graph(graph_path: Path, allowed_communities: Optional[list[in
     return _build_networkx_cached(graph_path, key)
 
 
-@lru_cache(maxsize=4)
-def _build_networkx_cached(graph_path: Path, allowed_key: Optional[tuple]) -> nx.DiGraph:
+@functools.lru_cache(maxsize=4)
+def _build_networkx_cached(graph_path: Path, allowed_key: tuple | None) -> nx.DiGraph:
     allowed_set = set(allowed_key) if allowed_key is not None else None
     graph_data = get_cached_graph_data(graph_path)
 
@@ -343,25 +355,25 @@ def _build_networkx_cached(graph_path: Path, allowed_key: Optional[tuple]) -> nx
     G = nx.DiGraph()
 
     # Add Nodes with their attributes (community, type, file_path, etc.)
-    for node in graph_data.get('nodes', []):
-        node_id = node.get('id')
+    for node in graph_data.get("nodes", []):
+        node_id = node.get("id")
         if not node_id:
             continue
 
         # FILTERING LOGIC: Skip node if it doesn't belong to the allowed communities
         if allowed_set is not None:
-            community_id = node.get('community')
+            community_id = node.get("community")
             if community_id not in allowed_set:
                 continue
 
         # Copy all other key-value pairs as node attributes
-        attributes = {k: v for k, v in node.items() if k != 'id'}
+        attributes = {k: v for k, v in node.items() if k != "id"}
         G.add_node(node_id, **attributes)
 
     # Add Edges with their attributes (e.g., relationship type like calls/imports)
-    for edge in graph_data.get('links', []):
-        source = edge.get('source')
-        target = edge.get('target')
+    for edge in graph_data.get("links", []):
+        source = edge.get("source")
+        target = edge.get("target")
         if not source or not target:
             continue
 
@@ -369,14 +381,16 @@ def _build_networkx_cached(graph_path: Path, allowed_key: Optional[tuple]) -> nx
         # Otherwise, NetworkX will silently re-create the deleted nodes.
         if source in G and target in G:
             # Copy all other key-value pairs as edge attributes
-            attributes = {k: v for k, v in edge.items() if k not in ['source', 'target']}
+            attributes = {
+                k: v for k, v in edge.items() if k not in ["source", "target"]
+            }
             G.add_edge(source, target, **attributes)
 
     return G
 
 
-@lru_cache(maxsize=8192)
-def read_file_text(source_file: str) -> Optional[str]:
+@functools.lru_cache(maxsize=8192)
+def read_file_text(source_file: str) -> str | None:
     """Read a source file's text exactly once and cache it in memory.
 
     Keys are the raw ``source_file`` strings found on graph nodes (absolute or
@@ -388,15 +402,15 @@ def read_file_text(source_file: str) -> Optional[str]:
     """
     path = (settings.app_path / Path(source_file)).resolve()
     if not path.exists():
-        logging.debug(f"read_file_text: skipping missing file '{path}'.")
+        logger.debug(f"read_file_text: skipping missing file '{path}'.")
         return None
     try:
         return path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
-        logging.debug(f"read_file_text: skipping binary file '{path}'.")
+        logger.debug(f"read_file_text: skipping binary file '{path}'.")
         return None
     except OSError as e:
-        logging.debug(f"read_file_text: skipping unreadable file '{path}': {e}")
+        logger.debug(f"read_file_text: skipping unreadable file '{path}': {e}")
         return None
 
 
@@ -438,9 +452,9 @@ def masked_source_for_parsing(source_text: str, file_path: str | Path | None) ->
     parts: list[str] = []
     pos = 0
     for m in _VUE_SCRIPT_RE.finditer(source_text):
-        parts.append(_blank(source_text[pos:m.start()]))
+        parts.append(_blank(source_text[pos : m.start()]))
         parts.append(_blank(m.group(1)))  # <script …> open tag
-        parts.append(m.group(2))          # script body, verbatim
+        parts.append(m.group(2))  # script body, verbatim
         parts.append(_blank(m.group(3)))  # </script> close tag
         pos = m.end()
     parts.append(_blank(source_text[pos:]))
@@ -448,7 +462,7 @@ def masked_source_for_parsing(source_text: str, file_path: str | Path | None) ->
 
 
 def iter_code_files():
-    """    Yield every unique, non-excluded source file whose graph nodes carry
+    """Yield every unique, non-excluded source file whose graph nodes carry
     ``file_type == "code"``, in first-seen order.
 
     Streaming: callers can scan the whole repo exactly once without
@@ -516,7 +530,7 @@ def find_unsupported_code_files(graph_data: dict) -> dict[str, list[str]]:
     return dict(unsupported)
 
 
-@lru_cache(maxsize=512)
+@functools.lru_cache(maxsize=512)
 def guard_map_for_node(node_id: str) -> dict[str, tuple[str, ...]]:
     """Map callee base names to their decision-guard usage contexts in a node's code.
 
@@ -556,12 +570,17 @@ def _name_base(name: str) -> str:
     by guard analysis.
     """
     return (
-        name.strip().rstrip("()").split("->")[-1].split("::")[-1]
-        .lstrip("$").lstrip(".").lower()
+        name.strip()
+        .rstrip("()")
+        .split("->")[-1]
+        .split("::")[-1]
+        .lstrip("$")
+        .lstrip(".")
+        .lower()
     )
 
 
-def _guard_annotation(source_node_id: Optional[str], target_base: str) -> str:
+def _guard_annotation(source_node_id: str | None, target_base: str) -> str:
     """Render the '(participates in: ...)' suffix for a connection.
 
     Looks up target_base among the guard usages found in source_node_id's code
@@ -609,11 +628,23 @@ def format_node_context(graph_data: dict, node_id: str) -> str:
     # Collect connections touching this node, resolved to neighbor labels.
     connections = []
     for arrow, edge in touched_links:
-        neighbor = node_map.get(edge.get("source") if arrow == "<--" else edge.get("target"))
+        neighbor = node_map.get(
+            edge.get("source") if arrow == "<--" else edge.get("target")
+        )
         default_label = edge.get("source") or edge.get("target")
-        neighbor_label = neighbor.get("label", default_label) if neighbor else default_label
+        neighbor_label = (
+            neighbor.get("label", default_label) if neighbor else default_label
+        )
         neighbor_id = edge.get("source") if arrow == "<--" else edge.get("target")
-        connections.append((arrow, neighbor_id, neighbor_label, edge.get("relation"), str(edge.get("source_location", ""))))
+        connections.append(
+            (
+                arrow,
+                neighbor_id,
+                neighbor_label,
+                edge.get("relation"),
+                str(edge.get("source_location", "")),
+            )
+        )
 
     # Stable ordering by source line number.
     connections.sort(key=lambda c: c[4])
@@ -638,14 +669,14 @@ def format_node_context(graph_data: dict, node_id: str) -> str:
     return "\n".join(lines)
 
 
-@lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=1)
 def get_cached_symbol_index(index_path: Path) -> list[dict]:
     """Caches the AST symbol index in memory to prevent disk I/O bottlenecks."""
     try:
         with open(index_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        logging.error(f"AST symbol index not found at '{index_path}'.")
+        logger.error(f"AST symbol index not found at '{index_path}'.")
         return []
 
 
@@ -663,7 +694,7 @@ def _merge_affected_nodes(target: dict, *sources: dict) -> None:
     target["affected_nodes"] = merged
 
 
-def reviewer_cache_key(report: Optional[dict], default: str = "Unknown") -> str:
+def reviewer_cache_key(report: dict | None, default: str = "Unknown") -> str:
     """Stable reviewer-cache key prefix derived from a report's affected nodes.
 
     The report content hash (which already includes `affected_nodes`) keeps
@@ -672,7 +703,7 @@ def reviewer_cache_key(report: Optional[dict], default: str = "Unknown") -> str:
     return "+".join(affected) if affected else default
 
 
-def is_feedback_review(report: Optional[dict]) -> bool:
+def is_feedback_review(report: dict | None) -> bool:
     """True when the report is a Validator->Reviewer feedback re-review or a
     Patcher->Reviewer patch-verification re-review rather than a first-pass
     hypothesis review.
@@ -737,7 +768,9 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
     for update in updates:
         # If it's a Pydantic model, convert to dict
         if not isinstance(update, dict):
-            update = update.model_dump() if hasattr(update, "model_dump") else dict(update)
+            update = (
+                update.model_dump() if hasattr(update, "model_dump") else dict(update)
+            )
 
         # --- OPERATOR RESET (one-shot scan-recovery escape hatch) ---
         # A record whose verdict was banked against a broken/unreachable sandbox
@@ -767,8 +800,16 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
             # re-reviewed it, the reviewer verdict must replace the flag unconditionally
             # (confirmed and review_error have LOWER priority than insufficient_context, so
             # the plain ladder would wrongly keep the flag).
-            re_review_statuses = {"confirmed", "false_positive", "exploitable", "review_error"}
-            if current_status == "insufficient_context" and new_status in re_review_statuses:
+            re_review_statuses = {
+                "confirmed",
+                "false_positive",
+                "exploitable",
+                "review_error",
+            }
+            if (
+                current_status == "insufficient_context"
+                and new_status in re_review_statuses
+            ):
                 _merge_affected_nodes(update, update, vuln_map[vid])
                 vuln_map[vid] = update
                 continue
@@ -804,7 +845,9 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
                 continue
 
             # --- STATUS UPGRADE: COMPLETELY REPLACE ---
-            if _STATUS_PRIORITY.get(new_status, 0) > _STATUS_PRIORITY.get(current_status, 0):
+            if _STATUS_PRIORITY.get(new_status, 0) > _STATUS_PRIORITY.get(
+                current_status, 0
+            ):
                 _merge_affected_nodes(update, update, vuln_map[vid])
                 vuln_map[vid] = update
 
@@ -814,7 +857,9 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
             # Exception: records from two DISTINCT known CVEs never text-merge,
             # even if their vuln_ids ever collide — each CVE is a canonical,
             # separately-fixed flaw, so only affected_nodes are unioned.
-            elif _STATUS_PRIORITY.get(new_status, 0) == _STATUS_PRIORITY.get(current_status, 0):
+            elif _STATUS_PRIORITY.get(new_status, 0) == _STATUS_PRIORITY.get(
+                current_status, 0
+            ):
                 current = vuln_map[vid]
                 distinct_cves = (
                     bool(current.get("source_cve"))
@@ -827,7 +872,9 @@ def merge_vulnerabilities(existing: list[dict], updates: list[dict]) -> list[dic
                     upd_desc = update.get("description", "")
 
                     if upd_desc and upd_desc not in curr_desc:
-                        current["description"] = f"{curr_desc}\n\nAdditional context: {upd_desc}"
+                        current["description"] = (
+                            f"{curr_desc}\n\nAdditional context: {upd_desc}"
+                        )
 
                 _merge_affected_nodes(current, current, update)
                 vuln_map[vid] = current
@@ -860,7 +907,11 @@ def estimate_message_tokens(messages: list[AnyMessage]) -> int:
         tool_calls = getattr(msg, "tool_calls", None)
         if tool_calls:
             for tc in tool_calls:
-                args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
+                args = (
+                    tc.get("args")
+                    if isinstance(tc, dict)
+                    else getattr(tc, "args", None)
+                )
                 if args:
                     total_chars += len(str(args))
     return int((total_chars / 2) * 1.15) + 8 * message_count
@@ -886,7 +937,7 @@ def _log_once(level: int, key: tuple, msg: str) -> bool:
         if key in _LOG_ONCE_SEEN:
             return False
         _LOG_ONCE_SEEN.add(key)
-    logging.log(level, msg)
+    logger.log(level, msg)
     return True
 
 
@@ -955,7 +1006,7 @@ def clear_feedback_dispatch_state() -> None:
         _DISPATCH_CLAIMED.clear()
 
 
-def sandbox_url_alive(sandbox_url: Optional[str], timeout: float = 5.0) -> bool:
+def sandbox_url_alive(sandbox_url: str | None, timeout: float = 5.0) -> bool:
     """False only when the sandbox URL is configured but answers no HTTP at all
     (refused/timeout — the crash-loop signature). Any HTTP status counts as
     alive: the port serving means the app stack is up (maintenance/error pages
@@ -970,7 +1021,7 @@ def sandbox_url_alive(sandbox_url: Optional[str], timeout: float = 5.0) -> bool:
         return False
 
 
-def ensure_sandbox_reachable(sandbox_url: Optional[str], phase: str) -> None:
+def ensure_sandbox_reachable(sandbox_url: str | None, phase: str) -> None:
     """Abort the scan loudly when a sandbox-consuming phase is about to fan out
     agents against a dead sandbox instead of burning LLM tokens (and caching
     garbage verdicts) on runs that can only observe an unreachable target.
@@ -998,10 +1049,8 @@ def _norm_node_label(label) -> str:
     """Match key shared by member labels (``.login()``), function labels
     (``login()``) and bare symbols coming from LLM notes."""
     l = str(label).strip().lower()
-    if l.startswith("."):
-        l = l[1:]
-    if l.endswith("()"):
-        l = l[:-2]
+    l = l.removeprefix(".")
+    l = l.removesuffix("()")
     return l
 
 
@@ -1083,9 +1132,11 @@ def _class_ids_for_hint(idx: dict, class_key: str) -> list:
     """Container ids a textual class/module hint points at (label or file stem)."""
     if not class_key:
         return []
-    return list(dict.fromkeys(
-        idx["class_by_label"].get(class_key, []) + idx["by_stem"].get(class_key, [])
-    ))
+    return list(
+        dict.fromkeys(
+            idx["class_by_label"].get(class_key, []) + idx["by_stem"].get(class_key, [])
+        )
+    )
 
 
 def _ancestor_closure(idx: dict, container_ids) -> list:
@@ -1238,7 +1289,7 @@ def resolve_node_id(module, symbol, caller_node_id=None):
     if "/" in symbol:
         symbol = symbol.split("/")[0].strip()
 
-    base_symbol = symbol[:-2] if symbol.endswith("()") else symbol
+    base_symbol = symbol.removesuffix("()")
     # Extract Class/Method from Symbol (e.g., "User::dropdown" -> "User", "dropdown")
     class_name = ""
     if "::" in base_symbol:
@@ -1265,18 +1316,25 @@ def resolve_node_id(module, symbol, caller_node_id=None):
             file_match = True
             if base_module_name:
                 file_match = (
-                    base_module_name in lower_file or
-                    normalized_module in lower_file
+                    base_module_name in lower_file or normalized_module in lower_file
                 )
             elif lower_class:
-                file_match = (lower_class in lower_file or lower_class in label)
+                file_match = lower_class in lower_file or lower_class in label
             if not file_match:
                 continue
             if (
-                label == lower_symbol or label == lower_symbol_paren
-                or label.endswith(f"::{lower_symbol}") or label.endswith(f"::{lower_symbol_paren}")
-                or label.endswith(f"->{lower_symbol}") or label.endswith(f"->{lower_symbol_paren}")
-                or label.endswith(f".{lower_symbol}") or label.endswith(f".{lower_symbol_paren}")
+                label == lower_symbol
+                or label == lower_symbol_paren
+                or label.endswith(
+                    (
+                        f"::{lower_symbol}",
+                        f"::{lower_symbol_paren}",
+                        f"->{lower_symbol}",
+                        f"->{lower_symbol_paren}",
+                        f".{lower_symbol}",
+                        f".{lower_symbol_paren}",
+                    )
+                )
             ):
                 strict_hit = nid
                 break
@@ -1288,7 +1346,9 @@ def resolve_node_id(module, symbol, caller_node_id=None):
             return strict_hit or loose_hit, ""
         # The hint may name a class that INHERITS the method (defined on a
         # grand- or great-grandparent): walk the class closure before failing.
-        mid = _inherited_member(idx, lower_class or base_module_name, lower_symbol_member)
+        mid = _inherited_member(
+            idx, lower_class or base_module_name, lower_symbol_member
+        )
         if mid:
             _record_stat("demand_nodes_resolved_fallback")
             return mid, ""
@@ -1299,7 +1359,9 @@ def resolve_node_id(module, symbol, caller_node_id=None):
         # caller's container before failing.
         if caller_node_id and (caller_cls := _caller_container(idx, caller_node_id)):
             ancestor_ids = _ancestor_closure(idx, [caller_cls])
-            if set(_class_ids_for_hint(idx, lower_class or base_module_name)) & set(ancestor_ids):
+            if set(_class_ids_for_hint(idx, lower_class or base_module_name)) & set(
+                ancestor_ids
+            ):
                 for cid in (caller_cls, *ancestor_ids):
                     mid = idx["members"].get(cid, {}).get(lower_symbol_member)
                     if mid:
@@ -1316,7 +1378,8 @@ def resolve_node_id(module, symbol, caller_node_id=None):
             _record_stat("demand_nodes_resolved_fallback")
             return hits[0], ""
         fn_style = [
-            nid for nid in hits
+            nid
+            for nid in hits
             if idx["labels"][nid] in (lower_symbol, lower_symbol_paren)
         ]
         if len(fn_style) == 1:
@@ -1325,8 +1388,10 @@ def resolve_node_id(module, symbol, caller_node_id=None):
         if hits:
             return None, (
                 "global-ambiguous",
-                f"{len(hits)} exact-label nodes ({len(fn_style)} function-style): "
-                f"ambiguous, refusing to guess the class",
+                (
+                    f"{len(hits)} exact-label nodes ({len(fn_style)} function-style): "
+                    f"ambiguous, refusing to guess the class"
+                ),
             )
         return None, ("global-none", "no exact-label node in the graph")
 
@@ -1337,13 +1402,17 @@ def resolve_node_id(module, symbol, caller_node_id=None):
     if _class_ids_for_hint(idx, lower_class or base_module_name):
         return None, (
             "method-absent",
-            f"class '{lower_class or base_module_name}' is in the graph but has no "
-            f"'{lower_symbol}' member of its own or inherited",
+            (
+                f"class '{lower_class or base_module_name}' is in the graph but has no "
+                f"'{lower_symbol}' member of its own or inherited"
+            ),
         )
     return None, (
         "class-absent",
-        f"no class/module '{lower_class or base_module_name}' exists in the graph "
-        f"(vendor code, external library, or hallucinated receiver)",
+        (
+            f"no class/module '{lower_class or base_module_name}' exists in the graph "
+            f"(vendor code, external library, or hallucinated receiver)"
+        ),
     )
 
 
@@ -1351,16 +1420,16 @@ def _run_osv(cmd: list, label: str, skip_os: bool = False) -> list | None:
     """Run an osv-scanner command and collect raw vulnerability records.
 
     Exit code 1 = "vulnerabilities found": stdout is still valid. Returns None
-    when the scan FAILED (missing binary, unparseable output, stderr-only
+    when the scan FAILED (missing binary, unparsable output, stderr-only
     error) — never cache a failed result; an empty successful scan is a plain
     []. ``skip_os`` drops OS-package results (image scans)."""
     raw_vulnerabilities = []
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
 
         if not result.stdout.strip():
             if result.stderr:
-                logging.error(f"Error running osv-scanner on {label}: {result.stderr}")
+                logger.error(f"Error running osv-scanner on {label}: {result.stderr}")
                 return None
             return []
 
@@ -1369,16 +1438,16 @@ def _run_osv(cmd: list, label: str, skip_os: bool = False) -> list | None:
         # Extract the vulnerability objects from the osv-scanner JSON schema
         for scan_result in data.get("results", []):
             if skip_os and scan_result.get("source", {}).get("type") == "os":
-                logging.debug("Skipping OS-package vulnerabilities from image scan.")
+                logger.debug("Skipping OS-package vulnerabilities from image scan.")
                 continue
             for package in scan_result.get("packages", []):
                 raw_vulnerabilities.extend(package.get("vulnerabilities", []))
 
     except FileNotFoundError:
-        logging.error("osv-scanner is not installed or not in PATH.")
+        logger.error("osv-scanner is not installed or not in PATH.")
         return None
     except json.JSONDecodeError:
-        logging.error("Could not parse osv-scanner output.")
+        logger.error("Could not parse osv-scanner output.")
         return None
 
     return raw_vulnerabilities
@@ -1400,13 +1469,13 @@ def _osv_cached_scan(label: str, key: str, run_scan) -> list[dict]:
             age_sec = time.time() - float(data.get("scanned_at", 0))
             if 0 <= age_sec < max_age_sec:
                 vulns = data.get("vulns", [])
-                logging.info(
+                logger.info(
                     f"Reusing cached SCA results for {label}: {len(vulns)} vuln(s), "
                     f"{age_sec / 3600:.1f} h old."
                 )
                 return vulns
         except (OSError, ValueError, TypeError):
-            logging.warning(f"Unusable osv-scanner cache file {path}; re-scanning.")
+            logger.warning(f"Unusable osv-scanner cache file {path}; re-scanning.")
 
     vulns = run_scan()
     if vulns is None:
@@ -1419,25 +1488,39 @@ def _osv_cached_scan(label: str, key: str, run_scan) -> list[dict]:
                 encoding="utf-8",
             )
         except OSError as e:
-            logging.warning(f"Failed to write osv-scanner cache {path}: {e}")
+            logger.warning(f"Failed to write osv-scanner cache {path}: {e}")
     return vulns
 
 
 def run_osv_scanner(repo_path: Path) -> list[dict]:
     """Runs osv-scanner on a directory and extracts raw vulnerability records."""
     if not repo_path.exists():
-        logging.error(f"Input report does not exist: {repo_path}")
+        logger.error(f"Input report does not exist: {repo_path}")
         return []
     return _osv_cached_scan(
         f"repo '{repo_path}'",
         f"repo::{repo_path.resolve()}",
-        lambda: _run_osv(["osv-scanner", "-r", "--format", "json", repo_path], str(repo_path)),
+        lambda: _run_osv(
+            ["osv-scanner", "-r", "--format", "json", repo_path], str(repo_path)
+        ),
     )
 
 
-COMPOSE_FILENAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
+COMPOSE_FILENAMES = (
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+)
 DOCKERFILE_NAMES = ("Dockerfile",)
-_BUILD_IGNORED_DIRS = {".git", "node_modules", "vendor", ".cache", ".next", "graphify-out"}
+_BUILD_IGNORED_DIRS = {
+    ".git",
+    "node_modules",
+    "vendor",
+    ".cache",
+    ".next",
+    "graphify-out",
+}
 
 
 def _is_build_ignored(path: Path) -> bool:
@@ -1451,23 +1534,30 @@ def find_container_builds(app_path: Path) -> list[tuple[str, Path]]:
     ``(kind, path)`` tuples where kind is ``"compose"`` or ``"dockerfile"``.
     """
     compose = sorted(
-        p for p in app_path.rglob("*")
+        p
+        for p in app_path.rglob("*")
         if p.is_file() and p.name in COMPOSE_FILENAMES and not _is_build_ignored(p)
     )
     if compose:
         return [("compose", compose[0])]
 
     dockerfiles = sorted(
-        p for p in app_path.rglob("*")
+        p
+        for p in app_path.rglob("*")
         if p.is_file()
-        and (p.name in DOCKERFILE_NAMES or p.name.startswith("Dockerfile.") or p.name.endswith(".dockerfile"))
+        and (
+            p.name in DOCKERFILE_NAMES
+            or p.name.startswith("Dockerfile.")
+            or p.name.endswith(".dockerfile")
+        )
         and not _is_build_ignored(p)
     )
     return [("dockerfile", d) for d in dockerfiles]
 
 
-def _docker(*args: str, timeout: int | None = None,
-            stream: bool = False) -> subprocess.CompletedProcess | None:
+def _docker(
+    *args: str, timeout: int | None = None, stream: bool = False
+) -> subprocess.CompletedProcess | None:
     """Run a docker CLI command; returns the CompletedProcess, or None (with a
     logged error) when the docker binary is missing.
 
@@ -1485,16 +1575,18 @@ def _docker(*args: str, timeout: int | None = None,
                 line = line.rstrip()
                 if line:
                     tail.append(line)
-                    logging.info("[docker %s] %s", args[0], line[:200])
+                    logger.info("[docker %s] %s", args[0], line[:200])
             try:
                 rc = proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 raise
             return subprocess.CompletedProcess(cmd, rc, "", "\n".join(tail))
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=timeout
+        )
     except FileNotFoundError:
-        logging.error("docker is not installed or not in PATH.")
+        logger.error("docker is not installed or not in PATH.")
         return None
 
 
@@ -1520,7 +1612,7 @@ def _image_content_id(image: str) -> str | None:
 
 def _parse_docker_time(value: str) -> float | None:
     """Parse a docker RFC3339 timestamp (Go prints nanosecond fractions and a
-    trailing Z) into an epoch float; None when unparseable."""
+    trailing Z) into an epoch float; None when unparsable."""
     value = value.strip()
     if not value:
         return None
@@ -1538,7 +1630,9 @@ def _parse_docker_time(value: str) -> float | None:
     return dt.timestamp()
 
 
-def _images_newer_than_definitions(images: list[str], definition_files: list[Path]) -> bool:
+def _images_newer_than_definitions(
+    images: list[str], definition_files: list[Path]
+) -> bool:
     """True when every image was created after ALL build-definition files were
     last modified (so the images provably reflect the current definitions)."""
     try:
@@ -1562,7 +1656,9 @@ def _build_definition_files(kind: str, path: Path) -> list[Path]:
         # build context bust the reuse check too.
         files.extend(
             candidate
-            for candidate in sorted(p for p in path.parent.rglob("Dockerfile*") if p.is_file())
+            for candidate in sorted(
+                p for p in path.parent.rglob("Dockerfile*") if p.is_file()
+            )
             if not _is_build_ignored(candidate)
         )
     return files
@@ -1604,16 +1700,18 @@ def _record_build_hash(kind: str, path: Path) -> None:
 
 def _compose_config(path: Path) -> dict | None:
     """Parsed `docker compose config --format json` output, or None on failure."""
-    result = _docker("compose", "-f", str(path), "config", "--format", "json", timeout=120)
+    result = _docker(
+        "compose", "-f", str(path), "config", "--format", "json", timeout=120
+    )
     if result is None:
         return None
     if result.returncode != 0:
-        logging.error(f"docker compose config failed: {result.stderr}")
+        logger.error(f"docker compose config failed: {result.stderr}")
         return None
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError:
-        logging.error("docker compose config returned unparseable JSON.")
+        logger.error("docker compose config returned unparsable JSON.")
         return None
 
 
@@ -1635,7 +1733,7 @@ def _compose_images(path: Path) -> list[str]:
         if svc.get("image")
     ]
     if not images:
-        logging.error("docker compose config returned no images.")
+        logger.error("docker compose config returned no images.")
     return sorted(images)
 
 
@@ -1647,7 +1745,9 @@ def _compose_built_refs(path: Path) -> set[str] | None:
     data = _compose_config(path)
     if data is None:
         return None
-    project = re.sub(r"[^a-z0-9-]+", "-", (data.get("name") or path.parent.name).lower())
+    project = re.sub(
+        r"[^a-z0-9-]+", "-", (data.get("name") or path.parent.name).lower()
+    )
     refs = set()
     for svc_name, svc in (data.get("services") or {}).items():
         if not svc.get("build"):
@@ -1660,10 +1760,12 @@ def _compose_built_refs(path: Path) -> set[str] | None:
 def _built_images_match_definitions(kind: str, images: list[str], path: Path) -> bool:
     """Stamp-less reuse test: the image(s) compose actually BUILDS must postdate
     every definition file. Pull-only services are exempt (no local definition;
-    their upstream build date says nothing about this repo). An unparseable
+    their upstream build date says nothing about this repo). An unparsable
     config or a built ref missing from ``images`` stays conservative (rebuild)."""
     if kind != "compose":
-        return _images_newer_than_definitions(images, _build_definition_files(kind, path))
+        return _images_newer_than_definitions(
+            images, _build_definition_files(kind, path)
+        )
     built = _compose_built_refs(path)
     if built is None:
         return False
@@ -1671,7 +1773,9 @@ def _built_images_match_definitions(kind: str, images: list[str], path: Path) ->
     # A built ref missing from `images` (config drift) or unreadable definition
     # files keeps it conservative (rebuild); an empty pull-only set passes, as
     # there is nothing local to compare against.
-    return len(to_check) == len(built) and _images_newer_than_definitions(to_check, _build_definition_files(kind, path))
+    return len(to_check) == len(built) and _images_newer_than_definitions(
+        to_check, _build_definition_files(kind, path)
+    )
 
 
 def build_images(kind: str, path: Path, tag: str, force: bool = False) -> list[str]:
@@ -1697,27 +1801,29 @@ def build_images(kind: str, path: Path, tag: str, force: bool = False) -> list[s
         if missing:
             reason = f"missing locally: {', '.join(missing)}"
         elif _build_definition_unchanged(kind, path):
-            logging.info(f"Reusing existing image(s) {images} (build definition unchanged).")
+            logger.info(
+                f"Reusing existing image(s) {images} (build definition unchanged)."
+            )
             return images
         elif _build_hash_file(path).exists():
             reason = "build definition changed since the last recorded build"
         elif _built_images_match_definitions(kind, images, path):
-            logging.info(
+            logger.info(
                 f"Reusing existing image(s) {images}: no build stamp in this cache, but the "
                 "image(s) are newer than every build-definition file."
             )
             _record_build_hash(kind, path)
             return images
         else:
-            reason = ("no build stamp and image(s) predate the build-definition files")
+            reason = "no build stamp and image(s) predate the build-definition files"
 
-    logging.info(f"Rebuilding container image(s): {reason}.")
+    logger.info(f"Rebuilding container image(s): {reason}.")
     if kind == "compose":
         build = _docker("compose", "-f", str(path), "build", stream=True)
         if build is None:
             return []
         if build.returncode != 0:
-            logging.error(f"docker compose build failed: {build.stderr}")
+            logger.error(f"docker compose build failed: {build.stderr}")
             return []
         _record_build_hash(kind, path)
         return _compose_images(path)
@@ -1727,7 +1833,7 @@ def build_images(kind: str, path: Path, tag: str, force: bool = False) -> list[s
     if build is None:
         return []
     if build.returncode != 0:
-        logging.error(f"docker build failed: {build.stderr}")
+        logger.error(f"docker build failed: {build.stderr}")
         return []
     _record_build_hash(kind, path)
     return [tag]
@@ -1763,12 +1869,15 @@ def docker_bridge_gateway() -> str | None:
     resolved, so callers can fall back to ``127.0.0.1``."""
     try:
         r = _docker(
-            "network", "inspect", "bridge",
-            "--format", "{{(index .IPAM.Config 0).Gateway}}",
+            "network",
+            "inspect",
+            "bridge",
+            "--format",
+            "{{(index .IPAM.Config 0).Gateway}}",
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
-        logging.warning("Failed to resolve bridge gateway: %s", e)
+        logger.warning("Failed to resolve bridge gateway: %s", e)
         return None
     if r is None or r.returncode != 0:
         return None
@@ -1825,7 +1934,7 @@ def _remove_stale_compose_containers(path: Path) -> None:
     if result is None:
         return
     if result.returncode != 0:
-        logging.warning(f"docker compose config failed: {result.stderr}")
+        logger.warning(f"docker compose config failed: {result.stderr}")
         return
     try:
         data = json.loads(result.stdout)
@@ -1838,10 +1947,12 @@ def _remove_stale_compose_containers(path: Path) -> None:
             continue
         rm = _docker("rm", "-f", name)
         if rm is not None and rm.returncode == 0:
-            logging.info(f"Removed stale container '{name}' before compose up.")
+            logger.info(f"Removed stale container '{name}' before compose up.")
 
 
-def start_sandbox(kind: str, path: Path, tag: str, app_name: str, force_recreate: bool = False) -> dict | None:
+def start_sandbox(
+    kind: str, path: Path, tag: str, app_name: str, force_recreate: bool = False
+) -> dict | None:
     """Start the built container image(s) in the background and return runtime data.
 
     Detaches the container(s) (compose: ``up -d``; Dockerfile: ``docker run -d -P``),
@@ -1862,7 +1973,7 @@ def start_sandbox(kind: str, path: Path, tag: str, app_name: str, force_recreate
         # by leftover containers from another compose project (e.g. a prior
         # run of this scanner on the same app, or a different checkout).
         # Compose refuses to reuse a name owned by a differently-labelled
-        # container, so pre-emptively remove anything holding those names.
+        # container, so preemptively remove anything holding those names.
         # These are throwaway scanner sandboxes - never a production service.
         _remove_stale_compose_containers(path)
         up_args = ["compose", "-f", str(path), "up", "-d"]
@@ -1872,14 +1983,14 @@ def start_sandbox(kind: str, path: Path, tag: str, app_name: str, force_recreate
         if up is None:
             return None
         if up.returncode != 0:
-            logging.error(f"docker compose up failed: {up.stderr}")
+            logger.error(f"docker compose up failed: {up.stderr}")
             return None
 
         ps = _docker("compose", "-f", str(path), "ps", "--format", "json")
         if ps is None:
             return None
         if ps.returncode != 0:
-            logging.error(f"docker compose ps failed: {ps.stderr}")
+            logger.error(f"docker compose ps failed: {ps.stderr}")
             return None
 
         containers = []
@@ -1894,7 +2005,7 @@ def start_sandbox(kind: str, path: Path, tag: str, app_name: str, force_recreate
                 continue
         containers = [c for c in containers if c]
         if not containers:
-            logging.error("docker compose up started no running containers.")
+            logger.error("docker compose up started no running containers.")
             return None
     else:
         name = f"vulnscan-{app_name}"
@@ -1904,7 +2015,7 @@ def start_sandbox(kind: str, path: Path, tag: str, app_name: str, force_recreate
         if run is None:
             return None
         if run.returncode != 0:
-            logging.error(f"docker run failed: {run.stderr}")
+            logger.error(f"docker run failed: {run.stderr}")
             return None
         containers = [name]
 
@@ -1913,10 +2024,10 @@ def start_sandbox(kind: str, path: Path, tag: str, app_name: str, force_recreate
         port = _probe_http_ports(_published_ports(container))
         if port:
             url = _sandbox_url_for_port(port)
-            logging.info(f"Sandbox running: container={container} url={url}")
+            logger.info(f"Sandbox running: container={container} url={url}")
             return {"container_name": container, "sandbox_url": url}
 
-    logging.warning(
+    logger.warning(
         "Sandbox container(s) started but none published a responsive HTTP port "
         f"({containers}). Validator tools will report no sandbox configured."
     )
@@ -1927,21 +2038,33 @@ SANDBOX_RESTART_TIMEOUT = 120  # seconds allowed for one `docker restart` of the
 # Filesystem roots probed when mapping an app-relative path into the sandbox
 # container for a docker-cp resync (the container WORKDIR is tried first).
 _SANDBOX_APP_ROOTS = (
-    "/var/www", "/var/www/html", "/app", "/srv", "/opt", "/usr/share",
-    "/code", "/workspace",
+    "/var/www",
+    "/var/www/html",
+    "/app",
+    "/srv",
+    "/opt",
+    "/usr/share",
+    "/code",
+    "/workspace",
 )
 
 
 def _container_running(container: str) -> bool:
     result = _docker("inspect", "-f", "{{.State.Running}}", container, timeout=30)
-    return result is not None and result.returncode == 0 and result.stdout.strip() == "true"
+    return (
+        result is not None
+        and result.returncode == 0
+        and result.stdout.strip() == "true"
+    )
 
 
 def _container_app_roots(container: str) -> list[str]:
     """Candidate deployment roots inside the sandbox container, WORKDIR first,
     filtered to the ones that actually exist."""
     roots: list[str] = []
-    result = _docker("inspect", "-f", "{{.Config.WorkingDirectory}}", container, timeout=30)
+    result = _docker(
+        "inspect", "-f", "{{.Config.WorkingDirectory}}", container, timeout=30
+    )
     if result is not None and result.returncode == 0:
         wd = result.stdout.strip()
         if wd and wd != "/":
@@ -1973,7 +2096,9 @@ def _container_find_target(container: str, rel_path: str) -> str | None:
     return None
 
 
-def _cp_patched_into_container(container: str, patched_files: list[str]) -> tuple[int, list[str]]:
+def _cp_patched_into_container(
+    container: str, patched_files: list[str]
+) -> tuple[int, list[str]]:
     """Best-effort docker-cp of patched app-relative files into the running
     sandbox container. Returns (copied, unresolved): anything whose container
     path cannot be verified BEFORE the copy (the pre-patch file must exist at
@@ -2004,7 +2129,7 @@ def _cp_patched_into_container(container: str, patched_files: list[str]) -> tupl
         if ok is None or ok.returncode != 0:
             unresolved.append(rel_norm)
             continue
-        logging.info(f"Patcher resync: docker cp {rel_norm} -> {container}:{target}")
+        logger.info(f"Patcher resync: docker cp {rel_norm} -> {container}:{target}")
         copied += 1
     return copied, unresolved
 
@@ -2034,7 +2159,9 @@ def resync_sandbox(patched_files: list[str], sandbox_container: str | None) -> d
     new_url = None
     container = sandbox_container
 
-    target = None  # (kind, build_file) of the last buildable definition (sandbox target)
+    target = (
+        None  # (kind, build_file) of the last buildable definition (sandbox target)
+    )
     for kind, build_file in find_container_builds(settings.app_path):
         if kind == "dockerfile" or _compose_built_refs(build_file):
             target = (kind, build_file)
@@ -2048,12 +2175,12 @@ def resync_sandbox(patched_files: list[str], sandbox_container: str | None) -> d
                 new_url = sandbox_data["sandbox_url"]
                 container = sandbox_data["container_name"]
             else:
-                logging.warning(
+                logger.warning(
                     "Patcher resync: image(s) rebuilt but the sandbox failed to "
                     "restart; the validator will re-test the old container."
                 )
         else:
-            logging.warning("Patcher resync: forced image rebuild failed.")
+            logger.warning("Patcher resync: forced image rebuild failed.")
 
     copied, unresolved = 0, []
     # A Tier-1 rebuild already shipped the patched files through the image
@@ -2063,15 +2190,19 @@ def resync_sandbox(patched_files: list[str], sandbox_container: str | None) -> d
         if container and _container_running(container):
             copied, unresolved = _cp_patched_into_container(container, patched_files)
             if copied:
-                restart = _docker("restart", "-t", "10", container, timeout=SANDBOX_RESTART_TIMEOUT)
+                restart = _docker(
+                    "restart", "-t", "10", container, timeout=SANDBOX_RESTART_TIMEOUT
+                )
                 restarted = restart is not None and restart.returncode == 0
                 if not restarted:
-                    logging.warning(
+                    logger.warning(
                         f"Patcher resync: docker restart of {container} failed; "
                         "long-lived runtimes may still serve the pre-patch code."
                     )
                 note = f"copied {copied} patched file(s) into {container}"
-                note += " and restarted it" if restarted else " (container restart FAILED)"
+                note += (
+                    " and restarted it" if restarted else " (container restart FAILED)"
+                )
             else:
                 note = f"no patched file could be mapped into {container}"
         else:
@@ -2081,10 +2212,14 @@ def resync_sandbox(patched_files: list[str], sandbox_container: str | None) -> d
         if rebuilt:
             note = "rebuilt image; " + note
     else:
-        note = "rebuilt image" if rebuilt else (
-            "skipped: sandbox image is stock (not built from this repo) and "
-            "no patched file was ready to copy; the dynamic re-test runs on the "
-            "pre-patch build"
+        note = (
+            "rebuilt image"
+            if rebuilt
+            else (
+                "skipped: sandbox image is stock (not built from this repo) and "
+                "no patched file was ready to copy; the dynamic re-test runs on the "
+                "pre-patch build"
+            )
         )
 
     if rebuilt and container:
@@ -2093,11 +2228,11 @@ def resync_sandbox(patched_files: list[str], sandbox_container: str | None) -> d
         if port:
             new_url = _sandbox_url_for_port(port)
         else:
-            logging.warning(
+            logger.warning(
                 "Patcher resync: rebuilt sandbox publishes no responsive HTTP "
                 "port; keeping the previous sandbox_url."
             )
-    logging.info(f"Patcher resync: {note}")
+    logger.info(f"Patcher resync: {note}")
     return {
         "note": note,
         "sandbox_url": new_url,
@@ -2132,10 +2267,10 @@ def run_osv_scanner_image(image: str) -> list[dict]:
 # filesystem index plus image metadata are written for the reviewer tools.
 
 # Size/count guards that keep the extracted artifacts directory small.
-ARTIFACT_MAX_FILE_BYTES = 512 * 1024      # per extracted file
+ARTIFACT_MAX_FILE_BYTES = 512 * 1024  # per extracted file
 ARTIFACT_MAX_TOTAL_BYTES = 20 * 1024 * 1024  # total across one image
-ARTIFACT_MAX_FILES = 300                  # max extracted files per image
-ARTIFACT_MAX_INDEX_ENTRIES = 100_000      # max lines in filesystem_index.txt per image
+ARTIFACT_MAX_FILES = 300  # max extracted files per image
+ARTIFACT_MAX_INDEX_ENTRIES = 100_000  # max lines in filesystem_index.txt per image
 
 # Catch-all pass: alongside the curated patterns we also pull small, text-like
 # files under the app's WORKDIR that the patterns missed (e.g. an arbitrary
@@ -2145,17 +2280,52 @@ ARTIFACT_MAX_INDEX_ENTRIES = 100_000      # max lines in filesystem_index.txt pe
 # sees the repo via the graph and read_file), as are dependency install trees.
 ARTIFACT_CATCHALL_MAX_BYTES = 256 * 1024
 _ARTIFACT_SOURCE_EXTS = tuple(sorted(set(LANGUAGE_MAP)))
-_ARTIFACT_BINARY_EXTS = (".so", ".o", ".a", ".bin", ".class", ".jar", ".woff",
-                         ".ttf", ".png", ".jpg", ".jpeg", ".gif", ".ico",
-                         ".webp", ".pdf", ".gz", ".xz", ".zip", ".whl", ".tgz",
-                         ".tar")
+_ARTIFACT_BINARY_EXTS = (
+    ".so",
+    ".o",
+    ".a",
+    ".bin",
+    ".class",
+    ".jar",
+    ".woff",
+    ".ttf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".webp",
+    ".pdf",
+    ".gz",
+    ".xz",
+    ".zip",
+    ".whl",
+    ".tgz",
+    ".tar",
+)
 # Pure build-noise files/extensions that are neither config nor source and
 # would flood the artifacts (framework build output: maps, RSC payloads,
 # bundled media, generated manifests deep in framework internals).
-_ARTIFACT_CATCHALL_NOISE_EXTS = (".map", ".rsc", ".meta", ".html", ".htm",
-                                 ".css", ".svg", ".nft.json", ".trace")
-_ARTIFACT_CATCHALL_NOISE_DIRS = ("/.next/", "/build/", "/server/", "/static/",
-                                 "/cache/", "/diagnostics/", "/media/")
+_ARTIFACT_CATCHALL_NOISE_EXTS = (
+    ".map",
+    ".rsc",
+    ".meta",
+    ".html",
+    ".htm",
+    ".css",
+    ".svg",
+    ".nft.json",
+    ".trace",
+)
+_ARTIFACT_CATCHALL_NOISE_DIRS = (
+    "/.next/",
+    "/build/",
+    "/server/",
+    "/static/",
+    "/cache/",
+    "/diagnostics/",
+    "/media/",
+)
 
 # Regexes matched (case-insensitive) against the FULL path inside the container.
 # These deliberately capture security-relevant configuration, entrypoints, and
@@ -2198,7 +2368,9 @@ ARTIFACT_PATTERNS = [
     r"(^|/)etc/[^/]*\.(conf|ini|cfg|ya?ml|yml|toml|json)$",
 ]
 
-_ARTIFACT_RE = re.compile("|".join(f"(?:{p})" for p in ARTIFACT_PATTERNS), re.IGNORECASE)
+_ARTIFACT_RE = re.compile(
+    "|".join(f"(?:{p})" for p in ARTIFACT_PATTERNS), re.IGNORECASE
+)
 
 # Paths inside these directories are never extracted: dependency install trees
 # (already handled by the SCA layer) and VCS metadata are pure noise.
@@ -2207,7 +2379,11 @@ _ARTIFACT_EXCLUDED_DIRS = ("node_modules", "vendor", ".git")
 
 def _slugify_image(image: str) -> str:
     """Turn a docker image reference into a safe directory name."""
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", image.split("@")[0].replace("/", "_").replace(":", "_"))
+    return re.sub(
+        r"[^A-Za-z0-9_.-]+",
+        "_",
+        image.split("@")[0].replace("/", "_").replace(":", "_"),
+    )
 
 
 def _docker_image_metadata(image: str) -> dict:
@@ -2219,17 +2395,28 @@ def _docker_image_metadata(image: str) -> dict:
             ["docker", "inspect", image],
             capture_output=True,
             text=True,
+            check=False,
             timeout=60,
         )
         if result.returncode != 0 or not result.stdout.strip():
-            logging.warning(f"docker inspect failed for '{image}': {result.stderr.strip()}")
+            logger.warning(
+                f"docker inspect failed for '{image}': {result.stderr.strip()}"
+            )
             return {}
         data = json.loads(result.stdout)
         config = (data or [{}])[0].get("Config", {})
-        keys = ["Env", "WorkingDir", "Entrypoint", "Cmd", "ExposedPorts", "User", "Labels"]
+        keys = [
+            "Env",
+            "WorkingDir",
+            "Entrypoint",
+            "Cmd",
+            "ExposedPorts",
+            "User",
+            "Labels",
+        ]
         return {k: config.get(k) for k in keys if config.get(k) is not None}
     except (json.JSONDecodeError, subprocess.SubprocessError, TimeoutError) as e:
-        logging.warning(f"Failed to inspect image '{image}': {e}")
+        logger.warning(f"Failed to inspect image '{image}': {e}")
         return {}
 
 
@@ -2320,7 +2507,7 @@ def extract_container_artifacts(images: list[str]) -> dict:
     current_slugs = {info["slug"] for info in summary.values()}
     for existing in artifacts_root.glob("*"):
         if existing.is_dir() and existing.name not in current_slugs:
-            logging.info(f"Removing stale artifact snapshot '{existing.name}'.")
+            logger.info(f"Removing stale artifact snapshot '{existing.name}'.")
             shutil.rmtree(existing)
 
     return summary
@@ -2336,30 +2523,41 @@ def _extract_image_artifacts(image: str) -> dict | None:
 
     if image_id and (image_dir / "filesystem_index.txt").exists():
         try:
-            previous = json.loads((image_dir / "extraction_summary.json").read_text(encoding="utf-8"))
+            previous = json.loads(
+                (image_dir / "extraction_summary.json").read_text(encoding="utf-8")
+            )
         except (OSError, ValueError):
             previous = {}
         if previous.get("image_id") == image_id:
-            logging.info(f"Container artifacts for '{image}' unchanged (image id {image_id[:19]}...); reusing snapshot.")
+            logger.info(
+                f"Container artifacts for '{image}' unchanged (image id {image_id[:19]}...); reusing snapshot."
+            )
             return {"slug": slug, "dir": str(image_dir)}
 
     try:
         # Remove any stale snapshot from a previous run so it always
         # reflects the current build.
-        subprocess.run(["docker", "rm", "-f", slug], capture_output=True, text=True)
+        subprocess.run(
+            ["docker", "rm", "-f", slug], capture_output=True, text=True, check=False
+        )
     except FileNotFoundError:
-        logging.warning("docker is not installed or not in PATH. Skipping container artifact extraction.")
+        logger.warning(
+            "docker is not installed or not in PATH. Skipping container artifact extraction."
+        )
         raise  # propagates through pool.map: the caller aborts the whole snapshot stage
-    except Exception as e:
-        logging.warning(f"Failed to remove stale container '{slug}': {e}")
+    except OSError as e:
+        logger.warning(f"Failed to remove stale container '{slug}': {e}")
 
     create = subprocess.run(
         ["docker", "create", "--name", slug, image],
         capture_output=True,
         text=True,
+        check=False,
     )
     if create.returncode != 0:
-        logging.warning(f"docker create failed for image '{image}': {create.stderr.strip()}")
+        logger.warning(
+            f"docker create failed for image '{image}': {create.stderr.strip()}"
+        )
         return None
 
     try:
@@ -2370,22 +2568,31 @@ def _extract_image_artifacts(image: str) -> dict | None:
         if metadata:
             with open(image_dir / "image_metadata.json", "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2)
-        logging.info(
+        logger.info(
             f"Container artifacts for '{image}' written to {image_dir} "
             f"(metadata keys: {sorted(metadata.keys())})."
         )
     finally:
         try:
-            subprocess.run(["docker", "rm", "-f", slug], capture_output=True, text=True)
-        except Exception:
+            subprocess.run(
+                ["docker", "rm", "-f", slug],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:  # noqa: BLE001, S110
             pass
 
     return {"slug": slug, "dir": str(image_dir)}
 
 
-def _extract_container_export(cid: str, image_dir: Path, rootfs_dir: Path,
-                             workdir: str | None = None,
-                             image_id: str | None = None) -> dict:
+def _extract_container_export(
+    cid: str,
+    image_dir: Path,
+    rootfs_dir: Path,
+    workdir: str | None = None,
+    image_id: str | None = None,
+) -> dict:
     """Stream `docker export <cid>` and write extracted files + fs index.
 
     ``workdir`` enables the catch-all pass for small text config files under the
@@ -2407,10 +2614,10 @@ def _extract_container_export(cid: str, image_dir: Path, rootfs_dir: Path,
             stderr=subprocess.PIPE,
         )
     except FileNotFoundError:
-        logging.warning("docker is not installed or not in PATH.")
+        logger.warning("docker is not installed or not in PATH.")
         return {"extracted": 0, "skipped": []}
-    except Exception as e:
-        logging.warning(f"Failed to export container '{cid}': {e}")
+    except OSError as e:
+        logger.warning(f"Failed to export container '{cid}': {e}")
         return {"extracted": 0, "skipped": []}
 
     try:
@@ -2473,21 +2680,21 @@ def _extract_container_export(cid: str, image_dir: Path, rootfs_dir: Path,
                     total_bytes += member.size
                 except (OSError, EOFError, tarfile.TarError) as e:
                     skipped.append(path)
-                    logging.debug(f"Failed to extract '{path}': {e}")
+                    logger.debug(f"Failed to extract '{path}': {e}")
     except (tarfile.TarError, OSError) as e:
-        logging.warning(f"Failed to stream export of container '{cid}': {e}")
+        logger.warning(f"Failed to stream export of container '{cid}': {e}")
     finally:
         if proc.stdout:
             proc.stdout.close()
         try:
             proc.wait(timeout=30)
-        except Exception:
+        except (subprocess.TimeoutExpired, OSError):
             # If the stream was aborted mid-read, docker blocks writing to a
             # full, unread pipe and never exits on its own: kill it so we do
             # not leak an orphaned `docker export` process.
             try:
                 proc.kill()
-            except Exception:
+            except OSError:
                 pass
 
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -2504,23 +2711,26 @@ def _extract_container_export(cid: str, image_dir: Path, rootfs_dir: Path,
             f.write("# type\tsize\tpath (container filesystem index)\n")
             f.write("\n".join(index_sorted))
     except OSError as e:
-        logging.warning(f"Failed to write filesystem index: {e}")
+        logger.warning(f"Failed to write filesystem index: {e}")
 
     try:
         summary_data = {
-            "extracted": extracted, "catchall": catchall, "skipped": skipped,
+            "extracted": extracted,
+            "catchall": catchall,
+            "skipped": skipped,
             "total_extracted_bytes": total_bytes,
-            "index_entries": len(index_sorted), "index_truncated": index_truncated,
+            "index_entries": len(index_sorted),
+            "index_truncated": index_truncated,
         }
         if image_id:
             summary_data["image_id"] = image_id
         with open(image_dir / "extraction_summary.json", "w", encoding="utf-8") as f:
             json.dump(summary_data, f, indent=2)
     except OSError as e:
-        logging.warning(f"Failed to write extraction summary: {e}")
+        logger.warning(f"Failed to write extraction summary: {e}")
 
     if skipped or catchall:
-        logging.info(
+        logger.info(
             f"Container '{cid}': extracted {len(extracted)} files "
             f"({len(catchall)} via WORKDIR catch-all), skipped "
             f"{len(skipped)} ({','.join(skipped[:5])}{'...' if len(skipped) > 5 else ''})."
@@ -2605,7 +2815,9 @@ def cvss_v3_base_score(vector: str | None) -> float | None:
     if not scope_changed:
         impact = 6.42 * impact_subscore
     else:
-        impact = 7.52 * (impact_subscore - 0.029) - 3.25 * (impact_subscore - 0.02) ** 15
+        impact = (
+            7.52 * (impact_subscore - 0.029) - 3.25 * (impact_subscore - 0.02) ** 15
+        )
     exploitability = 8.22 * av * ac * pr * ui
     raw_score = min(impact + exploitability, 10.0)
     if scope_changed:
@@ -2643,7 +2855,7 @@ def cvss_gate_blocks(record: dict, threshold: float | None) -> bool:
 
     The gate only matches records the dispatch would fan out (status 'confirmed'
     with a 'direct_to_validator' or 'requires_integration' strategy) and FAILS
-    OPEN: a missing or unparseable estimate always validates, so verdicts cached
+    OPEN: a missing or unparsable estimate always validates, so verdicts cached
     before the Reviewer shipped its own vector never silently skip the sandbox.
     Below-threshold records stay 'confirmed' and are reported unvalidated
     (stage_reporter._is_reportable applies this same predicate, so reportability
@@ -2653,7 +2865,10 @@ def cvss_gate_blocks(record: dict, threshold: float | None) -> bool:
         return False
     if record.get("status") != "confirmed":
         return False
-    if record.get("validation_strategy") not in ("direct_to_validator", "requires_integration"):
+    if record.get("validation_strategy") not in (
+        "direct_to_validator",
+        "requires_integration",
+    ):
         return False
     # Records inside the patch lifecycle (which only a VALIDATED record can
     # enter) are never gate-blocked: their fix adjudication must keep flowing
@@ -2681,8 +2896,12 @@ def boundary_deferred(record: dict, threshold: float | None) -> bool:
     status probe keeps the check verdict-time safe ('chained'/'unchainable'
     copies still evaluate against the gate)."""
     probe = {**record, "status": "confirmed"}
-    probe["validation_strategy"] = probe.get("validation_strategy") or "direct_to_validator"
-    return bool(probe.get("changes_security_boundary")) and cvss_gate_blocks(probe, threshold)
+    probe["validation_strategy"] = (
+        probe.get("validation_strategy") or "direct_to_validator"
+    )
+    return bool(probe.get("changes_security_boundary")) and cvss_gate_blocks(
+        probe, threshold
+    )
 
 
 def deduplicate_cves(vulns: list[dict]) -> list[dict]:
@@ -2721,7 +2940,7 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
                 kept.append(d)
         return kept[:3]
 
-    def extract_fixed_version(record: dict) -> Optional[str]:
+    def extract_fixed_version(record: dict) -> str | None:
         for affected in record.get("affected", []):
             for rng in affected.get("ranges", []):
                 for event in rng.get("events", []):
@@ -2732,19 +2951,21 @@ def deduplicate_cves(vulns: list[dict]) -> list[dict]:
     def extract_cwe_ids(record: dict) -> list[str]:
         return record.get("database_specific", {}).get("cwe_ids", []) or []
 
-    def extract_severity_label(record: dict) -> Optional[str]:
+    def extract_severity_label(record: dict) -> str | None:
         severity = record.get("database_specific", {}).get("severity")
         if isinstance(severity, str) and severity.strip():
             return severity.strip().upper()
         return None
 
-    def extract_cvss_vector(record: dict) -> Optional[str]:
+    def extract_cvss_vector(record: dict) -> str | None:
         vectors = record.get("severity", []) or []
         for entry in vectors:
             if not isinstance(entry, dict):
                 continue
             vector = entry.get("score")
-            if entry.get("type", "").upper().startswith("CVSS_V3") and isinstance(vector, str):
+            if entry.get("type", "").upper().startswith("CVSS_V3") and isinstance(
+                vector, str
+            ):
                 return vector
         return None
 
@@ -2814,11 +3035,13 @@ def safe_cache_filename(filename: str, max_bytes: int = 240) -> str:
     suffix = Path(filename).suffix
     digest = hashlib.md5(filename.encode("utf-8")).hexdigest()
     prefix_bytes = max_bytes - len(suffix.encode("utf-8")) - len(digest) - 1
-    prefix = filename.encode("utf-8")[:max(0, prefix_bytes)].decode("utf-8", "ignore")
+    prefix = filename.encode("utf-8")[: max(0, prefix_bytes)].decode("utf-8", "ignore")
     return f"{prefix}-{digest}{suffix}"
 
 
-def cache(file: Path, action: str, content: dict = {}) -> Optional[dict]:
+def cache(file: Path, action: str, content: dict | None = None) -> dict | None:
+    if content is None:
+        content = {}
     if action == "read":
         if not file.exists():
             return
@@ -2826,10 +3049,10 @@ def cache(file: Path, action: str, content: dict = {}) -> Optional[dict]:
         try:
             with open(file, "r") as f:
                 cached_data = json.load(f)
-            logging.debug(f"Loaded note from cache ({file}).")
+            logger.debug(f"Loaded note from cache ({file}).")
             return cached_data
         except json.JSONDecodeError:
-            logging.warning(f"Cache file {file} corrupted. Re-generating...")
+            logger.warning(f"Cache file {file} corrupted. Re-generating...")
 
     elif action == "write":
         if not file.parent.exists():
@@ -2838,21 +3061,25 @@ def cache(file: Path, action: str, content: dict = {}) -> Optional[dict]:
         try:
             with open(file, "w") as f:
                 json.dump(content, f, indent=2)
-            logging.debug(f"Saved cache file {file}.")
-        except Exception as e:
-            logging.warning(f"Failed to write cache file {file}: {e}")
+            logger.debug(f"Saved cache file {file}.")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to write cache file {file}: {e}")
 
     else:
-        logging.error(f"Unknown action: {action}")
+        logger.error(f"Unknown action: {action}")
 
 
-def _content_hash_cache(subdir: str, prefix: str, content: dict, result: Optional[dict] = None) -> Optional[dict]:
+def _content_hash_cache(
+    subdir: str, prefix: str, content: dict, result: dict | None = None
+) -> dict | None:
     """Read (``result`` is None) or write one content-hash cache entry under
     ``.cache/<subdir>/<prefix>_<md5(content)>.json``. Callers must keep the
     hashed ``content`` payload byte-identical across stages so entries neither
     miss spuriously nor collide."""
     digest = hashlib.md5(json.dumps(content, sort_keys=True).encode()).hexdigest()
-    cache_file = settings.cache_dir / subdir / safe_cache_filename(f"{prefix}_{digest}.json")
+    cache_file = (
+        settings.cache_dir / subdir / safe_cache_filename(f"{prefix}_{digest}.json")
+    )
     if result is None:
         return cache(cache_file, "read")
     cache(cache_file, "write", result)
@@ -2877,8 +3104,12 @@ def _strip_cvss_key(value):
 
 
 def _cache_stored_record(
-    subdir: str, prefix: str, content: dict, updated_vuln: Optional[dict], token_usage: Optional[dict]
-) -> Optional[dict]:
+    subdir: str,
+    prefix: str,
+    content: dict,
+    updated_vuln: dict | None,
+    token_usage: dict | None,
+) -> dict | None:
     """Read/write one verdict cache entry (reviewer/validator/auditor/patcher
     share this shape) with its token accounting attached.
 
@@ -2892,7 +3123,11 @@ def _cache_stored_record(
     back untouched and restore nothing."""
     from run_stats import record_cached_token_usage
 
-    result = None if updated_vuln is None else {"record": updated_vuln, "token_usage": token_usage}
+    result = (
+        None
+        if updated_vuln is None
+        else {"record": updated_vuln, "token_usage": token_usage}
+    )
     cached = _content_hash_cache(subdir, prefix, content, result)
     if cached is None:
         return None
@@ -2904,12 +3139,20 @@ def _cache_stored_record(
 
 def subdir_rid(subdir: str) -> str:
     """Ledger agent name for a verdict-cache subdir ('patchers' -> 'patcher')."""
-    return {"reviewer": "reviewer", "validator": "validator",
-            "integration_auditor": "integration_auditor", "patchers": "patcher"}[subdir]
+    return {
+        "reviewer": "reviewer",
+        "validator": "validator",
+        "integration_auditor": "integration_auditor",
+        "patchers": "patcher",
+    }[subdir]
 
 
-def cache_reviewer(node_id: str, report: dict, updated_vuln: Optional[dict] = None,
-                   token_usage: Optional[dict] = None) -> Optional[dict]:
+def cache_reviewer(
+    node_id: str,
+    report: dict,
+    updated_vuln: dict | None = None,
+    token_usage: dict | None = None,
+) -> dict | None:
     """Read (``updated_vuln`` is None) or write a reviewer outcome cache entry.
 
     Keyed by (node_id, report content hash); shared by the normal
@@ -2925,8 +3168,12 @@ def cache_reviewer(node_id: str, report: dict, updated_vuln: Optional[dict] = No
     return _cache_stored_record("reviewer", node_id, report, updated_vuln, token_usage)
 
 
-def cache_validator(report: dict, peer_payloads: Optional[list] = None, updated_vuln: Optional[dict] = None,
-                    token_usage: Optional[dict] = None) -> Optional[dict]:
+def cache_validator(
+    report: dict,
+    peer_payloads: list | None = None,
+    updated_vuln: dict | None = None,
+    token_usage: dict | None = None,
+) -> dict | None:
     """Read (``updated_vuln`` is None) or write a validator outcome cache entry.
 
     Keyed by (vuln_id, content hash of the report plus the injected
@@ -2944,12 +3191,20 @@ def cache_validator(report: dict, peer_payloads: Optional[list] = None, updated_
         key=lambda p: p.get("vuln_id", ""),
     )
     return _cache_stored_record(
-        "validator", vuln_id, _strip_cvss_key({"report": report, "peer_payloads": peers}), updated_vuln, token_usage
+        "validator",
+        vuln_id,
+        _strip_cvss_key({"report": report, "peer_payloads": peers}),
+        updated_vuln,
+        token_usage,
     )
 
 
-def cache_integration_auditor(report: dict, peers: Optional[list] = None, updated_vuln: Optional[dict] = None,
-                              token_usage: Optional[dict] = None) -> Optional[dict]:
+def cache_integration_auditor(
+    report: dict,
+    peers: list | None = None,
+    updated_vuln: dict | None = None,
+    token_usage: dict | None = None,
+) -> dict | None:
     """Read (``updated_vuln`` is None) or write an integration-auditor outcome cache entry.
 
     Keyed by (vuln_id, content hash of the report plus the ``confirmed_vulns``
@@ -2966,12 +3221,17 @@ def cache_integration_auditor(report: dict, peers: Optional[list] = None, update
         key=lambda p: p.get("vuln_id", ""),
     )
     return _cache_stored_record(
-        "integration_auditor", vuln_id, _strip_cvss_key({"report": report, "confirmed_vulns": peers_sorted}), updated_vuln, token_usage
+        "integration_auditor",
+        vuln_id,
+        _strip_cvss_key({"report": report, "confirmed_vulns": peers_sorted}),
+        updated_vuln,
+        token_usage,
     )
 
 
-def cache_patcher(report: dict, updated_vuln: Optional[dict] = None,
-                  token_usage: Optional[dict] = None) -> Optional[dict]:
+def cache_patcher(
+    report: dict, updated_vuln: dict | None = None, token_usage: dict | None = None
+) -> dict | None:
     """Read (``updated_vuln`` is None) or write a patcher outcome cache entry.
 
     Keyed by (vuln_id, content hash of the record being patched). Shared by
@@ -2981,11 +3241,14 @@ def cache_patcher(report: dict, updated_vuln: Optional[dict] = None,
     resumed/repeated run never re-applies the edits. ``token_usage`` rides the
     stored value and is booked back on a read — see _cache_stored_record."""
     vuln_id = (report or {}).get("vuln_id") or "Unknown"
-    return _cache_stored_record("patchers", vuln_id, _strip_cvss_key(report or {}), updated_vuln, token_usage)
+    return _cache_stored_record(
+        "patchers", vuln_id, _strip_cvss_key(report or {}), updated_vuln, token_usage
+    )
 
 
-def cache_reporter(report: dict, finding: Optional[dict] = None,
-                   token_usage: Optional[dict] = None) -> Optional[dict]:
+def cache_reporter(
+    report: dict, finding: dict | None = None, token_usage: dict | None = None
+) -> dict | None:
     """Read (``finding`` is None) or write a per-vulnerability reporter outcome.
 
     Keyed on the content hash of the single reportable record (including its
@@ -3003,11 +3266,18 @@ def cache_reporter(report: dict, finding: Optional[dict] = None,
             record_cached_token_usage("reporter", cached.get("token_usage"))
             return cached["finding"]
         return None
-    _content_hash_cache("reporter", vuln_id, report or {}, {"finding": finding, "token_usage": token_usage})
+    _content_hash_cache(
+        "reporter",
+        vuln_id,
+        report or {},
+        {"finding": finding, "token_usage": token_usage},
+    )
     return None
 
 
-def _extract_namespace_aliases(source_file: str, target_namespace: str) -> Optional[set[str]]:
+def _extract_namespace_aliases(
+    source_file: str, target_namespace: str
+) -> set[str] | None:
     """Discover the identifiers aliased from a namespace in the import/use
     statements of ``source_file`` (plus the namespace itself).
 
@@ -3033,7 +3303,7 @@ def _extract_namespace_aliases(source_file: str, target_namespace: str) -> Optio
             node_type = node.type.lower()
             # Check if this node is an import/use statement
             if any(kw in node_type for kw in ["import", "use", "require", "include"]):
-                text = full_code_bytes[node.start_byte:node.end_byte].decode("utf-8")
+                text = full_code_bytes[node.start_byte : node.end_byte].decode("utf-8")
 
                 # If this import statement pulls from our target namespace
                 if target_namespace in text:
@@ -3042,7 +3312,9 @@ def _extract_namespace_aliases(source_file: str, target_namespace: str) -> Optio
                         if len(n.children) == 0:
                             n_type = n.type.lower()
                             if "identifier" in n_type or "name" in n_type:
-                                val = full_code_bytes[n.start_byte:n.end_byte].decode("utf-8")
+                                val = full_code_bytes[n.start_byte : n.end_byte].decode(
+                                    "utf-8"
+                                )
                                 if val != target_namespace:
                                     aliases.add(val)
                         for c in n.children:
@@ -3054,22 +3326,24 @@ def _extract_namespace_aliases(source_file: str, target_namespace: str) -> Optio
                     extract_aliases(child)
 
         extract_aliases(full_tree.root_node)
-    except Exception as e:
-        logging.warning(f"Could not extract aliases from {source_file}: {e}")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not extract aliases from {source_file}: {e}")
 
     return aliases
 
 
-def _namespace_aliases(source_file: str, target_namespace: str) -> Optional[set[str]]:
+def _namespace_aliases(source_file: str, target_namespace: str) -> set[str] | None:
     """Memoized per-run access to ``_extract_namespace_aliases`` so a single
     (file, namespace) is parsed at most once across the whole aggregate pass."""
     key = (source_file, target_namespace)
     if key not in AGGREGATE_MEMO_ALIASES:
-        AGGREGATE_MEMO_ALIASES[key] = _extract_namespace_aliases(source_file, target_namespace)
+        AGGREGATE_MEMO_ALIASES[key] = _extract_namespace_aliases(
+            source_file, target_namespace
+        )
     return AGGREGATE_MEMO_ALIASES[key]
 
 
-def _folded_node_code(node_id: str, node_map=None, sub_nodes_index=None) -> Optional[str]:
+def _folded_node_code(node_id: str, node_map=None, sub_nodes_index=None) -> str | None:
     """Memoized per-run default-mode folded code for a node (via
     ``get_node_code``). Avoids re-reading/re-parsing the same node's file for
     every (node, namespace) usage check."""
@@ -3080,9 +3354,12 @@ def _folded_node_code(node_id: str, node_map=None, sub_nodes_index=None) -> Opti
     return AGGREGATE_MEMO_FOLDED[node_id]
 
 
-def uses_namespace_in_ast(node_id: str, target_namespace: str,
-                          node_map: Optional[dict] = None,
-                          sub_nodes_index: Optional[dict] = None) -> bool:
+def uses_namespace_in_ast(
+    node_id: str,
+    target_namespace: str,
+    node_map: dict | None = None,
+    sub_nodes_index: dict | None = None,
+) -> bool:
     """
     Checks if a specific namespace (or its imported symbols) is used within a node's AST.
     """
@@ -3094,14 +3371,16 @@ def uses_namespace_in_ast(node_id: str, target_namespace: str,
     if target_node is None:
         target_node = get_node_map(settings.graph).get(node_id)
     if not target_node or not target_node.get("source_file"):
-        logging.error(f"Node '{node_id}' does not have a valid source file mapped.")
+        logger.error(f"Node '{node_id}' does not have a valid source file mapped.")
         return False
 
     source_file = target_node.get("source_file")
     ext = Path(source_file).suffix.lower()
 
     if ext not in LANGUAGE_MAP:
-        logging.warning(f"Unsupported extension '{ext}' for AST parsing on node '{node_id}'.")
+        logger.warning(
+            f"Unsupported extension '{ext}' for AST parsing on node '{node_id}'."
+        )
         return False
 
     # Track the namespace and any symbols imported from it (e.g., 'g', 'request', 'Blueprint')
@@ -3116,15 +3395,21 @@ def uses_namespace_in_ast(node_id: str, target_namespace: str,
 
     def walk(node: tree_sitter.Node) -> bool:
         # Ignore import statements in the folded snippet to strictly verify actual usage
-        if any(keyword in node.type.lower() for keyword in ["import", "include", "use_declaration"]):
+        if any(
+            keyword in node.type.lower()
+            for keyword in ["import", "include", "use_declaration"]
+        ):
             return False
 
         # If it's a leaf node, check if its text matches the namespace OR any of its extracted aliases
-        if len(node.children) == 0:
-            if "comment" not in node.type.lower() and "string" not in node.type.lower():
-                token_text = source_bytes[node.start_byte:node.end_byte].decode("utf-8")
-                if token_text in aliases:
-                    return True
+        if (
+            len(node.children) == 0
+            and "comment" not in node.type.lower()
+            and "string" not in node.type.lower()
+        ):
+            token_text = source_bytes[node.start_byte : node.end_byte].decode("utf-8")
+            if token_text in aliases:
+                return True
 
         for child in node.children:
             if walk(child):
@@ -3135,9 +3420,13 @@ def uses_namespace_in_ast(node_id: str, target_namespace: str,
     return walk(tree.root_node)
 
 
-def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
-                  node_map: Optional[dict] = None,
-                  sub_nodes_index: Optional[dict] = None) -> str | None:
+def get_node_code(
+    node_id: str,
+    raw: bool = False,
+    reviewer_mode: bool = False,
+    node_map: dict | None = None,
+    sub_nodes_index: dict | None = None,
+) -> str | None:
     graph = settings.graph
 
     # Find the target node (precomputed map when available, else the
@@ -3146,12 +3435,12 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
     if target_node is None:
         target_node = get_node_map(graph).get(node_id)
     if not target_node:
-        logging.debug(f"Node ID '{node_id}' not found in graph.")
+        logger.debug(f"Node ID '{node_id}' not found in graph.")
         return None
 
     source_file_path = target_node.get("source_file")
     if not source_file_path:
-        logging.error(f"Node '{node_id}' does not have a source file mapped.")
+        logger.error(f"Node '{node_id}' does not have a source file mapped.")
         return None
 
     source_file = graph.parent.parent / Path(source_file_path)
@@ -3159,7 +3448,7 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
     file_type = target_node.get("file_type")
 
     if not source_file.exists():
-        logging.error(f"Source file '{source_file}' not found on disk.")
+        logger.error(f"Source file '{source_file}' not found on disk.")
         return None
 
     # Handle standard text/document files
@@ -3168,13 +3457,13 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
         if content is None:
             if source_file.exists():
                 return f"Error: '{source_file}' is binary."
-            logging.error(f"Source file '{source_file}' not found on disk.")
+            logger.error(f"Source file '{source_file}' not found on disk.")
             return None
         return content
 
     source_content = read_file_text(source_file_path)
     if source_content is None:
-        logging.error(f"Source file '{source_file}' not found on disk or unreadable.")
+        logger.error(f"Source file '{source_file}' not found on disk or unreadable.")
         return None
     # Get target start line
     try:
@@ -3182,7 +3471,9 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
     except ValueError:
         return None
 
-    is_file_node = (target_start_line == 1 and target_node.get("label", "") == source_file.name)
+    is_file_node = (
+        target_start_line == 1 and target_node.get("label", "") == source_file.name
+    )
 
     lang = LANGUAGE_MAP.get(source_file.suffix)
     if not lang:
@@ -3193,7 +3484,9 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
         # and the tree instead of re-deriving them (see _FILE_PARSE_MEMO).
         parsed = _FILE_PARSE_MEMO.get(source_file_path)
         if parsed is None:
-            source_bytes = masked_source_for_parsing(source_content, source_file_path).encode("utf-8")
+            source_bytes = masked_source_for_parsing(
+                source_content, source_file_path
+            ).encode("utf-8")
             tree = tree_sitter.Parser(lang).parse(source_bytes)
             _FILE_PARSE_MEMO[source_file_path] = (source_bytes, tree)
             if len(_FILE_PARSE_MEMO) > _FILE_PARSE_MEMO_MAX:
@@ -3202,19 +3495,30 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
             source_bytes, tree = parsed
 
         grammar = AST_GRAMMAR_MAP.get(source_file.suffix, {})
-        body_node_types = grammar.get("body_node", ["block", "compound_statement", "declaration_list", "statement_block", "class_body"])
+        body_node_types = grammar.get(
+            "body_node",
+            [
+                "block",
+                "compound_statement",
+                "declaration_list",
+                "statement_block",
+                "class_body",
+            ],
+        )
         if isinstance(body_node_types, str):
             body_node_types = [body_node_types]
 
         # Helper to find AST node containing a body starting on a specific line
         def find_ast_node_with_body(line_idx):
             candidates = []
+
             def walk(n):
                 if n.start_point[0] == line_idx:
                     candidates.append(n)
                 for c in n.children:
                     if c.start_point[0] <= line_idx <= c.end_point[0]:
                         walk(c)
+
             walk(tree.root_node)
 
             for cand in candidates:
@@ -3234,7 +3538,9 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
                 return source_content
 
         if raw:
-            return source_bytes[target_ast_node.start_byte:target_ast_node.end_byte].decode("utf-8")
+            return source_bytes[
+                target_ast_node.start_byte : target_ast_node.end_byte
+            ].decode("utf-8")
 
         # Find all sub-nodes in the graph mapped to this file (precomputed
         # index when available, otherwise the process-wide file index).
@@ -3266,7 +3572,10 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
                     and sub_start == target_body_node.start_byte
                     and sub_end == target_body_node.end_byte
                 )
-                is_ancestor = (sub_start <= target_ast_node.start_byte and sub_end >= target_ast_node.end_byte)
+                is_ancestor = (
+                    sub_start <= target_ast_node.start_byte
+                    and sub_end >= target_ast_node.end_byte
+                )
 
                 # Check for exact target match
                 if is_target:
@@ -3275,7 +3584,9 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
                 if is_ancestor:
                     continue
 
-            ranges_to_prune.append((child_body_node.start_byte, child_body_node.end_byte, child_id))
+            ranges_to_prune.append(
+                (child_body_node.start_byte, child_body_node.end_byte, child_id)
+            )
 
         # Filter out nested overlapping ranges
         ranges_to_prune.sort(key=lambda x: x[0])
@@ -3311,8 +3622,8 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
 
         return "".join(result_chunks)
 
-    except Exception as e:
-        logging.warning(f"Tree-sitter failed on '{source_file}': {e}")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Tree-sitter failed on '{source_file}': {e}")
         return source_content
 
 
@@ -3324,13 +3635,47 @@ def get_node_code(node_id: str, raw: bool = False, reviewer_mode: bool = False,
 # algorithm that reads those constants.
 
 _SECURITY_KEYWORDS: tuple[str, ...] = (
-    "verify", "auth", "authenticate", "authorize", "permission", "secret", "token",
-    "password", "passwd", "credential", "tls", "ssl", "private_key", "privatekey",
-    "api_key", "apikey", "csrf", "jwt", "session", "cookie", "role", "admin",
-    "sudo", "root", "privilege", "debug", "trust", "allow", "bypass", "skip", "disable",
+    "verify",
+    "auth",
+    "authenticate",
+    "authorize",
+    "permission",
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "credential",
+    "tls",
+    "ssl",
+    "private_key",
+    "privatekey",
+    "api_key",
+    "apikey",
+    "csrf",
+    "jwt",
+    "session",
+    "cookie",
+    "role",
+    "admin",
+    "sudo",
+    "root",
+    "privilege",
+    "debug",
+    "trust",
+    "allow",
+    "bypass",
+    "skip",
+    "disable",
 )
 _CRITICAL_SUBSTRINGS: tuple[str, ...] = (
-    "secret", "password", "passwd", "token", "credential", "privatekey", "apikey", "csrf",
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    "credential",
+    "privatekey",
+    "apikey",
+    "csrf",
 )
 
 
@@ -3384,7 +3729,13 @@ def _has_security_names(root: tree_sitter.Node, label: str) -> bool:
 
 def _body_of(def_node: tree_sitter.Node):
     for c in def_node.children:
-        if c.type in ("block", "statement_block", "class_body", "compound_statement", "declaration_list"):
+        if c.type in (
+            "block",
+            "statement_block",
+            "class_body",
+            "compound_statement",
+            "declaration_list",
+        ):
             return c
     return None
 
@@ -3415,8 +3766,11 @@ def _unwrap_root(root: tree_sitter.Node) -> tree_sitter.Node:
     module/program. If that unit holds exactly one definition, unwrap to it so skeleton
     detection applies. Files with many top-level definitions are left intact.
     """
-    defs = [n for n in _walk(root)
-            if n.type in DEFINITION_TYPES and n.type != "decorated_definition"]
+    defs = [
+        n
+        for n in _walk(root)
+        if n.type in DEFINITION_TYPES and n.type != "decorated_definition"
+    ]
     return defs[0] if len(defs) == 1 else root
 
 
@@ -3424,7 +3778,12 @@ def _is_empty_skeleton(root: tree_sitter.Node, ext: str) -> bool:
     node = _unwrap_root(root)
     if node.type not in DEFINITION_TYPES:
         return False
-    if node.type in ("interface_declaration", "type_alias_declaration", "enum_declaration", "type_alias_statement"):
+    if node.type in (
+        "interface_declaration",
+        "type_alias_declaration",
+        "enum_declaration",
+        "type_alias_statement",
+    ):
         return False
     body = _body_of(node)
     return _is_empty_body(body)
@@ -3446,9 +3805,18 @@ def _is_magic_method(label: str, ext: str) -> bool:
 
 def _has_field_defaults(root: tree_sitter.Node) -> bool:
     for n in _walk(root):
-        if n.type in ("assignment", "property_element", "public_field_definition", "property_signature", "enum_assignment"):
-            if "=" in n.text.decode():
-                return True
+        if (
+            n.type
+            in (
+                "assignment",
+                "property_element",
+                "public_field_definition",
+                "property_signature",
+                "enum_assignment",
+            )
+            and "=" in n.text.decode()
+        ):
+            return True
     return False
 
 
@@ -3458,7 +3826,11 @@ def _pydantic_base(class_node: tree_sitter.Node) -> bool:
             for b in _walk(c):
                 if b.type in ("identifier", "attribute"):
                     text = b.text.decode().lower()
-                    if "basemodel" in text or "pydantic" in text or text.endswith("model"):
+                    if (
+                        "basemodel" in text
+                        or "pydantic" in text
+                        or text.endswith("model")
+                    ):
                         return True
     return False
 
@@ -3469,7 +3841,10 @@ def _is_pydantic_like(root: tree_sitter.Node) -> bool:
             return True
         if n.type == "decorator" and "validator" in n.text.decode().lower():
             return True
-        if n.type == "assignment" and n.text.decode().split("=")[0].strip() == "model_config":
+        if (
+            n.type == "assignment"
+            and n.text.decode().split("=")[0].strip() == "model_config"
+        ):
             return True
     return False
 
@@ -3490,11 +3865,20 @@ def _class_is_field_only(class_node: tree_sitter.Node) -> bool:
 
     if not has_field:
         return False
-    if _has_node_type(class_node, {"call", "function_definition", "lambda", "if_statement",
-                                   "for_statement", "while_statement", "try_statement",
-                                   "with_statement", "match_statement"}):
-        return False
-    return True
+    return not _has_node_type(
+        class_node,
+        {
+            "call",
+            "function_definition",
+            "lambda",
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "try_statement",
+            "with_statement",
+            "match_statement",
+        },
+    )
 
 
 def _is_pure_type(root: tree_sitter.Node, ext: str) -> bool:
@@ -3521,9 +3905,11 @@ def _is_pure_type(root: tree_sitter.Node, ext: str) -> bool:
         for n in _walk(root):
             if n.type == "class_definition" and _class_is_field_only(n):
                 return True
-            if n.type == "decorated_definition":
-                if any(c.type == "class_definition" and _class_is_field_only(c) for c in n.children):
-                    return True
+            if n.type == "decorated_definition" and any(
+                c.type == "class_definition" and _class_is_field_only(c)
+                for c in n.children
+            ):
+                return True
         return False
 
     # PHP branch: interfaces without runtime signals, or property-only classes.
@@ -3536,9 +3922,12 @@ def _is_pure_type(root: tree_sitter.Node, ext: str) -> bool:
         for n in _walk(root):
             if n.type == "class_declaration":
                 body = _body_of(n)
-                if body is not None and _has_node_type(n, PHP_PROPERTY_TYPES):
-                    if not _has_node_type(n, PHP_METHOD_TYPES):
-                        return True
+                if (
+                    body is not None
+                    and _has_node_type(n, PHP_PROPERTY_TYPES)
+                    and not _has_node_type(n, PHP_METHOD_TYPES)
+                ):
+                    return True
         return False
 
     return False
@@ -3560,7 +3949,7 @@ def _has_regex_literal(root: tree_sitter.Node) -> bool:
     for n in _walk(root):
         if n.type in ("identifier", "name", "property_identifier", "variable_name"):
             text = n.text.decode().lower()
-            if "regex" in text or text.endswith("_re") or text.endswith("pattern"):
+            if "regex" in text or text.endswith(("_re", "pattern")):
                 return True
     return False
 
@@ -3580,7 +3969,9 @@ def _count_signal_nodes(root: tree_sitter.Node, ext: str, limit: int) -> int:
     return count
 
 
-def _node_code_is_worth_scanning(source_code: str, label: str, ext: str, min_signals: int = 1) -> bool:
+def _node_code_is_worth_scanning(
+    source_code: str, label: str, ext: str, min_signals: int = 1
+) -> bool:
     """Core triage on raw source. Returns True when the node cannot be inspected."""
     lang = LANGUAGE_MAP.get(ext)
     if not lang or ext not in SCAN_SIGNAL_TYPES:
@@ -3596,32 +3987,41 @@ def _node_code_is_worth_scanning(source_code: str, label: str, ext: str, min_sig
 
     try:
         tree = tree_sitter.Parser(lang).parse(source_code.encode("utf-8"))
-    except Exception as e:
-        logging.warning(f"tree-sitter failed on node '{label}': {e}")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"tree-sitter failed on node '{label}': {e}")
         return True
 
     root = tree.root_node
 
     # Rule 1: Pure Types & Interfaces -> keep only with defaults, validation, or security names
     if _is_pure_type(root, ext):
-        return (_has_field_defaults(root)
-                or _is_pydantic_like(root)
-                or _has_security_names(root, label))
+        return (
+            _has_field_defaults(root)
+            or _is_pydantic_like(root)
+            or _has_security_names(root, label)
+        )
 
     # Rule 2: Empty Skeletons & No-Ops -> keep only with security/magic names or docstrings
     if _is_empty_skeleton(root, ext):
-        return (_is_security_name(label)
-                or _is_magic_method(label, ext)
-                or _has_substantive_docstring(root))
+        return (
+            _is_security_name(label)
+            or _is_magic_method(label, ext)
+            or _has_substantive_docstring(root)
+        )
 
     # Rule 3: Primitive Constants & Configs -> keep only with security names, regex, or objects
     if _is_config_only(root, ext):
-        return (_has_security_names(root, label)
-                or _has_regex_literal(root)
-                or _has_object_literal(root))
+        return (
+            _has_security_names(root, label)
+            or _has_regex_literal(root)
+            or _has_object_literal(root)
+        )
 
     # Default: executable signal count (or a runtime validation wrapper)
-    return _is_pydantic_like(root) or _count_signal_nodes(root, ext, min_signals) >= min_signals
+    return (
+        _is_pydantic_like(root)
+        or _count_signal_nodes(root, ext, min_signals) >= min_signals
+    )
 
 
 # --------------------------------------------------------------------------
@@ -3638,13 +4038,36 @@ def _node_code_is_worth_scanning(source_code: str, label: str, ext: str, min_sig
 # Directory fragments dropped by default (matched as any path component).
 _DEFAULT_EXCLUDE_DIRS = {
     # dependency / third-party install trees
-    "vendor", "node_modules", "third_party", "thirdparty", "external",
-    "site-packages", "bower_components",
+    "vendor",
+    "node_modules",
+    "third_party",
+    "thirdparty",
+    "external",
+    "site-packages",
+    "bower_components",
     # build / cache / VCS / tooling noise
-    ".git", ".cache", ".next", "dist", "build", "__pycache__", ".venv",
-    "venv", "env", "graphify-out", ".idea", ".vscode", ".gradle", "target",
+    ".git",
+    ".cache",
+    ".next",
+    "dist",
+    "build",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "env",
+    "graphify-out",
+    ".idea",
+    ".vscode",
+    ".gradle",
+    "target",
     # non-app-source trees the user typically trims by hand
-    "tests", "__tests__", "spec", "specs", "docs", ".github", ".gitlab",
+    "tests",
+    "__tests__",
+    "spec",
+    "specs",
+    "docs",
+    ".github",
+    ".gitlab",
 }
 
 # Component globs dropped by default. THE PIPELINE ITSELF writes these into the
@@ -3660,8 +4083,17 @@ _DEFAULT_EXCLUDE_DIR_GLOBS = (
 
 # Basename globs dropped by default (docs + test files).
 _DEFAULT_EXCLUDE_NAME_GLOBS = (
-    "*.md", "*.markdown", "*.txt", "*.rst", "*.adoc", "*.rdoc",
-    "*.test.*", "*.spec.*", "test_*", "*_test.*", "*_spec.*",
+    "*.md",
+    "*.markdown",
+    "*.txt",
+    "*.rst",
+    "*.adoc",
+    "*.rdoc",
+    "*.test.*",
+    "*.spec.*",
+    "test_*",
+    "*_test.*",
+    "*_spec.*",
 )
 
 
@@ -3688,7 +4120,7 @@ def _parse_exclude_patterns(patterns: list[str]) -> tuple[set[str], list[str]]:
     return dirs, globs
 
 
-@lru_cache(maxsize=None)
+@functools.cache
 def is_path_excluded(source_file: str) -> bool:
     """Return True if ``source_file`` should be skipped during scanning.
 
@@ -3712,13 +4144,21 @@ def is_path_excluded(source_file: str) -> bool:
     parts = Path(rel).parts
     name = parts[-1] if parts else ""
 
-    user_dirs, user_globs = _parse_exclude_patterns(getattr(settings, "scan_exclude_paths", []))
+    user_dirs, user_globs = _parse_exclude_patterns(
+        getattr(settings, "scan_exclude_paths", [])
+    )
 
-    dir_fragments = _DEFAULT_EXCLUDE_DIRS | user_dirs if getattr(settings, "scan_exclude_defaults", True) else user_dirs
+    dir_fragments = (
+        _DEFAULT_EXCLUDE_DIRS | user_dirs
+        if getattr(settings, "scan_exclude_defaults", True)
+        else user_dirs
+    )
     if any(d in parts for d in dir_fragments):
         return True
     if getattr(settings, "scan_exclude_defaults", True) and any(
-        fnmatch.fnmatch(part, pat) for part in parts for pat in _DEFAULT_EXCLUDE_DIR_GLOBS
+        fnmatch.fnmatch(part, pat)
+        for part in parts
+        for pat in _DEFAULT_EXCLUDE_DIR_GLOBS
     ):
         return True
 
@@ -3726,7 +4166,11 @@ def is_path_excluded(source_file: str) -> bool:
         if fnmatch.fnmatch(rel_posix, pat):
             return True
 
-    name_globs = _DEFAULT_EXCLUDE_NAME_GLOBS if getattr(settings, "scan_exclude_defaults", True) else ()
+    name_globs = (
+        _DEFAULT_EXCLUDE_NAME_GLOBS
+        if getattr(settings, "scan_exclude_defaults", True)
+        else ()
+    )
     for pat in name_globs:
         if fnmatch.fnmatch(name, pat):
             return True
@@ -3747,7 +4191,7 @@ def is_node_worth_scanning(node_id: str, min_signals: int = 1) -> bool:
     - Remaining nodes are kept when they contain >= `min_signals` executable signals
       (function calls, imports, string interpolation, control flow).
 
-    Unparseable nodes (unsupported extension, parse failure) are kept.
+    Unparsable nodes (unsupported extension, parse failure) are kept.
     Dependency manifest/lockfile nodes are always dropped: they are already
     handled by the SCA layer (osv-scanner).
     """
@@ -3756,7 +4200,9 @@ def is_node_worth_scanning(node_id: str, min_signals: int = 1) -> bool:
         return False
 
     if Path(target_node["source_file"]).name in MANIFEST_NAMES:
-        logging.debug(f"Skipping dependency manifest node {node_id} ({target_node['source_file']}).")
+        logger.debug(
+            f"Skipping dependency manifest node {node_id} ({target_node['source_file']})."
+        )
         return False
 
     source_code = get_node_code(node_id, raw=True)
@@ -3825,7 +4271,7 @@ def index_file(filepath: str | Path) -> list[dict]:
     ext = path.suffix.lower()
 
     if ext not in LANGUAGE_MAP or ext not in SYMBOL_QUERIES:
-        return [] # Unsupported language
+        return []  # Unsupported language
 
     language = LANGUAGE_MAP[ext]
     query_code = SYMBOL_QUERIES[ext]
@@ -3856,7 +4302,7 @@ def index_file(filepath: str | Path) -> list[dict]:
 
     # Standardized extraction loop
     for match in matches:
-        captures = match[1] 
+        captures = match[1]
 
         # Method captures
         class_nodes = _as_list(captures.get("class_name"))
@@ -3872,17 +4318,19 @@ def index_file(filepath: str | Path) -> list[dict]:
         if class_nodes and method_name_nodes and method_body_nodes:
             raw_class = class_nodes[0].text
             raw_method = method_name_nodes[0].text
-            class_name = raw_class.decode('utf8') if raw_class else "Unknown"
-            method_name = raw_method.decode('utf8') if raw_method else "Unknown"
+            class_name = raw_class.decode("utf8") if raw_class else "Unknown"
+            method_name = raw_method.decode("utf8") if raw_method else "Unknown"
 
             # Safely extract the parent class if it exists
             parent_name = None
             if parent_nodes:
                 raw_parent = parent_nodes[0].text
-                parent_name = raw_parent.decode('utf8') if raw_parent else None
+                parent_name = raw_parent.decode("utf8") if raw_parent else None
 
             symbol_name = f"{class_name}::{method_name}"
-            if symbol_name not in symbol_index or (parent_name and not symbol_index[symbol_name]["parent"]):
+            if symbol_name not in symbol_index or (
+                parent_name and not symbol_index[symbol_name]["parent"]
+            ):
                 symbol_index[symbol_name] = {
                     "type": "method",
                     "name": symbol_name,
@@ -3891,13 +4339,13 @@ def index_file(filepath: str | Path) -> list[dict]:
                     "method": method_name,
                     "start_line": method_body_nodes[0].start_point[0] + 1,
                     "end_line": method_body_nodes[0].end_point[0] + 1,
-                    "filepath": str(path)
+                    "filepath": str(path),
                 }
 
         # Scenario B: It's a standalone function
         elif function_name_nodes and function_body_nodes:
             raw_func = function_name_nodes[0].text
-            func_name = raw_func.decode('utf8') if raw_func else "Unknown"
+            func_name = raw_func.decode("utf8") if raw_func else "Unknown"
 
             if func_name not in symbol_index:
                 symbol_index[func_name] = {
@@ -3905,7 +4353,7 @@ def index_file(filepath: str | Path) -> list[dict]:
                     "name": func_name,
                     "start_line": function_body_nodes[0].start_point[0] + 1,
                     "end_line": function_body_nodes[0].end_point[0] + 1,
-                    "filepath": str(path)
+                    "filepath": str(path),
                 }
 
     return list(symbol_index.values())
@@ -3916,8 +4364,8 @@ def _index_file_safe(filepath: Path) -> list[dict]:
     must not kill the whole index or the process pool chunk)."""
     try:
         return index_file(filepath)
-    except Exception as e:
-        logging.warning(f"Failed to index {filepath}: {e}")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Failed to index {filepath}: {e}")
         return []
 
 
@@ -3925,8 +4373,11 @@ def _iter_indexable_source_files(app_path: Path) -> list[Path]:
     """Application source files we have tree-sitter symbol queries for
     (dependency trees / excluded paths dropped)."""
     return [
-        f for f in app_path.rglob("*")
-        if f.is_file() and not is_path_excluded(str(f)) and f.suffix.lower() in SYMBOL_QUERIES
+        f
+        for f in app_path.rglob("*")
+        if f.is_file()
+        and not is_path_excluded(str(f))
+        and f.suffix.lower() in SYMBOL_QUERIES
     ]
 
 
@@ -3947,8 +4398,10 @@ def build_symbol_index(app_path: Path) -> list[dict]:
             for file_symbols in pool.map(_index_file_safe, files, chunksize=64):
                 symbols.extend(file_symbols)
         return symbols
-    except Exception as e:
-        logging.warning(f"Parallel symbol indexing failed ({e}); falling back to sequential.")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"Parallel symbol indexing failed ({e}); falling back to sequential."
+        )
         symbols = []
         for filepath in files:
             symbols.extend(_index_file_safe(filepath))

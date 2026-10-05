@@ -1,3 +1,4 @@
+# yamllint disable rule:line-length
 manager_agent:
   expert_keywords:
     WebSurfaceAuditor:
@@ -110,10 +111,24 @@ manager_agent:
       - "bootstrap"
       - "requirement"
   expert_descriptions:
-    WebSurfaceAuditor: Analyze external-facing interfaces, routes, and HTTP parameters. Identify missing authentication checks, input validation flaws (e.g., XSS, SSRF), and weak session management. Extract strict assumptions about expected input formats.
-    LogicFlowAuditor: Review multi-step business logic, state transitions, and authorization checks. Look for business logic flaws, privilege escalation (BOLA/IDOR), and race conditions. Define trust assumptions required from calling components.
-    DataPersistenceAuditor: Examine data storage interactions, ORM usage, and raw queries. Hunt for SQL/NoSQL injection, weak encryption of data-at-rest, and improper access controls. Identify assumptions about data sanitization.
-    InfraConfigAuditor: Audit configuration files, deployment manifests, and server settings. Identify hardcoded secrets, misconfigured CORS/CSP policies, over-permissive IAM roles, and vulnerable dependency declarations.
+    WebSurfaceAuditor:
+      Analyze external-facing interfaces, routes, and HTTP parameters. Identify
+      missing authentication checks, input validation flaws (e.g., XSS, SSRF),
+      and weak session management. Extract strict assumptions about expected
+      input formats.
+    LogicFlowAuditor:
+      Review multi-step business logic, state transitions, and authorization
+      checks. Look for business logic flaws, privilege escalation (BOLA/IDOR),
+      and race conditions. Define trust assumptions required from calling
+      components.
+    DataPersistenceAuditor:
+      Examine data storage interactions, ORM usage, and raw queries. Hunt for
+      SQL/NoSQL injection, weak encryption of data-at-rest, and improper access
+      controls. Identify assumptions about data sanitization.
+    InfraConfigAuditor:
+      Audit configuration files, deployment manifests, and server settings.
+      Identify hardcoded secrets, misconfigured CORS/CSP policies,
+      over-permissive IAM roles, and vulnerable dependency declarations.
 
 expert_agents:
   explorer_prompt: |
@@ -326,7 +341,7 @@ cve_analyzer:
     Formulate the demand strictly as a requirement for the application developer (the caller). State exactly what configuration flags, pre-processing, sanitization, or alternative functions the visible application code must implement to mitigate the vulnerability before calling the library. Focus heavily on the "Workarounds" section if provided. The demand must be verifiable by looking ONLY at the application's source code.
 
     CRITICAL RULE 2: Explicit Trigger Conditions
-    Identify the specific mechanism required for the exploit to execute. 
+    Identify the specific mechanism required for the exploit to execute.
     - For code-level library flaws: Identify the specific function call or data flow (e.g., "Immediate execution upon calling yaml.load()").
     - For framework/middleware flaws: Identify the specific HTTP request primitive or routing behavior (e.g., "A crafted Transfer-Encoding header").
     If the CVE description is too vague, DO NOT guess—leave it empty.
@@ -418,7 +433,7 @@ cve_analyzer:
     }
 
     Example 3 (True Global Configuration):
-    In Laravel, if `app.debug` is enabled in production, exceptions display sensitive credentials. 
+    In Laravel, if `app.debug` is enabled in production, exceptions display sensitive credentials.
     Output 3:
     {
       "reasoning": "The application can disable debug mode in its configuration, so this is application_mitigation.",
@@ -645,7 +660,7 @@ reviewer_agent:
     2. CONTRACT SUPREMACY: If the local code lacks the demanded sanitization, mark it vulnerable. Do not audit downstream framework internals to see if they act as a safety net.
     3. STRUCTURAL PAYLOADS: If untrusted input controls structural keys (dict/array keys), inspect downstream parsers for conditional logic. Extract hardcoded branch strings as fuzzing candidates for your reproduction steps.
     4. DEAD ENDS: If the tainted variable is explicitly allowlisted or discarded, reject it. Contextual escaping or encoding only eliminates a finding if it neutralizes the vulnerability at the final consumer, not merely during intermediate serialization.
-    5. TOOL COST HIERARCHY: 
+    5. TOOL COST HIERARCHY:
        - LOW COST (Preferred): `get_definition(Class::method)` to read code, and `get_node_connections(node_id)` to trace callers/callees.
        - EXTREMELY HIGH COST (Last Resort): `search_codebase`. Use this ONLY if the low-cost graph tools have exhausted all options. If a search yields "No matches", do not spend further budget reformulating it; fall back to the graph tools.
 
@@ -691,7 +706,7 @@ validator_agent:
 
     1. CONFIRMED EXPLOIT OUTCOME (`is_confirmed: true` via `mark_validation_complete`):
        - Concrete Evidence of Impact (`execution_logs`): Runtime output demonstrating an undeniable security boundary violation. Acceptable evidence includes unauthorized data extraction (e.g., reading `/etc/passwd`, accessing arbitrary user records/tokens), verified privilege escalation, or arbitrary code/command execution. Theoretical flaws or unverified status codes do not constitute confirmation.
-       - Deterministic Reproducibility (`poc_payload`): A self-contained, automated artifact that reproduces the exact evidence upon execution. For single-request flaws, provide the full HTTP request (method, URI, headers, body). 
+       - Deterministic Reproducibility (`poc_payload`): A self-contained, automated artifact that reproduces the exact evidence upon execution. For single-request flaws, provide the full HTTP request (method, URI, headers, body).
        - Shippable PoC script (`poc_script`): For stateful or multi-step proofs, save the final working version in your workdir (`write_attacker_file`, mode 0755) and submit its relative path (e.g., `main.py`). CRITICAL: This final script must be a single clean, human-readable, and immediately usable artifact.
          * Strip all fuzzing loops, failed payloads, and exploratory logic.
          * Structure the script like a lightweight exploit module: extract all execution variables—such as `TARGET_URL`, `TARGET_PORT`, `CREDENTIALS` (if authenticated), and the exact `EXPLOIT_PAYLOAD` (e.g., the specific SQL query) into a clearly labeled configuration block at the very top of the file.

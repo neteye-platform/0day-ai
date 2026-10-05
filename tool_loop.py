@@ -12,7 +12,7 @@ summary-ledger prompt text.
 
 import json
 import logging
-from typing import Any, Optional
+from typing import Any
 
 from langchain_core.messages import (
     AnyMessage,
@@ -36,6 +36,8 @@ from run_stats import (
     record_llm_usage,
 )
 from utils import estimate_message_tokens
+
+logger = logging.getLogger(__name__)
 
 
 class CompactionConfig:
@@ -82,9 +84,7 @@ class CompactionConfig:
         must stay under ``window - output_budget - hard_reserved``.
         """
         return (
-            self.model_context_window
-            - self.max_output_tokens
-            - settings.hard_reserved
+            self.model_context_window - self.max_output_tokens - settings.hard_reserved
         )
 
     @property
@@ -183,8 +183,12 @@ def _render_message_transcript(messages: list[AnyMessage]) -> str:
             calls = getattr(m, "tool_calls", None) or []
             rendered = []
             for tc in calls:
-                tc_name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
-                tc_args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+                tc_name = (
+                    tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
+                )
+                tc_args = (
+                    tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+                )
                 rendered.append(f"{tc_name}({json.dumps(tc_args, default=str)[:600]})")
             label = f"### ai (tool_calls: {', '.join(rendered) or 'none'})"
         else:
@@ -195,7 +199,7 @@ def _render_message_transcript(messages: list[AnyMessage]) -> str:
 
 def _generate_agent_context_summary(
     middle: list[AnyMessage], ledger_prompt: str, llm, agent: str = ""
-) -> tuple[SystemMessage | None, Optional[dict]]:
+) -> tuple[SystemMessage | None, dict | None]:
     """Summarize the compressible middle of an agent history into a structured
     ledger via the cheap summarizer LLM. ``ledger_prompt`` carries the agent's
     ledger format (investigation ledger for the reviewer, validation ledger for
@@ -218,7 +222,9 @@ def _generate_agent_context_summary(
             )
         )
         response = llm.invoke([ledger_prompt, human_prompt])
-        usage = record_llm_usage(agent, response) if agent else extract_llm_usage(response)
+        usage = (
+            record_llm_usage(agent, response) if agent else extract_llm_usage(response)
+        )
         summary_content = str(response.content).strip()
         if not summary_content:
             return None, usage
@@ -236,8 +242,8 @@ def _generate_agent_context_summary(
                 f"{summary_content}"
             ),
         ), usage
-    except Exception as e:
-        logging.warning(f"Context compaction summarization failed, failing open: {e}")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Context compaction summarization failed, failing open: {e}")
         return None, None
 
 
@@ -303,9 +309,13 @@ class SequentialToolNode(ToolNode):
 
     def _func(self, input: Any, config: RunnableConfig, runtime: Any) -> Any:
         try:
-            tool_calls, input_type, tool_runtimes = self._prepare(input, config, runtime)
-        except Exception:
-            logging.warning("SequentialToolNode preparation failed; falling back to the stock concurrent ToolNode.")
+            tool_calls, input_type, tool_runtimes = self._prepare(
+                input, config, runtime
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "SequentialToolNode preparation failed; falling back to the stock concurrent ToolNode."
+            )
             return super()._func(input, config, runtime)
         outputs = [
             self._run_one(call, input_type, tool_runtime)
@@ -315,9 +325,13 @@ class SequentialToolNode(ToolNode):
 
     async def _afunc(self, input: Any, config: RunnableConfig, runtime: Any) -> Any:
         try:
-            tool_calls, input_type, tool_runtimes = self._prepare(input, config, runtime)
-        except Exception:
-            logging.warning("SequentialToolNode preparation failed; falling back to the stock concurrent ToolNode.")
+            tool_calls, input_type, tool_runtimes = self._prepare(
+                input, config, runtime
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "SequentialToolNode preparation failed; falling back to the stock concurrent ToolNode."
+            )
             return await super()._afunc(input, config, runtime)
         outputs = []
         for call, tool_runtime in zip(tool_calls, tool_runtimes, strict=False):
@@ -329,17 +343,19 @@ def _tool_batch_fingerprint(message: AnyMessage) -> tuple:
     """Order-insensitive canonical signature of an AI message's tool calls:
     (name, sorted-key args json) pairs, so a re-issued batch with the tools
     listed in a different order still matches."""
-    return tuple(sorted(
-        (
-            call["name"] if isinstance(call, dict) else call.name,
-            json.dumps(
-                call["args"] if isinstance(call, dict) else call.args,
-                sort_keys=True,
-                default=str,
-            ),
+    return tuple(
+        sorted(
+            (
+                call["name"] if isinstance(call, dict) else call.name,
+                json.dumps(
+                    call["args"] if isinstance(call, dict) else call.args,
+                    sort_keys=True,
+                    default=str,
+                ),
+            )
+            for call in (getattr(message, "tool_calls", None) or [])
         )
-        for call in (getattr(message, "tool_calls", None) or [])
-    ))
+    )
 
 
 def _repeats_previous_tool_batch(messages: list[AnyMessage]) -> bool:
@@ -438,9 +454,7 @@ class ToolLoopAgent:
         # A HIT is by definition zero-LLM-turn; the note would be redundant.
         if note and tag != "HIT":
             detail += f", {note}"
-        _log_agent_completion(
-            state.get("progress_id", ""), self.progress_label, detail
-        )
+        _log_agent_completion(state.get("progress_id", ""), self.progress_label, detail)
 
     # -- per-agent hooks ------------------------------------------------------
 
@@ -467,7 +481,7 @@ class ToolLoopAgent:
         cached = self.cached_verdict(state)
         if cached:
             if not self.progress_label:
-                logging.info(f"{self.cache_hit_label} cache hit.")
+                logger.info(f"{self.cache_hit_label} cache hit.")
                 return Command(update={"vulnerabilities": [cached]})
             # Ledger agents get no separate line: the HIT rides on the
             # progress completion produced by the pre_router terminal route.
@@ -508,7 +522,9 @@ class ToolLoopAgent:
 
     # -- memory management ----------------------------------------------------
 
-    def summarize(self, middle: list[AnyMessage]) -> tuple[SystemMessage | None, Optional[dict]]:
+    def summarize(
+        self, middle: list[AnyMessage]
+    ) -> tuple[SystemMessage | None, dict | None]:
         # The cheap summarizer is the per-loop summary_llm (get_llm("compaction"))
         # call with its OWN window and output budget (summarizer_compaction);
         # its transcript (rendered inside the summary prompt) must fit
@@ -528,7 +544,7 @@ class ToolLoopAgent:
         )
         working = list(middle)
         if estimate_message_tokens(working) >= summarizer_budget:
-            logging.warning(
+            logger.warning(
                 "middle estimates %d tokens >= summarizer budget %d; dropping "
                 "largest message(s) before summarizing",
                 estimate_message_tokens(working),
@@ -540,7 +556,7 @@ class ToolLoopAgent:
                     key=lambda i: estimate_message_tokens([working[i]]),
                 )
                 dropped = working.pop(idx)
-                logging.debug(
+                logger.debug(
                     "dropped %s message (%d est tokens) from middle before summarizing",
                     getattr(dropped, "type", "?"),
                     estimate_message_tokens([dropped]),
@@ -563,7 +579,7 @@ class ToolLoopAgent:
         updates: list = []
         did_compact = False
         hard_capped = False
-        compaction_usage: Optional[dict] = None
+        compaction_usage: dict | None = None
 
         # Split with oversized-tail demotion only — NO per-message truncation.
         # A pathological single message (e.g. a ~120k-token 'finish_reason:
@@ -586,10 +602,7 @@ class ToolLoopAgent:
         # errors; also skip when the compressible middle is trivially small.
         if estimate_message_tokens(messages_for_llm) >= self.compaction.threshold():
             compressible = estimate_message_tokens(middle)
-            if (
-                len(head) == 2
-                and compressible >= self.compaction.min_compressible
-            ):
+            if len(head) == 2 and compressible >= self.compaction.min_compressible:
                 summary_msg, summary_usage = self.summarize(middle)
                 compaction_usage = add_usage(compaction_usage, summary_usage)
                 if summary_msg is not None:
@@ -614,7 +627,9 @@ class ToolLoopAgent:
                 forced = head + [summary_msg] + tail
             else:
                 forced = head + tail[-2:]
-            if estimate_message_tokens(forced) < estimate_message_tokens(messages_for_llm):
+            if estimate_message_tokens(forced) < estimate_message_tokens(
+                messages_for_llm
+            ):
                 messages_for_llm = forced
                 updates = [
                     RemoveMessage(id=REMOVE_ALL_MESSAGES),
@@ -622,7 +637,7 @@ class ToolLoopAgent:
                 ]
                 did_compact = True
                 hard_capped = True
-                logging.warning(
+                logger.warning(
                     f"{self.name} on {subject} hard-capped context "
                     f"to avoid exceeding the model window."
                 )
@@ -631,12 +646,14 @@ class ToolLoopAgent:
         # push the agent to emit its terminal tool next round.
         if current_turn >= self._countdown_start:
             terminal_display = " or ".join(self._terminal_names())
-            warning_msg = HumanMessage(content=(
-                f"System Warning: You are on turn {current_turn} of "
-                f"{self._max_iterations}. You must call {terminal_display} in your next "
-                f"turn based on the best available evidence, or the system will forcefully "
-                f"terminate this task."
-            ))
+            warning_msg = HumanMessage(
+                content=(
+                    f"System Warning: You are on turn {current_turn} of "
+                    f"{self._max_iterations}. You must call {terminal_display} in your next "
+                    f"turn based on the best available evidence, or the system will forcefully "
+                    f"terminate this task."
+                )
+            )
             messages_for_llm = list(messages_for_llm) + [warning_msg]
             updates.append(warning_msg)
 
@@ -658,24 +675,28 @@ class ToolLoopAgent:
         full_messages = list(state["messages"])
         subject = self._subject(state)
         current_turn = state.get("iterations", 0) + 1
-        messages_for_llm, updates, did_compact, _, compaction_usage = self.prepare_history(
-            full_messages, subject, current_turn
+        messages_for_llm, updates, did_compact, _, compaction_usage = (
+            self.prepare_history(full_messages, subject, current_turn)
         )
         # Hallucination guard: a byte-identical re-run of the previous batch adds
         # no evidence; nudge the model (transiently — the state history stays
         # byte-identical) to change the call or conclude.
         if _repeats_previous_tool_batch(full_messages):
             terminal_display = " or ".join(self._terminal_names())
-            messages_for_llm = list(messages_for_llm) + [HumanMessage(content=(
-                "System Warning: your last two responses executed EXACTLY the "
-                "same tool calls; that result is already in your history. Reissue "
-                f"the call with changed arguments, or conclude with {terminal_display} now."
-            ))]
+            messages_for_llm = list(messages_for_llm) + [
+                HumanMessage(
+                    content=(
+                        "System Warning: your last two responses executed EXACTLY the "
+                        "same tool calls; that result is already in your history. Reissue "
+                        f"the call with changed arguments, or conclude with {terminal_display} now."
+                    )
+                )
+            ]
         response = llm_with_tools.invoke(messages_for_llm)
         turn_usage = record_llm_usage(self.name, response)
         updates.append(response)
         if did_compact:
-            logging.info(
+            logger.info(
                 f"{self.name} on {subject} compacted context: "
                 f"{estimate_message_tokens(full_messages)} est. tokens -> "
                 f"{estimate_message_tokens(messages_for_llm)} est. tokens."
@@ -698,7 +719,7 @@ class ToolLoopAgent:
         # Hard loop guard: if the model never submits a verdict, terminate
         # gracefully instead of spinning until the recursion limit.
         if state.get("iterations", 0) >= self._max_iterations:
-            logging.warning(
+            logger.warning(
                 f"{self.name} on {self._subject(state)} exceeded "
                 f"{self._max_iterations} iterations without a verdict; falling back."
             )

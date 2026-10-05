@@ -67,13 +67,13 @@ BROWSER_TOOL_NAMES = {
 
 class _Session:
     __slots__ = (
-        "session_id",
-        "context",
-        "page",
         "console_msgs",
+        "context",
         "delivered",
-        "last_used",
         "in_use",
+        "last_used",
+        "page",
+        "session_id",
     )
 
     def __init__(self, session_id, context, page):
@@ -81,7 +81,7 @@ class _Session:
         self.context = context
         self.page = page
         self.console_msgs = []  # bounded ring of already-truncated event lines
-        self.delivered = 0      # watermark: index already surfaced to the LLM
+        self.delivered = 0  # watermark: index already surfaced to the LLM
         self.last_used = time.time()
         self.in_use = False
 
@@ -89,7 +89,7 @@ class _Session:
 def _host(url) -> str:
     try:
         return (urlparse(url).netloc or "").split(":")[0]
-    except Exception:
+    except ValueError:
         return ""
 
 
@@ -156,7 +156,7 @@ class BrowserSessionManager:
                 try:
                     if self._browser.is_connected():
                         return self._browser
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
                 # Dead browser (crash): drop it so the next call relaunches.
                 self._stop_locked()
@@ -175,12 +175,14 @@ class BrowserSessionManager:
                     )
                 self._browser_tid = threading.get_ident()
                 return self._browser
-            except Exception as e:  # fail open: no browser, keep HTTP path
+            except (
+                Exception  # noqa: BLE001
+            ) as e:  # fail open: no browser, keep HTTP path
                 self._disabled = True
                 self._disabled_reason = str(e)[:300]
                 logger.warning(
-                    "Headless browser unavailable (%s); validator continues "
-                    "HTTP-only.", self._disabled_reason
+                    "Headless browser unavailable (%s); validator continues HTTP-only.",
+                    self._disabled_reason,
                 )
                 return None
 
@@ -188,7 +190,7 @@ class BrowserSessionManager:
         try:
             if self._browser is not None:
                 self._browser_thread_run(self._browser.close)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         self._browser = None
 
@@ -202,7 +204,7 @@ class BrowserSessionManager:
         if self._playwright is not None:
             try:
                 self._browser_thread_run(self._playwright.stop)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             self._playwright = None
         self._executor.shutdown(wait=True)
@@ -212,18 +214,22 @@ class BrowserSessionManager:
     def _on_console(self, session, msg_obj):
         try:
             text = f"[console:{msg_obj.type}] {msg_obj.text}"
-        except Exception:
+        except Exception:  # noqa: BLE001
             return
         self._append_event(session, text)
 
     def _on_pageerror(self, session, exc):
-        self._append_event(session, f"[pageerror] {exc}".strip()[: settings.browser_console_msg_chars])
+        self._append_event(
+            session, f"[pageerror] {exc}".strip()[: settings.browser_console_msg_chars]
+        )
 
     def _on_dialog(self, session, dialog):
-        self._append_event(session, f"[dialog] {dialog.message}"[: settings.browser_console_msg_chars])
+        self._append_event(
+            session, f"[dialog] {dialog.message}"[: settings.browser_console_msg_chars]
+        )
         try:
             self._browser_thread_run(dialog.dismiss)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     def _append_event(self, session, text):
@@ -241,7 +247,7 @@ class BrowserSessionManager:
                 session.delivered = 0
 
     def _drain_new(self, session) -> str:
-        new = session.console_msgs[session.delivered:]
+        new = session.console_msgs[session.delivered :]
         session.delivered = len(session.console_msgs)
         return "\n".join(new)
 
@@ -291,7 +297,7 @@ class BrowserSessionManager:
 
             try:
                 s = self._browser_thread_run(_build)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 return None, (
                     f"Error: failed to create browser session: {str(e)[:300]}"
                 )
@@ -322,26 +328,31 @@ class BrowserSessionManager:
             ]
             if defs:
                 context.add_cookies(defs)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("Failed to seed browser cookies: %s", e)
 
     def cookie_artifact(self, session) -> dict:
         """Flatten the context's cookie jar into a ``{name: value}`` dict."""
         flat = {}
         try:
+
             def _cookies():
                 return {
                     c["name"]: c["value"]
                     for c in session.context.cookies()
                     if c.get("name") and c.get("value") is not None
                 }
+
             flat = self._browser_thread_run(_cookies)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return flat or {}
 
     def browser_artifact(self, session) -> dict:
-        return {"session_id": session.session_id, "cookies": self.cookie_artifact(session)}
+        return {
+            "session_id": session.session_id,
+            "cookies": self.cookie_artifact(session),
+        }
 
     def unavailable_art(self) -> dict:
         return {"session_id": "", "cookies": {}}
@@ -359,9 +370,7 @@ class BrowserSessionManager:
             return
         prefix = f"{agent_id}:"
         with self._lock:
-            doomed = [
-                s for key, s in self._sessions.items() if key.startswith(prefix)
-            ]
+            doomed = [s for key, s in self._sessions.items() if key.startswith(prefix)]
             for s in doomed:
                 self._close_session(s)
             for key in [k for k in self._sessions if k.startswith(prefix)]:
@@ -370,7 +379,7 @@ class BrowserSessionManager:
     def _close_session(self, session: _Session):
         try:
             self._browser_thread_run(session.context.close)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     def use(self, session: _Session, body):
@@ -424,25 +433,27 @@ def _describe(session) -> str:
     parts = []
     try:
         parts.append(f"URL: {session.page.url}")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         parts.append(f"Title: {session.page.title()}")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     body = ""
     try:
         body = session.page.locator("body").inner_text(
             timeout=min(settings.browser_timeout_ms, 5000)
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         try:
             body = session.page.content()
-        except Exception:
+        except Exception:  # noqa: BLE001
             body = ""
     body = body.strip()
     if len(body) > settings.browser_describe_max_chars:
-        body = body[: settings.browser_describe_max_chars] + "\n... [body truncated] ..."
+        body = (
+            body[: settings.browser_describe_max_chars] + "\n... [body truncated] ..."
+        )
     parts.append("\n--- VISIBLE TEXT ---\n" + (body or "(no visible text)"))
     events = manager._drain_new(session)
     parts.append(
@@ -465,7 +476,10 @@ def _url_from(state, url) -> tuple[str | None, str | None]:
             url = f"/{url}"
         url = f"{sandbox_url}{url}"
     if not url.startswith(sandbox_url):
-        return None, f"Error: You can only navigate the sandbox application at {sandbox_url}"
+        return (
+            None,
+            f"Error: You can only navigate the sandbox application at {sandbox_url}",
+        )
     return url, None
 
 
@@ -496,10 +510,11 @@ def browser_navigate(
     session, err = manager.session_for(state, session_id, create=True)
     if err:
         return err, manager.unavailable_art()
-    target, ure = _url_from(state, url)
-    if ure:
-        return ure, manager.browser_artifact(session)
+    target, err = _url_from(state, url)
+    if err:
+        return err, manager.browser_artifact(session)
     try:
+
         def _navigate():
             try:
                 session.page.goto(
@@ -507,7 +522,7 @@ def browser_navigate(
                     wait_until=wait_for,
                     timeout=settings.browser_timeout_ms,
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 return (
                     f"Error: navigation failed: {str(e)[:500]}",
                     manager.browser_artifact(session),
@@ -520,8 +535,11 @@ def browser_navigate(
             "on this vulnerability.]"
         )
         return snap + hint, art
-    except Exception as e:
-        return f"Error: browser_navigate failed: {str(e)[:500]}", manager.unavailable_art()
+    except Exception as e:  # noqa: BLE001
+        return (
+            f"Error: browser_navigate failed: {str(e)[:500]}",
+            manager.unavailable_art(),
+        )
 
 
 @tool(response_format="content_and_artifact")
@@ -543,10 +561,11 @@ def browser_click(
     if err:
         return err, manager.unavailable_art()
     try:
+
         def _click():
             try:
                 session.page.click(selector, timeout=settings.browser_timeout_ms)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 return (
                     f"Error: could not click {selector!r}: {str(e)[:500]}",
                     manager.browser_artifact(session),
@@ -555,13 +574,13 @@ def browser_click(
                 session.page.wait_for_load_state(
                     "domcontentloaded", timeout=min(settings.browser_timeout_ms, 5000)
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             return _describe(session), manager.browser_artifact(session)
 
         snap, art = manager.use(session, _click)
         return snap, art
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return f"Error: browser_click failed: {str(e)[:500]}", manager.unavailable_art()
 
 
@@ -586,10 +605,11 @@ def browser_fill(
     if err:
         return err, manager.unavailable_art()
     try:
+
         def _fill():
             try:
                 session.page.fill(selector, value, timeout=settings.browser_timeout_ms)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 return (
                     f"Error: could not fill {selector!r}: {str(e)[:500]}",
                     manager.browser_artifact(session),
@@ -598,7 +618,7 @@ def browser_fill(
 
         snap, art = manager.use(session, _fill)
         return snap, art
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return f"Error: browser_fill failed: {str(e)[:500]}", manager.unavailable_art()
 
 
@@ -623,10 +643,11 @@ def browser_evaluate(
     if err:
         return err, manager.unavailable_art()
     try:
+
         def _evaluate():
             try:
                 result = session.page.evaluate(expression)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 return (
                     f"Error: evaluate failed: {str(e)[:500]}",
                     manager.browser_artifact(session),
@@ -644,8 +665,11 @@ def browser_evaluate(
 
         out, art = manager.use(session, _evaluate)
         return out, art
-    except Exception as e:
-        return f"Error: browser_evaluate failed: {str(e)[:500]}", manager.unavailable_art()
+    except Exception as e:  # noqa: BLE001
+        return (
+            f"Error: browser_evaluate failed: {str(e)[:500]}",
+            manager.unavailable_art(),
+        )
 
 
 @tool(response_format="content_and_artifact")
@@ -667,12 +691,13 @@ def browser_console(
     if err:
         return err, manager.unavailable_art()
     try:
+
         def _console():
             events = manager._drain_new(session)
             head = ""
             try:
                 head = f"URL: {session.page.url}"
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             return (
                 f"{head}\n--- BROWSER EVENTS (console/pageerror/dialog since last call) ---\n"
@@ -681,5 +706,8 @@ def browser_console(
 
         out, art = manager.use(session, _console)
         return out, art
-    except Exception as e:
-        return f"Error: browser_console failed: {str(e)[:500]}", manager.unavailable_art()
+    except Exception as e:  # noqa: BLE001
+        return (
+            f"Error: browser_console failed: {str(e)[:500]}",
+            manager.unavailable_art(),
+        )

@@ -13,11 +13,18 @@ import credential_finder
 import settings
 import tools
 from llms import get_llm
-from run_stats import _record_stat, _start_agent_progress, affected_nodes_label, as_dicts, record_llm_usage, steps_block
+from run_stats import (
+    _record_stat,
+    _start_agent_progress,
+    affected_nodes_label,
+    as_dicts,
+    record_llm_usage,
+    steps_block,
+)
 from schemas import VALIDATOR_AGENT
 from stage_patcher import patchable_records
-from state import MasterState, ValidatorState
 from stage_reviewer import build_reviewer_payload
+from state import MasterState, ValidatorState
 from tool_loop import CompactionConfig, ToolLoopAgent
 from utils import (
     boundary_deferred,
@@ -31,6 +38,7 @@ from utils import (
     take_feedback_dispatch,
 )
 
+logger = logging.getLogger(__name__)
 
 _BARE_IDENT_RE = re.compile(r"^[\w$]+$")
 
@@ -44,7 +52,9 @@ def _validation_group_key(record: dict):
     descriptive labels (>= 3 words) or structural-selector tokens do identify
     one specific flaw site.
     """
-    comp = re.sub(r"\s+", " ", (record.get("vulnerable_component") or "").strip().lower())
+    comp = re.sub(
+        r"\s+", " ", (record.get("vulnerable_component") or "").strip().lower()
+    )
     if not comp:
         return None
     tokens = comp.split()
@@ -95,7 +105,7 @@ def dispatch_validators(state: MasterState):
     """
     all_vulns = as_dicts(state.get("vulnerabilities", []))
     confirmed_vulns = [v for v in all_vulns if v.get("status") == "confirmed"]
-    logging.info(
+    logger.info(
         f"dispatch_validators sees {len(all_vulns)} records in the parent channel, "
         f"{len(confirmed_vulns)} confirmed "
         f"({[v.get('vuln_id') for v in confirmed_vulns]})."
@@ -107,14 +117,14 @@ def dispatch_validators(state: MasterState):
         strategy = evaluation.get("validation_strategy") or "direct_to_validator"
         if strategy == "static_finding_only":
             # Real in source, no network-reachable path: static proof accepted.
-            logging.info(
+            logger.info(
                 f"{evaluation.get('vuln_id')} marked static_finding_only — "
                 f"accepted into report without validation."
             )
             continue
         if strategy == "requires_integration":
             # Deferred so the auditor sees exploitable peers with proven payloads.
-            logging.info(
+            logger.info(
                 f"{evaluation.get('vuln_id')} requires_integration — deferred to "
                 f"the integration audit phase (after direct validation)."
             )
@@ -128,7 +138,7 @@ def dispatch_validators(state: MasterState):
                 # verdict on the isolated low-severity flaw is not the point),
                 # but dispatch_integration_audits will chain-audit it once the
                 # direct records are proven.
-                logging.info(
+                logger.info(
                     f"{evaluation.get('vuln_id')} CVSS estimate {evaluation.get('cvss_vector')} "
                     f"below gate threshold {settings.validator_min_cvss} but "
                     f"changes_security_boundary is set — deferred to the integration "
@@ -138,7 +148,7 @@ def dispatch_validators(state: MasterState):
             # Reviewer's CVSS estimate below settings.validator_min_cvss: the
             # sandbox is never spent on it; the record stays 'confirmed' and the
             # reporter ships it unvalidated (same predicate, state-derived row).
-            logging.info(
+            logger.info(
                 f"{evaluation.get('vuln_id')} CVSS estimate {evaluation.get('cvss_vector')} "
                 f"below gate threshold {settings.validator_min_cvss} — validation skipped, "
                 f"will be reported unvalidated."
@@ -151,8 +161,10 @@ def dispatch_validators(state: MasterState):
         # peeked here and committed after the dead-sandbox abort point, so an
         # aborted dispatch never burns claims for records that never went out.
         claim_key = (
-            evaluation.get("vuln_id") or "", "direct",
-            evaluation.get("review_round") or 0, evaluation.get("patch_round") or 0,
+            evaluation.get("vuln_id") or "",
+            "direct",
+            evaluation.get("review_round") or 0,
+            evaluation.get("patch_round") or 0,
         )
         if dispatch_claim_taken(*claim_key):
             info_once(
@@ -178,13 +190,17 @@ def dispatch_validators(state: MasterState):
             continue
         if key := _validation_group_key(evaluation):
             groups.setdefault(key, []).append(evaluation)
-    batched = {k: v for k, v in groups.items() if 1 < len(v) <= settings.validator_variant_max_group}
+    batched = {
+        k: v
+        for k, v in groups.items()
+        if 1 < len(v) <= settings.validator_variant_max_group
+    }
     shared_ids = {id(r) for members in batched.values() for r in members}
 
     payloads: list[tuple[dict, list[dict] | None]] = []
     for members in batched.values():
         seed, variants = members[0], members[1:]
-        logging.info(
+        logger.info(
             f"Sharing one validation run across {len(members)} equivalent "
             f"findings ({[m.get('vuln_id') for m in members]})."
         )
@@ -206,7 +222,8 @@ def dispatch_validators(state: MasterState):
             and evaluation.get("patch_state") == "reviewed"
         ):
             claim_key = (
-                evaluation.get("vuln_id") or "", "patch_verify",
+                evaluation.get("vuln_id") or "",
+                "patch_verify",
                 evaluation.get("patch_round") or 0,
             )
             if dispatch_claim_taken(*claim_key):
@@ -217,7 +234,7 @@ def dispatch_validators(state: MasterState):
                 )
                 continue
             pending_claims.append(claim_key)
-            logging.info(
+            logger.info(
                 f"{evaluation.get('vuln_id')} is a reviewer-cleared PATCHED fix — "
                 f"dispatching dynamic fix-proof."
             )
@@ -245,9 +262,8 @@ def dispatch_validators(state: MasterState):
         Send("validator_agent", _validator_payload(state, seed, variants, progress_id))
         for seed, variants in payloads
     ]
-    logging.info(
-        f"Dispatched validator: 0/{len(payloads)} complete, "
-        f"{len(payloads)} remaining."
+    logger.info(
+        f"Dispatched validator: 0/{len(payloads)} complete, {len(payloads)} remaining."
     )
     _record_stat("validator_records", len(commands))
     return commands
@@ -290,12 +306,16 @@ def route_validator_feedback(state: MasterState):
 
     commands = []
     for record in flagged:
-        commands.append(Send(
-            "reviewer_agent",
-            build_reviewer_payload(record, progress_id, state.get("pipeline_run_id")),
-        ))
+        commands.append(
+            Send(
+                "reviewer_agent",
+                build_reviewer_payload(
+                    record, progress_id, state.get("pipeline_run_id")
+                ),
+            )
+        )
 
-    logging.info(
+    logger.info(
         f"Validator requested more context for {len(commands)} vulnerability(ies); "
         f"dispatching reviewer feedback re-reviews: 0/{len(flagged)} complete, "
         f"{len(flagged)} remaining."
@@ -365,13 +385,13 @@ class ValidatorAgent(ToolLoopAgent):
             browser_tools.browser_fill,
             browser_tools.browser_evaluate,
             browser_tools.browser_console,
-            tools.mark_validation_complete
+            tools.mark_validation_complete,
         ]
         if settings.attacker_enabled:
             validator_tools += [
                 attacker_tools.run_command,
                 attacker_tools.write_attacker_file,
-                attacker_tools.read_attacker_file
+                attacker_tools.read_attacker_file,
             ]
         # ask_for_context is bound ONLY on the first validation pass.
         if _is_first_pass(state):
@@ -426,7 +446,7 @@ class ValidatorAgent(ToolLoopAgent):
         # (attacker shell only when enabled; insufficient-context hatch only on
         # the first pass, mirroring bind_tools; patched-target contract only
         # when the record carries an applied patch).
-        report = state['report_to_test']
+        report = state["report_to_test"]
         sys_prompt = VALIDATOR_AGENT["prompt"]
         if settings.attacker_enabled:
             sys_prompt += "\n\n" + VALIDATOR_AGENT.get("attacker_tools", "")
@@ -436,8 +456,8 @@ class ValidatorAgent(ToolLoopAgent):
             sys_prompt += "\n\n" + VALIDATOR_AGENT.get("patched_target", "")
         sys_msg = SystemMessage(content=sys_prompt)
         affected = [n for n in (report.get("affected_nodes") or []) if n]
-        affected_str = affected_nodes_label(report, report.get('node_id', 'Unknown'))
-        steps_str = steps_block(report.get('reproduction_steps') or [])
+        affected_str = affected_nodes_label(report, report.get("node_id", "Unknown"))
+        steps_str = steps_block(report.get("reproduction_steps") or [])
         formatted_report = (
             f"--- CORE VULNERABILITY ---\n"
             f"Vulnerability ID: {report.get('vuln_id', 'Unknown')}\n"
@@ -480,7 +500,7 @@ class ValidatorAgent(ToolLoopAgent):
             sync_note = (
                 state.get("sandbox_resync_note")
                 or "unknown: no resync outcome was recorded — treat the sandbox's "
-                   "patch state as UNVERIFIED."
+                "patch state as UNVERIFIED."
             )
             formatted_report += (
                 f"\n\n--- PROPOSED PATCH (attempt {report.get('patch_round', 1)}; applied "
@@ -535,8 +555,11 @@ class ValidatorAgent(ToolLoopAgent):
                     f"{steps_block(v.get('reproduction_steps') or [])}"
                     + (
                         "\n--- REVIEWER RESERVATIONS (resolve for this variant too) ---\n"
-                        + "\n".join(f"  {i}. {r}" for i, r in enumerate(v["reservations"], 1))
-                        if v.get("reservations") else ""
+                        + "\n".join(
+                            f"  {i}. {r}" for i, r in enumerate(v["reservations"], 1)
+                        )
+                        if v.get("reservations")
+                        else ""
                     )
                 )
             formatted_report += (
@@ -556,16 +579,14 @@ class ValidatorAgent(ToolLoopAgent):
         # exact code under test without extra lookups.
         all_nodes = list(affected)
         for v in variants:
-            for n in (v.get("affected_nodes") or []):
+            for n in v.get("affected_nodes") or []:
                 if n and n not in all_nodes:
                     all_nodes.append(n)
         code_sections = []
         for node_id in all_nodes:
             node_source = get_node_code(node_id)
             if node_source:
-                code_sections.append(
-                    f"Node: {node_id}\n```\n{node_source}\n```"
-                )
+                code_sections.append(f"Node: {node_id}\n```\n{node_source}\n```")
         if code_sections:
             formatted_report += (
                 f"\n\n--- AFFECTED NODES SOURCE CODE ---\n"
@@ -575,11 +596,13 @@ class ValidatorAgent(ToolLoopAgent):
             )
         # Pre-configured sandbox credentials (from preprocessing); empty if none.
         auth_block = credential_finder.authentication_block()
-        human_msg = HumanMessage(content=(
-            f"Target Sandbox: {state['sandbox_url']}\n\n"
-            + (f"{auth_block}\n\n" if auth_block else "")
-            + f"Vulnerability to Prove:\n{formatted_report}"
-        ))
+        human_msg = HumanMessage(
+            content=(
+                f"Target Sandbox: {state['sandbox_url']}\n\n"
+                + (f"{auth_block}\n\n" if auth_block else "")
+                + f"Vulnerability to Prove:\n{formatted_report}"
+            )
+        )
         messages = [sys_msg, human_msg]
         response = llm_with_tools.invoke(messages)
         return {
@@ -596,11 +619,17 @@ class ValidatorAgent(ToolLoopAgent):
         for msg in reversed(state["messages"]):
             if getattr(msg, "type", "") == "ai":
                 break
-            if getattr(msg, "type", "") == "tool" and hasattr(msg, "artifact") and msg.artifact:
+            if (
+                getattr(msg, "type", "") == "tool"
+                and hasattr(msg, "artifact")
+                and msg.artifact
+            ):
                 name = getattr(msg, "name", "")
                 if name == "send_http_request":
                     current_cookies.update(msg.artifact)
-                elif name in browser_tools.BROWSER_TOOL_NAMES and isinstance(msg.artifact, dict):
+                elif name in browser_tools.BROWSER_TOOL_NAMES and isinstance(
+                    msg.artifact, dict
+                ):
                     jar = msg.artifact.get("cookies") or {}
                     if isinstance(jar, dict):
                         current_cookies.update(jar)
@@ -612,8 +641,7 @@ class ValidatorAgent(ToolLoopAgent):
         # never count: a rejected mark_validation_complete must bounce back.
         first_pass = _is_first_pass(state)
         terminal_names = [
-            n for n in self._terminal_names()
-            if n != "ask_for_context" or first_pass
+            n for n in self._terminal_names() if n != "ask_for_context" or first_pass
         ]
         for msg in reversed(state["messages"]):
             if getattr(msg, "type", "") != "tool":

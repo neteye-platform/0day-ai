@@ -1,29 +1,57 @@
-from typing import Annotated, Optional, Any, Union
+import itertools
 import json
-from langchain_core.messages import ToolMessage
-import requests
-from requests.adapters import HTTPAdapter
-from pathlib import Path
 import logging
-import threading
-from bs4 import BeautifulSoup
-from fnmatch import fnmatch
-from langgraph.prebuilt import InjectedState
-from langchain_core.tools import tool, InjectedToolCallId
-from langgraph.types import Command
 import re
-import networkx as nx
+import threading
+from fnmatch import fnmatch
+from pathlib import Path
+from typing import Annotated, Any
 
-from schemas import EvaluationToolInput, ValidationToolInput, AskForContextInput, IntegrationAuditInput, VulnerabilityDetailsInput, cwes
-from utils import build_networkx_graph, get_cached_graph_data, get_cached_symbol_index, get_node_code, get_container_artifacts_root, cache_reviewer, cache_validator, cache_integration_auditor, reviewer_cache_key, is_feedback_review, is_path_excluded, boundary_deferred
-from languages import MANIFEST_NAMES
-import settings
-import browser_tools
+import networkx as nx
+import requests
+from bs4 import BeautifulSoup
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import InjectedToolCallId, tool
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
+from requests.adapters import HTTPAdapter
+
 import attacker_tools
+import browser_tools
+import settings
+from languages import MANIFEST_NAMES
+from schemas import (
+    AskForContextInput,
+    EvaluationToolInput,
+    IntegrationAuditInput,
+    ValidationToolInput,
+    VulnerabilityDetailsInput,
+    cwes,
+)
+from utils import (
+    boundary_deferred,
+    build_networkx_graph,
+    cache_integration_auditor,
+    cache_reviewer,
+    cache_validator,
+    get_cached_graph_data,
+    get_cached_symbol_index,
+    get_container_artifacts_root,
+    get_node_code,
+    is_feedback_review,
+    is_path_excluded,
+    reviewer_cache_key,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @tool
-def read_source_code(node_id: str, include_context: bool = False, state: Annotated[Optional[dict], InjectedState] = None) -> str:
+def read_source_code(
+    node_id: str,
+    include_context: bool = False,
+    state: Annotated[dict | None, InjectedState] = None,
+) -> str:
     """
     Fetches the source code for a given Node ID.
 
@@ -40,9 +68,12 @@ def read_source_code(node_id: str, include_context: bool = False, state: Annotat
         if msg.get("type") == "ai":
             tool_calls = msg.get("tool_calls", [])
             for tc in tool_calls:
-                if (tc.get("name") == "read_source_code"
-                        and tc.get("args", {}).get("node_id") == node_id
-                        and tc.get("args", {}).get("include_context", False) == include_context):
+                if (
+                    tc.get("name") == "read_source_code"
+                    and tc.get("args", {}).get("node_id") == node_id
+                    and tc.get("args", {}).get("include_context", False)
+                    == include_context
+                ):
                     return f"System Notice: You have already read the source code for '{node_id}' in a previous step. The code is static and it will not change."
 
     node_code = get_node_code(node_id, reviewer_mode=True, raw=not include_context)
@@ -61,9 +92,17 @@ MAX_PATHS = 50
 MAX_PATH_CUTOFF = 12
 
 
-def _read_lines_range(file_path: str, target: Path, start_line: int,
-                      end_line: int | None, max_lines: int, *, kind: str = "File",
-                      header_path: str | None = None, continuation: str = "read_file") -> str:
+def _read_lines_range(
+    file_path: str,
+    target: Path,
+    start_line: int,
+    end_line: int | None,
+    max_lines: int,
+    *,
+    kind: str = "File",
+    header_path: str | None = None,
+    continuation: str = "read_file",
+) -> str:
     """Read a bounded line range of an existing text file.
 
     Shared by ``read_file`` and ``read_container_artifact`` so that paging,
@@ -74,7 +113,7 @@ def _read_lines_range(file_path: str, target: Path, start_line: int,
             lines = f.readlines()
     except UnicodeDecodeError:
         return f"Error: '{file_path}' appears to be a binary file and cannot be read as text."
-    except Exception as e:
+    except OSError as e:
         return f"Error reading {kind.lower()} '{file_path}': {e}"
 
     total_lines = len(lines)
@@ -82,8 +121,7 @@ def _read_lines_range(file_path: str, target: Path, start_line: int,
         return f"{kind} '{file_path}' is empty (0 lines)."
 
     requested_start = start_line
-    if start_line < 1:
-        start_line = 1
+    start_line = max(start_line, 1)
     if start_line > total_lines:
         return f"Error: start_line {requested_start} is beyond the end of '{file_path}' (file has {total_lines} lines)."
 
@@ -99,7 +137,8 @@ def _read_lines_range(file_path: str, target: Path, start_line: int,
         truncated = True
 
     body = "".join(
-        f"{i:>6}: {line}" for i, line in enumerate(lines[start_line - 1:end], start_line)
+        f"{i:>6}: {line}"
+        for i, line in enumerate(lines[start_line - 1 : end], start_line)
     )
 
     header = f"{kind}: {header_path or file_path} (lines {start_line}-{end} of {total_lines})\n"
@@ -145,7 +184,9 @@ def read_file(file_path: str, start_line: int = 1, end_line: int | None = None) 
     if not target.is_file():
         return f"Error: File '{file_path}' not found in the application directory."
 
-    return _read_lines_range(file_path, target, start_line, end_line, READ_FILE_MAX_LINES)
+    return _read_lines_range(
+        file_path, target, start_line, end_line, READ_FILE_MAX_LINES
+    )
 
 
 # Maximum number of lines read_container_artifact will return in a single call.
@@ -173,7 +214,9 @@ def list_container_artifacts() -> str:
     """
     artifacts_root = get_container_artifacts_root().resolve()
 
-    if not artifacts_root.exists() or not any(p.is_dir() for p in artifacts_root.iterdir()):
+    if not artifacts_root.exists() or not any(
+        p.is_dir() for p in artifacts_root.iterdir()
+    ):
         return (
             "No container artifacts are available. The preprocessor did not "
             "build/snapshot any container image for this target (no Dockerfile/"
@@ -202,7 +245,9 @@ def list_container_artifacts() -> str:
                 lines.append("  ENV:")
                 for pair in env:
                     key, _, value = pair.partition("=")
-                    shown = value if len(value) <= 500 else value[:500] + "...[truncated]"
+                    shown = (
+                        value if len(value) <= 500 else value[:500] + "...[truncated]"
+                    )
                     lines.append(f"    {key}={shown}")
 
         # Extracted files
@@ -221,7 +266,9 @@ def list_container_artifacts() -> str:
         # Fall back to walking the tree when the summary is missing.
         if not extracted and rootfs_dir.is_dir():
             extracted = sorted(
-                str(p.relative_to(rootfs_dir)) for p in rootfs_dir.rglob("*") if p.is_file()
+                str(p.relative_to(rootfs_dir))
+                for p in rootfs_dir.rglob("*")
+                if p.is_file()
             )
 
         lines.append(f"  Extracted files ({len(extracted)}):")
@@ -240,7 +287,9 @@ def list_container_artifacts() -> str:
                     pass
             lines.append(f"    rootfs/{rel}{size}")
         if len(extracted) > CONTAINER_ARTIFACT_MAX_SUMMARY_FILES:
-            lines.append(f"    ... [{len(extracted) - CONTAINER_ARTIFACT_MAX_SUMMARY_FILES} more] ...")
+            lines.append(
+                f"    ... [{len(extracted) - CONTAINER_ARTIFACT_MAX_SUMMARY_FILES} more] ..."
+            )
 
         sections.append("\n".join(lines))
 
@@ -253,7 +302,9 @@ def list_container_artifacts() -> str:
 
 
 @tool
-def read_container_artifact(file_path: str, start_line: int = 1, end_line: int | None = None) -> str:
+def read_container_artifact(
+    file_path: str, start_line: int = 1, end_line: int | None = None
+) -> str:
     """
     Reads a specific line range of a file extracted from the BUILT container
     image snapshot. Use this to inspect effective runtime configuration that is
@@ -293,8 +344,10 @@ def read_container_artifact(file_path: str, start_line: int = 1, end_line: int |
     if not target.is_file():
         image_dirs = [p for p in artifacts_root.iterdir() if p.is_dir()]
         if len(image_dirs) == 1:
-            slug = image_dirs[0].name
-            for candidate in (image_dirs[0] / "rootfs" / file_path, image_dirs[0] / file_path):
+            for candidate in (
+                image_dirs[0] / "rootfs" / file_path,
+                image_dirs[0] / file_path,
+            ):
                 resolved = candidate.resolve()
                 if resolved.is_file() and resolved.is_relative_to(artifacts_root):
                     target = resolved
@@ -304,9 +357,14 @@ def read_container_artifact(file_path: str, start_line: int = 1, end_line: int |
 
     rel = target.relative_to(artifacts_root)
     return _read_lines_range(
-        file_path, target, start_line, end_line,
+        file_path,
+        target,
+        start_line,
+        end_line,
         CONTAINER_ARTIFACT_MAX_LINES,
-        kind="Artifact", header_path=rel, continuation="read_container_artifact",
+        kind="Artifact",
+        header_path=rel,
+        continuation="read_container_artifact",
     )
 
 
@@ -334,7 +392,9 @@ def find_in_container(keyword: str, is_regex: bool = False) -> str:
     """
     artifacts_root = get_container_artifacts_root().resolve()
 
-    if not artifacts_root.exists() or not any(p.is_dir() for p in artifacts_root.iterdir()):
+    if not artifacts_root.exists() or not any(
+        p.is_dir() for p in artifacts_root.iterdir()
+    ):
         return (
             "No container artifacts are available. The preprocessor did not "
             "build/snapshot any container image for this target (no Dockerfile/"
@@ -365,7 +425,7 @@ def find_in_container(keyword: str, is_regex: bool = False) -> str:
             with open(index_file, "r", encoding="utf-8") as f:
                 index_lines = f.read().splitlines()
         except (OSError, UnicodeDecodeError) as e:
-            logging.info(f"Failed to read index for '{slug}': {e}")
+            logger.info(f"Failed to read index for '{slug}': {e}")
             continue
 
         for line in index_lines:
@@ -427,11 +487,11 @@ def _reject_submission(tool_call_id: str, text: str) -> Command:
 def submit_evaluation(
     state: Annotated[dict, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
-    **kwargs
+    **kwargs,
 ) -> Command:
     """
-    TERMINAL ACTION: Call this tool IMMEDIATELY as soon as you have a working 
-    exploit (is_confirmed=True) OR have definitively exhausted the attack surface 
+    TERMINAL ACTION: Call this tool IMMEDIATELY as soon as you have a working
+    exploit (is_confirmed=True) OR have definitively exhausted the attack surface
     (is_confirmed=False). Do not over-explore unneeded code.
     """
 
@@ -452,7 +512,7 @@ def submit_evaluation(
                 "Adjudicate it — rule it out by adding its sites to `untrusted_uses` with "
                 "the concrete blocking defense, or resubmit is_exploitable=true + "
                 "'direct_to_validator' describing the full observed chain in "
-                "`reproduction_steps` and keeping the concern so the Validator tests it."
+                "`reproduction_steps` and keeping the concern so the Validator tests it.",
             )
         uses = [u for u in (kwargs.get("untrusted_uses") or []) if str(u).strip()]
         if mode in ("code_level", "dependency_mitigation") and not uses:
@@ -463,7 +523,7 @@ def submit_evaluation(
                 "cannot reach an execution sink), including derived variables and "
                 "warn-and-continue branches. If any use cannot be excluded, resubmit with "
                 "is_exploitable=true and that point in `reservations`; if a guard only warns "
-                "and continues, it is not a defense."
+                "and continues, it is not a defense.",
             )
         if mode == "systemic":
             n_nodes = len(report.get("affected_nodes") or [])
@@ -475,12 +535,14 @@ def submit_evaluation(
                     f"node ({n_nodes}) citing that node's blocking defense (file:line). A "
                     "defense proven on an exemplar instance proves nothing about the "
                     "others; route unsettled nodes to the Validator via "
-                    "is_exploitable=true + `reservations` instead."
+                    "is_exploitable=true + `reservations` instead.",
                 )
 
     # Mutate a copy of the single report
     updated_vuln = dict(report)
-    updated_vuln["status"] = "confirmed" if kwargs.get("is_exploitable") else "false_positive"
+    updated_vuln["status"] = (
+        "confirmed" if kwargs.get("is_exploitable") else "false_positive"
+    )
     updated_vuln["reviewer_reasoning"] = kwargs.get("reasoning")
     updated_vuln["mitigation"] = kwargs.get("mitigation")
     updated_vuln["reservations"] = kwargs.get("reservations") or None
@@ -498,7 +560,9 @@ def submit_evaluation(
         updated_vuln["cvss_vector"] = (kwargs.get("cvss_vector") or "").strip() or None
     # Below-gate records carrying this flag are deferred to the Integration
     # Auditor instead of being gate-skipped outright (utils.boundary_deferred).
-    updated_vuln["changes_security_boundary"] = bool(kwargs.get("changes_security_boundary"))
+    updated_vuln["changes_security_boundary"] = bool(
+        kwargs.get("changes_security_boundary")
+    )
 
     # Patch lifecycle: this verdict adjudicates the PATCHED code, so the re-check
     # is consumed — route_patch_reviews only re-dispatches "applied" records, and
@@ -509,7 +573,7 @@ def submit_evaluation(
     tool_msg = ToolMessage(
         content="Evaluation submitted successfully. Ending review.",
         name="submit_evaluation",
-        tool_call_id=tool_call_id
+        tool_call_id=tool_call_id,
     )
 
     # Save to cache so subsequent runs skip the tool-calling loop. Feedback
@@ -524,12 +588,7 @@ def submit_evaluation(
             state.get("token_spent"),
         )
 
-    return Command(
-        update={
-            "vulnerabilities": [updated_vuln],
-            "messages": [tool_msg]
-        }
-    )
+    return Command(update={"vulnerabilities": [updated_vuln], "messages": [tool_msg]})
 
 
 # --- send_http_request: redirect cap, per-session cookies, CSRF handling -----
@@ -542,14 +601,27 @@ CSRF_PLACEHOLDERS = {"__CSRF__", "__CSRF_TOKEN__", "TOKEN"}
 
 # <meta> name attributes that conventionally carry (or name) a CSRF token.
 CSRF_META_NAMES = {
-    "csrf-token", "csrf_token", "csrftoken", "csrfToken", "csrf", "_csrf",
-    "csrf-param", "authenticity_token",
+    "csrf-token",
+    "csrf_token",
+    "csrftoken",
+    "csrfToken",
+    "csrf",
+    "_csrf",
+    "csrf-param",
+    "authenticity_token",
 }
 
 # Hidden <input> name attributes that conventionally carry a CSRF token.
 CSRF_INPUT_NAMES = {
-    "csrf_token", "csrftoken", "csrfmiddlewaretoken", "_token", "_csrf",
-    "csrf", "csrfToken", "_csrf_token", "authenticity_token",
+    "csrf_token",
+    "csrftoken",
+    "csrfmiddlewaretoken",
+    "_token",
+    "_csrf",
+    "csrf",
+    "csrfToken",
+    "_csrf_token",
+    "authenticity_token",
     "__RequestVerificationToken",
 }
 
@@ -619,10 +691,12 @@ class HttpSessionManager:
 
     @staticmethod
     def _key(state, session_id) -> str:
-        agent = (state.get("agent_id") if isinstance(state, dict) else None) or "no-agent"
+        agent = (
+            state.get("agent_id") if isinstance(state, dict) else None
+        ) or "no-agent"
         return f"{agent}:{session_id}"
 
-    def load(self, state, session_id) -> Optional[dict]:
+    def load(self, state, session_id) -> dict | None:
         key = self._key(state, session_id)
         with self._lock:
             jar = self._jars.get(key)
@@ -655,17 +729,18 @@ def _fetch_csrf_tokens(session, target_url, sandbox_url, allow_redirects: bool) 
     for candidate in candidates:
         try:
             resp = session.get(candidate, timeout=5, allow_redirects=allow_redirects)
-        except Exception:
+        except Exception:  # noqa: BLE001, S112
             continue
         if "text/html" in resp.headers.get("Content-Type", ""):
-            tokens = _extract_csrf_tokens(BeautifulSoup(resp.text, 'html.parser'))
+            tokens = _extract_csrf_tokens(BeautifulSoup(resp.text, "html.parser"))
             if tokens:
                 return tokens
     return {}
 
 
-def _inject_csrf_tokens(data, session, target_url, sandbox_url,
-                        allow_redirects: bool) -> tuple:
+def _inject_csrf_tokens(
+    data, session, target_url, sandbox_url, allow_redirects: bool
+) -> tuple:
     """Replace CSRF sentinel values in a form ``data`` dict with real tokens.
 
     Drops each placeholder field and writes the discovered token under its real
@@ -673,8 +748,7 @@ def _inject_csrf_tokens(data, session, target_url, sandbox_url,
     against Django is still served correctly. Returns (data, None) on success or
     (data, error_msg) when no token could be fetched."""
     placeholders = [
-        k for k, v in data.items()
-        if isinstance(v, str) and v in CSRF_PLACEHOLDERS
+        k for k, v in data.items() if isinstance(v, str) and v in CSRF_PLACEHOLDERS
     ]
     if not placeholders:
         return data, None
@@ -699,18 +773,18 @@ def _inject_csrf_tokens(data, session, target_url, sandbox_url,
 def send_http_request(
     method: str,
     endpoint: str,
-    headers: Optional[dict[str, str]] = None,
-    params: Optional[dict[str, Any]] = None,
-    data: Optional[dict[str, Any]] = None,
-    json_data: Optional[dict[str, Any]] = None,
-    files: Optional[dict[str, Union[str, tuple[str, str, str]]]] = None,
-    body: Optional[str] = None,
+    headers: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
+    data: dict[str, Any] | None = None,
+    json_data: dict[str, Any] | None = None,
+    files: dict[str, str | tuple[str, str, str]] | None = None,
+    body: str | None = None,
     follow_redirects: bool = True,
     max_redirects: int = 5,
-    session_id: Optional[str] = "default",
+    session_id: str | None = "default",
     reset_session: bool = False,
     extract_mode: str = "text",
-    state: Annotated[Optional[dict], InjectedState] = None,
+    state: Annotated[dict | None, InjectedState] = None,
 ) -> tuple[str, dict]:
     """
     Sends an HTTP request to the sandboxed application and maintains session state. Always returns raw response headers. The response body is parsed according to 'extract_mode'.
@@ -757,7 +831,10 @@ def send_http_request(
     endpoint = endpoint.strip()
     sandbox_url = state.get("sandbox_url") if state else None
     if not sandbox_url:
-        return "Error: No sandbox is configured. The preprocessor could not start a sandbox container.", {}
+        return (
+            "Error: No sandbox is configured. The preprocessor could not start a sandbox container.",
+            {},
+        )
     if endpoint.startswith(("http://", "https://")):
         url = endpoint
     else:
@@ -766,7 +843,10 @@ def send_http_request(
         url = f"{sandbox_url}{endpoint}"
 
     if not url.startswith(sandbox_url):
-        return f"Error: You can only make requests to the sandbox application at {sandbox_url}", {}
+        return (
+            f"Error: You can only make requests to the sandbox application at {sandbox_url}",
+            {},
+        )
 
     # Resolve the starting cookie jar: a persistent per-(agent, session_id)
     # jar when a session label is given, otherwise the shared state jar.
@@ -775,19 +855,21 @@ def send_http_request(
         if reset_session:
             http_sessions.reset(state, session_id)
         start_jar = http_sessions.load(state, session_id)
-        if start_jar is None:
+        if start_jar is None and state and "cookies" in state:
             # First use of this session_id: seed from the shared cookie state so
             # cookies set by the browser channel (or earlier transient calls)
             # carry into this session.
-            if state and "cookies" in state:
-                start_jar = dict(state.get("cookies", {}))
+            start_jar = dict(state.get("cookies", {}))
     elif not reset_session and state and "cookies" in state:
         start_jar = dict(state.get("cookies", {}))
 
     session = requests.Session()
     if follow_redirects:
         redirect_adapter = _CappedRedirectAdapter(max_redirects)
-        session.mount("http://", redirect_adapter)
+        # nosemgrep: python.lang.security.audit.insecure-transport.requests.request-session-with-http.request-session-with-http
+        session.mount(
+            "http://", redirect_adapter
+        )  # support direct communication with local container sandbox
         session.mount("https://", redirect_adapter)
     if start_jar:
         session.cookies.update(start_jar)
@@ -809,11 +891,15 @@ def send_http_request(
             uploads = {}
             for field, spec in files.items():
                 path = spec if isinstance(spec, (str, Path)) else spec[1]
-                container_bytes = attacker_tools.read_attacker_file_bytes(str(path), state)
+                container_bytes = attacker_tools.read_attacker_file_bytes(
+                    str(path), state
+                )
                 if container_bytes is not None:
                     if isinstance(spec, (str, Path)):
                         uploads[field] = (
-                            Path(path).name, container_bytes, "application/octet-stream"
+                            Path(path).name,
+                            container_bytes,
+                            "application/octet-stream",
                         )
                     else:
                         filename, _, content_type = spec
@@ -831,8 +917,7 @@ def send_http_request(
         # Automatic CSRF resolution: replace sentinel form-field values with a
         # freshly fetched token (same session, so the token's cookie applies).
         if isinstance(user_data, dict) and any(
-            isinstance(v, str) and v in CSRF_PLACEHOLDERS
-            for v in user_data.values()
+            isinstance(v, str) and v in CSRF_PLACEHOLDERS for v in user_data.values()
         ):
             user_data, csrf_error = _inject_csrf_tokens(
                 user_data, session, url, sandbox_url, follow_redirects
@@ -846,25 +931,31 @@ def send_http_request(
         response = session.request(**request_kwargs)
 
         raw_headers = "\r\n".join(f"{k}: {v}" for k, v in response.headers.items())
-        http_response_head = f"HTTP/1.1 {response.status_code} {response.reason}\n{raw_headers}\r\n\r\n"
+        http_response_head = (
+            f"HTTP/1.1 {response.status_code} {response.reason}\n{raw_headers}\r\n\r\n"
+        )
 
         # HTML parsing
         body_display = ""
 
         if "text/html" in response.headers.get("Content-Type", ""):
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(response.text, "html.parser")
 
             if extract_mode == "forms":
-                forms = soup.find_all('form')
-                body_display = f"[Found {len(forms)} forms]:\n\n" + "\n\n".join([str(f) for f in forms])
+                forms = soup.find_all("form")
+                body_display = f"[Found {len(forms)} forms]:\n\n" + "\n\n".join(
+                    [str(f) for f in forms]
+                )
             elif extract_mode == "links":
-                links = soup.find_all('a', href=True)
-                body_display = f"[Found {len(links)} links]:\n" + "\n".join([str(l) for l in links])
+                links = soup.find_all("a", href=True)
+                body_display = f"[Found {len(links)} links]:\n" + "\n".join(
+                    [str(l) for l in links]
+                )
             elif extract_mode == "text":
-                body_display = soup.get_text(separator='\n', strip=True)
+                body_display = soup.get_text(separator="\n", strip=True)
             elif extract_mode == "clean_html":
                 # Destroy noise tags
-                for noise in soup(['script', 'style', 'svg', 'noscript', 'canvas']):
+                for noise in soup(["script", "style", "svg", "noscript", "canvas"]):
                     noise.decompose()
                 body_display = str(soup)
             elif extract_mode == "raw":
@@ -875,7 +966,9 @@ def send_http_request(
                     body_display = f"[Found {len(tags)} <{extract_mode}> tags]:\n\n"
                     body_display += "\n\n".join([str(t) for t in tags[:50]])
                     if len(tags) > 50:
-                        body_display += f"\n\n... [{len(tags) - 50} more tags truncated] ..."
+                        body_display += (
+                            f"\n\n... [{len(tags) - 50} more tags truncated] ..."
+                        )
                 else:
                     body_display = f"[No <{extract_mode}> tags found on this page]"
 
@@ -884,7 +977,10 @@ def send_http_request(
             body_display = response.text
 
         if len(body_display) > 8000:
-            body_display = body_display[:8000] + "\n\n... [TRUNCATED: Try a specific extract_mode like 'forms' or 'text'] ..."
+            body_display = (
+                body_display[:8000]
+                + "\n\n... [TRUNCATED: Try a specific extract_mode like 'forms' or 'text'] ..."
+            )
 
         llm_output = f"{http_response_head}{body_display}"
 
@@ -908,8 +1004,8 @@ def send_http_request(
             http_sessions.save(state, session_id, cookies)
 
         return llm_output, cookies
-    except Exception as e:
-        return f"Error: Request failed: {str(e)}", {}
+    except Exception as e:  # noqa: BLE001
+        return f"Error: Request failed: {e!s}", {}
 
 
 def propagate_validation_update(state: dict, updated_vuln: dict) -> list[dict]:
@@ -946,7 +1042,7 @@ def _stage_poc_script(script_path, record: dict, state: dict) -> str | None:
         return None
     data = attacker_tools.read_attacker_file_bytes(rel, state)
     if not data:
-        logging.warning(
+        logger.warning(
             f"Validator: PoC script '{rel}' not found for {vuln_id}; "
             "the report will fall back to the poc_payload text."
         )
@@ -956,7 +1052,7 @@ def _stage_poc_script(script_path, record: dict, state: dict) -> str | None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
     except OSError as exc:
-        logging.warning(f"Validator: failed to stage PoC script for {vuln_id}: {exc}")
+        logger.warning(f"Validator: failed to stage PoC script for {vuln_id}: {exc}")
         return None
     return rel
 
@@ -965,14 +1061,14 @@ def _stage_poc_script(script_path, record: dict, state: dict) -> str | None:
 def mark_validation_complete(
     state: Annotated[dict, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
-    **kwargs
+    **kwargs,
 ) -> Command:
     """
-    TERMINAL ACTION: Call this tool IMMEDIATELY once you have a working exploit 
+    TERMINAL ACTION: Call this tool IMMEDIATELY once you have a working exploit
     (is_confirmed=True) OR have definitively exhausted the attack surface (is_confirmed=False).
 
-    PREREQUISITE: If your proof requires a standalone script, you MUST call 
-    `write_attacker_file` to save it either before or IN THE EXACT SAME RESPONSE 
+    PREREQUISITE: If your proof requires a standalone script, you MUST call
+    `write_attacker_file` to save it either before or IN THE EXACT SAME RESPONSE
     as calling this tool.
     """
     # Get the single vulnerability assigned to this Validator agent
@@ -1013,7 +1109,9 @@ def mark_validation_complete(
     )
 
     # Save to cache so subsequent runs skip the tool-calling loop.
-    cache_validator(report, state.get("peer_payloads"), updated_vuln, state.get("token_spent"))
+    cache_validator(
+        report, state.get("peer_payloads"), updated_vuln, state.get("token_spent")
+    )
 
     # Close this validator's headless-browser sessions and remove its dedicated
     # attacker container (per-agent, never touching other concurrently running
@@ -1024,13 +1122,13 @@ def mark_validation_complete(
     tool_msg = ToolMessage(
         content="Validation complete. Ending validation phase.",
         name="mark_validation_complete",
-        tool_call_id=tool_call_id
+        tool_call_id=tool_call_id,
     )
 
     return Command(
         update={
             "vulnerabilities": propagate_validation_update(state, updated_vuln),
-            "messages": [tool_msg]
+            "messages": [tool_msg],
         }
     )
 
@@ -1039,7 +1137,7 @@ def mark_validation_complete(
 def ask_for_context(
     state: Annotated[dict, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
-    **kwargs
+    **kwargs,
 ) -> Command:
     """
     Call this when you CANNOT reach a verdict because the report leaves you
@@ -1070,7 +1168,9 @@ def ask_for_context(
     # Save to cache so subsequent runs skip the tool-calling loop (the cached
     # insufficient_context record keeps review_round bumped, so a repeat of the
     # same round-0 report re-triggers the reviewer feedback loop exactly).
-    cache_validator(report, state.get("peer_payloads"), updated_vuln, state.get("token_spent"))
+    cache_validator(
+        report, state.get("peer_payloads"), updated_vuln, state.get("token_spent")
+    )
 
     # Close this validator's headless-browser sessions and remove its dedicated
     # attacker container (per-agent, never touching other concurrently running
@@ -1084,13 +1184,13 @@ def ask_for_context(
             "you will not continue validating unless this record is re-dispatched."
         ),
         name="ask_for_context",
-        tool_call_id=tool_call_id
+        tool_call_id=tool_call_id,
     )
 
     return Command(
         update={
             "vulnerabilities": propagate_validation_update(state, updated_vuln),
-            "messages": [tool_msg]
+            "messages": [tool_msg],
         }
     )
 
@@ -1179,7 +1279,7 @@ def get_vulnerability_details(
 def submit_integration_audit(
     state: Annotated[dict, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
-    **kwargs
+    **kwargs,
 ) -> Command:
     """Call this tool when you have decided whether the assigned `requires_integration`
     vulnerability combines with other confirmed vulnerabilities into a concrete
@@ -1203,7 +1303,7 @@ def submit_integration_audit(
         # report). Revert to 'confirmed' so the reporter ships it unvalidated
         # via the same gate predicate — chaining was pure upside.
         updated_vuln["status"] = "confirmed"
-        logging.info(
+        logger.info(
             f"{updated_vuln.get('vuln_id')}: unchainable verdict revoked — "
             f"below-gate security-boundary finding falls back to 'confirmed' "
             f"(reported unvalidated)."
@@ -1222,7 +1322,7 @@ def submit_integration_audit(
     tool_msg = ToolMessage(
         content="Integration audit submitted. Ending chaining review.",
         name="submit_integration_audit",
-        tool_call_id=tool_call_id
+        tool_call_id=tool_call_id,
     )
 
     # Save to cache so subsequent runs skip the tool-calling loop.
@@ -1230,12 +1330,7 @@ def submit_integration_audit(
         report, state.get("confirmed_vulns"), updated_vuln, state.get("token_spent")
     )
 
-    return Command(
-        update={
-            "vulnerabilities": [updated_vuln],
-            "messages": [tool_msg]
-        }
-    )
+    return Command(update={"vulnerabilities": [updated_vuln], "messages": [tool_msg]})
 
 
 def _compile_pattern(keyword: str, is_regex: bool) -> re.Pattern:
@@ -1246,7 +1341,7 @@ def _compile_pattern(keyword: str, is_regex: bool) -> re.Pattern:
         return re.compile(keyword)
     except re.error:
         # Split only on pipes NOT preceded by an odd number of backslashes
-        branches = re.split(r'(?<!\\)\|', keyword)
+        branches = re.split(r"(?<!\\)\|", keyword)
         if len(branches) > 1:
             safe_branches = []
             for branch in branches:
@@ -1297,17 +1392,22 @@ def _split_file_patterns(file_pattern: str) -> tuple[list[str], list[str]]:
             elif part[i] == "}":
                 depth -= 1
                 if depth == 0:
-                    head, group, tail = part[:start], part[start + 1:i], part[i + 1:]
-                    return [head + alt + rest
-                            for a in _split_top_level(group) for alt in expand(a)
-                            for rest in expand(tail)]
+                    head, group, tail = part[:start], part[start + 1 : i], part[i + 1 :]
+                    return [
+                        head + alt + rest
+                        for a in _split_top_level(group)
+                        for alt in expand(a)
+                        for rest in expand(tail)
+                    ]
         return [part]  # unbalanced: leave verbatim (matches nothing, but never crashes)
 
     positive, negated = [], []
     for part in _split_top_level(file_pattern):
         for alt in expand(part.strip()):
             if alt:
-                (negated if alt.startswith("!") else positive).append(alt.removeprefix("!"))
+                (negated if alt.startswith("!") else positive).append(
+                    alt.removeprefix("!")
+                )
     return positive, negated
 
 
@@ -1315,19 +1415,19 @@ def _split_file_patterns(file_pattern: str) -> tuple[list[str], list[str]]:
 def search_codebase(
     query: str,
     state: Annotated[dict, InjectedState],
-    file_pattern: Optional[str] = None,
+    file_pattern: str | None = None,
     match_whole_word: bool = True,
-    is_regex: bool = False
+    is_regex: bool = False,
 ) -> str:
     """
     [HIGH COST OPERATION - USE AS LAST RESORT]
-    Searches the entire application codebase for a specific string or regular expression. 
-    Use this to find where specific libraries, functions, variables, or class instantiations are used. 
+    Searches the entire application codebase for a specific string or regular expression.
+    Use this to find where specific libraries, functions, variables, or class instantiations are used.
 
-    WARNING: Output is strictly truncated to 20 lines. Searching bare identifier 
-    names or common terms (e.g., 'getItem', 'data', 'handle') produces massive noise 
-    and truncates useful results. Narrow your query by including contextual code 
-    syntax (such as brackets, assignment operators, or declaration keywords) or 
+    WARNING: Output is strictly truncated to 20 lines. Searching bare identifier
+    names or common terms (e.g., 'getItem', 'data', 'handle') produces massive noise
+    and truncates useful results. Narrow your query by including contextual code
+    syntax (such as brackets, assignment operators, or declaration keywords) or
     by restricting `file_pattern`.
 
     Args:
@@ -1354,13 +1454,17 @@ def search_codebase(
                 if tc.get("name") != "search_codebase":
                     continue
                 a = tc.get("args", {})
-                if (a.get("query") == query
-                        and (a.get("file_pattern") or None) == (file_pattern or None)
-                        and a.get("match_whole_word", True) == match_whole_word
-                        and a.get("is_regex", False) == is_regex):
-                    return ("System Notice: You already ran this exact search_codebase call "
-                            "in a previous step; its results are in your history above. Change "
-                            "the query, add a file_pattern, or conclude with your final tool.")
+                if (
+                    a.get("query") == query
+                    and (a.get("file_pattern") or None) == (file_pattern or None)
+                    and a.get("match_whole_word", True) == match_whole_word
+                    and a.get("is_regex", False) == is_regex
+                ):
+                    return (
+                        "System Notice: You already ran this exact search_codebase call "
+                        "in a previous step; its results are in your history above. Change "
+                        "the query, add a file_pattern, or conclude with your final tool."
+                    )
 
     # Load the graph (manifest/dependency nodes already stripped centrally) to
     # map physical files to Node IDs: {"src/main.py": "node_123"}
@@ -1373,14 +1477,21 @@ def search_codebase(
 
     results = []
     match_count = 0
-    MAX_MATCHES = 20 # prevent context window overflow
+    MAX_MATCHES = 20  # prevent context window overflow
     hit_limit = False
     omitted_dirs = set()
-    pos_globs, neg_globs = _split_file_patterns(file_pattern) if file_pattern else ([], [])
+    pos_globs, neg_globs = (
+        _split_file_patterns(file_pattern) if file_pattern else ([], [])
+    )
     pattern = _compile_pattern(query, is_regex)
     # Whole-word boundaries only make sense when both ends of the raw query are
     # word chars; skipping them keeps '$foo' and 'foo(' style queries searchable.
-    if match_whole_word and query and re.match(r"\w", query) and re.search(r"\w$", query):
+    if (
+        match_whole_word
+        and query
+        and re.match(r"\w", query)
+        and re.search(r"\w$", query)
+    ):
         pattern = re.compile(rf"(?<!\w)(?:{pattern.pattern})(?!\w)")
 
     # Recursively search all files
@@ -1389,9 +1500,14 @@ def search_codebase(
         # hidden directories (like .git), pycache, and common heavy folders.
         if file_path.is_file() and file_path.name in MANIFEST_NAMES:
             continue
-        if any((part.startswith('.') and not part.startswith('..')) or \
-            part in ['venv', '__pycache__', 'node_modules', 'graphify-out'] for part in file_path.parts) or \
-            not file_path.is_file():
+        if (
+            any(
+                (part.startswith(".") and not part.startswith(".."))
+                or part in ["venv", "__pycache__", "node_modules", "graphify-out"]
+                for part in file_path.parts
+            )
+            or not file_path.is_file()
+        ):
             continue
         # Respect the scan path-exclusion filter so the reviewer never spends
         # tokens roaming into dependency trees, tests, or docs.
@@ -1404,9 +1520,13 @@ def search_codebase(
         # Optional glob restriction (app-relative path or bare file name);
         # positive globs any-match, '!' globs exclude (agents reach for this
         # negation naturally, e.g. '!src/User.php').
-        if pos_globs and not any(fnmatch(rel, g) or fnmatch(file_path.name, g) for g in pos_globs):
+        if pos_globs and not any(
+            fnmatch(rel, g) or fnmatch(file_path.name, g) for g in pos_globs
+        ):
             continue
-        if neg_globs and any(fnmatch(rel, g) or fnmatch(file_path.name, g) for g in neg_globs):
+        if neg_globs and any(
+            fnmatch(rel, g) or fnmatch(file_path.name, g) for g in neg_globs
+        ):
             continue
 
         try:
@@ -1423,7 +1543,9 @@ def search_codebase(
                             break
 
                         # Match the file back to its Node ID so the agent can read it
-                        node_id = file_to_node.get(relative_path, "Unknown (Not in Graph)")
+                        node_id = file_to_node.get(
+                            relative_path, "Unknown (Not in Graph)"
+                        )
 
                         results.append(
                             f"File: {relative_path} | Node ID: {node_id}\n"
@@ -1441,7 +1563,7 @@ def search_codebase(
 
     if hit_limit:
         # Sort and cap the directories to keep the prompt clean
-        dirs_list = sorted(list(omitted_dirs))[:10]
+        dirs_list = sorted(omitted_dirs)[:10]
         dirs_str = ", ".join(dirs_list)
         example_dir = dirs_list[0] if dirs_list else "src"
 
@@ -1486,9 +1608,8 @@ def get_node_connections(node_ids: list[str]) -> str:
             )
 
         return "\n\n".join(blocks)
-    except Exception as e:
-        return f"Error traversing graph: {str(e)}"
-
+    except Exception as e:  # noqa: BLE001
+        return f"Error traversing graph: {e!s}"
 
 
 @tool
@@ -1515,9 +1636,9 @@ def get_path(source_node: str, target_node: str) -> str:
 
         paths = []
         truncated = False
-        for i, path in enumerate(nx.all_simple_paths(
-            G, source_node, target_node, cutoff=MAX_PATH_CUTOFF
-        )):
+        for i, path in enumerate(
+            nx.all_simple_paths(G, source_node, target_node, cutoff=MAX_PATH_CUTOFF)
+        ):
             if i >= MAX_PATHS:
                 truncated = True
                 break
@@ -1533,7 +1654,7 @@ def get_path(source_node: str, target_node: str) -> str:
         lines = [f"{len(paths)} path(s) from '{source_node}' to '{target_node}':"]
         for i, path in enumerate(paths, 1):
             hops = []
-            for a, b in zip(path, path[1:]):
+            for a, b in itertools.pairwise(path):
                 rel = G.edges[a, b].get("relation", "")
                 hops.append(f"{a} -{rel}-> " if rel else f"{a} -> ")
             hops.append(path[-1])
@@ -1543,8 +1664,8 @@ def get_path(source_node: str, target_node: str) -> str:
             lines.append(f"(Only the first {MAX_PATHS} paths shown; more may exist.)")
 
         return "\n".join(lines)
-    except Exception as e:
-        return f"Error traversing graph: {str(e)}"
+    except Exception as e:  # noqa: BLE001
+        return f"Error traversing graph: {e!s}"
 
 
 @tool
@@ -1572,7 +1693,10 @@ def get_definition(symbol_name: str) -> str:
 
         while current_class:
             # Find any method belonging to the current class to look up its parent
-            class_entry = next((item for item in symbol_index if item.get("class") == current_class), None)
+            class_entry = next(
+                (item for item in symbol_index if item.get("class") == current_class),
+                None,
+            )
 
             if not class_entry or not class_entry.get("parent"):
                 break  # Reached the top of the chain, or class doesn't exist
@@ -1582,7 +1706,9 @@ def get_definition(symbol_name: str) -> str:
 
             # Check if the parent implements the target method
             parent_symbol = f"{parent_class}::{method}"
-            target = next((item for item in symbol_index if item["name"] == parent_symbol), None)
+            target = next(
+                (item for item in symbol_index if item["name"] == parent_symbol), None
+            )
 
             if target:
                 break  # We found the inherited method
@@ -1615,5 +1741,5 @@ def get_definition(symbol_name: str) -> str:
 
         return f"{header}\n{code}"
 
-    except Exception as e:
-        return f"Error reading file {filepath}: {str(e)}"
+    except (OSError, UnicodeDecodeError) as e:
+        return f"Error reading file {filepath}: {e!s}"

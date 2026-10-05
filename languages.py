@@ -1,11 +1,12 @@
 import re
-import tree_sitter
-import tree_sitter_python
-import tree_sitter_javascript
-import tree_sitter_typescript
-import tree_sitter_php
-import tree_sitter_go
 from functools import lru_cache
+
+import tree_sitter
+import tree_sitter_go
+import tree_sitter_javascript
+import tree_sitter_php
+import tree_sitter_python
+import tree_sitter_typescript
 
 LANGUAGE_MAP = {
     ".py": tree_sitter.Language(tree_sitter_python.language()),
@@ -28,42 +29,88 @@ LANGUAGE_MAP = {
 # LLM explorers should never spend budget re-analyzing them.
 MANIFEST_NAMES = {
     # Python / Conda
-    "requirements.txt", "requirements.in", "Pipfile", "Pipfile.lock",
-    "poetry.lock", "pyproject.toml",
-    "environment.yml", "conda.yaml", "conda-lock.yml",
+    "requirements.txt",
+    "requirements.in",
+    "Pipfile",
+    "Pipfile.lock",
+    "poetry.lock",
+    "pyproject.toml",
+    "environment.yml",
+    "conda.yaml",
+    "conda-lock.yml",
     # Node / JavaScript
-    "package.json", "packages.json", "package-lock.json", "npm-shrinkwrap.json",
-    "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb",
-    "deno.lock", "deno.json", "deno.jsonc",
+    "package.json",
+    "packages.json",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "deno.lock",
+    "deno.json",
+    "deno.jsonc",
     # JVM
-    "pom.xml", "build.gradle", "build.gradle.kts",
-    "settings.gradle", "settings.gradle.kts", "gradle.lockfile",
-    "gradle/libs.versions.toml", "ivy.xml",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "gradle.lockfile",
+    "gradle/libs.versions.toml",
+    "ivy.xml",
     # Go
-    "go.mod", "go.sum",
+    "go.mod",
+    "go.sum",
     # Ruby
-    "Gemfile", "Gemfile.lock", "gems.rb", "gems.locked",
+    "Gemfile",
+    "Gemfile.lock",
+    "gems.rb",
+    "gems.locked",
     # PHP
-    "composer.json", "composer.lock",
+    "composer.json",
+    "composer.lock",
     # Rust
-    "Cargo.toml", "Cargo.lock",
+    "Cargo.toml",
+    "Cargo.lock",
     # Dart
-    "pubspec.yaml", "pubspec.lock",
+    "pubspec.yaml",
+    "pubspec.lock",
     # Elixir
-    "mix.exs", "mix.lock",
+    "mix.exs",
+    "mix.lock",
     # Swift / Objective-C
-    "Package.swift", "Package.resolved", "Podfile", "Podfile.lock",
+    "Package.swift",
+    "Package.resolved",
+    "Podfile",
+    "Podfile.lock",
     # .NET
-    "packages.config", "packages.lock.json", "project.json", "project.lock.json", "global.json",
+    "packages.config",
+    "packages.lock.json",
+    "project.json",
+    "project.lock.json",
+    "global.json",
     # C / C++
-    "vcpkg.json", "conanfile.txt", "conanfile.py", "conan.lock", "CMakeLists.txt",
+    "vcpkg.json",
+    "conanfile.txt",
+    "conanfile.py",
+    "conan.lock",
+    "CMakeLists.txt",
 }
 
 # Define the AST mappings for the languages your agents will scan
 AST_GRAMMAR_MAP = {
     ".py": {
-        "keep_whole": ["import_statement", "import_from_statement", "expression_statement"],
-        "prune_bodies": ["function_definition", "class_definition", "decorated_definition"],
+        "keep_whole": [
+            "import_statement",
+            "import_from_statement",
+            "expression_statement",
+        ],
+        "prune_bodies": [
+            "function_definition",
+            "class_definition",
+            "decorated_definition",
+        ],
         "body_node": "block",
         "comment": "#",
         "container_nodes": ["class_definition"],
@@ -71,52 +118,100 @@ AST_GRAMMAR_MAP = {
             (import_statement (dotted_name) @import)
             (import_from_statement module_name: (dotted_name) @import)
         """,
-        "import_separator": "."
+        "import_separator": ".",
     },
     ".js": {
-        "keep_whole": ["import_statement", "lexical_declaration", "variable_declaration"],
-        "prune_bodies": ["function_declaration", "class_declaration", "arrow_function", "method_definition"],
+        "keep_whole": [
+            "import_statement",
+            "lexical_declaration",
+            "variable_declaration",
+        ],
+        "prune_bodies": [
+            "function_declaration",
+            "class_declaration",
+            "arrow_function",
+            "method_definition",
+        ],
         "body_node": "statement_block",
         "comment": "//",
         "container_nodes": ["class_declaration"],
         "import_query": "(import_statement source: (string) @import)",
-        "import_separator": "/"
+        "import_separator": "/",
     },
     ".go": {
         "keep_whole": ["import_declaration"],
         "prune_bodies": ["function_declaration", "method_declaration"],
         "body_node": "block",
         "comment": "//",
-        "container_nodes": [], # Go methods attach to structs, but aren't nested inside them in the AST
+        "container_nodes": [],  # Go methods attach to structs, but aren't nested inside them in the AST
         "import_query": "(import_spec path: (_) @import)",
-        "import_separator": "/"
+        "import_separator": "/",
     },
     ".php": {
-        "keep_whole": ["namespace_definition", "namespace_use_declaration", "expression_statement"],
-        "prune_bodies": ["function_definition", "method_declaration", "class_declaration", "trait_declaration", "interface_declaration"],
+        "keep_whole": [
+            "namespace_definition",
+            "namespace_use_declaration",
+            "expression_statement",
+        ],
+        "prune_bodies": [
+            "function_definition",
+            "method_declaration",
+            "class_declaration",
+            "trait_declaration",
+            "interface_declaration",
+        ],
         "body_node": ["compound_statement", "declaration_list", "block"],
         "comment": "//",
-        "container_nodes": ["class_declaration", "trait_declaration", "interface_declaration", "namespace_definition"],
+        "container_nodes": [
+            "class_declaration",
+            "trait_declaration",
+            "interface_declaration",
+            "namespace_definition",
+        ],
         "import_query": "(namespace_use_clause) @import",
-        "import_separator": "\\"
+        "import_separator": "\\",
     },
     ".ts": {
-        "keep_whole": ["import_statement", "lexical_declaration", "variable_declaration", "type_alias_declaration"],
-        "prune_bodies": ["function_declaration", "class_declaration", "arrow_function", "method_definition", "interface_declaration", "module"],
+        "keep_whole": [
+            "import_statement",
+            "lexical_declaration",
+            "variable_declaration",
+            "type_alias_declaration",
+        ],
+        "prune_bodies": [
+            "function_declaration",
+            "class_declaration",
+            "arrow_function",
+            "method_definition",
+            "interface_declaration",
+            "module",
+        ],
         "body_node": ["statement_block", "class_body", "object_type", "module_block"],
         "comment": "//",
         "container_nodes": ["class_declaration", "interface_declaration", "module"],
         "import_query": "(import_statement source: (string) @import)",
-        "import_separator": "/"
+        "import_separator": "/",
     },
     ".tsx": {
-        "keep_whole": ["import_statement", "lexical_declaration", "variable_declaration", "type_alias_declaration"],
-        "prune_bodies": ["function_declaration", "class_declaration", "arrow_function", "method_definition", "interface_declaration", "module"],
+        "keep_whole": [
+            "import_statement",
+            "lexical_declaration",
+            "variable_declaration",
+            "type_alias_declaration",
+        ],
+        "prune_bodies": [
+            "function_declaration",
+            "class_declaration",
+            "arrow_function",
+            "method_definition",
+            "interface_declaration",
+            "module",
+        ],
         "body_node": ["statement_block", "class_body", "object_type", "module_block"],
         "comment": "//",
         "container_nodes": ["class_declaration", "interface_declaration", "module"],
         "import_query": "(import_statement source: (string) @import)",
-        "import_separator": "/"
+        "import_separator": "/",
     },
 }
 
@@ -200,11 +295,29 @@ _PHP_GUARD_SPEC = {
     },
     "condition_nodes": {"if_statement": "condition", "else_if_clause": "condition"},
     "assignment_nodes": {"assignment_expression": ("left", "right")},
-    "boolean_types": ("binary_expression", "unary_op_expression", "parenthesized_expression"),
+    "boolean_types": (
+        "binary_expression",
+        "unary_op_expression",
+        "parenthesized_expression",
+    ),
     "builtins": {
-        "isset", "empty", "count", "sizeof", "is_array", "is_string", "is_null",
-        "is_numeric", "strtolower", "strtoupper", "trim", "explode", "implode",
-        "in_array", "array_key_exists", "sprintf", "printf",
+        "isset",
+        "empty",
+        "count",
+        "sizeof",
+        "is_array",
+        "is_string",
+        "is_null",
+        "is_numeric",
+        "strtolower",
+        "strtoupper",
+        "trim",
+        "explode",
+        "implode",
+        "in_array",
+        "array_key_exists",
+        "sprintf",
+        "printf",
     },
     "wrap": ("<?php\nclass _SnippetScope {\n", "\n}"),
     "text_node": "text",
@@ -216,14 +329,58 @@ _PY_GUARD_SPEC = {
     },
     "condition_nodes": {"if_statement": "condition"},
     "assignment_nodes": {"assignment": ("left", "right")},
-    "boolean_types": ("boolean_operator", "not_operator", "unary_operator", "binary_operator", "parenthesized_expression"),
+    "boolean_types": (
+        "boolean_operator",
+        "not_operator",
+        "unary_operator",
+        "binary_operator",
+        "parenthesized_expression",
+    ),
     "builtins": {
-        "len", "isinstance", "issubclass", "callable", "hasattr", "getattr",
-        "setattr", "delattr", "print", "bool", "int", "str", "float", "list",
-        "dict", "set", "tuple", "type", "super", "vars", "dir", "id", "hash",
-        "iter", "next", "any", "all", "sum", "min", "max", "abs", "sorted",
-        "reversed", "enumerate", "zip", "map", "filter", "range", "open",
-        "repr", "format", "classmethod", "staticmethod", "property",
+        "len",
+        "isinstance",
+        "issubclass",
+        "callable",
+        "hasattr",
+        "getattr",
+        "setattr",
+        "delattr",
+        "print",
+        "bool",
+        "int",
+        "str",
+        "float",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "type",
+        "super",
+        "vars",
+        "dir",
+        "id",
+        "hash",
+        "iter",
+        "next",
+        "any",
+        "all",
+        "sum",
+        "min",
+        "max",
+        "abs",
+        "sorted",
+        "reversed",
+        "enumerate",
+        "zip",
+        "map",
+        "filter",
+        "range",
+        "open",
+        "repr",
+        "format",
+        "classmethod",
+        "staticmethod",
+        "property",
     },
 }
 
@@ -239,12 +396,35 @@ _JS_GUARD_SPEC = {
         "assignment_expression": ("left", "right"),
         "variable_declarator": ("name", "value"),
     },
-    "boolean_types": ("binary_expression", "unary_expression", "parenthesized_expression"),
+    "boolean_types": (
+        "binary_expression",
+        "unary_expression",
+        "parenthesized_expression",
+    ),
     "builtins": {
-        "boolean", "string", "number", "bigint", "symbol", "object", "array",
-        "json", "math", "date", "regexp", "error", "typeerror", "rangeerror",
-        "parseint", "parsefloat", "isnan", "isfinite", "encodeuri",
-        "encodeuricomponent", "decodeuri", "decodeuricomponent", "require",
+        "boolean",
+        "string",
+        "number",
+        "bigint",
+        "symbol",
+        "object",
+        "array",
+        "json",
+        "math",
+        "date",
+        "regexp",
+        "error",
+        "typeerror",
+        "rangeerror",
+        "parseint",
+        "parsefloat",
+        "isnan",
+        "isfinite",
+        "encodeuri",
+        "encodeuricomponent",
+        "decodeuri",
+        "decodeuricomponent",
+        "require",
     },
     "wrap": ("class _SnippetScope {\n", "\n}"),
 }
@@ -258,11 +438,30 @@ _GO_GUARD_SPEC = {
         "assignment_statement": ("left", "right"),
         "short_var_declaration": ("left", "right"),
     },
-    "boolean_types": ("binary_expression", "unary_expression", "parenthesized_expression"),
+    "boolean_types": (
+        "binary_expression",
+        "unary_expression",
+        "parenthesized_expression",
+    ),
     "builtins": {
-        "len", "cap", "make", "new", "append", "copy", "delete", "panic",
-        "recover", "print", "println", "close", "complex", "real", "imag",
-        "min", "max", "clear",
+        "len",
+        "cap",
+        "make",
+        "new",
+        "append",
+        "copy",
+        "delete",
+        "panic",
+        "recover",
+        "print",
+        "println",
+        "close",
+        "complex",
+        "real",
+        "imag",
+        "min",
+        "max",
+        "clear",
     },
 }
 
@@ -347,7 +546,7 @@ def _extract_decision_guards(root_node, spec: dict) -> list[dict]:
 
 
 def guard_usages(code: str, ext: str) -> list[dict] | None:
-    """Extract decision-guard usages from a source slice, or None if unparseable.
+    """Extract decision-guard usages from a source slice, or None if unparsable.
 
     Whole-file slices parse bare; slices that error bare (e.g. class methods)
     are retried wrapped in the language's class shell. A bare result holding
@@ -365,9 +564,9 @@ def guard_usages(code: str, ext: str) -> list[dict] | None:
         if root.has_error:
             return False
         text_node = spec.get("text_node")
-        if text_node and all(child.type == text_node for child in root.children):
-            return False
-        return True
+        return not (
+            text_node and all(child.type == text_node for child in root.children)
+        )
 
     sources = [code]
     wrap = spec.get("wrap")
@@ -393,42 +592,91 @@ def guard_usages(code: str, ext: str) -> list[dict] | None:
 # string interpolation, control flow). Nodes exposing none of these are inert.
 SCAN_SIGNAL_TYPES: dict[str, set[str]] = {
     ".py": {
-        "call", "import_statement", "import_from_statement",
-        "if_statement", "for_statement", "while_statement", "try_statement",
-        "with_statement", "match_statement", "interpolation",
+        "call",
+        "import_statement",
+        "import_from_statement",
+        "if_statement",
+        "for_statement",
+        "while_statement",
+        "try_statement",
+        "with_statement",
+        "match_statement",
+        "interpolation",
     },
     ".js": {
-        "call_expression", "new_expression", "import_statement",
-        "if_statement", "for_statement", "while_statement", "switch_statement",
-        "try_statement", "template_substitution",
+        "call_expression",
+        "new_expression",
+        "import_statement",
+        "if_statement",
+        "for_statement",
+        "while_statement",
+        "switch_statement",
+        "try_statement",
+        "template_substitution",
     },
     ".jsx": {
-        "call_expression", "new_expression", "import_statement",
-        "if_statement", "for_statement", "while_statement", "switch_statement",
-        "try_statement", "template_substitution",
+        "call_expression",
+        "new_expression",
+        "import_statement",
+        "if_statement",
+        "for_statement",
+        "while_statement",
+        "switch_statement",
+        "try_statement",
+        "template_substitution",
     },
     ".ts": {
-        "call_expression", "new_expression", "import_statement",
-        "if_statement", "for_statement", "while_statement", "switch_statement",
-        "try_statement", "template_substitution",
+        "call_expression",
+        "new_expression",
+        "import_statement",
+        "if_statement",
+        "for_statement",
+        "while_statement",
+        "switch_statement",
+        "try_statement",
+        "template_substitution",
     },
     ".tsx": {
-        "call_expression", "new_expression", "import_statement",
-        "if_statement", "for_statement", "while_statement", "switch_statement",
-        "try_statement", "template_substitution",
+        "call_expression",
+        "new_expression",
+        "import_statement",
+        "if_statement",
+        "for_statement",
+        "while_statement",
+        "switch_statement",
+        "try_statement",
+        "template_substitution",
     },
     # .vue scripts parse with the TypeScript grammar, so they share its signals.
     ".vue": {
-        "call_expression", "new_expression", "import_statement",
-        "if_statement", "for_statement", "while_statement", "switch_statement",
-        "try_statement", "template_substitution",
+        "call_expression",
+        "new_expression",
+        "import_statement",
+        "if_statement",
+        "for_statement",
+        "while_statement",
+        "switch_statement",
+        "try_statement",
+        "template_substitution",
     },
     ".php": {
-        "function_call_expression", "member_call_expression", "scoped_call_expression",
-        "object_creation_expression", "namespace_use_declaration", "include_expression",
-        "include_once_expression", "require_expression", "require_once_expression",
-        "echo_statement", "if_statement", "for_statement", "foreach_statement",
-        "while_statement", "switch_statement", "try_statement", "encapsed_string",
+        "function_call_expression",
+        "member_call_expression",
+        "scoped_call_expression",
+        "object_creation_expression",
+        "namespace_use_declaration",
+        "include_expression",
+        "include_once_expression",
+        "require_expression",
+        "require_once_expression",
+        "echo_statement",
+        "if_statement",
+        "for_statement",
+        "foreach_statement",
+        "while_statement",
+        "switch_statement",
+        "try_statement",
+        "encapsed_string",
     },
 }
 
@@ -446,32 +694,79 @@ IMPORT_TYPES: dict[str, set[str]] = {
 
 # Nodes that introduce callable/structured definitions (bodies, classes, types).
 DEFINITION_TYPES: set[str] = {
-    "function_definition", "class_definition", "decorated_definition", "method_declaration",
-    "function_declaration", "class_declaration", "arrow_function", "method_definition",
-    "function_expression", "lambda", "interface_declaration", "type_alias_declaration",
-    "enum_declaration", "type_alias_statement",
+    "function_definition",
+    "class_definition",
+    "decorated_definition",
+    "method_declaration",
+    "function_declaration",
+    "class_declaration",
+    "arrow_function",
+    "method_definition",
+    "function_expression",
+    "lambda",
+    "interface_declaration",
+    "type_alias_declaration",
+    "enum_declaration",
+    "type_alias_statement",
 }
 
 # Node types whose names are security-relevant when used as assignment targets.
 NAME_NODE_TYPES: set[str] = {
-    "assignment", "variable_declarator", "assignment_expression", "property_declaration",
-    "property_element", "public_field_definition", "property_signature", "pair",
+    "assignment",
+    "variable_declarator",
+    "assignment_expression",
+    "property_declaration",
+    "property_element",
+    "public_field_definition",
+    "property_signature",
+    "pair",
     "array_element_initializer",
 }
 
 MAGIC_METHODS: dict[str, set[str]] = {
     ".py": {
-        "__reduce__", "__reduce_ex__", "__setstate__", "__getstate__", "__getattr__",
-        "__setattr__", "__getattribute__", "__del__", "__delattr__", "__enter__",
-        "__exit__", "__new__", "__init__", "__call__", "__getitem__", "__setitem__",
-        "__repr__", "__str__",
+        "__reduce__",
+        "__reduce_ex__",
+        "__setstate__",
+        "__getstate__",
+        "__getattr__",
+        "__setattr__",
+        "__getattribute__",
+        "__del__",
+        "__delattr__",
+        "__enter__",
+        "__exit__",
+        "__new__",
+        "__init__",
+        "__call__",
+        "__getitem__",
+        "__setitem__",
+        "__repr__",
+        "__str__",
     },
     ".php": {
-        "__construct", "__destruct", "__wakeup", "__sleep", "__call", "__callstatic",
-        "__get", "__set", "__isset", "__unset", "__tostring", "__invoke", "__set_state",
-        "__clone", "__debuginfo", "__serialize", "__unserialize",
+        "__construct",
+        "__destruct",
+        "__wakeup",
+        "__sleep",
+        "__call",
+        "__callstatic",
+        "__get",
+        "__set",
+        "__isset",
+        "__unset",
+        "__tostring",
+        "__invoke",
+        "__set_state",
+        "__clone",
+        "__debuginfo",
+        "__serialize",
+        "__unserialize",
     },
-    ".js": set(), ".jsx": set(), ".ts": set(), ".tsx": set(),
+    ".js": set(),
+    ".jsx": set(),
+    ".ts": set(),
+    ".tsx": set(),
 }
 
 # ---- utils._is_pure_type() detection ------------------------------------------
@@ -479,11 +774,21 @@ MAGIC_METHODS: dict[str, set[str]] = {
 # ext -> AST node types that mark a node as "declares types". Languages absent
 # from this map never take the type-declaration branch (notably .vue, which
 # falls through to the behavioral/default branches exactly as before).
-_JS_TS_TYPE_CONSTRUCTS = {"type_alias_declaration", "interface_declaration", "enum_declaration"}
+_JS_TS_TYPE_CONSTRUCTS = {
+    "type_alias_declaration",
+    "interface_declaration",
+    "enum_declaration",
+}
 _JS_TS_PURE_FORBIDDEN = {
-    "function_declaration", "class_declaration", "arrow_function",
-    "method_definition", "function_expression",
-    "assignment", "variable_declarator", "public_field_definition", "pair",
+    "function_declaration",
+    "class_declaration",
+    "arrow_function",
+    "method_definition",
+    "function_expression",
+    "assignment",
+    "variable_declarator",
+    "public_field_definition",
+    "pair",
 }
 PURE_TYPE_CONSTRUCTS: dict[str, set[str]] = {
     ext: _JS_TS_TYPE_CONSTRUCTS for ext in (".js", ".jsx", ".ts", ".tsx")
@@ -497,9 +802,16 @@ PURE_TYPE_FORBIDDEN_TYPES: dict[str, set[str]] = {
 # Python branch: any behavioral node type disqualifies a "pure type" node.
 BEHAVIORAL_NODE_TYPES: dict[str, set[str]] = {
     ".py": {
-        "call", "if_statement", "for_statement", "while_statement",
-        "try_statement", "with_statement", "match_statement",
-        "interpolation", "function_definition", "lambda",
+        "call",
+        "if_statement",
+        "for_statement",
+        "while_statement",
+        "try_statement",
+        "with_statement",
+        "match_statement",
+        "interpolation",
+        "function_definition",
+        "lambda",
     },
 }
 # ext -> standalone type-alias statement types that prove purity on their own.

@@ -46,10 +46,10 @@ from pathlib import Path
 
 import settings
 from utils import (
-    get_node_code,
-    read_file_text,
-    is_path_excluded,
     get_container_artifacts_root,
+    get_node_code,
+    is_path_excluded,
+    read_file_text,
 )
 
 log = logging.getLogger("boundary_edges")
@@ -77,10 +77,30 @@ _DIRECT_RELATIONS = ("calls", "references", "imports")
 # are noisy (every controller statically references the CMS base classes), so
 # they are pruned from the direct edge set.
 _LOW_SIGNAL_TARGET_FRAGMENTS = (
-    "exception", "exceptions", "logger", "logfile", "logging",
-    "constant", "constants", "enum", "enums", "interface", "interfaces",
-    "util", "utils", "helper", "helpers", "test", "tests", "spec",
-    "fixture", "fixtures", "migration", "migrations", "dto", "dtos",
+    "exception",
+    "exceptions",
+    "logger",
+    "logfile",
+    "logging",
+    "constant",
+    "constants",
+    "enum",
+    "enums",
+    "interface",
+    "interfaces",
+    "util",
+    "utils",
+    "helper",
+    "helpers",
+    "test",
+    "tests",
+    "spec",
+    "fixture",
+    "fixtures",
+    "migration",
+    "migrations",
+    "dto",
+    "dtos",
 )
 
 
@@ -89,7 +109,9 @@ def _is_low_signal_target(node: dict) -> bool:
     return any(frag in label for frag in _LOW_SIGNAL_TARGET_FRAGMENTS)
 
 
-def _direct_cross_community_edges(graph_data: dict, nodes_by_id: dict, note_ids: set) -> list[dict]:
+def _direct_cross_community_edges(
+    graph_data: dict, nodes_by_id: dict, note_ids: set
+) -> list[dict]:
     require_note = getattr(settings, "edge_traversal_require_note", True)
     edges: list[dict] = []
     for link in graph_data.get("links", []):
@@ -100,7 +122,10 @@ def _direct_cross_community_edges(graph_data: dict, nodes_by_id: dict, note_ids:
         target_node = nodes_by_id.get(target_id)
         if not source_node or not target_node:
             continue
-        if source_node.get("file_type") != "code" or target_node.get("file_type") != "code":
+        if (
+            source_node.get("file_type") != "code"
+            or target_node.get("file_type") != "code"
+        ):
             continue
         src_comm, tgt_comm = source_node.get("community"), target_node.get("community")
         if src_comm is None or tgt_comm is None or src_comm == tgt_comm:
@@ -109,24 +134,36 @@ def _direct_cross_community_edges(graph_data: dict, nodes_by_id: dict, note_ids:
         tgt_file = target_node.get("source_file") or ""
         if is_path_excluded(src_file) or is_path_excluded(tgt_file):
             continue
-        if link.get("relation") in ("references", "imports") and _is_low_signal_target(target_node):
+        if link.get("relation") in ("references", "imports") and _is_low_signal_target(
+            target_node
+        ):
             continue
         if require_note and source_id not in note_ids and target_id not in note_ids:
             continue
-        edges.append(_make_edge(
-            boundary_type="in_process",
-            source_node_id=source_id,
-            target_node_id=target_id,
-            source_node=source_node,
-            target_node=target_node,
-            match_key=f"community {src_comm}->{tgt_comm} via {link.get('relation')}",
-            transport_artifact=None,
-        ))
+        edges.append(
+            _make_edge(
+                boundary_type="in_process",
+                source_node_id=source_id,
+                target_node_id=target_id,
+                source_node=source_node,
+                target_node=target_node,
+                match_key=f"community {src_comm}->{tgt_comm} via {link.get('relation')}",
+                transport_artifact=None,
+            )
+        )
     return edges
 
 
-def _make_edge(*, boundary_type, source_node_id, target_node_id, source_node, target_node,
-               match_key, transport_artifact) -> dict:
+def _make_edge(
+    *,
+    boundary_type,
+    source_node_id,
+    target_node_id,
+    source_node,
+    target_node,
+    match_key,
+    transport_artifact,
+) -> dict:
     return {
         "boundary_type": boundary_type,
         "source_node": source_node_id,
@@ -156,14 +193,42 @@ def _attach_notes(edges: list[dict], note_map: dict) -> list[dict]:
 # worker entry points. The full-codebase entry scan is gated on these so
 # massive repos are not fully re-read just to find endpoint declarations.
 _ENTRY_GATE_DIR_FRAGMENTS = (
-    "ajax", "front", "api", "apiv1", "grpc", "internal",
-    "controller", "controllers", "route", "routes", "router", "web",
-    "handler", "handlers", "worker", "workers", "tasks", "jobs",
-    "consumer", "consumers", "listener", "listeners", "middleware",
+    "ajax",
+    "front",
+    "api",
+    "apiv1",
+    "grpc",
+    "internal",
+    "controller",
+    "controllers",
+    "route",
+    "routes",
+    "router",
+    "web",
+    "handler",
+    "handlers",
+    "worker",
+    "workers",
+    "tasks",
+    "jobs",
+    "consumer",
+    "consumers",
+    "listener",
+    "listeners",
+    "middleware",
 )
 _ENTRY_GATE_BASENAMES = (
-    "routes.php", "web.php", "routing.py", "urls.py", "api.php",
-    "routes.ts", "routes.js", "app.ts", "app.js", "server.ts", "server.js",
+    "routes.php",
+    "web.php",
+    "routing.py",
+    "urls.py",
+    "api.php",
+    "routes.ts",
+    "routes.js",
+    "app.ts",
+    "app.js",
+    "server.ts",
+    "server.js",
 )
 
 
@@ -199,13 +264,14 @@ def _node_for_name(file_nodes: list[dict], name: str | None) -> dict | None:
         low = name.lower()
         for node in file_nodes:
             label = str(node.get("label") or "").lower()
-            if label == low or label.endswith(f"::{low}") or label.endswith(f".{low}") or label.endswith(f"->{low}"):
+            if label == low or label.endswith((f"::{low}", f".{low}", f"->{low}")):
                 return node
     return _file_level_node(file_nodes)
 
 
-def _node_after_declaration(file_nodes: list[dict], text: str, position: int,
-                            known_name: str | None = None) -> dict | None:
+def _node_after_declaration(
+    file_nodes: list[dict], text: str, position: int, known_name: str | None = None
+) -> dict | None:
     """Resolve the graph node defined right after a decorator/statement.
 
     Falls back to the file-level skeleton node when the decorated function
@@ -233,7 +299,9 @@ def _group_nodes_by_file(nodes_by_id: dict) -> dict[str, list[dict]]:
 _QUEUE_DISPATCH_NAMED_RE = re.compile(
     r"\b(?:send_task|enqueue|publish|produce|basic_publish|publish_to_queue)\s*\(\s*[\"']([^\"']+)[\"']"
 )
-_QUEUE_DISPATCH_OBJ_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*(?:delay|apply_async)\s*\(")
+_QUEUE_DISPATCH_OBJ_RE = re.compile(
+    r"\b([A-Za-z_]\w*)\s*\.\s*(?:delay|apply_async)\s*\("
+)
 # Worker/board registration decorators:  @app.task(name="x")  |  @shared_task
 # @receiver(signal)  |  bare  @app.task  followed by  def <name>
 _QUEUE_ENTRY_NAMED_RE = re.compile(
@@ -299,7 +367,7 @@ def _route_to_regex(route: str) -> str:
 def _url_matches(route: str, path: str) -> bool:
     """Match a client request URL/path against a registered route pattern."""
     if not path.startswith("/"):
-        scheme = re.match(r"^[a-z][a-z0-9+.\-]*://[^/]+(/.*)$", path, re.I)
+        scheme = re.match(r"^[a-z][a-z0-9+.\-]*://[^/]+(/.*)$", path, re.IGNORECASE)
         if not scheme:
             return False
         path = scheme.group(1)
@@ -314,7 +382,9 @@ def _url_matches(route: str, path: str) -> bool:
     return re.fullmatch(_route_to_regex(route), path) is not None
 
 
-def _scan_entry_declarations(nodes_by_id: dict) -> tuple[list[tuple[str, str, str]], dict[str, list[str]]]:
+def _scan_entry_declarations(
+    nodes_by_id: dict,
+) -> tuple[list[tuple[str, str, str]], dict[str, list[str]]]:
     """One pass over the (dir-gated) endpoint files discovering both web routes
     and queue/event entry points.
 
@@ -345,7 +415,9 @@ def _scan_entry_declarations(nodes_by_id: dict) -> tuple[list[tuple[str, str, st
             if node and node.get("id"):
                 queue_entries[match.group(1)].append(node["id"])
         for match in _QUEUE_ENTRY_BARE_RE.finditer(text):
-            node = _node_after_declaration(file_nodes, text, match.end(), known_name=match.group(1))
+            node = _node_after_declaration(
+                file_nodes, text, match.end(), known_name=match.group(1)
+            )
             if node and node.get("id"):
                 queue_entries[match.group(1)].append(node["id"])
     return _dedupe_routes(routes), {k: v for k, v in queue_entries.items()}
@@ -369,15 +441,22 @@ def _dispatch_surface(nodes_by_id: dict, note_ids: set) -> list[tuple[str, dict]
     both virtual-edge passes (they walked the identical surface)."""
     require_note = getattr(settings, "edge_traversal_require_note", True)
     return [
-        (node_id, node) for node_id, node in nodes_by_id.items()
+        (node_id, node)
+        for node_id, node in nodes_by_id.items()
         if not require_note or node_id in note_ids
     ]
 
 
-def _queue_virtual_edges(nodes_by_id: dict, note_ids: set, queue_entries: dict,
-                         surface: list[tuple[str, dict]] | None = None) -> list[dict]:
+def _queue_virtual_edges(
+    nodes_by_id: dict,
+    note_ids: set,
+    queue_entries: dict,
+    surface: list[tuple[str, dict]] | None = None,
+) -> list[dict]:
     edges: list[dict] = []
-    for node_id, node in (surface if surface is not None else _dispatch_surface(nodes_by_id, note_ids)):
+    for node_id, node in (
+        surface if surface is not None else _dispatch_surface(nodes_by_id, note_ids)
+    ):
         code = get_node_code(node_id, raw=True)
         if not code:
             continue
@@ -395,27 +474,39 @@ def _queue_virtual_edges(nodes_by_id: dict, note_ids: set, queue_entries: dict,
                 target_node = nodes_by_id.get(target_id)
                 if not target_node:
                     continue
-                edges.append(_make_edge(
-                    boundary_type="async_messaging",
-                    source_node_id=node_id,
-                    target_node_id=target_id,
-                    source_node=node,
-                    target_node=target_node,
-                    match_key=f"event/task '{key}'",
-                    transport_artifact=None,
-                ))
+                edges.append(
+                    _make_edge(
+                        boundary_type="async_messaging",
+                        source_node_id=node_id,
+                        target_node_id=target_id,
+                        source_node=node,
+                        target_node=target_node,
+                        match_key=f"event/task '{key}'",
+                        transport_artifact=None,
+                    )
+                )
     return edges
 
 
-def _http_virtual_edges(nodes_by_id: dict, note_ids: set, route_entries: list[tuple],
-                        surface: list[tuple[str, dict]] | None = None) -> list[dict]:
+def _http_virtual_edges(
+    nodes_by_id: dict,
+    note_ids: set,
+    route_entries: list[tuple],
+    surface: list[tuple[str, dict]] | None = None,
+) -> list[dict]:
     edges: list[dict] = []
-    for node_id, node in (surface if surface is not None else _dispatch_surface(nodes_by_id, note_ids)):
+    for node_id, node in (
+        surface if surface is not None else _dispatch_surface(nodes_by_id, note_ids)
+    ):
         code = get_node_code(node_id, raw=True)
         if not code:
             continue
         paths: set[str] = set()
-        for pattern in (_HTTP_CLIENT_API_RE, _HTTP_CLIENT_REQUEST_RE, _HTTP_CLIENT_FETCH_RE):
+        for pattern in (
+            _HTTP_CLIENT_API_RE,
+            _HTTP_CLIENT_REQUEST_RE,
+            _HTTP_CLIENT_FETCH_RE,
+        ):
             for match in pattern.finditer(code):
                 paths.add(match.group(1))
         if not paths:
@@ -427,27 +518,40 @@ def _http_virtual_edges(nodes_by_id: dict, note_ids: set, route_entries: list[tu
                 target_node = nodes_by_id.get(route_node_id)
                 if not target_node:
                     continue
-                edges.append(_make_edge(
-                    boundary_type="network_ipc",
-                    source_node_id=node_id,
-                    target_node_id=route_node_id,
-                    source_node=node,
-                    target_node=target_node,
-                    match_key=f"HTTP {path} -> route {route}",
-                    transport_artifact=None,
-                ))
+                edges.append(
+                    _make_edge(
+                        boundary_type="network_ipc",
+                        source_node_id=node_id,
+                        target_node_id=route_node_id,
+                        source_node=node,
+                        target_node=target_node,
+                        match_key=f"HTTP {path} -> route {route}",
+                        transport_artifact=None,
+                    )
+                )
     return edges
 
 
 # ---- Infra-to-app (reverse proxy configuration) -----------------------------
 
 _PROXY_CONFIG_PATTERNS = (
-    "nginx.conf", "nginx*.conf", "*.vhost", "httpd.conf", "apache2.conf",
-    ".htaccess", "Caddyfile", "traefik.yml", "traefik.yaml", "traefik.toml",
-    "haproxy.cfg", "site.conf",
+    "nginx.conf",
+    "nginx*.conf",
+    "*.vhost",
+    "httpd.conf",
+    "apache2.conf",
+    ".htaccess",
+    "Caddyfile",
+    "traefik.yml",
+    "traefik.yaml",
+    "traefik.toml",
+    "haproxy.cfg",
+    "site.conf",
 )
-_NGINX_LOCATION_RE = re.compile(r"location\s+([^\s{]+)\s*\{(.*?)\}", re.S)
-_APACHE_LOCATION_RE = re.compile(r"<Location\s*\"?([^\">]+)\"?>(.*?)</Location>", re.S)
+_NGINX_LOCATION_RE = re.compile(r"location\s+([^\s{]+)\s*\{(.*?)\}", re.DOTALL)
+_APACHE_LOCATION_RE = re.compile(
+    r"<Location\s*\"?([^\">]+)\"?>(.*?)</Location>", re.DOTALL
+)
 _APACHE_PROXYPASS_RE = re.compile(r"ProxyPass\s+([^\s]+)\s+([^\s]+)")
 _PROXY_PASS_RE = re.compile(r"proxy_pass\s+https?://[^/]+([^;\s]*);")
 
@@ -463,8 +567,12 @@ def _find_proxy_config_files() -> list[tuple[str, str]]:
             if not file_path.is_file():
                 continue
             name = file_path.name
-            if any(fnmatch.fnmatch(name, pattern) for pattern in _PROXY_CONFIG_PATTERNS):
-                results.append((str(file_path.relative_to(rootfs)), _bounded_read(file_path)))
+            if any(
+                fnmatch.fnmatch(name, pattern) for pattern in _PROXY_CONFIG_PATTERNS
+            ):
+                results.append(
+                    (str(file_path.relative_to(rootfs)), _bounded_read(file_path))
+                )
     return [r for r in results if r[1]]
 
 
@@ -502,7 +610,9 @@ def _proxy_upstream_path(prefix: str, body: str) -> str | None:
     return prefix if prefix.startswith("/") else None
 
 
-def _infra_edges(nodes_by_id: dict, note_ids: set, route_entries: list[tuple]) -> list[dict]:
+def _infra_edges(
+    nodes_by_id: dict, note_ids: set, route_entries: list[tuple]
+) -> list[dict]:
     require_note = getattr(settings, "edge_traversal_require_note", True)
     route_entries = [r for r in route_entries if not require_note or r[0] in note_ids]
     if not route_entries:
@@ -516,7 +626,9 @@ def _infra_edges(nodes_by_id: dict, note_ids: set, route_entries: list[tuple]) -
         directives = _extract_proxy_directives(text)
         for idx, (prefix, body) in enumerate(directives):
             upstream = _proxy_upstream_path(prefix, body)
-            candidates = [prefix, upstream] if upstream and upstream != prefix else [prefix]
+            candidates = (
+                [prefix, upstream] if upstream and upstream != prefix else [prefix]
+            )
             for route_node_id, route, _file in route_entries:
                 if not any(_url_matches(route, cand) for cand in candidates):
                     continue
@@ -528,15 +640,17 @@ def _infra_edges(nodes_by_id: dict, note_ids: set, route_entries: list[tuple]) -
                     "label": f"{name} :: {prefix}",
                     "source_file": f"container:{name}",
                 }
-                edges.append(_make_edge(
-                    boundary_type="infra",
-                    source_node_id=src_id,
-                    target_node_id=route_node_id,
-                    source_node=pseudo,
-                    target_node=target_node,
-                    match_key=f"proxy {prefix} -> route {route}",
-                    transport_artifact=f"{prefix}: {body}",
-                ))
+                edges.append(
+                    _make_edge(
+                        boundary_type="infra",
+                        source_node_id=src_id,
+                        target_node_id=route_node_id,
+                        source_node=pseudo,
+                        target_node=target_node,
+                        match_key=f"proxy {prefix} -> route {route}",
+                        transport_artifact=f"{prefix}: {body}",
+                    )
+                )
     return edges
 
 
@@ -549,10 +663,15 @@ def _slug(value: str) -> str:
 # -----------------------------------------------
 
 _EDGE_SYNTHESIS_SETTING_KEYS = (
-    "edge_traversal_direct_enabled", "edge_traversal_queue_enabled",
-    "edge_traversal_http_enabled", "edge_traversal_infra_enabled",
-    "edge_traversal_require_note", "edge_traversal_max_edges_per_category",
-    "scan_exclude_paths", "scan_exclude_defaults", "repair_call_edges",
+    "edge_traversal_direct_enabled",
+    "edge_traversal_queue_enabled",
+    "edge_traversal_http_enabled",
+    "edge_traversal_infra_enabled",
+    "edge_traversal_require_note",
+    "edge_traversal_max_edges_per_category",
+    "scan_exclude_paths",
+    "scan_exclude_defaults",
+    "repair_call_edges",
 )
 
 
@@ -567,7 +686,9 @@ def _artifacts_fingerprint() -> list[str]:
     for image_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         summary = image_dir / "extraction_summary.json"
         try:
-            lines.append(f"{image_dir.name}:summary:{hashlib.md5(summary.read_bytes()).hexdigest()}")
+            lines.append(
+                f"{image_dir.name}:summary:{hashlib.md5(summary.read_bytes()).hexdigest()}"
+            )
         except OSError:
             lines.append(f"{image_dir.name}:summary:none")
         rootfs = image_dir / "rootfs"
@@ -576,11 +697,15 @@ def _artifacts_fingerprint() -> list[str]:
         for file_path in sorted(rootfs.rglob("*")):
             if not file_path.is_file():
                 continue
-            if not any(fnmatch.fnmatch(file_path.name, pat) for pat in _PROXY_CONFIG_PATTERNS):
+            if not any(
+                fnmatch.fnmatch(file_path.name, pat) for pat in _PROXY_CONFIG_PATTERNS
+            ):
                 continue
             try:
                 st = file_path.stat()
-                lines.append(f"{file_path.relative_to(rootfs)}:{st.st_size}:{st.st_mtime_ns}")
+                lines.append(
+                    f"{file_path.relative_to(rootfs)}:{st.st_size}:{st.st_mtime_ns}"
+                )
             except OSError:
                 lines.append(f"{file_path.relative_to(rootfs)}:stale")
     return lines
@@ -600,7 +725,9 @@ def _synthesis_fingerprint(note_map: dict) -> str:
     """
     payload: dict = {
         "app_path": str(settings.app_path),
-        "settings": {k: getattr(settings, k, None) for k in _EDGE_SYNTHESIS_SETTING_KEYS},
+        "settings": {
+            k: getattr(settings, k, None) for k in _EDGE_SYNTHESIS_SETTING_KEYS
+        },
     }
     try:
         st = settings.graph.stat()
@@ -629,25 +756,36 @@ def build_boundary_edges(graph_data: dict, note_map: dict) -> list[dict]:
     from utils import cache, safe_cache_filename
 
     fingerprint = _synthesis_fingerprint(note_map)
-    cache_file = settings.cache_dir / "edge_traversal" / safe_cache_filename(f"synthesis_{fingerprint}.json")
+    cache_file = (
+        settings.cache_dir
+        / "edge_traversal"
+        / safe_cache_filename(f"synthesis_{fingerprint}.json")
+    )
     hit = cache(cache_file, "read")
     if isinstance(hit, dict) and isinstance(hit.get("edges"), list):
         edges = hit["edges"]
-        log.info("Edge traversal: reusing cached boundary-edge synthesis: %d edge(s) (%s).",
-                 len(edges), fingerprint[:12])
+        log.info(
+            "Edge traversal: reusing cached boundary-edge synthesis: %d edge(s) (%s).",
+            len(edges),
+            fingerprint[:12],
+        )
         return edges
 
     started = time.monotonic()
     edges = _build_boundary_edges(graph_data, note_map)
     cache(cache_file, "write", {"fingerprint": fingerprint, "edges": edges})
-    log.info("Edge traversal: boundary-edge synthesis done in %.1fs (%d edge(s) after capping); cached.",
-             time.monotonic() - started, len(edges))
+    log.info(
+        "Edge traversal: boundary-edge synthesis done in %.1fs (%d edge(s) after capping); cached.",
+        time.monotonic() - started,
+        len(edges),
+    )
     return edges
 
 
 def _build_boundary_edges(graph_data: dict, note_map: dict) -> list[dict]:
     nodes_by_id = {
-        n.get("id"): n for n in graph_data.get("nodes", [])
+        n.get("id"): n
+        for n in graph_data.get("nodes", [])
         if n.get("id") and n.get("file_type") == "code"
     }
     note_ids = {str(nid) for nid in (note_map or {})}
@@ -660,8 +798,10 @@ def _build_boundary_edges(graph_data: dict, note_map: dict) -> list[dict]:
 
     route_entries: list[tuple] = []
     queue_entries: dict[str, list[str]] = {}
-    if any(getattr(settings, f"edge_traversal_{kind}_enabled", True)
-           for kind in ("queue", "http", "infra")):
+    if any(
+        getattr(settings, f"edge_traversal_{kind}_enabled", True)
+        for kind in ("queue", "http", "infra")
+    ):
         route_entries, queue_entries = _scan_entry_declarations(nodes_by_id)
         log.info(
             "Edge traversal: discovered %d web route(s) and %d queue/event registration(s).",
@@ -673,8 +813,9 @@ def _build_boundary_edges(graph_data: dict, note_map: dict) -> list[dict]:
     # note-scoped node surface; walk it once. (Code extraction stays inside
     # each pass — the per-file tree parse behind it is memoized in utils.)
     surface: list[tuple[str, dict]] | None = None
-    if (getattr(settings, "edge_traversal_queue_enabled", True)
-            or getattr(settings, "edge_traversal_http_enabled", True)):
+    if getattr(settings, "edge_traversal_queue_enabled", True) or getattr(
+        settings, "edge_traversal_http_enabled", True
+    ):
         surface = _dispatch_surface(nodes_by_id, note_ids)
 
     if getattr(settings, "edge_traversal_queue_enabled", True):
@@ -726,7 +867,12 @@ def _cap_per_category(edges: list[dict]) -> list[dict]:
     def rank(edge: dict) -> tuple:
         both = int(bool(edge.get("source_note")) and bool(edge.get("target_note")))
         source = int(bool(edge.get("source_note")))
-        return (-both, -source, edge.get("source_node", ""), edge.get("target_node", ""))
+        return (
+            -both,
+            -source,
+            edge.get("source_node", ""),
+            edge.get("target_node", ""),
+        )
 
     kept: list[dict] = []
     for category in BOUNDARY_CATEGORY_ORDER:
@@ -736,7 +882,9 @@ def _cap_per_category(edges: list[dict]) -> list[dict]:
         if len(members) > len(limited):
             log.info(
                 "Edge traversal: capped '%s' edges at %d (from %d).",
-                category, len(limited), len(members),
+                category,
+                len(limited),
+                len(members),
             )
     return kept
 
@@ -757,7 +905,11 @@ def cluster_boundary_edges(edges: list[dict]) -> list[list[dict]]:
     for category in BOUNDARY_CATEGORY_ORDER:
         members = sorted(
             grouped.get(category, []),
-            key=lambda e: (e.get("source_node", ""), e.get("target_node", ""), e.get("match_key", "")),
+            key=lambda e: (
+                e.get("source_node", ""),
+                e.get("target_node", ""),
+                e.get("match_key", ""),
+            ),
         )
         for i in range(0, len(members), batch_size):
             if len(batches) >= max_batches:
@@ -793,7 +945,7 @@ def render_note_profile(note: dict) -> str:
     """Render an explorer AnalysisNote as the node's exit/ingress profile."""
     if not note:
         return "(no explorer interface note recorded for this node)"
-    note = note if isinstance(note, dict) else getattr(note, "model_dump", lambda: {})()
+    note = note if isinstance(note, dict) else getattr(note, "model_dump", dict)()
     lines: list[str] = []
     for key in _NOTE_FIELDS:
         values = note.get(key) or []

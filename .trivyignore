@@ -1,0 +1,3 @@
+# Allow root user for the attacker container
+DS-0002
+AVD-DS-0002

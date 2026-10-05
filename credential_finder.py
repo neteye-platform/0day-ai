@@ -9,19 +9,25 @@ the raw list. Result goes to ``<target_app>/.cache/credentials.json`` for
 validator agents. Importing this module never touches docker or the network.
 """
 
-from pathlib import Path
 import hashlib
 import json
 import logging
 import re
-from typing import Any, Iterator, Optional
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
 
 import yaml
 
 import settings
 import utils
 from llms import get_llm, invoke_tracked
-from utils import COMPOSE_FILENAMES, is_path_excluded, get_container_artifacts_root, safe_cache_filename
+from utils import (
+    COMPOSE_FILENAMES,
+    get_container_artifacts_root,
+    is_path_excluded,
+    safe_cache_filename,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +37,28 @@ logger = logging.getLogger(__name__)
 
 # Token test so `tokenizer` / `password_expiration_delay` / `csrf_token` do not match.
 _SECRET_WORDS = {
-    "password", "passwd", "pwd", "passphrase", "pass", "secret",
-    "apikey", "apisecret", "auth",
+    "password",
+    "passwd",
+    "pwd",
+    "passphrase",
+    "pass",
+    "secret",
+    "apikey",
+    "apisecret",
+    "auth",
 }
 _PREFIX_KEY_WORDS = {
-    "secret", "api", "apikey", "access", "private", "client",
-    "auth", "app", "session", "signing", "root",
+    "secret",
+    "api",
+    "apikey",
+    "access",
+    "private",
+    "client",
+    "auth",
+    "app",
+    "session",
+    "signing",
+    "root",
 }
 
 
@@ -48,18 +70,32 @@ def _is_secret_key(key: str) -> bool:
     last = low[-1]
     if last in _SECRET_WORDS:
         return True
-    if last in ("key", "secret", "token") and len(low) >= 2 and low[-2] in _PREFIX_KEY_WORDS:
-        return True
-    return False
+    return bool(
+        last in ("key", "secret", "token")
+        and len(low) >= 2
+        and low[-2] in _PREFIX_KEY_WORDS
+    )
+
 
 # Keys that identify a principal (paired with a secret for a full credential).
 
 # Trailing components stripped to derive a pairing "namespace".
 _USER_SUFFIXES = ("USERNAME", "USER", "LOGIN", "ACCOUNT")
 _SECRET_SUFFIXES = (
-    "PASSWORD", "PASSWD", "PWD", "PASSPHRASE", "PASS", "TOKEN", "SECRET",
-    "APIKEY", "API_KEY", "APISECRET", "CLIENT_SECRET", "ACCESS_KEY",
-    "SECRET_KEY", "PRIVATE_KEY",
+    "PASSWORD",
+    "PASSWD",
+    "PWD",
+    "PASSPHRASE",
+    "PASS",
+    "TOKEN",
+    "SECRET",
+    "APIKEY",
+    "API_KEY",
+    "APISECRET",
+    "CLIENT_SECRET",
+    "ACCESS_KEY",
+    "SECRET_KEY",
+    "PRIVATE_KEY",
 )
 
 # Generic `KEY = 'value'` / `KEY: "value"` / `'key' => "value"` assignment
@@ -80,26 +116,30 @@ _DEFINE = re.compile(
 )
 # Seed code `password_hash('admin', PASSWORD_DEFAULT)` -> the literal is the
 # plaintext default password.
-_PASSWORD_HASH = re.compile(r"""password_hash\s*\(\s*['"](?P<val>[^'"]{1,100})['"]""", re.I)
+_PASSWORD_HASH = re.compile(
+    r"""password_hash\s*\(\s*['"](?P<val>[^'"]{1,100})['"]""", re.IGNORECASE
+)
 # `'name' => 'admin'` (or login/username) literals, used to recover the account
 # name sitting near a password_hash call.
-_NAME_ASSIGN = re.compile(r"""['"](?:name|login|username)['"]\s*=>\s*['"]([^'"]+)['"]""", re.I)
+_NAME_ASSIGN = re.compile(
+    r"""['"](?:name|login|username)['"]\s*=>\s*['"]([^'"]+)['"]""", re.IGNORECASE
+)
 
 # SQL statements carrying an explicit DB user + plaintext password.
 _SQL_CREATE_USER = re.compile(
     r"""CREATE\s+USER(?:\s+IF\s+NOT\s+EXISTS)?\s+['"](?P<user>[^'"]+)['"]@[^\s]+
         \s+IDENTIFIED\s+BY\s+['"](?P<pass>[^'"]+)['"]""",
-    re.I | re.X,
+    re.IGNORECASE | re.VERBOSE,
 )
 _SQL_SET_PASSWORD = re.compile(
     r"""SET\s+PASSWORD\s+FOR\s+['"](?P<user>[^'"]+)['"]@[^\s]+
         \s*=\s*(?:PASSWORD\()?['"](?P<pass>[^'"]+)['"]\)?""",
-    re.I | re.X,
+    re.IGNORECASE | re.VERBOSE,
 )
 _SQL_GRANT = re.compile(
     r"""GRANT[^;]*?TO\s+['"](?P<user>[^'"]+)['"]@[^\s]+
         \s+IDENTIFIED\s+BY\s+['"](?P<pass>[^'"]+)['"]""",
-    re.I | re.X,
+    re.IGNORECASE | re.VERBOSE,
 )
 _SQL_STMTS = (_SQL_CREATE_USER, _SQL_SET_PASSWORD, _SQL_GRANT)
 
@@ -114,10 +154,26 @@ _PLACEHOLDER = re.compile(
     r"^(?:\s*<.*>\s*|changeme|your[-_ ]?(?:password|secret|key|pass)|"
     r"example|xxxx+|\.\.\.+|todo|fixme|insert\s+your|none|null|"
     r"\$\{.*\}|%[^%]+%|\*+|unknown)$",
-    re.I,
+    re.IGNORECASE,
 )
-_HASHED_VALUE = re.compile(r"^(?:\$2[aby]\$\d{2}\$|sha1:|md5:|sha256:|{SHA}|\$1\$|\$5\$|\$6\$|pbkdf2:)")
-_BOOLISH = {"true", "false", "yes", "no", "1", "0", "on", "off", "null", "none", "undefined", "nan", "inf"}
+_HASHED_VALUE = re.compile(
+    r"^(?:\$2[aby]\$\d{2}\$|sha1:|md5:|sha256:|{SHA}|\$1\$|\$5\$|\$6\$|pbkdf2:)"
+)
+_BOOLISH = {
+    "true",
+    "false",
+    "yes",
+    "no",
+    "1",
+    "0",
+    "on",
+    "off",
+    "null",
+    "none",
+    "undefined",
+    "nan",
+    "inf",
+}
 
 _MAX_CANDIDATES_TO_LLM = 150
 
@@ -125,6 +181,7 @@ _MAX_CANDIDATES_TO_LLM = 150
 # ---------------------------------------------------------------------------
 # Candidate helpers
 # ---------------------------------------------------------------------------
+
 
 def _is_placeholder(value: str) -> bool:
     v = value.strip()
@@ -136,9 +193,7 @@ def _is_placeholder(value: str) -> bool:
         return True
     if _HASHED_VALUE.match(v):
         return True
-    if _PLACEHOLDER.match(v):
-        return True
-    return False
+    return bool(_PLACEHOLDER.match(v))
 
 
 def _namespace(key: str) -> str:
@@ -152,7 +207,7 @@ def _namespace(key: str) -> str:
 
 
 def _candidates_from_pairs(
-    source: str, key_values: list[tuple[str, str]], scope: Optional[str] = None
+    source: str, key_values: list[tuple[str, str]], scope: str | None = None
 ) -> list[dict]:
     """Turn ``(key, value)`` env-style pairs into raw candidates, pairing each
     secret with a sibling ``*_USER`` value in the same namespace."""
@@ -176,13 +231,15 @@ def _candidates_from_pairs(
         for item in items:
             if _is_placeholder(item["value"]):
                 continue
-            candidates.append({
-                "source": source,
-                "scope": scope,
-                "key": item["key"],
-                "username": username,
-                "secret": item["value"],
-            })
+            candidates.append(
+                {
+                    "source": source,
+                    "scope": scope,
+                    "key": item["key"],
+                    "username": username,
+                    "secret": item["value"],
+                }
+            )
     return candidates
 
 
@@ -209,7 +266,8 @@ def _add(candidates: list[dict], **fields: Any) -> None:
 # Text readers
 # ---------------------------------------------------------------------------
 
-def _iter_lines(path: Path) -> Optional[Iterator[str]]:
+
+def _iter_lines(path: Path) -> Iterator[str] | None:
     try:
         return iter(path.open("r", encoding="utf-8"))
     except (OSError, UnicodeDecodeError) as e:
@@ -219,7 +277,9 @@ def _iter_lines(path: Path) -> Optional[Iterator[str]]:
 
 def _file_size_ok(path: Path) -> bool:
     try:
-        max_bytes = getattr(settings, "credential_finder_max_file_bytes", 2 * 1024 * 1024)
+        max_bytes = getattr(
+            settings, "credential_finder_max_file_bytes", 2 * 1024 * 1024
+        )
         return path.stat().st_size <= max_bytes
     except OSError:
         return False
@@ -227,13 +287,18 @@ def _file_size_ok(path: Path) -> bool:
 
 def _windows(path: Path, lineno: int) -> str:
     """A single display line: relative path, optional line number, trimmed."""
-    rel = str(path.relative_to(settings.app_path)) if path.is_relative_to(settings.app_path) else str(path)
+    rel = (
+        str(path.relative_to(settings.app_path))
+        if path.is_relative_to(settings.app_path)
+        else str(path)
+    )
     return f"{rel}:{lineno}" if lineno else rel
 
 
 # ---------------------------------------------------------------------------
 # Env / compose / dockerfile collectors
 # ---------------------------------------------------------------------------
+
 
 def _env_file_pairs(path: Path) -> list[tuple[str, str]]:
     """Parse a dotenv-style file into ``(KEY, VALUE)`` pairs."""
@@ -273,7 +338,9 @@ def _collect_env_files() -> list[dict]:
         pairs = _env_file_pairs(path)
         if not pairs:
             continue
-        candidates.extend(_candidates_from_pairs(f"{path.relative_to(settings.app_path)}", pairs))
+        candidates.extend(
+            _candidates_from_pairs(f"{path.relative_to(settings.app_path)}", pairs)
+        )
     return candidates
 
 
@@ -311,9 +378,17 @@ def _collect_compose() -> list[dict]:
             env_pairs: list[tuple[str, str]] = []
             local_env = dict(env)
             for ef in conf.get("env_file") or []:
-                ef_path = (path.parent / str(ef)).resolve() if isinstance(ef, str) else None
-                if ef_path and ef_path.is_file() and ef_path.is_relative_to(settings.app_path):
-                    local_env.update({k.upper(): v for k, v in _env_file_pairs(ef_path)})
+                ef_path = (
+                    (path.parent / str(ef)).resolve() if isinstance(ef, str) else None
+                )
+                if (
+                    ef_path
+                    and ef_path.is_file()
+                    and ef_path.is_relative_to(settings.app_path)
+                ):
+                    local_env.update(
+                        {k.upper(): v for k, v in _env_file_pairs(ef_path)}
+                    )
             raw_env = conf.get("environment") or {}
             if isinstance(raw_env, list):
                 for item in raw_env:
@@ -323,7 +398,9 @@ def _collect_compose() -> list[dict]:
             elif isinstance(raw_env, dict):
                 for k, v in raw_env.items():
                     env_pairs.append((str(k), str(v)))
-            resolved = [(k, str(_resolve_compose_value(v, local_env))) for k, v in env_pairs]
+            resolved = [
+                (k, str(_resolve_compose_value(v, local_env))) for k, v in env_pairs
+            ]
             if not resolved:
                 continue
             source = f"{path.name} service '{service}'"
@@ -388,11 +465,14 @@ def _collect_dockerfiles() -> list[dict]:
 # SQL collector
 # ---------------------------------------------------------------------------
 
+
 def _sql_candidates_from_statement(stmt: str, source: str) -> list[dict]:
     found = []
     for pat in _SQL_STMTS:
         for m in pat.finditer(stmt):
-            found.append({"user": m.group("user"), "pass": m.group("pass"), "source": source})
+            found.append(
+                {"user": m.group("user"), "pass": m.group("pass"), "source": source}
+            )
     return found
 
 
@@ -431,6 +511,7 @@ def _collect_sql(path: Path, allow_excluded: bool = False) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Source collector
 # ---------------------------------------------------------------------------
+
 
 def _norm_name(value: str) -> str:
     """Normalize an account identifier for pairing: lowercase, drop separators
@@ -484,7 +565,9 @@ def _collect_source() -> list[dict]:
                         recent_names.pop(0)
                 for m in _PASSWORD_HASH.finditer(line):
                     literal = m.group("val")
-                    username = literal if literal in {r for r, _ in recent_names} else None
+                    username = (
+                        literal if literal in {r for r, _ in recent_names} else None
+                    )
                     if username is None:
                         norm = _norm_name(literal)
                         for raw_name, raw_norm in recent_names:
@@ -532,6 +615,7 @@ def _collect_source() -> list[dict]:
 # ---------------------------------------------------------------------------
 # Container artifact collector
 # ---------------------------------------------------------------------------
+
 
 def _collect_container_artifacts() -> list[dict]:
     """Read baked-in ENV vars and credential-bearing files from the built-image
@@ -593,10 +677,19 @@ def _collect_container_artifacts() -> list[dict]:
 # Aggregation / dedup / output
 # ---------------------------------------------------------------------------
 
+
 def _dedupe(candidates: list[dict]) -> list[dict]:
     seen = set()
     out = []
-    for c in sorted(candidates, key=lambda c: (c.get("source") or "", c.get("key") or "", c.get("username") or "", c.get("secret") or "")):
+    for c in sorted(
+        candidates,
+        key=lambda c: (
+            c.get("source") or "",
+            c.get("key") or "",
+            c.get("username") or "",
+            c.get("secret") or "",
+        ),
+    ):
         key = (c.get("username"), c.get("secret"))
         if key in seen:
             continue
@@ -615,7 +708,9 @@ def _raw_to_record(c: dict) -> dict:
     else:
         kind = "secret"
     service = key or username or "credential"
-    notes = f"found in {c.get('source')}" + (f" ({c.get('scope')})" if c.get("scope") else "")
+    notes = f"found in {c.get('source')}" + (
+        f" ({c.get('scope')})" if c.get("scope") else ""
+    )
     return {
         "service": service,
         "kind": kind,
@@ -632,7 +727,7 @@ def _fallback_records(candidates: list[dict]) -> list[dict]:
 
 def _render_candidates(candidates: list[dict]) -> str:
     lines = []
-    for i, c in enumerate(candidates[: _MAX_CANDIDATES_TO_LLM], 1):
+    for i, c in enumerate(candidates[:_MAX_CANDIDATES_TO_LLM], 1):
         parts = [
             f"key={c.get('key') or '-'}",
             f"username={c.get('username') or '-'}",
@@ -644,40 +739,51 @@ def _render_candidates(candidates: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _llm_normalize(candidates: list[dict]) -> tuple[Optional[list[dict]], Optional[dict]]:
+def _llm_normalize(candidates: list[dict]) -> tuple[list[dict] | None, dict | None]:
     """One structured LLM call to label/dedupe raw candidates into records.
     Returns ``(records_or_None, token_usage)``; None records (and a log) on any
     failure so the caller fails open. The usage is booked to the run ledger by
     invoke_tracked; it is returned so the caller can persist it in the cache."""
     try:
-        from langchain_core.messages import SystemMessage, HumanMessage
+        from langchain_core.messages import HumanMessage, SystemMessage
+
         from schemas import CREDENTIAL_FINDER_AGENT, CredentialList
 
         sys_msg = SystemMessage(content=CREDENTIAL_FINDER_AGENT.get("prompt", ""))
-        human_msg = HumanMessage(content=(
-            f"Target application: {settings.app_path.name}\n\n"
-            f"RAW CREDENTIAL CANDIDATES ({len(candidates)} total, up to "
-            f"{_MAX_CANDIDATES_TO_LLM} shown):\n{_render_candidates(candidates)}"
-        ))
-        structured = get_llm("credential_finder").with_structured_output(CredentialList, method="json_schema", strict=True)
-        result, usage = invoke_tracked(structured, [sys_msg, human_msg], "credential_finder")
+        human_msg = HumanMessage(
+            content=(
+                f"Target application: {settings.app_path.name}\n\n"
+                f"RAW CREDENTIAL CANDIDATES ({len(candidates)} total, up to "
+                f"{_MAX_CANDIDATES_TO_LLM} shown):\n{_render_candidates(candidates)}"
+            )
+        )
+        structured = get_llm("credential_finder").with_structured_output(
+            CredentialList, method="json_schema", strict=True
+        )
+        result, usage = invoke_tracked(
+            structured, [sys_msg, human_msg], "credential_finder"
+        )
         result = result if isinstance(result, dict) else result.model_dump()
         records = []
         for item in result.get("credentials") or []:
             item = item if isinstance(item, dict) else item.model_dump()
             if not str(item.get("secret") or "").strip():
                 continue
-            records.append({
-                "service": str(item.get("service") or "credential").strip(),
-                "kind": item.get("kind", "secret"),
-                "username": item.get("username"),
-                "secret": str(item["secret"]).strip(),
-                "source": item.get("source"),
-                "notes": item.get("notes"),
-            })
+            records.append(
+                {
+                    "service": str(item.get("service") or "credential").strip(),
+                    "kind": item.get("kind", "secret"),
+                    "username": item.get("username"),
+                    "secret": str(item["secret"]).strip(),
+                    "source": item.get("source"),
+                    "notes": item.get("notes"),
+                }
+            )
         return records, usage
-    except Exception as e:
-        logger.warning("Credential finder LLM pass failed; using raw candidates: %s", e)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Credential finder LLM pass failed; using raw candidates: %s", e
+        )  # nosemgrep
         return None, None
 
 
@@ -686,9 +792,13 @@ def _write_credentials(records: list[dict]) -> None:
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(records, indent=2), encoding="utf-8")
-        logger.info("Credential finder: wrote %d credential(s) to %s.", len(records), target)
+        logger.info(
+            "Credential finder: wrote %d credential(s) to %s.", len(records), target
+        )  # nosemgrep
     except OSError as e:
-        logger.error("Credential finder: failed to write %s: %s", target, e)
+        logger.error(
+            "Credential finder: failed to write %s: %s", target, e
+        )  # nosemgrep
 
 
 def load_credentials() -> list[dict]:
@@ -703,8 +813,7 @@ def load_credentials() -> list[dict]:
     if not isinstance(data, list):
         return []
     return [
-        r for r in data
-        if isinstance(r, dict) and str(r.get("secret") or "").strip()
+        r for r in data if isinstance(r, dict) and str(r.get("secret") or "").strip()
     ]
 
 
@@ -741,21 +850,23 @@ def authentication_block() -> str:
     return (
         "TARGET AUTHENTICATION:\n"
         "Use the following sandbox credentials/sessions when authenticated "
-        "access is required:\n"
-        + "\n".join(lines)
+        "access is required:\n" + "\n".join(lines)
     )
 
 
-def _llm_cache(candidates: list[dict]) -> tuple[Optional[list[dict]], bool]:
+def _llm_cache(candidates: list[dict]) -> tuple[list[dict] | None, bool]:
     """Read (or write) the LLM normalization cache keyed on the raw
     candidates. Returns ``(records, was_cached)``."""
     digest = hashlib.md5(
         json.dumps(candidates, sort_keys=True).encode("utf-8")
     ).hexdigest()
-    cache_file = settings.cache_dir / "credential_finder" / safe_cache_filename(f"{digest}.json")
+    cache_file = (
+        settings.cache_dir / "credential_finder" / safe_cache_filename(f"{digest}.json")
+    )
     cached = utils.cache(cache_file, "read")
     if cached and isinstance(cached.get("credentials"), list):
         from run_stats import take_cached_usage
+
         take_cached_usage("credential_finder", cached)
         return cached["credentials"], True
     records, usage = _llm_normalize(candidates)
@@ -770,9 +881,12 @@ def credential_finder_node(state) -> dict:
     ``<target_app>/.cache/credentials.json``. Runs after container setup.
     Returns {} (no state change)."""
     from run_stats import raise_if_stopping
+
     raise_if_stopping()
     if not getattr(settings, "credential_finder_enabled", True):
-        logger.info("Credential finder disabled via settings.credential_finder_enabled=False.")
+        logger.info(
+            "Credential finder disabled via settings.credential_finder_enabled=False."
+        )
         return {}
 
     collected: dict[str, list[dict]] = {
@@ -799,7 +913,10 @@ def credential_finder_node(state) -> dict:
     if use_llm and candidates:
         records, cached = _llm_cache(candidates)
         if cached:
-            logger.info("Credential finder: reused cached LLM normalization (%d records).", len(records or []))
+            logger.info(
+                "Credential finder: reused cached LLM normalization (%d records).",
+                len(records or []),
+            )
     if records is None:
         records = _fallback_records(candidates)
 

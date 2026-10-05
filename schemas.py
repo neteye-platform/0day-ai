@@ -1,8 +1,8 @@
-from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Literal, Optional
-import yaml
 import re
+from typing import Literal
 
+import yaml
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 with open("agents.yaml", "r") as f:
     data = yaml.safe_load(f)
@@ -60,7 +60,7 @@ cwes = {
     "CWE-284": "Improper Access Control (Use ONLY if no specific access control CWE fits)",
     "CWE-20": "Improper Input Validation (Use ONLY if no specific injection CWE fits)",
     "CWE-840": "Business Logic Errors",
-    "OTHER_UNCATEGORIZED": "Use ONLY if no other CWE fits"
+    "OTHER_UNCATEGORIZED": "Use ONLY if no other CWE fits",
 }
 
 # CWE classes whose flaws are systemic/architectural (the same insecure pattern
@@ -81,7 +81,9 @@ SYSTEMIC_CWES = {
 
 # Deterministic (numerically sorted) rendering used in LLM-facing field
 # descriptions, so the wording never drifts from the allowlist above.
-_SYSTEMIC_CWE_LABEL = ", ".join(sorted(SYSTEMIC_CWES, key=lambda c: int(c.split("-")[1])))
+_SYSTEMIC_CWE_LABEL = ", ".join(
+    sorted(SYSTEMIC_CWES, key=lambda c: int(c.split("-")[1]))
+)
 
 CWE_KEYS = Literal[tuple(cwes.keys())]
 
@@ -105,10 +107,10 @@ def _normalize_signature(value) -> str:
 
 
 def canonical_signature(
-    vulnerable_component: Optional[str] = None,
-    demand_id: Optional[str] = None,
-    source_cve: Optional[str] = None,
-    description: Optional[str] = None,
+    vulnerable_component: str | None = None,
+    demand_id: str | None = None,
+    source_cve: str | None = None,
+    description: str | None = None,
 ) -> str:
     """Deterministic identity for grouping systemic findings across nodes.
 
@@ -134,10 +136,19 @@ def canonical_signature(
 
 
 class VulnerabilityRecord(BaseModel):
-    vuln_id: Optional[str] = None
+    vuln_id: str | None = None
 
     # Lifecycle tracking
-    status: Literal["hypothesis", "confirmed", "exploitable", "false_positive", "review_error", "insufficient_context", "chained", "unchainable"] = "hypothesis"
+    status: Literal[
+        "hypothesis",
+        "confirmed",
+        "exploitable",
+        "false_positive",
+        "review_error",
+        "insufficient_context",
+        "chained",
+        "unchainable",
+    ] = "hypothesis"
 
     # Core details (from Explorer/Verifier). Systemic records accumulate every
     # affected graph node here; localized records carry exactly one.
@@ -149,45 +160,42 @@ class VulnerabilityRecord(BaseModel):
             "insecure pattern appears (e.g. login AND registration endpoints)."
         ),
     )
-    cwe_id: str = Field(
-        description="CWE ID of the vulnerability."
-    )
+    cwe_id: str = Field(description="CWE ID of the vulnerability.")
     vulnerability_type: str = "Code Defect"
     description: str
-    demand_id: Optional[str] = None
-    source_cve: Optional[str] = Field(
+    demand_id: str | None = None
+    source_cve: str | None = Field(
         default=None,
-        description="The CVE ID a dependency-related hypothesis was derived from. Set on hypotheses emitted directly by the CVE analyzer (upgrade_only CVEs) and on contract-verifier findings for application_mitigation CVEs."
+        description="The CVE ID a dependency-related hypothesis was derived from. Set on hypotheses emitted directly by the CVE analyzer (upgrade_only CVEs) and on contract-verifier findings for application_mitigation CVEs.",
     )
-    vulnerable_component: Optional[str] = Field(
-        default=None,
-        description="The structural anchor from the Explorer hypothesis."
+    vulnerable_component: str | None = Field(
+        default=None, description="The structural anchor from the Explorer hypothesis."
     )
 
     # Reviewer additions
-    reviewer_reasoning: Optional[str] = None
-    mitigation: Optional[str] = Field(
+    reviewer_reasoning: str | None = None
+    mitigation: str | None = Field(
         default=None,
         description=(
             "Reviewer's cited blocking defense for a `false_positive` record "
             "(file/function; per-field for enumerated filters)."
         ),
     )
-    reservations: Optional[list[str]] = Field(
+    reservations: list[str] | None = Field(
         default=None,
         description=(
             "'Confirmed with reservations': the reviewer's unresolved points, which the "
             "Validator must prove or refute in the sandbox."
         ),
     )
-    out_of_scope_concern: Optional[str] = Field(
+    out_of_scope_concern: str | None = Field(
         default=None,
         description=(
             "A source-to-sink flow the Reviewer observed while tracing that this record's "
             "hypothesis does not cover; rendered for the Validator alongside reservations."
         ),
     )
-    reproduction_steps: Optional[list[str]] = Field(
+    reproduction_steps: list[str] | None = Field(
         default=None,
         description=(
             "Chronological, numbered steps the downstream Validator must execute to "
@@ -196,7 +204,10 @@ class VulnerabilityRecord(BaseModel):
             "state carried from earlier steps) because the Validator cannot read source code."
         ),
     )
-    validation_strategy: Optional[Literal["direct_to_validator", "requires_integration", "static_finding_only"]] = Field(
+    validation_strategy: (
+        Literal["direct_to_validator", "requires_integration", "static_finding_only"]
+        | None
+    ) = Field(
         default=None,
         description=(
             "Determines graph routing. 'direct_to_validator': Triggerable directly, or the "
@@ -207,7 +218,7 @@ class VulnerabilityRecord(BaseModel):
         ),
     )
 
-    cvss_vector: Optional[str] = Field(
+    cvss_vector: str | None = Field(
         default=None,
         description=(
             "Reviewer's CVSS v3.1 base-vector estimate for the adjudicated finding "
@@ -230,19 +241,19 @@ class VulnerabilityRecord(BaseModel):
     )
 
     # Validator additions
-    poc_payload: Optional[str] = None
-    poc_script: Optional[str] = None
-    execution_logs: Optional[str] = None
+    poc_payload: str | None = None
+    poc_script: str | None = None
+    execution_logs: str | None = None
 
     # Integration Auditor additions
-    integration_audit_reasoning: Optional[str] = Field(
+    integration_audit_reasoning: str | None = Field(
         default=None,
         description=(
             "The Integration Auditor's reasoning for the `chained`/`unchainable` "
             "verdict on a `requires_integration` record."
         ),
     )
-    chained_with: Optional[list[str]] = Field(
+    chained_with: list[str] | None = Field(
         default=None,
         description=(
             "vuln_ids of the other confirmed vulnerabilities this record chains "
@@ -252,18 +263,18 @@ class VulnerabilityRecord(BaseModel):
 
     # Patcher additions (post-validator source-code fix; inert when
     # settings.patcher_enabled is False — these fields stay None on every record).
-    patch_summary: Optional[str] = Field(
+    patch_summary: str | None = Field(
         default=None,
         description=(
             "Patcher's one-paragraph statement of the applied fix: what hunk "
             "changes and exactly which step of the proven exploit it blocks."
         ),
     )
-    patch_diff: Optional[str] = Field(
+    patch_diff: str | None = Field(
         default=None,
         description="Unified diff of every edit the Patcher applied for this record.",
     )
-    patched_files: Optional[list[str]] = Field(
+    patched_files: list[str] | None = Field(
         default=None,
         description="App-relative paths of the files the Patcher modified.",
     )
@@ -274,7 +285,7 @@ class VulnerabilityRecord(BaseModel):
             "the fix loop at settings.patcher_max_attempts."
         ),
     )
-    patch_history: Optional[list[dict]] = Field(
+    patch_history: list[dict] | None = Field(
         default=None,
         description=(
             "Prior patch attempts for this record ({round, summary, diff, files, "
@@ -284,7 +295,9 @@ class VulnerabilityRecord(BaseModel):
             "discards the audit trail; may be empty/None on the first attempt."
         ),
     )
-    patch_state: Optional[Literal["applied", "reviewed", "verified", "rejected", "failed"]] = Field(
+    patch_state: (
+        Literal["applied", "reviewed", "verified", "rejected", "failed"] | None
+    ) = Field(
         default=None,
         description=(
             "Patch lifecycle marker: 'applied' = edits landed, re-review pending; "
@@ -298,7 +311,7 @@ class VulnerabilityRecord(BaseModel):
     )
 
     # Validator -> Reviewer feedback loop
-    open_questions: Optional[list[str]] = Field(
+    open_questions: list[str] | None = Field(
         default=None,
         description=(
             "Specific questions the Validator raised about the evidence it needs "
@@ -315,7 +328,7 @@ class VulnerabilityRecord(BaseModel):
         ),
     )
 
-    @model_validator(mode='before')
+    @model_validator(mode="before")
     @classmethod
     def migrate_legacy_node_id(cls, values):
         """Back-compat: old cached records carry the removed `node_id` field.
@@ -333,7 +346,7 @@ class VulnerabilityRecord(BaseModel):
                     values["affected_nodes"] = nodes
         return values
 
-    @field_validator('cwe_id', mode='before')
+    @field_validator("cwe_id", mode="before")
     @classmethod
     def validate_cwe(cls, value: str) -> str:
         # Clean up LLM formatting quirks (whitespace, lowercase)
@@ -345,8 +358,8 @@ class VulnerabilityRecord(BaseModel):
             return "OTHER_UNCATEGORIZED"
         return value
 
-    @model_validator(mode='after')
-    def set_vuln_id(self) -> 'VulnerabilityRecord':
+    @model_validator(mode="after")
+    def set_vuln_id(self) -> "VulnerabilityRecord":
         # Systemic classification: deterministic CWE allowlist. Dependency-CVE
         # records are excluded — they already carry a stable per-CVE identity
         # and route to the framework/dependency reviewer track. application_mitigation
@@ -356,7 +369,10 @@ class VulnerabilityRecord(BaseModel):
             self.cwe_id in SYSTEMIC_CWES
             and not self.source_cve
             and self.vulnerability_type
-            not in ("Known Dependency Vulnerability", "Dependency Mitigation Vulnerability")
+            not in (
+                "Known Dependency Vulnerability",
+                "Dependency Mitigation Vulnerability",
+            )
         )
         if systemic:
             self.vulnerability_type = "Systemic Vulnerability"
@@ -371,7 +387,11 @@ class VulnerabilityRecord(BaseModel):
                 # share one vuln_id, so merge_vulnerabilities groups them. An
                 # empty signature (no short canonical label available) degrades
                 # to CWE-level grouping instead of a per-node-unique key.
-                self.vuln_id = f"systemic:{self.cwe_id}:{sig}" if sig else f"systemic:{self.cwe_id}"
+                self.vuln_id = (
+                    f"systemic:{self.cwe_id}:{sig}"
+                    if sig
+                    else f"systemic:{self.cwe_id}"
+                )
             return self
 
         if not self.vuln_id:
@@ -407,7 +427,7 @@ class VulnerabilityRecord(BaseModel):
 class ExpertTask(BaseModel):
     agent_role: str = Field(
         description="The PREDEFINED role best suited for this specific architectural area.",
-        json_schema_extra={"enum": list(EXPERT_AGENTS.keys())}
+        json_schema_extra={"enum": list(EXPERT_AGENTS.keys())},
     )
     target_community: str = Field(
         description="The EXACT single community ID this agent must focus on (e.g., '3'). Extract this exact ID from the summary."
@@ -416,13 +436,20 @@ class ExpertTask(BaseModel):
         description="Detailed instructions on what specific vulnerability classes, architectural risks, or cross-component interactions to investigate within this subgraph."
     )
 
+
 # Matches patterns like 15.0.5, v1.2, 19.0.0-rc.1. The bounds avoid corrupting
 # IPv4-like dotted numerics (e.g. 192.168.1.1 must survive untouched).
-_VERSION_PATTERN = r'(?<![\d.])\b(?:v|version\s*)?\d+\.\d+(?:\.\d+)?(?!\.\d)(?:-[a-zA-Z0-9.]+)?\b'
+_VERSION_PATTERN = (
+    r"(?<![\d.])\b(?:v|version\s*)?\d+\.\d+(?:\.\d+)?(?!\.\d)(?:-[a-zA-Z0-9.]+)?\b"
+)
 
 # Matches full phrases the LLM likes to generate (e.g. "fixed in 15.0.5"),
 # optionally swallowing a trailing , or . so sentences stay clean.
-_PHRASE_PATTERN = r'(?i)(?:fixed\s+in|prior\s+to|before|upgrading\s+to)\s+(?:' + _VERSION_PATTERN + r'[.,]?)'
+_PHRASE_PATTERN = (
+    r"(?i)(?:fixed\s+in|prior\s+to|before|upgrading\s+to)\s+(?:"
+    + _VERSION_PATTERN
+    + r"[.,]?)"
+)
 
 
 def strip_version_numbers(text: str) -> str:
@@ -437,10 +464,10 @@ def strip_version_numbers(text: str) -> str:
     """
     if not isinstance(text, str):
         return text
-    cleaned = re.sub(_PHRASE_PATTERN, '', text)
-    cleaned = re.sub(_VERSION_PATTERN, '[VERSION_REDACTED]', cleaned)
-    cleaned = re.sub(r'[ \t]+', ' ', cleaned)
-    cleaned = '\n'.join(line.strip() for line in cleaned.split('\n'))
+    cleaned = re.sub(_PHRASE_PATTERN, "", text)
+    cleaned = re.sub(_VERSION_PATTERN, "[VERSION_REDACTED]", cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = "\n".join(line.strip() for line in cleaned.split("\n"))
     return cleaned.strip()
 
 
@@ -456,10 +483,11 @@ class CVEHypothesis(BaseModel):
         description="How the framework/library inherently exposes the flaw to the attacker. Frame it as framework behavior (e.g., 'The framework intercepts payloads on all routes', 'The middleware parses all multipart requests')."
     )
 
-    @field_validator('description', 'framework_exposure_mechanism')
+    @field_validator("description", "framework_exposure_mechanism")
     @classmethod
     def _strip_versions(cls, v: str) -> str:
         return strip_version_numbers(v)
+
 
 class CVEAnalysis(BaseModel):
     reasoning: str = Field(
@@ -481,7 +509,7 @@ class CVEAnalysis(BaseModel):
         # No "\-" escape: ollama's regex-to-grammar converter fails on it,
         # which 400s every json_schema structured-output call. Hyphen-last is
         # the identical character class.
-        pattern=r"^[a-zA-Z0-9_-]+$"
+        pattern=r"^[a-zA-Z0-9_-]+$",
     )
     required_keywords: list[str] = Field(
         default_factory=list,
@@ -491,48 +519,53 @@ class CVEAnalysis(BaseModel):
             "(e.g., 'requests.get', 'app.use') that developers actually write, especially if the vulnerability "
             "resides in a hidden internal class or sub-dependency. "
             "REQUIRED for BOTH fix categories. NEVER use generic terms. Keep to 1-5 highly specific keywords."
-        )
+        ),
     )
-    security_assumption: Optional[str] = Field(
+    security_assumption: str | None = Field(
         default=None,
         description=(
             "REQUIRED iff fix_category is 'application_mitigation'. The specific demand or configuration requirement. "
             "This MUST be framed around the public API the developer interacts with. If the vulnerable internal "
             "component is enabled by default by a higher-level class, state that explicitly in the assumption."
-        )
+        ),
     )
-    trigger_condition: Optional[str] = Field(
+    trigger_condition: str | None = Field(
         default=None,
-        description="The explicit data flow, function call, OR network request required for the exploit. For code-level library flaws, specify the function call (e.g., 'calling yaml.load()'). For framework/middleware flaws, specify the exact HTTP request primitive. If vague, leave empty."
+        description="The explicit data flow, function call, OR network request required for the exploit. For code-level library flaws, specify the function call (e.g., 'calling yaml.load()'). For framework/middleware flaws, specify the exact HTTP request primitive. If vague, leave empty.",
     )
-    attacker_request_primitive: Optional[str] = Field(
+    attacker_request_primitive: str | None = Field(
         default=None,
-        description="The exact theoretical request or input primitive an attacker uses (e.g., 'POST request with Next-Action header', 'crafted Transfer-Encoding header', 'multipart/form-data payload')."
+        description="The exact theoretical request or input primitive an attacker uses (e.g., 'POST request with Next-Action header', 'crafted Transfer-Encoding header', 'multipart/form-data payload').",
     )
-    hypothesis: Optional[CVEHypothesis] = Field(
+    hypothesis: CVEHypothesis | None = Field(
         default=None,
-        description="REQUIRED iff fix_category is 'upgrade_only'. The vulnerability hypothesis describing the dependency-internal flaw."
+        description="REQUIRED iff fix_category is 'upgrade_only'. The vulnerability hypothesis describing the dependency-internal flaw.",
     )
 
-    @field_validator('security_assumption', 'trigger_condition')
+    @field_validator("security_assumption", "trigger_condition")
     @classmethod
-    def _strip_versions(cls, v: Optional[str]) -> Optional[str]:
+    def _strip_versions(cls, v: str | None) -> str | None:
         return strip_version_numbers(v) if v else None
+
 
 class VulnerabilityEvaluation(BaseModel):
     is_exploitable: bool = Field(
         description="True if the vulnerability has a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by standard mitigations."
     )
-    confidence_score: int = Field(description="Confidence in this assessment from 1 to 10.")
+    confidence_score: int = Field(
+        description="Confidence in this assessment from 1 to 10."
+    )
     reasoning: str = Field(description="Brief technical explanation for the decision.")
     original_report: list[dict]
-    reproduction_steps: Optional[list[str]] = Field(
+    reproduction_steps: list[str] | None = Field(
         default=None,
-        description="Chronological, numbered external actions required to trigger and prove the vulnerability."
+        description="Chronological, numbered external actions required to trigger and prove the vulnerability.",
     )
+
 
 class ReviewerOutput(BaseModel):
     vulnerabilities: list[VulnerabilityEvaluation]
+
 
 class ValidatorOutput(BaseModel):
     # Constrained to vulnerabilities only: validator subgraphs must not echo their
@@ -540,26 +573,36 @@ class ValidatorOutput(BaseModel):
     # those scalars raised "Can receive only one value per step" at checkpoint time.
     vulnerabilities: list[VulnerabilityRecord]
 
+
 class PatcherOutput(BaseModel):
     # Same constraint as ValidatorOutput: the patcher subgraph writes ONLY the
     # patched record back to MasterState (patch_log stays subgraph-internal).
     vulnerabilities: list[VulnerabilityRecord]
 
+
 class UpstreamDemand(BaseModel):
     target: str = Field(
         description="Target parameter name (e.g. '$id', 'order_id') or member call form defined in this node."
     )
-    description: str = Field(description="The security invariant required of the caller.")
+    description: str = Field(
+        description="The security invariant required of the caller."
+    )
+
 
 class DownstreamDemand(BaseModel):
     target: str = Field(
         description="First-party callee in the exact form written at the call site (e.g., 'Class::method' or 'function_name')."
     )
-    description: str = Field(description="The security requirement the callee must enforce.")
+    description: str = Field(
+        description="The security requirement the callee must enforce."
+    )
+
 
 class Hypothesis(BaseModel):
     cwe: CWE_KEYS = Field(description="The matching CWE ID.")
-    component: str = Field(description="The vulnerable parameter, logic check, or missing control.")
+    component: str = Field(
+        description="The vulnerable parameter, logic check, or missing control."
+    )
     description: str = Field(
         description=(
             "One or two sentences: which untrusted input reaches which exact "
@@ -567,7 +610,7 @@ class Hypothesis(BaseModel):
             "parameter, function, or CWE name is invalid."
         )
     )
-    pattern_label: Optional[str] = Field(
+    pattern_label: str | None = Field(
         default=None,
         description=(
             f"Short canonical name (≤6 lowercase words) REQUIRED for architectural flaws: "
@@ -576,9 +619,15 @@ class Hypothesis(BaseModel):
         ),
     )
 
+
 class AnalysisNote(BaseModel):
-    sources: list[str] | None = Field(default=None, description="External untrusted data entering this snippet.")
-    sinks: list[str] | None = Field(default=None, description="Dangerous execution sinks, state changes, or auth checks.")
+    sources: list[str] | None = Field(
+        default=None, description="External untrusted data entering this snippet."
+    )
+    sinks: list[str] | None = Field(
+        default=None,
+        description="Dangerous execution sinks, state changes, or auth checks.",
+    )
     upstream: list[UpstreamDemand] | None = Field(
         default=None,
         description=(
@@ -586,7 +635,7 @@ class AnalysisNote(BaseModel):
             "an exploitable security impact (e.g., unauthorized access, injection, data tampering) "
             "within this snippet unless the caller enforces an invariant. "
             "Leave empty if malicious input cannot cause a security compromise here."
-        )
+        ),
     )
     downstream: list[DownstreamDemand] | None = Field(
         default=None,
@@ -594,7 +643,7 @@ class AnalysisNote(BaseModel):
             "Populate ONLY when delegating sensitive operations (e.g. authentication, "
             "token verification, access checks, or database persistence) where the callee "
             "must enforce specific security guarantees to prevent a security bypass."
-        )
+        ),
     )
     vulns: list[Hypothesis] | None = Field(
         default=None,
@@ -604,28 +653,40 @@ class AnalysisNote(BaseModel):
             "operation (e.g. authentication, authorization, or sensitive state changes) "
             "omits necessary constraints or rate limits. "
             "Leave empty if safety depends on caller data validation."
-        )
+        ),
     )
 
-    @model_validator(mode='after')
+    @model_validator(mode="after")
     def set_empty_lists(self) -> "AnalysisNote":
-        if self.sources is None: self.sources = []
-        if self.sinks is None: self.sinks = []
-        if self.upstream is None: self.upstream = []
-        if self.downstream is None: self.downstream = []
-        if self.vulns is None: self.vulns = []
+        if self.sources is None:
+            self.sources = []
+        if self.sinks is None:
+            self.sinks = []
+        if self.upstream is None:
+            self.upstream = []
+        if self.downstream is None:
+            self.downstream = []
+        if self.vulns is None:
+            self.vulns = []
         return self
 
+
 class BatchedAnalysisNote(AnalysisNote):
-    node_id: str = Field(description="The exact graph node ID this analysis note refers to.")
+    node_id: str = Field(
+        description="The exact graph node ID this analysis note refers to."
+    )
+
 
 class BatchedAnalysisResult(BaseModel):
     notes: list[BatchedAnalysisNote] = Field(
         description="List of analysis notes. MUST contain one note per input node."
     )
 
+
 class DemandEvaluation(BaseModel):
-    demand_id: str = Field(description="The exact ID extracted from the [ID: ...] tag provided in the demand description.")
+    demand_id: str = Field(
+        description="The exact ID extracted from the [ID: ...] tag provided in the demand description."
+    )
     status: Literal["MET", "FAILED", "DELEGATED", "OUT_OF_SCOPE"] = Field(
         description=(
             "MET: If the visible code explicitly implements standard, robust security controls (e.g., parameterized queries) that neutralize the threat.\n"
@@ -637,13 +698,15 @@ class DemandEvaluation(BaseModel):
     evidence: str = Field(
         description="A single factual statement (max 30 words) specifying the exact function call, sanitizer, or missing check that justifies the status."
     )
-    cwe: Optional[CWE_KEYS] = Field(
+    cwe: CWE_KEYS | None = Field(
         default=None,
-        description="The matching CWE ID if status is FAILED; null otherwise."
+        description="The matching CWE ID if status is FAILED; null otherwise.",
     )
+
 
 class VerifierOutput(BaseModel):
     evaluations: list[DemandEvaluation]
+
 
 # ==========================================
 # Tools
@@ -670,15 +733,16 @@ CVSS_V31_BASE_EXAMPLES = (
     "The pipeline recomputes the numeric base score from this vector."
 )
 
+
 class EvaluationToolInput(BaseModel):
     reasoning: str = Field(
         description="THINKING SPACE. Freely reason through the evidence you gathered, the code you traced, and the defenses present before committing to a final verdict below."
     )
-    mitigation_bypass: Optional[str] = Field(
+    mitigation_bypass: str | None = Field(
         default=None,
-        description="Optionally describe how an attacker bypasses the defenses or can abuse the application logic. Do NOT set it to justify a false positive; the blocking defense goes in `mitigation`."
+        description="Optionally describe how an attacker bypasses the defenses or can abuse the application logic. Do NOT set it to justify a false positive; the blocking defense goes in `mitigation`.",
     )
-    untrusted_uses: Optional[list[str]] = Field(
+    untrusted_uses: list[str] | None = Field(
         default=None,
         description=(
             "REQUIRED for code-level false positives: every use of the untrusted value in the "
@@ -691,7 +755,7 @@ class EvaluationToolInput(BaseModel):
             "is_exploitable=true + `reservations`."
         ),
     )
-    out_of_scope_concern: Optional[str] = Field(
+    out_of_scope_concern: str | None = Field(
         default=None,
         description=(
             "A source-to-sink flow you OBSERVED while tracing that this hypothesis does not "
@@ -700,7 +764,7 @@ class EvaluationToolInput(BaseModel):
             "with the full chain in `reproduction_steps`."
         ),
     )
-    reservations: Optional[list[str]] = Field(
+    reservations: list[str] | None = Field(
         default=None,
         description=(
             "Points you could not settle statically (unaudited fields, assumptions only a "
@@ -712,19 +776,19 @@ class EvaluationToolInput(BaseModel):
     is_exploitable: bool = Field(
         description="True if there is a realistic path to exploitation. False if it is a false positive, purely theoretical, or blocked by application mitigations."
     )
-    cvss_vector: Optional[str] = Field(
+    cvss_vector: str | None = Field(
         default=None,
         description=(
             "REQUIRED when is_exploitable is true; never set for false positives. "
             "Your honest CVSS severity estimate of the adjudicated flaw, judged from the "
             "flow you traced (not a number you wish it were).\n"
-            + CVSS_V31_BASE_HELP +
-            "The pipeline recomputes the numeric base score from this vector and it decides "
+            + CVSS_V31_BASE_HELP
+            + "The pipeline recomputes the numeric base score from this vector and it decides "
             "whether a live Validator is spent on the finding, so an inflated vector wastes "
             "sandbox time and a deflated one hides the finding's true risk."
-        )
+        ),
     )
-    mitigation: Optional[str] = Field(
+    mitigation: str | None = Field(
         default=None,
         description=(
             "REQUIRED when is_exploitable is false: the defense blocking exploitation, cited "
@@ -733,14 +797,17 @@ class EvaluationToolInput(BaseModel):
             "if the list cannot be complete, use is_exploitable=true + `reservations`."
         ),
     )
-    validation_strategy: Optional[Literal["direct_to_validator", "requires_integration", "static_finding_only"]] = Field(
+    validation_strategy: (
+        Literal["direct_to_validator", "requires_integration", "static_finding_only"]
+        | None
+    ) = Field(
         default=None,
         description=(
             "REQUIRED when is_exploitable is true (pick exactly one). Leave unset for false positives.\n"
             "- 'direct_to_validator': Triggerable directly, or the only barrier is authentication the Validator may already be provisioned for and will attempt. Do NOT search for credentials — judge reachability only.\n"
             "- 'requires_integration': Demands privileges the Validator cannot obtain OR the output of another confirmed exploit.\n"
             "- 'static_finding_only': 100% real in source code but NO network-reachable exploit path (e.g., plaintext DB passwords)."
-        )
+        ),
     )
     changes_security_boundary: bool = Field(
         default=False,
@@ -752,15 +819,15 @@ class EvaluationToolInput(BaseModel):
             "victim interaction (e.g., XSS, CSRF, phishing redirects) or localized bugs."
         ),
     )
-    reproduction_steps: Optional[list[str]] = Field(
+    reproduction_steps: list[str] | None = Field(
         default_factory=list,
         description=(
             "REQUIRED when is_exploitable is true. Leave unset for false positives.\n"
             "Chronological, self-sufficient external actions required to trigger the vulnerability over HTTP. "
             "The downstream Validator cannot read source code. You MUST state exact HTTP methods, paths, parameters, headers, and carried session state. "
-            "Example: '1. POST credentials to /api/login and capture cookie. 2. POST /api/export with JSON {\"title\":\"<payload>\"} using cookie.' "
+            'Example: \'1. POST credentials to /api/login and capture cookie. 2. POST /api/export with JSON {"title":"<payload>"} using cookie.\' '
             "Leave empty for false positives."
-        )
+        ),
     )
 
     @model_validator(mode="after")
@@ -803,6 +870,7 @@ class EvaluationToolInput(BaseModel):
             return None
         # Lazy import: utils imports schemas at module level (merge_vulnerabilities).
         from utils import cvss_v3_base_score
+
         if not v.startswith("CVSS:3.") or cvss_v3_base_score(v) is None:
             raise ValueError(
                 "cvss_vector must be a complete CVSS v3.x base vector: start with "
@@ -820,19 +888,26 @@ class EvaluationToolInput(BaseModel):
             return [step.strip() for step in v.split("\n") if step.strip()]
         return v
 
+
 class ValidationToolInput(BaseModel):
-    is_confirmed: bool = Field(description="True if the exploit successfully triggered in the sandbox.")
-    poc_payload: Optional[str] = Field(description="The exact payload, script, or HTTP request that triggered the vulnerability.")
-    poc_script: Optional[str] = Field(
+    is_confirmed: bool = Field(
+        description="True if the exploit successfully triggered in the sandbox."
+    )
+    poc_payload: str | None = Field(
+        description="The exact payload, script, or HTTP request that triggered the vulnerability."
+    )
+    poc_script: str | None = Field(
         default=None,
         description=(
             "When the proof is a script you wrote with write_attacker_file: path of "
             "that complete, runnable PoC script RELATIVE TO YOUR WORKDIR (e.g. "
             "'main.py' or 'pocs/exploit.py'). The final report ships this script to "
             "the human reader. Leave unset for pure single-request proofs."
-        )
+        ),
     )
-    execution_logs: str = Field(description="Relevant logs or output from the sandbox confirming the exploit.")
+    execution_logs: str = Field(
+        description="Relevant logs or output from the sandbox confirming the exploit."
+    )
 
 
 class AskForContextInput(BaseModel):
@@ -874,16 +949,18 @@ class IntegrationAuditInput(BaseModel):
             "if no usable chain exists in isolation."
         )
     )
-    confidence_score: int = Field(description="Confidence in this assessment from 1 to 10.")
+    confidence_score: int = Field(
+        description="Confidence in this assessment from 1 to 10."
+    )
     reasoning: str = Field(description="Brief technical explanation for the decision.")
-    chained_with: Optional[list[str]] = Field(
+    chained_with: list[str] | None = Field(
         default=None,
         description=(
             "The vuln_ids of the other confirmed vulnerabilities this record chains "
             "with, in step order. REQUIRED when is_chained is true."
         ),
     )
-    reproduction_steps: Optional[list[str]] = Field(
+    reproduction_steps: list[str] | None = Field(
         default=None,
         description=(
             "REQUIRED when is_chained is true. The complete chronological, numbered "
@@ -919,7 +996,9 @@ EDGE_BOUNDARY_TYPES = Literal["in_process", "async_messaging", "network_ipc", "i
 
 
 class EdgeTraversalFinding(BaseModel):
-    vulnerability_type: Literal["cross_boundary_contract_mismatch", "differential_parsing", "confused_deputy"] = Field(
+    vulnerability_type: Literal[
+        "cross_boundary_contract_mismatch", "differential_parsing", "confused_deputy"
+    ] = Field(
         description=(
             "The composite vulnerability class: "
             "'cross_boundary_contract_mismatch' (an assumption at one side of the "
@@ -943,35 +1022,45 @@ class EdgeTraversalFinding(BaseModel):
     gap_details: str = Field(
         description="Explicit description of the semantic mismatch across the boundary (e.g., 'Node A strips the user auth token before enqueuing the task; Node B assumes every incoming queue task is pre-authorized')."
     )
-    validation_strategy: Literal["direct_to_validator", "requires_integration", "static_finding_only"] = Field(
+    validation_strategy: Literal[
+        "direct_to_validator", "requires_integration", "static_finding_only"
+    ] = Field(
         description="'requires_integration' for multi-step logic gaps that depend on another exploit output or privileges the Validator cannot obtain; 'direct_to_validator' for infrastructure/parsing discrepancies reproducible over HTTP; 'static_finding_only' for real-in-source mismatches with no network-reachable path."
     )
 
-    @field_validator('affected_nodes')
+    @field_validator("affected_nodes")
     @classmethod
     def _exactly_two_nodes(cls, v: list[str]) -> list[str]:
         if not v or len(v) > 2:
-            raise ValueError("affected_nodes must contain exactly the [source, target] node IDs.")
+            raise ValueError(
+                "affected_nodes must contain exactly the [source, target] node IDs."
+            )
         return v
 
 
 class EdgeInvariantAssertion(BaseModel):
-    source_node: str = Field(description="The upstream/source node of the boundary edge.")
-    target_node: str = Field(description="The downstream/target node of the boundary edge.")
+    source_node: str = Field(
+        description="The upstream/source node of the boundary edge."
+    )
+    target_node: str = Field(
+        description="The downstream/target node of the boundary edge."
+    )
     satisfied: bool = Field(
         description="True when the upstream node's sanitization/validation demonstrably satisfies the downstream node's entry demands (the edge is SAFE and must NOT produce a finding). False otherwise."
     )
-    reasoning: str = Field(description="Brief technical explanation referencing the visible exit/ingress code.")
+    reasoning: str = Field(
+        description="Brief technical explanation referencing the visible exit/ingress code."
+    )
 
 
 class EdgeTraversalOutput(BaseModel):
     findings: list[EdgeTraversalFinding] = Field(
         default_factory=list,
-        description="One entry per genuinely composition-only vulnerability found across the boundary edges in this batch. Empty when none exist."
+        description="One entry per genuinely composition-only vulnerability found across the boundary edges in this batch. Empty when none exist.",
     )
     assertions: list[EdgeInvariantAssertion] = Field(
         default_factory=list,
-        description="Edge invariant assertions: flags confirming when an upstream boundary's validation satisfies a downstream node's entry demands, pruning unnecessary false-positive evaluations. Emit one per edge you explicitly verified as safe."
+        description="Edge invariant assertions: flags confirming when an upstream boundary's validation satisfies a downstream node's entry demands, pruning unnecessary false-positive evaluations. Emit one per edge you explicitly verified as safe.",
     )
 
 
@@ -1008,6 +1097,7 @@ class DedupAgentOutput(BaseModel):
 # Reporter agent
 # ==========================================
 
+
 class ReporterFinding(BaseModel):
     title: str = Field(
         description="Short, clean, human-readable title for this finding (a few words). You may reuse the meaningful parts of the raw vulnerability ID or CWE description (e.g. 'Unauthenticated SQL Injection in Export Endpoint'). Keep it brief and readable: no file paths, no full node IDs, no boilerplate."
@@ -1015,9 +1105,7 @@ class ReporterFinding(BaseModel):
     summary: str = Field(
         description="As short as possible: the finding in one or two direct sentences, distilled from the record's description and reviewer reasoning. Nothing beyond what a reader needs to grasp it."
     )
-    cvss_vector: str = Field(
-        description=CVSS_V31_BASE_HELP + CVSS_V31_BASE_EXAMPLES
-    )
+    cvss_vector: str = Field(description=CVSS_V31_BASE_HELP + CVSS_V31_BASE_EXAMPLES)
     severity: Literal["Critical", "High", "Medium", "Low", "None"] = Field(
         description="Qualitative severity matching the CVSS v3 score ranges (Critical >= 9.0, High >= 7.0, Medium >= 4.0, Low >= 0.1, None = 0.0). Overridden by the pipeline if it disagrees with the vector's computed score."
     )
@@ -1027,25 +1115,28 @@ class ReporterFinding(BaseModel):
     worst_case_scenario: str = Field(
         description="Decisive and terse answer to 'what is the worst thing that could happen if a malicious actor exploits this vulnerability?', grounded in this vulnerability's real mechanics and the application's actual function."
     )
-    remediation: Optional[str] = Field(
+    remediation: str | None = Field(
         default=None,
-        description="A one-line statement of the concrete fix (code change, configuration, or library upgrade) followed by a MINIMAL, correctly fenced and language-tagged code snippet showing the change (e.g. ```php / ```yaml / ```sql). Prefer the snippet over prose; put the fenced block at the start of its own line. Leave null when no concrete remediation is known."
+        description="A one-line statement of the concrete fix (code change, configuration, or library upgrade) followed by a MINIMAL, correctly fenced and language-tagged code snippet showing the change (e.g. ```php / ```yaml / ```sql). Prefer the snippet over prose; put the fenced block at the start of its own line. Leave null when no concrete remediation is known.",
     )
 
-    @field_validator('cvss_vector')
+    @field_validator("cvss_vector")
     @classmethod
     def _validate_cvss_vector(cls, v: str) -> str:
         if not isinstance(v, str):
             return v
         v = v.strip()
         if not v.startswith("CVSS:3."):
-            raise ValueError("cvss_vector must be a CVSS v3.x base vector (start with 'CVSS:3.').")
+            raise ValueError(
+                "cvss_vector must be a CVSS v3.x base vector (start with 'CVSS:3.')."
+            )
         return v
 
 
 # ==========================================
 # Credential finder agent (preprocessing)
 # ==========================================
+
 
 class CredentialRecord(BaseModel):
     service: str = Field(
@@ -1059,20 +1150,20 @@ class CredentialRecord(BaseModel):
     kind: Literal["login", "database", "api_key", "secret", "other"] = Field(
         description="'login' for an interactive user account, 'database' for a DB user, 'api_key' for a token/API key, 'secret' for a raw secret (signing key, root password), 'other' otherwise."
     )
-    username: Optional[str] = Field(
+    username: str | None = Field(
         default=None,
-        description="The username/account identifier when one is known (e.g. 'admin', 'root'). Leave unset for bare secrets without a principal."
+        description="The username/account identifier when one is known (e.g. 'admin', 'root'). Leave unset for bare secrets without a principal.",
     )
     secret: str = Field(
         description="The credential value: the plaintext password, token, API key, or secret."
     )
-    source: Optional[str] = Field(
+    source: str | None = Field(
         default=None,
-        description="Where this was found, e.g. '.env:3', 'docker-compose.yml' service 'db', 'install/empty_data.php:9420', 'image_metadata Env'."
+        description="Where this was found, e.g. '.env:3', 'docker-compose.yml' service 'db', 'install/empty_data.php:9420', 'image_metadata Env'.",
     )
-    notes: Optional[str] = Field(
+    notes: str | None = Field(
         default=None,
-        description="Optional context: which account/profile this belongs to (e.g. 'administrator'), whether it is a well-known default, and anything that helps a consumer use it."
+        description="Optional context: which account/profile this belongs to (e.g. 'administrator'), whether it is a well-known default, and anything that helps a consumer use it.",
     )
 
 

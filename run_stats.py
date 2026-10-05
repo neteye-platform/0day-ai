@@ -19,10 +19,11 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
 
 import settings
 from dedup import Embeddings
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Cooperative run stop (Ctrl+C). The first SIGINT only sets this event: every
@@ -74,7 +75,7 @@ def install_signal_handlers(run_live: threading.Event) -> None:
 
     def _hard_exit(message: str, code: int):
         print(f"\n{message}", flush=True)
-        logging.info(message)
+        logger.info(message)
         for handler in logging.getLogger().handlers:
             handler.flush()
         os._exit(code)
@@ -150,7 +151,7 @@ def new_usage() -> dict:
     return {field: 0 for field in USAGE_FIELDS}
 
 
-def normalize_usage(usage) -> Optional[dict]:
+def normalize_usage(usage) -> dict | None:
     """Normalize any token-usage carrier (AIMessage usage_metadata dict or a
     stored usage accumulator) to {calls, input_tokens, output_tokens}; None
     when it carries no tokens at all (so zeroed payloads — e.g. an endpoint
@@ -170,7 +171,7 @@ def normalize_usage(usage) -> Optional[dict]:
     }
 
 
-def add_usage(a: Optional[dict], b: Optional[dict]) -> Optional[dict]:
+def add_usage(a: dict | None, b: dict | None) -> dict | None:
     """Field-wise sum of two usage dicts (either may be None)."""
     na, nb = normalize_usage(a), normalize_usage(b)
     if na is None:
@@ -180,12 +181,12 @@ def add_usage(a: Optional[dict], b: Optional[dict]) -> Optional[dict]:
     return {field: na[field] + nb[field] for field in USAGE_FIELDS}
 
 
-def extract_llm_usage(message) -> Optional[dict]:
+def extract_llm_usage(message) -> dict | None:
     """Token usage of one LLM response message (usage_metadata), normalized."""
     return normalize_usage(getattr(message, "usage_metadata", None))
 
 
-def record_usage(agent: str, usage) -> Optional[dict]:
+def record_usage(agent: str, usage) -> dict | None:
     """Add one call's normalized usage to the agent's run totals; returns the
     normalized dict (state/ledger bookkeeping) or None when nothing to add."""
     usage = normalize_usage(usage)
@@ -199,7 +200,7 @@ def record_usage(agent: str, usage) -> Optional[dict]:
     return usage
 
 
-def record_llm_usage(agent: str, message) -> Optional[dict]:
+def record_llm_usage(agent: str, message) -> dict | None:
     """Record one chat-model response's token usage under `agent`; the
     response's AIMessage carries usage_metadata (stream_usage is on)."""
     return record_usage(agent, extract_llm_usage(message))
@@ -242,7 +243,7 @@ def snapshot_token_totals() -> dict[str, dict[str, int]]:
 # per-invocation behavior.
 
 _LEDGER_DIR = Path("states")
-_ledger_file: Optional[Path] = None
+_ledger_file: Path | None = None
 _ledger_lock = threading.Lock()
 
 
@@ -263,7 +264,7 @@ def _ledger_write_locked() -> None:
         tmp.write_text(json.dumps(payload, indent=2))
         os.replace(tmp, _ledger_file)
     except OSError as exc:
-        logging.warning(f"Failed to persist ledger {_ledger_file}: {exc}")
+        logger.warning(f"Failed to persist ledger {_ledger_file}: {exc}")
 
 
 def _flush_ledger() -> None:
@@ -300,19 +301,19 @@ def init_usage_ledger(thread_id: str, fresh: bool) -> None:
         try:
             data = json.loads(ledger.read_text())
         except (OSError, ValueError) as exc:
-            logging.warning(f"Corrupt ledger {ledger} ({exc}); starting from zero.")
+            logger.warning(f"Corrupt ledger {ledger} ({exc}); starting from zero.")
             _ledger_write_locked()
             return
         with _pipeline_stats_lock:
-            _pipeline_stats.update({
-                str(k): int(v) for k, v in (data.get("pipeline_stats") or {}).items()
-            })
+            _pipeline_stats.update(
+                {str(k): int(v) for k, v in (data.get("pipeline_stats") or {}).items()}
+            )
         with _token_lock:
             for agent, totals in (data.get("token_totals") or {}).items():
                 live = _token_totals.setdefault(agent, new_usage())
                 for field in USAGE_FIELDS:
                     live[field] += int(totals.get(field) or 0)
-    logging.info(
+    logger.info(
         f"Restored scan ledger {ledger.name} (agents: "
         + ", ".join(
             f"{a}: {t['input_tokens']}in/{t['output_tokens']}out"
@@ -344,7 +345,7 @@ def _start_agent_progress(total: int) -> str:
                 json.dumps({"total": total, "completed": 0})
             )
         except OSError as exc:
-            logging.debug("Progress ledger for %s is memory-only: %s", progress_id, exc)
+            logger.debug("Progress ledger for %s is memory-only: %s", progress_id, exc)
     return progress_id
 
 
@@ -377,7 +378,7 @@ def _log_agent_completion(progress_id: str, agent_name: str, detail: str) -> Non
         except OSError:
             pass
 
-    logging.info(
+    logger.info(
         "%s progress: %d/%d complete, %d remaining (%s).",
         agent_name,
         completed,
@@ -435,6 +436,7 @@ def langsmith_detached_node(subgraph, agent: str):
     callbacks (e.g. a caller-supplied custom tracing handler).
     """
     if not langsmith_split_active():
+
         def node(state, config):
             raise_if_stopping()
             return subgraph.invoke(state, config)
@@ -499,7 +501,7 @@ def get_embedder(gate: bool, warn_prefix: str, exact_mode_note: str):
     )
     if embedder.available():
         return embedder
-    logging.warning(
+    logger.warning(
         "%s: embeddings unavailable (Ollama idle or model %r not pulled?); using %s.",
         warn_prefix,
         settings.embeddings_model,
@@ -514,12 +516,12 @@ def affected_nodes_label(report: dict, fallback: str) -> str:
     return ", ".join(affected) if affected else fallback
 
 
-_STEP_NUM_RE = re.compile(r'^\s*\d+[\.\)]\s+')
+_STEP_NUM_RE = re.compile(r"^\s*\d+[\.\)]\s+")
 
 
 def strip_step_numbering(step) -> str:
     """Drop any leading 'N.' / 'N)' the reviewer embedded, so steps never double-number."""
-    return _STEP_NUM_RE.sub('', str(step))
+    return _STEP_NUM_RE.sub("", str(step))
 
 
 def steps_block(steps, strip_numbering: bool = False) -> str:
@@ -529,5 +531,6 @@ def steps_block(steps, strip_numbering: bool = False) -> str:
             f"  {i}. {strip_step_numbering(s) if strip_numbering else s}"
             for i, s in enumerate(steps, 1)
         )
-        if steps else "  None provided by reviewer"
+        if steps
+        else "  None provided by reviewer"
     )

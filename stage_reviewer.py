@@ -28,6 +28,8 @@ from utils import (
     reviewer_cache_key,
 )
 
+logger = logging.getLogger(__name__)
+
 # Each track binds only its own tool subset; the ToolNode in graph.py registers
 # the union so all tracks run through the same compiled subgraph.
 CODE_LEVEL_REVIEWER_TOOLS = [
@@ -109,7 +111,7 @@ def build_reviewer_payload(
         progress_id=progress_id,
         iterations=0,
         vulnerabilities=[],
-        messages=[]
+        messages=[],
     )
 
 
@@ -119,7 +121,7 @@ def dispatch_reviewers(state: MasterState):
     hypotheses = [v for v in all_vulns if v.get("status") == "hypothesis"]
 
     if not hypotheses:
-        logging.warning("No vulnerabilities hypotheses to dispatch.")
+        logger.warning("No vulnerabilities hypotheses to dispatch.")
         # Advance straight to the reporter-dispatch barrier: it writes an empty
         # report rather than silently ENDing (reviewer/validator phases skipped).
         return "reporter_dispatch"
@@ -138,13 +140,13 @@ def dispatch_reviewers(state: MasterState):
     )
     if agent_merged:
         _record_stat("hypotheses_merged_by_agent", agent_merged)
-        logging.info(
+        logger.info(
             "Dedup agent merged away %d duplicate hypothesis record(s) before reviewer dispatch.",
             agent_merged,
         )
 
     progress_id = _start_agent_progress(len(hypotheses))
-    logging.info(
+    logger.info(
         "Starting reviewer pass: 0/%d complete, %d remaining.",
         len(hypotheses),
         len(hypotheses),
@@ -152,12 +154,16 @@ def dispatch_reviewers(state: MasterState):
 
     commands = []
     for hypothesis in hypotheses:
-        commands.append(Send(
-            "reviewer_agent",
-            build_reviewer_payload(hypothesis, progress_id, state.get("pipeline_run_id")),
-        ))
+        commands.append(
+            Send(
+                "reviewer_agent",
+                build_reviewer_payload(
+                    hypothesis, progress_id, state.get("pipeline_run_id")
+                ),
+            )
+        )
 
-    logging.info(f"Dispatching {len(commands)} reviewers.")
+    logger.info(f"Dispatching {len(commands)} reviewers.")
     _record_stat("reviewer_hypotheses", len(commands))
     return commands
 
@@ -209,11 +215,10 @@ class ReviewerAgent(ToolLoopAgent):
     progress_label = "Reviewer"
 
     def bind_tools(self, state):
-        reviewer_tools = _MODE_TOOLS.get(state.get("mode", "code_level"), CODE_LEVEL_REVIEWER_TOOLS)
-        return get_llm("reviewer").bind_tools(
-            reviewer_tools,
-            parallel_tool_calls=True
+        reviewer_tools = _MODE_TOOLS.get(
+            state.get("mode", "code_level"), CODE_LEVEL_REVIEWER_TOOLS
         )
+        return get_llm("reviewer").bind_tools(reviewer_tools, parallel_tool_calls=True)
 
     def cached_verdict(self, state):
         # Feedback re-reviews bypass the cache: checkpoint replays re-dispatch
@@ -222,7 +227,9 @@ class ReviewerAgent(ToolLoopAgent):
         report = state.get("expert_report", {})
         if is_feedback_review(report):
             return None
-        return cache_reviewer(reviewer_cache_key(report, state.get("node_id", "Unknown")), report)
+        return cache_reviewer(
+            reviewer_cache_key(report, state.get("node_id", "Unknown")), report
+        )
 
     def first_turn(self, state, llm_with_tools) -> dict:
         # System prompt = shared directives + the mode-specific reachability
@@ -235,16 +242,20 @@ class ReviewerAgent(ToolLoopAgent):
         # byte-identical.
         mode = state.get("mode", "code_level")
         mode_prompt = REVIEWER_AGENT.get(mode, "")
-        sys_prompt = REVIEWER_AGENT.get('prompt', '')
+        sys_prompt = REVIEWER_AGENT.get("prompt", "")
         if mode_prompt:
             sys_prompt = f"{sys_prompt}\n\n{mode_prompt}"
 
         report = state.get("expert_report", {})
         feedback_qs = report.get("open_questions") or []
         if feedback_qs:
-            sys_prompt = f"{sys_prompt}\n\n{REVIEWER_AGENT.get('validator_feedback', '')}"
+            sys_prompt = (
+                f"{sys_prompt}\n\n{REVIEWER_AGENT.get('validator_feedback', '')}"
+            )
         if report.get("patch_state") == "applied":
-            sys_prompt = f"{sys_prompt}\n\n{REVIEWER_AGENT.get('patch_verification', '')}"
+            sys_prompt = (
+                f"{sys_prompt}\n\n{REVIEWER_AGENT.get('patch_verification', '')}"
+            )
         sys_msg = SystemMessage(content=sys_prompt)
 
         node_id = state.get("node_id")
@@ -281,12 +292,13 @@ class ReviewerAgent(ToolLoopAgent):
         if report.get("patch_state") == "applied":
             patch_files = ", ".join(report.get("patched_files") or []) or "_none_"
             formatted_vuln += (
-                f"\n--- PATCH APPLIED (re-adjudicate the PATCHED code) ---\n"
-                f"A Patcher agent edited the source to block this previously "
-                f"PROVEN-EXPLOITABLE flow"
+                "\n--- PATCH APPLIED (re-adjudicate the PATCHED code) ---\n"
+                "A Patcher agent edited the source to block this previously "
+                "PROVEN-EXPLOITABLE flow"
                 + (
                     f" — this is patch attempt {report.get('patch_round', 1)}"
-                    if (report.get('patch_round') or 0) > 1 else ""
+                    if (report.get("patch_round") or 0) > 1
+                    else ""
                 )
                 + ".\n"
                 f"Fix summary: {report.get('patch_summary') or '_none_'}\n"
@@ -308,27 +320,31 @@ class ReviewerAgent(ToolLoopAgent):
             target_node_source = get_node_code(node_id, reviewer_mode=True)
             if target_node_source:
                 formatted_vuln += (
-                    f"--- TARGET NODE SOURCE CODE ---\n"
-                    f"```\n"
-                    f"{target_node_source}\n"
-                    f"```\n"
+                    f"--- TARGET NODE SOURCE CODE ---\n```\n{target_node_source}\n```\n"
                 )
             # Explorer-style graph-position block: saves the reviewers'
             # get_node_connections + follow-up lookup turns.
-            node_ctx = format_node_context(
-                get_cached_graph_data(settings.graph), node_id) or ""
+            node_ctx = (
+                format_node_context(get_cached_graph_data(settings.graph), node_id)
+                or ""
+            )
             if len(node_ctx) > 2500:
-                node_ctx = node_ctx[:2500] + "\n... [context truncated: use get_node_connections for the full link list]"
+                node_ctx = (
+                    node_ctx[:2500]
+                    + "\n... [context truncated: use get_node_connections for the full link list]"
+                )
             if node_ctx:
                 formatted_vuln += (
                     f"--- TARGET NODE CONTEXT (callers/callees, guards, file:line) ---\n"
                     f"{node_ctx}\n"
                 )
 
-        human_msg = HumanMessage(content=(
-            f"Review the following potential issues found in the target node.\n\n"
-            f"{formatted_vuln}"
-        ))
+        human_msg = HumanMessage(
+            content=(
+                f"Review the following potential issues found in the target node.\n\n"
+                f"{formatted_vuln}"
+            )
+        )
 
         response = llm_with_tools.invoke([sys_msg, human_msg])
         return {

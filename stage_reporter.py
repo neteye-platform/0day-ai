@@ -17,10 +17,25 @@ from weasyprint import HTML
 
 import settings
 from llms import get_llm, invoke_tracked
-from run_stats import _record_stat, _snapshot_pipeline_stats, as_dict, as_dicts, raise_if_stopping, snapshot_token_totals, strip_step_numbering
+from run_stats import (
+    _record_stat,
+    _snapshot_pipeline_stats,
+    as_dict,
+    as_dicts,
+    raise_if_stopping,
+    snapshot_token_totals,
+    strip_step_numbering,
+)
 from schemas import REPORTER_AGENT, ReporterFinding, cwes
 from state import MasterState, ReporterState
-from utils import cache_reporter, cvss_gate_blocks, cvss_severity_label, cvss_v3_base_score
+from utils import (
+    cache_reporter,
+    cvss_gate_blocks,
+    cvss_severity_label,
+    cvss_v3_base_score,
+)
+
+logger = logging.getLogger(__name__)
 
 
 # Reportable = proven exploitable, or confirmed with a static-only proof.
@@ -35,7 +50,9 @@ def _below_cvss_gate(record: dict) -> bool:
     was never dynamically proven — the user asked below-threshold confirmed
     findings to reach the report untested rather than die unseen."""
     strategy = record.get("validation_strategy") or "direct_to_validator"
-    return cvss_gate_blocks({**record, "validation_strategy": strategy}, settings.validator_min_cvss)
+    return cvss_gate_blocks(
+        {**record, "validation_strategy": strategy}, settings.validator_min_cvss
+    )
 
 
 def _is_patched_closure(record: dict) -> bool:
@@ -54,7 +71,10 @@ def _is_reportable(record: dict) -> bool:
         return True
     if _is_patched_closure(record):
         return True
-    if record.get("status") == "confirmed" and record.get("validation_strategy") == "static_finding_only":
+    if (
+        record.get("status") == "confirmed"
+        and record.get("validation_strategy") == "static_finding_only"
+    ):
         return True
     return _below_cvss_gate(record)
 
@@ -83,7 +103,8 @@ def _render_reporter_prompt(record: dict) -> str:
             f"Reviewer CVSS estimate (pre-validation): {reviewer_vector}"
             + (
                 f" (score {reviewer_score:.1f}, {cvss_severity_label(reviewer_score)})"
-                if reviewer_score is not None else ""
+                if reviewer_score is not None
+                else ""
             )
         )
     if record.get("confidence_score") is not None:
@@ -98,8 +119,10 @@ def _render_reporter_prompt(record: dict) -> str:
     if record.get("poc_payload"):
         lines += [
             "",
-            "Validator PoC payload (ground truth — use it to correct the steps; "
-            "do NOT quote it verbatim in your output):",
+            (
+                "Validator PoC payload (ground truth — use it to correct the steps; "
+                "do NOT quote it verbatim in your output):"
+            ),
             "```",
             str(record["poc_payload"]).rstrip(),
             "```",
@@ -107,16 +130,20 @@ def _render_reporter_prompt(record: dict) -> str:
     if record.get("execution_logs"):
         lines += [
             "",
-            "Validation evidence / execution logs (ground truth — use it to prove "
-            "success; do NOT quote it verbatim in your output):",
+            (
+                "Validation evidence / execution logs (ground truth — use it to prove "
+                "success; do NOT quote it verbatim in your output):"
+            ),
             str(record["execution_logs"]).rstrip(),
         ]
     lines += [
         "",
-        "Produce ONE ReporterFinding for this vulnerability: a short summary, "
-        "rewritten self-sufficient reproduction steps based on the PoC payload and "
-        "execution logs, a CVSS v3.1 base vector, a worst-case scenario, and a "
-        "remediation.",
+        (
+            "Produce ONE ReporterFinding for this vulnerability: a short summary, "
+            "rewritten self-sufficient reproduction steps based on the PoC payload and "
+            "execution logs, a CVSS v3.1 base vector, a worst-case scenario, and a "
+            "remediation."
+        ),
     ]
     if reviewer_vector:
         lines.append(
@@ -250,19 +277,49 @@ def _build_pipeline_statistics(state: MasterState) -> str:
         ]
 
     for label, key in (
-        ("Demands skipped at output cap (verifier)", "verifier_demands_skipped_output_cap"),
+        (
+            "Demands skipped at output cap (verifier)",
+            "verifier_demands_skipped_output_cap",
+        ),
         ("Explorer nodes skipped at output cap", "explorer_nodes_skipped_output_cap"),
-        ("Explorer nodes skipped (prompt over explorer_max_prompt_chars)", "explorer_nodes_skipped_oversized"),
+        (
+            "Explorer nodes skipped (prompt over explorer_max_prompt_chars)",
+            "explorer_nodes_skipped_oversized",
+        ),
         ("CVE analyses skipped at output cap", "cve_analyses_skipped_output_cap"),
-        ("Threat-intel enrichments skipped at output cap", "threat_intel_skipped_output_cap"),
-        ("Edge-traversal batches skipped at output cap", "edge_traversal_batches_skipped_output_cap"),
+        (
+            "Threat-intel enrichments skipped at output cap",
+            "threat_intel_skipped_output_cap",
+        ),
+        (
+            "Edge-traversal batches skipped at output cap",
+            "edge_traversal_batches_skipped_output_cap",
+        ),
         ("LLM dedup-agent group calls", "dedup_agent_groups"),
-        ("LLM dedup-agent groups skipped at output cap", "dedup_agent_groups_skipped_output_cap"),
-        ("LLM dedup-agent groups skipped on error (failed open)", "dedup_agent_groups_skipped_errors"),
-        ("Node resolutions via fallback (global-exact / caller-scoped)", "demand_nodes_resolved_fallback"),
-        ("Unresolved node targets (unique, logged once each)", "resolve_targets_unresolved_unique"),
-        ("Demands dropped: unresolvable target (unique)", "demands_dropped_unresolved_unique"),
-        ("Demands dropped: no qualifying caller (unique)", "demands_dropped_scoped_unique"),
+        (
+            "LLM dedup-agent groups skipped at output cap",
+            "dedup_agent_groups_skipped_output_cap",
+        ),
+        (
+            "LLM dedup-agent groups skipped on error (failed open)",
+            "dedup_agent_groups_skipped_errors",
+        ),
+        (
+            "Node resolutions via fallback (global-exact / caller-scoped)",
+            "demand_nodes_resolved_fallback",
+        ),
+        (
+            "Unresolved node targets (unique, logged once each)",
+            "resolve_targets_unresolved_unique",
+        ),
+        (
+            "Demands dropped: unresolvable target (unique)",
+            "demands_dropped_unresolved_unique",
+        ),
+        (
+            "Demands dropped: no qualifying caller (unique)",
+            "demands_dropped_scoped_unique",
+        ),
     ):
         if stats.get(key):
             lines.append(f"| {label} | {stats[key]} |")
@@ -326,8 +383,10 @@ def _build_token_usage() -> str:
     lines = [
         "## Token Usage",
         "",
-        "_LLM tokens attributed to each pipeline agent for this report, "
-        "including token counts persisted with reused (cached) verdicts._",
+        (
+            "_LLM tokens attributed to each pipeline agent for this report, "
+            "including token counts persisted with reused (cached) verdicts._"
+        ),
         "",
         "| Agent | LLM calls | Input tokens | Output tokens | Total tokens |",
         "| --- | ---: | ---: | ---: | ---: |",
@@ -345,9 +404,7 @@ def _build_token_usage() -> str:
         grand_in += tin
         grand_out += tout
         label = _TOKEN_AGENT_LABELS.get(agent, agent.replace("_", " ").capitalize())
-        lines.append(
-            f"| {label} | {calls:,} | {tin:,} | {tout:,} | {tin + tout:,} |"
-        )
+        lines.append(f"| {label} | {calls:,} | {tin:,} | {tout:,} | {tin + tout:,} |")
     lines.append(
         f"| **Total** | **{grand_calls:,}** | **{grand_in:,}** | "
         f"**{grand_out:,}** | **{grand_in + grand_out:,}** |"
@@ -384,7 +441,9 @@ def _ranked_rows(records: list[dict], findings_by_id: dict[str, dict]) -> list[t
 
 def _vuln_slug(vuln_id: str) -> str:
     """Filesystem-safe id slug, capped so paths never overflow a PDF page."""
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(vuln_id or "")).strip("_")[:60].strip("_")
+    slug = (
+        re.sub(r"[^A-Za-z0-9._-]+", "_", str(vuln_id or "")).strip("_")[:60].strip("_")
+    )
     return slug or "finding"
 
 
@@ -419,9 +478,13 @@ def _patch_section_lines(record: dict, patch_file: str | None) -> list[str]:
     if not diff:
         if record.get("patch_state") == "failed":
             return [
-                "", "#### Proposed fix", "",
-                "_An automatic fix was attempted and abandoned: no safe minimal "
-                "first-party patch could be authored — remediate manually._",
+                "",
+                "#### Proposed fix",
+                "",
+                (
+                    "_An automatic fix was attempted and abandoned: no safe minimal "
+                    "first-party patch could be authored — remediate manually._"
+                ),
             ]
         return []
     status = record.get("status")
@@ -449,9 +512,13 @@ def _patch_section_lines(record: dict, patch_file: str | None) -> list[str]:
             "dynamic re-proof was executed."
         )
     lines = [
-        "", "#### Proposed fix", "",
-        str(record.get("patch_summary") or "_no summary_").rstrip(), "",
-        verdict, "",
+        "",
+        "#### Proposed fix",
+        "",
+        str(record.get("patch_summary") or "_no summary_").rstrip(),
+        "",
+        verdict,
+        "",
     ]
     if record.get("patched_files"):
         lines.append(f"**Files changed:** {', '.join(record['patched_files'])}  ")
@@ -462,7 +529,10 @@ def _patch_section_lines(record: dict, patch_file: str | None) -> list[str]:
         files = ", ".join(record.get("patched_files") or []) or "n/a"
         lines += ["", f"```diff\n# {files}\n{diff_text}\n```"]
     else:
-        lines += ["", f"_The diff is too long to reproduce here; it is bundled as `patches/{patch_file}`._"]
+        lines += [
+            "",
+            f"_The diff is too long to reproduce here; it is bundled as `patches/{patch_file}`._",
+        ]
     return lines
 
 
@@ -505,17 +575,23 @@ def _render_main_report(rows: list[tuple], statistics: str | None = None) -> str
     records = [r[0] for r in rows]
     exploitable = sum(1 for r in records if r.get("status") == "exploitable")
     patched_verified = sum(
-        1 for r in records
+        1
+        for r in records
         if r.get("status") == "false_positive"
-        and r.get("patch_diff") and r.get("patch_state") == "verified"
+        and r.get("patch_diff")
+        and r.get("patch_state") == "verified"
     )
     patched_static = sum(
-        1 for r in records
+        1
+        for r in records
         if r.get("status") == "false_positive"
-        and r.get("patch_diff") and r.get("patch_state") != "verified"
+        and r.get("patch_diff")
+        and r.get("patch_state") != "verified"
     )
     gate_skipped = sum(1 for r in records if _below_cvss_gate(r))
-    static = len(records) - exploitable - patched_verified - patched_static - gate_skipped
+    static = (
+        len(records) - exploitable - patched_verified - patched_static - gate_skipped
+    )
 
     lines = [
         f"# Vulnerability Report — {settings.app_path.name}",
@@ -524,17 +600,26 @@ def _render_main_report(rows: list[tuple], statistics: str | None = None) -> str
         f"- **Generated:** {datetime.now().astimezone().isoformat(timespec='seconds')}",
         f"- **Exploitable findings:** {exploitable}",
         *(
-            [f"- **Auto-patched & verified (fix applied, exploit dead, feature intact):** {patched_verified}"]
-            if patched_verified else []
+            [
+                f"- **Auto-patched & verified (fix applied, exploit dead, feature intact):** {patched_verified}"
+            ]
+            if patched_verified
+            else []
         ),
         *(
-            [f"- **Auto-patched, statically adjudicated (no dynamic re-proof):** {patched_static}"]
-            if patched_static else []
+            [
+                f"- **Auto-patched, statically adjudicated (no dynamic re-proof):** {patched_static}"
+            ]
+            if patched_static
+            else []
         ),
         f"- **Static findings (no network-reachable path):** {static}",
         *(
-            [f"- **Confirmed, not dynamically validated (below CVSS validation gate):** {gate_skipped}"]
-            if gate_skipped else []
+            [
+                f"- **Confirmed, not dynamically validated (below CVSS validation gate):** {gate_skipped}"
+            ]
+            if gate_skipped
+            else []
         ),
         "",
     ]
@@ -611,16 +696,18 @@ def _render_finding_report(
     if _below_cvss_gate(record):
         lines += [
             "",
-            "**Validation:** not performed — the Reviewer's CVSS estimate fell below "
-            "the pipeline's validation gate, so this finding carries NO dynamic proof.  ",
+            (
+                "**Validation:** not performed — the Reviewer's CVSS estimate fell below "
+                "the pipeline's validation gate, so this finding carries NO dynamic proof.  "
+            ),
         ]
     if _is_patched_closure(record):
         verified = record.get("patch_state") == "verified"
         lines += [
             "",
-            f"**Status: PATCHED** — an automatic fix was applied; this section "
-            f"describes the ORIGINAL vulnerability as proven exploitable BEFORE the "
-            f"fix. "
+            "**Status: PATCHED** — an automatic fix was applied; this section "
+            "describes the ORIGINAL vulnerability as proven exploitable BEFORE the "
+            "fix. "
             + (
                 "Dynamic re-validation on the patched build confirmed the exploit no "
                 "longer reproduces and the legitimate flow still works (see "
@@ -644,7 +731,9 @@ def _render_finding_report(
     if finding.get("worst_case_scenario"):
         lines.append(str(finding["worst_case_scenario"]).rstrip())
     else:
-        lines.append("_The reporter produced no worst-case assessment for this finding._")
+        lines.append(
+            "_The reporter produced no worst-case assessment for this finding._"
+        )
     lines += ["", "## Remediation", ""]
     if finding.get("remediation"):
         lines.append(str(finding["remediation"]).rstrip())
@@ -654,8 +743,11 @@ def _render_finding_report(
         lines += ["", "## PoC script", ""]
         if artifacts.get("poc_inline"):
             lines += [
-                f"_Reproduced below and bundled as `poc/{poc_file}`._", "",
-                "```", str(artifacts["poc_inline"]).rstrip(), "```",
+                f"_Reproduced below and bundled as `poc/{poc_file}`._",
+                "",
+                "```",
+                str(artifacts["poc_inline"]).rstrip(),
+                "```",
             ]
         else:
             lines.append(
@@ -674,8 +766,10 @@ def _render_empty_report(statistics: str | None = None) -> str:
         f"- **Target application:** `{settings.app_path}`",
         f"- **Generated:** {datetime.now().astimezone().isoformat(timespec='seconds')}",
         "",
-        "No exploitable vulnerabilities were confirmed and no static findings were "
-        "accepted during this scan.",
+        (
+            "No exploitable vulnerabilities were confirmed and no static findings were "
+            "accepted during this scan."
+        ),
         "",
     ]
     if statistics:
@@ -730,9 +824,9 @@ def _write_report(path: Path, markdown_text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         pdf_bytes = _markdown_to_pdf(markdown_text)
         path.write_bytes(pdf_bytes)
-        logging.info(f"Reporter: wrote {path} ({len(pdf_bytes)} bytes).")
-    except Exception as exc:
-        logging.error(f"Reporter: failed to write {path}: {exc}")
+        logger.info(f"Reporter: wrote {path} ({len(pdf_bytes)} bytes).")
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"Reporter: failed to write {path}: {exc}")
 
 
 def dispatch_reporters(state: MasterState):
@@ -746,11 +840,11 @@ def dispatch_reporters(state: MasterState):
     ]
 
     if not records:
-        logging.warning("Reporter: no exploitable/static findings to report.")
+        logger.warning("Reporter: no exploitable/static findings to report.")
         return "report_assembler"
 
     _record_stat("reporters_dispatched", len(records))
-    logging.info(f"Dispatching {len(records)} per-vulnerability reporter task(s).")
+    logger.info(f"Dispatching {len(records)} per-vulnerability reporter task(s).")
     return [Send("reporter", ReporterState(report=record)) for record in records]
 
 
@@ -765,7 +859,7 @@ def reporter_node(state: ReporterState) -> dict:
 
     finding = cache_reporter(report)
     if finding is not None:
-        logging.info(f"Reporter cache hit for {vuln_id}.")
+        logger.info(f"Reporter cache hit for {vuln_id}.")
         finding = dict(finding)
     else:
         sys_msg = SystemMessage(content=REPORTER_AGENT.get("prompt", ""))
@@ -775,11 +869,15 @@ def reporter_node(state: ReporterState) -> dict:
         )
         usage = None
         try:
-            result, usage = invoke_tracked(reporter_llm, [sys_msg, human_msg], "reporter")
+            result, usage = invoke_tracked(
+                reporter_llm, [sys_msg, human_msg], "reporter"
+            )
             finding = result if isinstance(result, dict) else result.model_dump()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             # Fail open: keep the record's own evidence, losing no finding.
-            logging.error(f"Reporter: LLM call failed for {vuln_id} ({exc}); using record evidence.")
+            logger.error(
+                f"Reporter: LLM call failed for {vuln_id} ({exc}); using record evidence."
+            )
             finding = {
                 "title": "",
                 "summary": report.get("description") or "",
@@ -836,9 +934,11 @@ def _bundle_finding_artifacts(record: dict, finding_dir: Path) -> dict:
                 if _fits_inline(text):
                     artifacts["poc_inline"] = text.rstrip("\n")
             except OSError as exc:
-                logging.warning(f"Reporter: could not bundle PoC script for {vuln_id}: {exc}")
+                logger.warning(
+                    f"Reporter: could not bundle PoC script for {vuln_id}: {exc}"
+                )
         else:
-            logging.info(f"Reporter: no PoC script to bundle for {vuln_id}.")
+            logger.info(f"Reporter: no PoC script to bundle for {vuln_id}.")
 
     diff = record.get("patch_diff")
     if diff:
@@ -849,7 +949,7 @@ def _bundle_finding_artifacts(record: dict, finding_dir: Path) -> dict:
             (patches_dir / name).write_text(str(diff).rstrip() + "\n", encoding="utf-8")
             artifacts["patch_file"] = name
         except OSError as exc:
-            logging.warning(f"Reporter: could not bundle patch for {vuln_id}: {exc}")
+            logger.warning(f"Reporter: could not bundle patch for {vuln_id}: {exc}")
     return artifacts
 
 
@@ -868,7 +968,7 @@ def report_assembler_node(state: MasterState) -> dict:
     {"report_dir": <name>}."""
     name = str(state.get("report_dir") or "").strip().strip("/")
     if not (name.startswith("report_") and Path(name).name == name):
-        name = f"report_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
+        name = f"report_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"  # noqa: DTZ005
     report_dir = settings.app_path / name
     if report_dir.exists():
         # Re-triggered arrival: wipe the previous render, because findings
@@ -894,7 +994,9 @@ def report_assembler_node(state: MasterState) -> dict:
 
     rows = _ranked_rows(records, findings_by_id)
     for i, (record, finding, vector, score, label) in enumerate(rows, 1):
-        finding_dir = report_dir / "findings" / _finding_folder(i, record.get("vuln_id", ""))
+        finding_dir = (
+            report_dir / "findings" / _finding_folder(i, record.get("vuln_id", ""))
+        )
         artifacts = _bundle_finding_artifacts(record, finding_dir)
         _write_report(
             finding_dir / "report.pdf",

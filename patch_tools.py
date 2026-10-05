@@ -18,21 +18,22 @@ is visible to the agent on the very next turn, and warns about line shifts.
 machinery re-adjudicates the PATCHED code.
 """
 
-from pathlib import Path
 import difflib
 import logging
 import threading
-from typing import Annotated, Optional
+from pathlib import Path
+from typing import Annotated
 
 from langchain_core.messages import ToolMessage
-from langchain_core.tools import tool, InjectedToolCallId
+from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 
+import schemas
 import settings
 from utils import cache_patcher, is_path_excluded
-import schemas
 
+logger = logging.getLogger(__name__)
 
 # Serializes every source write: two concurrent patchers (and a resumed run
 # overlapping a live one) can otherwise interleave reads/writes on one file and
@@ -65,10 +66,18 @@ def _reject(tool_call_id: str, text: str) -> Command:
     status='error' message never ends the loop — ToolLoopAgent.tool_batch_done
     skips it — so the agent sees the problem and fixes it, mirroring
     tools._reject_submission)."""
-    return Command(update={"messages": [ToolMessage(
-        content=text, name="patch_tool_rejected", tool_call_id=tool_call_id,
-        status="error",
-    )]})
+    return Command(
+        update={
+            "messages": [
+                ToolMessage(
+                    content=text,
+                    name="patch_tool_rejected",
+                    tool_call_id=tool_call_id,
+                    status="error",
+                )
+            ]
+        }
+    )
 
 
 def _split(text: str) -> list[str]:
@@ -150,87 +159,116 @@ def patch_source_file(
                 "If the file shifted since your last read, re-read it with read_file "
                 "and use its printed numbering.",
             )
-        old_lines = lines[start_line - 1:end_line]
+        old_lines = lines[start_line - 1 : end_line]
         if old_lines == new_lines:
             # Idempotence guard: the content already IS the replacement (typical
             # for a resumed run that already applied this edit). Count the entry
             # so submit_patch sees the hunk as applied without rewriting bytes.
             note = f"lines {start_line}-{end_line} of '{rel}' already match the replacement (already applied)"
-            logging.info(f"Patcher: no-op edit on {rel} ({note})")
-            return Command(update={
-                "messages": [ToolMessage(
-                    content=(
-                        f"Already applied: {note}. Treat this edit as done; if it "
-                        "was part of your plan, proceed to submit_patch — otherwise "
-                        "fix the range/content of the intended edit."
-                    ),
-                    name="patch_source_file",
-                    tool_call_id=tool_call_id,
-                )],
-                "patch_log": [{"file": rel, "diff": "", "note": note}],
-            })
+            logger.info(f"Patcher: no-op edit on {rel} ({note})")
+            return Command(
+                update={
+                    "messages": [
+                        ToolMessage(
+                            content=(
+                                f"Already applied: {note}. Treat this edit as done; if it "
+                                "was part of your plan, proceed to submit_patch — otherwise "
+                                "fix the range/content of the intended edit."
+                            ),
+                            name="patch_source_file",
+                            tool_call_id=tool_call_id,
+                        )
+                    ],
+                    "patch_log": [{"file": rel, "diff": "", "note": note}],
+                }
+            )
 
-        updated = lines[:start_line - 1] + new_lines + lines[end_line:]
+        updated = lines[: start_line - 1] + new_lines + lines[end_line:]
         trailing = "\n" if content.endswith("\n") else ""
         try:
             target.write_text("\n".join(updated) + trailing, encoding="utf-8")
         except OSError as exc:
             return _reject(tool_call_id, f"Edit refused: cannot write '{rel}' ({exc}).")
 
-    diff = "\n".join(difflib.unified_diff(
-        old_lines, new_lines,
-        fromfile=f"a/{rel}", tofile=f"b/{rel}", lineterm="", n=3,
-    ))
-    echo = "\n".join(f"{i:>6}: {l}" for i, l in enumerate(old_lines[:_ECHO_MAX_LINES], start_line))
+    diff = "\n".join(
+        difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile=f"a/{rel}",
+            tofile=f"b/{rel}",
+            lineterm="",
+            n=3,
+        )
+    )
+    echo = "\n".join(
+        f"{i:>6}: {l}" for i, l in enumerate(old_lines[:_ECHO_MAX_LINES], start_line)
+    )
     delta = len(new_lines) - len(old_lines)
     shift_note = (
         f"LINE SHIFT: this edit {'added ' + str(delta) if delta > 0 else 'removed ' + str(-delta)} "
         "line(s) — every line number BELOW the edit moved; re-read the file before "
-        "the next edit in it." if delta else
-        "Same line count: line numbering below the edit is unchanged."
+        "the next edit in it."
+        if delta
+        else "Same line count: line numbering below the edit is unchanged."
     )
-    logging.info(f"Patcher: patched {rel} (lines {start_line}-{end_line}, "
-                 f"{len(old_lines)} -> {len(new_lines)} lines).")
+    logger.info(
+        f"Patcher: patched {rel} (lines {start_line}-{end_line}, "
+        f"{len(old_lines)} -> {len(new_lines)} lines)."
+    )
 
     # Soft minimalism advisories, each surfaced only on its FIRST crossing.
     issued = _issued_advisories(applied)
     advisories: list[tuple[str, str]] = []
     edit_count = len([e for e in applied if isinstance(e, dict)]) + 1
     if edit_count >= _EDIT_BUDGET and "count" not in issued:
-        advisories.append((
-            "count",
-            f"SOFT BUDGET: this is edit #{edit_count} of the patch (recommended "
-            f"budget ~{_EDIT_BUDGET} small hunks). A bigger change is refactoring, "
-            "not patching — refine what you have or call submit_patch.",
-        ))
-    if (max(len(new_lines), end_line - start_line + 1) > _EDIT_LINES_BUDGET
-            and "lines" not in issued):
-        advisories.append((
-            "lines",
-            f"SOFT BUDGET: this hunk spans over {_EDIT_LINES_BUDGET} lines "
-            "(recommended per-edit budget). Pasting a rewritten function is "
-            "refactoring, not patching — shrink to the minimum that blocks the "
-            "exploit flow.",
-        ))
+        advisories.append(
+            (
+                "count",
+                (
+                    f"SOFT BUDGET: this is edit #{edit_count} of the patch (recommended "
+                    f"budget ~{_EDIT_BUDGET} small hunks). A bigger change is refactoring, "
+                    "not patching — refine what you have or call submit_patch."
+                ),
+            )
+        )
+    if (
+        max(len(new_lines), end_line - start_line + 1) > _EDIT_LINES_BUDGET
+        and "lines" not in issued
+    ):
+        advisories.append(
+            (
+                "lines",
+                (
+                    f"SOFT BUDGET: this hunk spans over {_EDIT_LINES_BUDGET} lines "
+                    "(recommended per-edit budget). Pasting a rewritten function is "
+                    "refactoring, not patching — shrink to the minimum that blocks the "
+                    "exploit flow."
+                ),
+            )
+        )
     entry: dict = {"file": rel, "diff": diff}
     if advisories:
         entry["advisories"] = [key for key, _ in advisories]
     advisory_block = "".join(f"\n--- {text} ---" for _, text in advisories)
 
-    return Command(update={
-        "messages": [ToolMessage(
-            content=(
-                f"EDIT APPLIED: {rel} lines {start_line}-{end_line} replaced with "
-                f"{len(new_lines)} line(s).\n"
-                f"--- OLD LINES (verify this is what you meant to replace) ---\n{echo}\n"
-                f"--- DIFF ---\n{diff}\n"
-                f"--- {shift_note} ---{advisory_block}"
-            ),
-            name="patch_source_file",
-            tool_call_id=tool_call_id,
-        )],
-        "patch_log": [entry],
-    })
+    return Command(
+        update={
+            "messages": [
+                ToolMessage(
+                    content=(
+                        f"EDIT APPLIED: {rel} lines {start_line}-{end_line} replaced with "
+                        f"{len(new_lines)} line(s).\n"
+                        f"--- OLD LINES (verify this is what you meant to replace) ---\n{echo}\n"
+                        f"--- DIFF ---\n{diff}\n"
+                        f"--- {shift_note} ---{advisory_block}"
+                    ),
+                    name="patch_source_file",
+                    tool_call_id=tool_call_id,
+                )
+            ],
+            "patch_log": [entry],
+        }
+    )
 
 
 def _attempt_outcome(report: dict) -> str:
@@ -243,8 +281,10 @@ def _attempt_outcome(report: dict) -> str:
     logs = str(report.get("execution_logs") or "").strip()
     excerpt = (" | evidence: ..." + logs[-800:]) if logs else ""
     if state == "rejected":
-        return ("REJECTED — the exploit still fired after the sandbox adopted "
-                "this patch" + excerpt)
+        return (
+            "REJECTED — the exploit still fired after the sandbox adopted "
+            "this patch" + excerpt
+        )
     if status == "false_positive" and state in ("reviewed", "verified"):
         return "false_positive on the patched code (re-review/validator cleared it)"
     if status == "confirmed":
@@ -295,13 +335,15 @@ def submit_patch(
     # current patch_* fields — the next attempt's first turn reads this.
     history = list(report.get("patch_history") or [])
     if report.get("patch_diff") or report.get("patch_summary"):
-        history.append({
-            "round": report.get("patch_round") or 1,
-            "summary": str(report.get("patch_summary") or ""),
-            "files": list(report.get("patched_files") or []),
-            "diff": str(report.get("patch_diff") or ""),
-            "outcome": _attempt_outcome(report),
-        })
+        history.append(
+            {
+                "round": report.get("patch_round") or 1,
+                "summary": str(report.get("patch_summary") or ""),
+                "files": list(report.get("patched_files") or []),
+                "diff": str(report.get("patch_diff") or ""),
+                "outcome": _attempt_outcome(report),
+            }
+        )
     updated["patch_history"] = history or None
     updated["patch_summary"] = summary.strip()
     updated["patch_diff"] = diff_text
@@ -316,18 +358,22 @@ def submit_patch(
     # is neither needed nor safe.
     cache_patcher(dict(report), updated, state.get("token_spent"))
 
-    logging.info(
+    logger.info(
         f"Patcher: submitted fix for {report.get('vuln_id', 'Unknown')} "
         f"touching {files}."
     )
-    return Command(update={
-        "vulnerabilities": [updated],
-        "messages": [ToolMessage(
-            content=(
-                "Patch banked. The record returns to the Reviewer for "
-                "re-adjudication against the patched source."
-            ),
-            name="submit_patch",
-            tool_call_id=tool_call_id,
-        )],
-    })
+    return Command(
+        update={
+            "vulnerabilities": [updated],
+            "messages": [
+                ToolMessage(
+                    content=(
+                        "Patch banked. The record returns to the Reviewer for "
+                        "re-adjudication against the patched source."
+                    ),
+                    name="submit_patch",
+                    tool_call_id=tool_call_id,
+                )
+            ],
+        }
+    )

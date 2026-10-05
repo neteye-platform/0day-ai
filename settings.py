@@ -1,11 +1,12 @@
-from pathlib import Path
 import logging
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
-_REQUIRED_KEYS = ("LLM_API_KEY", "TAVILY_API_KEY", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
+_REQUIRED_KEYS = ("LLM_API_KEY", "TAVILY_API_KEY")
 _missing = [k for k in _REQUIRED_KEYS if not os.environ.get(k)]
 if _missing:
     logging.getLogger(__name__).warning(
@@ -37,7 +38,9 @@ communities_to_analyze = None
 
 # Path patterns (relative to app root) skipped before analysis and blocked from
 # reviewer file reads; globs and bare dir names supported.
-scan_exclude_paths = ["*.sql"]   # e.g. ["install/mysql/", "tests/", "docs/api/*", "**/migrations/*"]
+scan_exclude_paths = [
+    "*.sql"
+]  # e.g. ["install/mysql/", "tests/", "docs/api/*", "**/migrations/*"]
 # SQL dumps/seeds (e.g. an app's *-empty.sql installer files can be hundreds of KB)
 # are unanalyzable (no tree-sitter grammar) and were blowing the explorer's
 # unmanaged prompt past the model window; excluded by default.
@@ -125,7 +128,9 @@ integration_auditor_max_iterations = 20
 COUNTDOWN_LEAD_TURNS = 8
 reviewer_countdown_start = max(1, reviewer_max_iterations - COUNTDOWN_LEAD_TURNS)
 validator_countdown_start = max(1, validator_max_iterations - COUNTDOWN_LEAD_TURNS)
-integration_auditor_countdown_start = max(1, integration_auditor_max_iterations - COUNTDOWN_LEAD_TURNS)
+integration_auditor_countdown_start = max(
+    1, integration_auditor_max_iterations - COUNTDOWN_LEAD_TURNS
+)
 # Max times the Validator may request more context from the Reviewer per record;
 # past this it must conclude on the evidence it has.
 validator_feedback_max_rounds = 1
@@ -133,7 +138,7 @@ validator_feedback_max_rounds = 1
 # CVSS validation gate: a Reviewer-confirmed record whose own CVSS vector estimate
 # (submitted via submit_evaluation) computes below this base score is never sent to
 # the Validator/Integration Auditor — it stays 'confirmed' and is reported without
-# dynamic proof. Findings with a missing/unparseable estimate ALWAYS validate
+# dynamic proof. Findings with a missing/unparsable estimate ALWAYS validate
 # (fail-open). 0 (or negative) disables the gate entirely.
 validator_min_cvss = 7.0
 
@@ -203,10 +208,12 @@ embeddings_base_url = "http://localhost:11434"
 # genuine paraphrased duplicates sit at cosine >= 0.93 even with low component
 # overlap. At 0.85 + jaccard alone, degenerate anchors coalesce hundreds of
 # distinct per-target claims into one oversized review.
-dedup_cross_node_similarity = 0.93      # high-confidence tier (embedding decides)
-dedup_anchor_confirmed_similarity = 0.85  # mid tier: needs a strong descriptive component
-dedup_anchor_min_jaccard = 0.6          # component token overlap for the mid tier
-dedup_max_merged_cluster = 25           # cap on cross-node cluster growth
+dedup_cross_node_similarity = 0.93  # high-confidence tier (embedding decides)
+dedup_anchor_confirmed_similarity = (
+    0.85  # mid tier: needs a strong descriptive component
+)
+dedup_anchor_min_jaccard = 0.6  # component token overlap for the mid tier
+dedup_max_merged_cluster = 25  # cap on cross-node cluster growth
 
 # LLM dedup agent (stage_dedup node, between edge_traversal and the reviewer
 # fan-out): groups hypotheses by cwe_id and spends ONE structured
@@ -218,16 +225,16 @@ dedup_max_merged_cluster = 25           # cap on cross-node cluster growth
 # component to keep each call's context focused. Fails open: a group whose
 # call errors/caps passes through un-deduplicated.
 dedup_agent_enabled = True
-dedup_agent_group_max = 50     # CWE groups larger than this get dir-ordered packing
-dedup_agent_max_group = 50     # hard cap of records per LLM call (chunk size);
-                               # 50 was picked for prompt-size focus (the
-                               # embedding pass has already collapsed verbatim
-                               # twins before this)
-dedup_agent_parallel = 4       # concurrent group calls
-dedup_agent_desc_chars = 900   # per-record description budget in the prompt
-                               # (verifier "Fails to satisfy demand… Evidence:"
-                               # texts often run ~1 KB; cutting mid-Evidence
-                               # would hide the discriminating sink call)
+dedup_agent_group_max = 50  # CWE groups larger than this get dir-ordered packing
+dedup_agent_max_group = 50  # hard cap of records per LLM call (chunk size);
+# 50 was picked for prompt-size focus (the
+# embedding pass has already collapsed verbatim
+# twins before this)
+dedup_agent_parallel = 4  # concurrent group calls
+dedup_agent_desc_chars = 900  # per-record description budget in the prompt
+# (verifier "Fails to satisfy demand… Evidence:"
+# texts often run ~1 KB; cutting mid-Evidence
+# would hide the discriminating sink call)
 
 # Demand dedup (contract-verifier input): collapse paraphrases of one requirement
 # per target node (exact identity, then embedding similarity). cve_assumption
@@ -279,7 +286,12 @@ explorer_batch_char_threshold = 15000
 # pathological tokenizers inside window - output budget - context_reserved.
 _explorer_llm_cfg = {**llm_defaults, **llm_overrides.get("explorer", {})}
 explorer_max_prompt_chars = int(
-    (_explorer_llm_cfg["context_window"] - _explorer_llm_cfg["max_completion_tokens"] - context_reserved) * 0.75
+    (
+        _explorer_llm_cfg["context_window"]
+        - _explorer_llm_cfg["max_completion_tokens"]
+        - context_reserved
+    )
+    * 0.75
 )
 
 # Max expert roles assigned per community (top-K by heuristic score).
@@ -334,10 +346,10 @@ edge_traversal_batch_size = 8
 # handful of proxy ingress points, queue topologies, and network listeners).
 edge_traversal_max_batches = 12
 # Deterministic extraction toggles (all on by default).
-edge_traversal_direct_enabled = True     # cross-community AST calls/references
-edge_traversal_queue_enabled = True      # task/event dispatch -> worker entry
-edge_traversal_http_enabled = True       # HTTP client call -> route entry
-edge_traversal_infra_enabled = True      # reverse-proxy config -> app route
+edge_traversal_direct_enabled = True  # cross-community AST calls/references
+edge_traversal_queue_enabled = True  # task/event dispatch -> worker entry
+edge_traversal_http_enabled = True  # HTTP client call -> route entry
+edge_traversal_infra_enabled = True  # reverse-proxy config -> app route
 # Only traverse edges that touch at least one node carrying an explorer
 # interface note (exit/ingress profile). Keeps the candidate set scoped to the
 # analyzed surface instead of flooding on unexamined cross-community edges.
@@ -380,7 +392,11 @@ force_rebuild = False
 # run is tagged `agent:<name>` and carries `pipeline_run_id` metadata for
 # cross-project correlation with the main trace. No effect unless tracing is
 # actually active; fails open (plain env-level tracing) on any langsmith issue.
-langsmith_tracing = os.environ.get("LANGSMITH_TRACING", "").lower() in ("true", "1", "yes")
+langsmith_tracing = os.environ.get("LANGSMITH_TRACING", "").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 # "default" is LangSmith's fallback project when LANGSMITH_PROJECT is unset —
 # keeping them aligned preserves the root-project == "-reviewer" prefix invariant.
 langsmith_project = os.environ.get("LANGSMITH_PROJECT") or "default"

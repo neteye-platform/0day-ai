@@ -8,11 +8,24 @@ from tavily import TavilyClient
 
 import settings
 from llms import get_llm, invoke_structured_capped
-from run_stats import _log_agent_completion, _record_stat, _start_agent_progress, raise_if_stopping, take_cached_usage
+from run_stats import (
+    _log_agent_completion,
+    _record_stat,
+    _start_agent_progress,
+    raise_if_stopping,
+    take_cached_usage,
+)
 from schemas import THREAT_INTEL_AGENT, CVEAnalysis
-from stage_cve import _backfill_osv_cwe_ids, _finalize_cve_analysis, cve_descriptions, osv_enrichment_lines
+from stage_cve import (
+    _backfill_osv_cwe_ids,
+    _finalize_cve_analysis,
+    cve_descriptions,
+    osv_enrichment_lines,
+)
 from state import MasterState, ThreatIntelState
 from utils import cache, is_high_severity
+
+logger = logging.getLogger(__name__)
 
 
 def threat_intel_gate_node(state: MasterState) -> dict:
@@ -28,15 +41,21 @@ def _analysis_needs_threat_intel(cve: dict, analysis: dict | None) -> bool:
     if "required_keywords" in analysis and not analysis["required_keywords"]:
         return True
     trigger_keys = {"trigger_condition", "attacker_request_primitive"}
-    if trigger_keys & analysis.keys() and not any(analysis.get(key) for key in trigger_keys):
-        return True
-    return False
+    return bool(
+        trigger_keys & analysis.keys()
+        and not any(analysis.get(key) for key in trigger_keys)
+    )
 
 
 def _noop_threat_intel_send() -> list[Send]:
     """Stateless Send firing the aggregate_demands join barrier when there is
     nothing to enrich; threat_intel_node returns immediately for empty cve."""
-    return [Send("threat_intel", ThreatIntelState(cve={}, prior_analysis=None, progress_id=""))]
+    return [
+        Send(
+            "threat_intel",
+            ThreatIntelState(cve={}, prior_analysis=None, progress_id=""),
+        )
+    ]
 
 
 def dispatch_threat_intel(state: MasterState):
@@ -45,10 +64,10 @@ def dispatch_threat_intel(state: MasterState):
     Always returns at least one threat_intel Send: the join barrier requires
     it to run exactly once, so the empty case emits a no-op task."""
     if not getattr(settings, "threat_intel_enabled", True):
-        logging.info("Threat Intel disabled via settings.threat_intel_enabled=False.")
+        logger.info("Threat Intel disabled via settings.threat_intel_enabled=False.")
         return _noop_threat_intel_send()
     if not os.environ.get("TAVILY_API_KEY"):
-        logging.warning("Threat Intel disabled: TAVILY_API_KEY is not configured.")
+        logger.warning("Threat Intel disabled: TAVILY_API_KEY is not configured.")
         return _noop_threat_intel_send()
 
     analyzed = {}
@@ -68,17 +87,24 @@ def dispatch_threat_intel(state: MasterState):
             candidates.append((cve, prior))
 
     if not candidates:
-        logging.info("Threat Intel: no CVEs met the enrichment criteria.")
+        logger.info("Threat Intel: no CVEs met the enrichment criteria.")
         return _noop_threat_intel_send()
 
     progress_id = _start_agent_progress(len(candidates))
-    logging.info("Starting Threat Intel scan: 0/%d complete, %d remaining.", len(candidates), len(candidates))
+    logger.info(
+        "Starting Threat Intel scan: 0/%d complete, %d remaining.",
+        len(candidates),
+        len(candidates),
+    )
     return [
-        Send("threat_intel", ThreatIntelState(
-            cve=cve,
-            prior_analysis=prior,
-            progress_id=progress_id,
-        ))
+        Send(
+            "threat_intel",
+            ThreatIntelState(
+                cve=cve,
+                prior_analysis=prior,
+                progress_id=progress_id,
+            ),
+        )
         for cve, prior in candidates
     ]
 
@@ -119,36 +145,46 @@ def _threat_intel_node(state: ThreatIntelState) -> dict:
             max_results=5,
             include_answer=True,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         # Fail open: keep the analyzer output on any Tavily error.
-        logging.warning(f"{cve_id}: Tavily search failed; keeping analyzer output: {exc}")
+        logger.warning(
+            f"{cve_id}: Tavily search failed; keeping analyzer output: {exc}"
+        )
         return {"cve_demands": [prior] if prior else []}
 
     descriptions = cve_descriptions(cve)
     enrichment = osv_enrichment_lines(cve)
-    human_msg = HumanMessage(content=(
-        f"Analyze and complete this CVE using the external threat intelligence.\n\n"
-        f"CVE ID: {cve_id}\nPackage: {package_name}\n"
-        f"OSV descriptions:\n{chr(10).join(descriptions)}\n"
-        f"{' '.join(enrichment)}\n\n"
-        f"Prior CVE analyzer output (may be null or incomplete):\n"
-        f"{json.dumps(prior or {}, indent=2)}\n\n"
-        f"--- WEB INTEL ---\n{_format_threat_intel_results(search_data)}"
-    ))
+    human_msg = HumanMessage(
+        content=(
+            f"Analyze and complete this CVE using the external threat intelligence.\n\n"
+            f"CVE ID: {cve_id}\nPackage: {package_name}\n"
+            f"OSV descriptions:\n{chr(10).join(descriptions)}\n"
+            f"{' '.join(enrichment)}\n\n"
+            f"Prior CVE analyzer output (may be null or incomplete):\n"
+            f"{json.dumps(prior or {}, indent=2)}\n\n"
+            f"--- WEB INTEL ---\n{_format_threat_intel_results(search_data)}"
+        )
+    )
     sys_msg = SystemMessage(content=THREAT_INTEL_AGENT.get("prompt", ""))
-    structured_llm = get_llm("threat_intel").with_structured_output(CVEAnalysis, method="json_schema", strict=True)
+    structured_llm = get_llm("threat_intel").with_structured_output(
+        CVEAnalysis, method="json_schema", strict=True
+    )
     response, usage = invoke_structured_capped(
         structured_llm, [sys_msg, human_msg], f"Threat Intel {cve_id}", "threat_intel"
     )
     if response is None:
         # Fail open to the prior analyzer output.
         _record_stat("threat_intel_skipped_output_cap")
-        logging.warning(f"{cve_id}: Threat Intel hit the output cap; keeping prior output.")
+        logger.warning(
+            f"{cve_id}: Threat Intel hit the output cap; keeping prior output."
+        )
         return {"cve_demands": [prior] if prior else []}
     response = response if isinstance(response, dict) else response.model_dump()
     enriched = _finalize_cve_analysis(response, cve, enriched_by="threat_intel")
     if enriched is None:
-        logging.warning(f"{cve_id}: Threat Intel returned an invalid analysis; keeping prior output.")
+        logger.warning(
+            f"{cve_id}: Threat Intel returned an invalid analysis; keeping prior output."
+        )
         return {"cve_demands": [prior] if prior else []}
 
     # token_usage rides ONLY the cache payload (see stage_cve note).

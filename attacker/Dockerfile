@@ -1,4 +1,4 @@
-FROM kalilinux/kali-rolling
+FROM kalilinux/kali-rolling:amd64
 
 # Dedicated attacker box for the validator agent. kali-linux-headless is the
 # Kali meta-package with the full tool surface minus the heavyweight
@@ -12,6 +12,7 @@ FROM kalilinux/kali-rolling
 # default source, pin the HTTPS kali.download mirror, stop apt from following
 # mirror redirects, bump retries, and disable peer-verify for the one-time
 # package download - pragmatic for a throwaway local attacker image.
+# hadolint ignore=DL3008
 RUN set -eux; \
     rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; \
     printf '%s\n' \

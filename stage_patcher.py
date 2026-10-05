@@ -33,7 +33,16 @@ from schemas import PATCHER_AGENT
 from stage_reviewer import build_reviewer_payload
 from state import MasterState, PatcherState
 from tool_loop import CompactionConfig, ToolLoopAgent
-from utils import cache_patcher, format_node_context, get_cached_graph_data, get_node_code, resync_sandbox, take_dispatch_claim
+from utils import (
+    cache_patcher,
+    format_node_context,
+    get_cached_graph_data,
+    get_node_code,
+    resync_sandbox,
+    take_dispatch_claim,
+)
+
+logger = logging.getLogger(__name__)
 
 # Record classes the patcher must never touch: dependency-anchored hypotheses
 # have their sink inside the vendor tree (first-party edit impossible), and a
@@ -68,7 +77,8 @@ def _applied(state: MasterState) -> list[dict]:
     sandbox resync preceding it) is still owed. The reviewer's submit flips
     "applied" -> "reviewed", so a re-arrival of this router never re-loops."""
     return [
-        v for v in as_dicts(state.get("vulnerabilities", []))
+        v
+        for v in as_dicts(state.get("vulnerabilities", []))
         if v.get("patch_state") == "applied"
     ]
 
@@ -96,7 +106,7 @@ def dispatch_patchers(state: MasterState):
         return "integration_audit_dispatch"
 
     progress_id = _start_agent_progress(len(records))
-    logging.info(
+    logger.info(
         f"Starting patch pass: 0/{len(records)} complete, {len(records)} remaining "
         f"({[r.get('vuln_id') for r in records]})."
     )
@@ -144,7 +154,8 @@ def dispatch_patch_reviews(state: MasterState):
     # (the record keeps patch_state 'applied' until submit_evaluation flips it
     # to 'reviewed'); a rejected round bump still re-dispatches.
     applied = [
-        r for r in _applied(state)
+        r
+        for r in _applied(state)
         if take_dispatch_claim(
             r.get("vuln_id") or "", "patch_review", r.get("patch_round") or 0
         )
@@ -160,7 +171,7 @@ def dispatch_patch_reviews(state: MasterState):
         )
         for record in applied
     ]
-    logging.info(
+    logger.info(
         f"Patched records returning to the Reviewer: 0/{len(applied)} complete, "
         f"{len(applied)} remaining ({[r.get('vuln_id') for r in applied]})."
     )
@@ -220,10 +231,10 @@ class PatcherAgent(ToolLoopAgent):
     def bind_tools(self, state):
         return get_llm("patcher").bind_tools(
             [
-                tools.read_source_code,   # graph-attached code + its numbering
-                tools.read_file,          # paged host reads relative to app root
-                tools.search_codebase,    # find related flows / other sinks
-                tools.get_definition,     # symbol bodies
+                tools.read_source_code,  # graph-attached code + its numbering
+                tools.read_file,  # paged host reads relative to app root
+                tools.search_codebase,  # find related flows / other sinks
+                tools.get_definition,  # symbol bodies
                 patch_tools.patch_source_file,
                 patch_tools.submit_patch,
             ],
@@ -300,14 +311,16 @@ class PatcherAgent(ToolLoopAgent):
             if node_source:
                 code_sections.append(f"Node: {node_id}\n```\n{node_source}\n```")
             # Graph-position block: file:line + callers, to anchor the first reads.
-            node_ctx = format_node_context(
-                get_cached_graph_data(settings.graph), node_id) or ""
+            node_ctx = (
+                format_node_context(get_cached_graph_data(settings.graph), node_id)
+                or ""
+            )
             if len(node_ctx) > 2500:
-                node_ctx = node_ctx[:2500] + "\n... [context truncated: search/read for more]"
-            if node_ctx:
-                code_sections.append(
-                    f"Node position: {node_id}\n{node_ctx}"
+                node_ctx = (
+                    node_ctx[:2500] + "\n... [context truncated: search/read for more]"
                 )
+            if node_ctx:
+                code_sections.append(f"Node position: {node_id}\n{node_ctx}")
         if code_sections:
             formatted += (
                 "\n\n--- AFFECTED NODES SOURCE (current on-disk code, "
@@ -315,13 +328,15 @@ class PatcherAgent(ToolLoopAgent):
                 f"{'\n\n'.join(code_sections)}"
             )
 
-        human_msg = HumanMessage(content=(
-            f"The application source root (all relative paths in patch_source_file / "
-            f"read_file resolve against it) is: {settings.app_path}\n\n"
-            "Author the minimal patch blocking the exploit flow below, then call "
-            "submit_patch once.\n\n"
-            f"{formatted}"
-        ))
+        human_msg = HumanMessage(
+            content=(
+                f"The application source root (all relative paths in patch_source_file / "
+                f"read_file resolve against it) is: {settings.app_path}\n\n"
+                "Author the minimal patch blocking the exploit flow below, then call "
+                "submit_patch once.\n\n"
+                f"{formatted}"
+            )
+        )
         messages = [sys_msg, human_msg]
         response = llm_with_tools.invoke(messages)
         return {
@@ -345,7 +360,7 @@ class PatcherAgent(ToolLoopAgent):
         # adjudicate them; the status stays exploitable either way).
         cache_patcher(dict(report), updated, state.get("token_spent"))
 
-        logging.info(
+        logger.info(
             f"Patcher on {updated.get('vuln_id', 'Unknown')} ended after "
             f"{state.get('iterations', 0)} iterations without submitting a fix."
         )

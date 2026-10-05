@@ -30,6 +30,7 @@ representative real-world scans; see settings.py):
     exact-identity pre-merge; individual permanently failing texts stay
     unembedded and degrade only their own cluster/group.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -82,10 +83,18 @@ class Embeddings:
 
     PROGRESS_EVERY = 200
 
-    def __init__(self, base_url: str, model: str, timeout: int = 60, *,
-                 batch_size: int = 200, parallel_chunks: int = 1,
-                 prewarm_timeout: int = 600, keep_alive: str = "6h",
-                 stall_budget_sec: float = 540.0):
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        timeout: int = 60,
+        *,
+        batch_size: int = 200,
+        parallel_chunks: int = 1,
+        prewarm_timeout: int = 600,
+        keep_alive: str = "6h",
+        stall_budget_sec: float = 540.0,
+    ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
@@ -112,7 +121,7 @@ class Embeddings:
                 return False
             names = [m.get("name", "") for m in (resp.json().get("models") or [])]
             return any(n.split(":", 1)[0] == self.model for n in names)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return False
 
     def prewarm(self) -> bool:
@@ -127,17 +136,26 @@ class Embeddings:
         try:
             resp = requests.post(
                 f"{self.base_url}/api/embed",
-                json={"model": self.model, "input": ["warm up"],
-                      "keep_alive": self.keep_alive, "truncate": True},
+                json={
+                    "model": self.model,
+                    "input": ["warm up"],
+                    "keep_alive": self.keep_alive,
+                    "truncate": True,
+                },
                 timeout=self.prewarm_timeout,
             )
             resp.raise_for_status()
-        except Exception as e:
-            log.warning("Embeddings: pre-warm failed (%s); continuing anyway.",
-                        str(e)[:200])
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "Embeddings: pre-warm failed (%s); continuing anyway.", str(e)[:200]
+            )
             return False
-        log.info("Embeddings: pre-warmed model %r in %.1fs (keep_alive=%s).",
-                 self.model, time.monotonic() - started, self.keep_alive)
+        log.info(
+            "Embeddings: pre-warmed model %r in %.1fs (keep_alive=%s).",
+            self.model,
+            time.monotonic() - started,
+            self.keep_alive,
+        )
         return True
 
     def embed_batch(
@@ -189,12 +207,15 @@ class Embeddings:
                 state["done"] += 1
                 done = state["done"]
             if done % self.PROGRESS_EVERY == 0:
-                log.info("Embeddings: %d/%d uncached text(s) embedded.",
-                         done, len(missing))
+                log.info(
+                    "Embeddings: %d/%d uncached text(s) embedded.", done, len(missing)
+                )
             if on_result is not None:
                 try:
                     on_result(t, vec)
-                except Exception:  # disk-cache write errors are mere misses
+                except (  # noqa: S110
+                    Exception  # noqa: BLE001
+                ):  # disk-cache write errors are mere misses
                     pass
 
         def _note_failure() -> None:
@@ -216,8 +237,12 @@ class Embeddings:
         def _post(inputs: list[str]) -> list[list[float]]:
             resp = requests.post(
                 f"{self.base_url}/api/embed",
-                json={"model": self.model, "input": inputs,
-                      "keep_alive": self.keep_alive, "truncate": True},
+                json={
+                    "model": self.model,
+                    "input": inputs,
+                    "keep_alive": self.keep_alive,
+                    "truncate": True,
+                },
                 timeout=self.timeout,
             )
             resp.raise_for_status()
@@ -234,11 +259,12 @@ class Embeddings:
             _check_stall()
             try:
                 vecs = _post([t for _, t in chunk])
-            except Exception as err:
+            except Exception as err:  # noqa: BLE001
                 if len(chunk) > 1:
                     log.warning(
                         "Embeddings: %d-text chunk failed (%s); halving.",
-                        len(chunk), str(err)[:200],
+                        len(chunk),
+                        str(err)[:200],
                     )
                     mid = len(chunk) // 2
                     _fetch(chunk[:mid])
@@ -250,20 +276,27 @@ class Embeddings:
                 i, t = chunk[0]
                 try:
                     vecs = _post([t])
-                except Exception as err2:
-                    log.warning("Embeddings: dropping text idx %d after retry (%s).",
-                                i, str(err2)[:200])
+                except Exception as err2:  # noqa: BLE001
+                    log.warning(
+                        "Embeddings: dropping text idx %d after retry (%s).",
+                        i,
+                        str(err2)[:200],
+                    )
                     _note_failure()
                     return
             for (i, t), vec in zip(chunk, vecs):
                 _publish(i, t, vec)
 
         chunks = [
-            missing[s:s + self.batch_size]
+            missing[s : s + self.batch_size]
             for s in range(0, len(missing), self.batch_size)
         ]
-        log.info("Embeddings: %d uncached text(s) in %d chunk(s) of <=%d.",
-                 len(missing), len(chunks), self.batch_size)
+        log.info(
+            "Embeddings: %d uncached text(s) in %d chunk(s) of <=%d.",
+            len(missing),
+            len(chunks),
+            self.batch_size,
+        )
 
         if self.parallel_chunks > 1 and len(chunks) > 1:
             pool = ThreadPoolExecutor(
@@ -275,7 +308,7 @@ class Embeddings:
             for fut in as_completed(futures):
                 try:
                     fut.result()
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     errors.append(e)
             # Queue nothing else on a stall; in-flight requests die on their
             # own request timeout (already-embedded texts are disk-cached).
@@ -290,7 +323,10 @@ class Embeddings:
             log.warning(
                 "Embeddings: embedded %d/%d uncached text(s); %d dropped — "
                 "clusters/groups touching a dropped text fall back to exact "
-                "-only merging.", state["done"], len(missing), state["failed"],
+                "-only merging.",
+                state["done"],
+                len(missing),
+                state["failed"],
             )
         return results
 
@@ -310,7 +346,9 @@ def _normalize_text(vulnerability_type, cwe_id, description) -> str:
     return " ".join(p for p in parts if p).strip()
 
 
-def _hypothesis_text(vulnerability_type, cwe_id, vulnerable_component, description) -> str:
+def _hypothesis_text(
+    vulnerability_type, cwe_id, vulnerable_component, description
+) -> str:
     """Cross-node gate text: the component anchor leads, then the description."""
     comp = (vulnerable_component or "").strip()
     desc = (description or "").strip()
@@ -343,9 +381,7 @@ def is_degenerate_anchor(component) -> bool:
         return True
     if _STRUCTURAL_RE.search(raw):
         return False
-    if len(component_tokens(component)) >= 3:
-        return False
-    return True
+    return not len(component_tokens(component)) >= 3
 
 
 def _token_jaccard(a: frozenset[str], b: frozenset[str]) -> float:
@@ -408,7 +444,9 @@ def _merge_cluster(members: list[dict]) -> dict:
     return merged
 
 
-def _greedy_cluster_indices(vectors: list[list[float]], threshold: float) -> list[list[int]]:
+def _greedy_cluster_indices(
+    vectors: list[list[float]], threshold: float
+) -> list[list[int]]:
     """Greedy fixed-representative clustering over precomputed vectors.
 
     Returns index clusters in input order; the first member of each cluster is
@@ -440,11 +478,17 @@ HIGH_CONFIDENCE_COSINE = 0.95
 
 
 def _pair_mergeable_fast(
-    nodes_a: tuple, nodes_b: tuple, sim: float,
-    ta: frozenset[str], tb: frozenset[str],
-    degen_a: bool, degen_b: bool,
-    threshold: float, cross_threshold: float,
-    anchor_confirmed_threshold: float, anchor_min_jaccard: float,
+    nodes_a: tuple,
+    nodes_b: tuple,
+    sim: float,
+    ta: frozenset[str],
+    tb: frozenset[str],
+    degen_a: bool,
+    degen_b: bool,
+    threshold: float,
+    cross_threshold: float,
+    anchor_confirmed_threshold: float,
+    anchor_min_jaccard: float,
 ) -> bool:
     """Two-tier cross-node merge gate over precomputed per-record features."""
     if nodes_a == nodes_b:
@@ -452,8 +496,11 @@ def _pair_mergeable_fast(
 
     degen = degen_a or degen_b
     if sim >= cross_threshold:
-        return (degen or sim >= HIGH_CONFIDENCE_COSINE
-                or _token_jaccard(ta, tb) >= CONFIDENT_BAND_MIN_JACCARD)
+        return (
+            degen
+            or sim >= HIGH_CONFIDENCE_COSINE
+            or _token_jaccard(ta, tb) >= CONFIDENT_BAND_MIN_JACCARD
+        )
     if sim >= anchor_confirmed_threshold:
         return (not degen) and _token_jaccard(ta, tb) >= anchor_min_jaccard
     return False
@@ -469,17 +516,22 @@ def _sim_matrix(vectors: list[list[float]]):
 
         def lookup(i: int, j: int) -> float:
             return float(S[i, j])
+
         return lookup
 
     def lookup(i: int, j: int) -> float:
         return _cosine(vectors[i], vectors[j])
+
     return lookup
 
 
 def _cluster_by_similarity(
-    records: list[dict], vectors: list[list[float]],
-    threshold: float, cross_threshold: float,
-    anchor_confirmed_threshold: float, anchor_min_jaccard: float,
+    records: list[dict],
+    vectors: list[list[float]],
+    threshold: float,
+    cross_threshold: float,
+    anchor_confirmed_threshold: float,
+    anchor_min_jaccard: float,
     max_merged_cluster: int,
 ) -> list[list[int]]:
     """Greedy fixed-representative clustering with the two-tier merge gate.
@@ -489,7 +541,9 @@ def _cluster_by_similarity(
     ``max_merged_cluster`` members (same-node-set members are exempt) so a
     hub-parameter flood can't coalesce into one oversized review.
     """
-    nodesets = [tuple(sorted(n for n in r.get("affected_nodes") or [])) for r in records]
+    nodesets = [
+        tuple(sorted(n for n in r.get("affected_nodes") or [])) for r in records
+    ]
     comps = [r.get("vulnerable_component") for r in records]
     tokens = [component_tokens(c) for c in comps]
     degenerate = [is_degenerate_anchor(c) for c in comps]
@@ -505,15 +559,25 @@ def _cluster_by_similarity(
             if s <= best:
                 continue
             if not _pair_mergeable_fast(
-                nodesets[i], nodesets[seed], s,
-                tokens[i], tokens[seed],
-                degenerate[i], degenerate[seed],
-                threshold, cross_threshold,
-                anchor_confirmed_threshold, anchor_min_jaccard,
+                nodesets[i],
+                nodesets[seed],
+                s,
+                tokens[i],
+                tokens[seed],
+                degenerate[i],
+                degenerate[seed],
+                threshold,
+                cross_threshold,
+                anchor_confirmed_threshold,
+                anchor_min_jaccard,
             ):
                 continue
             cross = nodesets[i] != nodesets[seed]
-            if cross and max_merged_cluster and cross_members.get(c, 0) + 1 > max_merged_cluster:
+            if (
+                cross
+                and max_merged_cluster
+                and cross_members.get(c, 0) + 1 > max_merged_cluster
+            ):
                 continue
             best, best_c = s, c
         if best_c >= 0:
@@ -527,8 +591,10 @@ def _cluster_by_similarity(
 
 
 def cluster_vulnerabilities(
-    hypotheses: list[dict], threshold: float = 0.80,
-    embedder: Embeddings | None = None, *,
+    hypotheses: list[dict],
+    threshold: float = 0.80,
+    embedder: Embeddings | None = None,
+    *,
     cross_threshold: float = 0.93,
     anchor_confirmed_threshold: float = 0.85,
     anchor_min_jaccard: float = 0.6,
@@ -563,8 +629,10 @@ def cluster_vulnerabilities(
         else:
             exact[_exact_key(h)].append(h)
     pool = sorted(
-        (_merge_cluster(members) if len(members) > 1 else members[0]
-         for members in exact.values()),
+        (
+            _merge_cluster(members) if len(members) > 1 else members[0]
+            for members in exact.values()
+        ),
         key=_sort_key,
     )
 
@@ -574,18 +642,22 @@ def cluster_vulnerabilities(
         try:
             texts = [
                 _hypothesis_text(
-                    h.get("vulnerability_type"), h.get("cwe_id"),
-                    h.get("vulnerable_component"), h.get("description"),
+                    h.get("vulnerability_type"),
+                    h.get("cwe_id"),
+                    h.get("vulnerable_component"),
+                    h.get("description"),
                 )
                 for h in pool
             ]
             vectors = _embed_with_disk_cache(embedder, texts, disk_cache_dir)
             if len(vectors) != len(pool):
                 raise ValueError("embedding count mismatch in hypothesis dedup")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             log.warning(
                 "Semantic dedup: embedding failed (%s); dispatching %d "
-                "hypotheses with exact-identity merging only.", e, len(pool),
+                "hypotheses with exact-identity merging only.",
+                e,
+                len(pool),
             )
             outcome.extend(pool)
         else:
@@ -595,7 +667,8 @@ def cluster_vulnerabilities(
             if all(v is None for v in vectors):
                 log.warning(
                     "Semantic dedup: every text failed to embed; dispatching "
-                    "%d hypotheses with exact-identity merging only.", len(pool),
+                    "%d hypotheses with exact-identity merging only.",
+                    len(pool),
                 )
                 outcome.extend(pool)
             else:
@@ -603,7 +676,9 @@ def cluster_vulnerabilities(
                 if dropped:
                     log.warning(
                         "Semantic dedup: %d/%d hypothesis texts failed to embed; "
-                        "those records dispatch unmerged.", len(dropped), len(pool),
+                        "those records dispatch unmerged.",
+                        len(dropped),
+                        len(pool),
                     )
                 groups: dict[tuple, list[int]] = {}
                 for i, v in enumerate(vectors):
@@ -619,17 +694,27 @@ def cluster_vulnerabilities(
                     sub = [pool[i] for i in idxs]
                     sub_vecs = [vectors[i] for i in idxs]
                     clusters = _cluster_by_similarity(
-                        sub, sub_vecs, threshold, cross_threshold,
-                        anchor_confirmed_threshold, anchor_min_jaccard,
+                        sub,
+                        sub_vecs,
+                        threshold,
+                        cross_threshold,
+                        anchor_confirmed_threshold,
+                        anchor_min_jaccard,
                         max_merged_cluster,
                     )
                     for cl in clusters:
-                        outcome.append(_merge_cluster([sub[i] for i in cl]) if len(cl) > 1 else sub[cl[0]])
+                        outcome.append(
+                            _merge_cluster([sub[i] for i in cl])
+                            if len(cl) > 1
+                            else sub[cl[0]]
+                        )
                 outcome.extend(pool[i] for i in sorted(dropped))
 
     log.info(
         "Semantic dedup: %d hypotheses -> %d unique dispatch records (%d merged).",
-        len(hypotheses), len(outcome), len(hypotheses) - len(outcome),
+        len(hypotheses),
+        len(outcome),
+        len(hypotheses) - len(outcome),
     )
     return outcome
 
@@ -669,21 +754,23 @@ def _embed_with_disk_cache(
     model = embedder.model
 
     def _cache_path(t: str) -> Path:
-        return cache_dir / f"{hashlib.sha256(f'{model}:{t}'.encode('utf-8')).hexdigest()}.json"
+        return cache_dir / f"{hashlib.sha256(f'{model}:{t}'.encode()).hexdigest()}.json"
 
     for i, t in enumerate(texts):
         try:
             results[i] = json.loads(_cache_path(t).read_text())["embedding"]
             continue
-        except Exception:
+        except (OSError, ValueError, KeyError):
             missing.append((i, t))
     if missing:
+
         def _cache_one(t: str, vec: list[float]) -> None:
             try:
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 _cache_path(t).write_text(json.dumps({"embedding": vec}))
-            except Exception:
+            except OSError:
                 pass
+
         vecs = embedder.embed_batch([t for _, t in missing], on_result=_cache_one)
         for (i, _t), vec in zip(missing, vecs):
             results[i] = vec
@@ -757,7 +844,11 @@ def deduplicate_demands(
                 exact: dict[tuple, int] = {}
                 for i in idxs:
                     d = demands[i]
-                    key = (d.get("source"), d.get("parameter_name"), _norm(d.get("description")))
+                    key = (
+                        d.get("source"),
+                        d.get("parameter_name"),
+                        _norm(d.get("description")),
+                    )
                     if key not in exact:
                         exact[key] = i
                 keep.extend(exact.values())
@@ -775,7 +866,9 @@ def deduplicate_demands(
             if len(seeds) == 1 or embedder is None:
                 keep.extend(seeds)
                 continue
-            pending.append((keep, seeds, [_norm(demands[i].get("description")) for i in seeds]))
+            pending.append(
+                (keep, seeds, [_norm(demands[i].get("description")) for i in seeds])
+            )
 
     # Pass 2: one global batched embed over the unique texts, then per-group
     # greedy clustering with the precomputed vectors.
@@ -787,16 +880,17 @@ def deduplicate_demands(
             if len(vectors) != len(unique_texts):
                 raise ValueError("embedding count mismatch in demand dedup")
             vec_map = dict(zip(unique_texts, vectors))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             log.warning(
                 "Demand dedup: embedding failed (%s); keeping exact-unique "
                 "demands for %d multi-demand group(s).",
-                e, len(pending),
+                e,
+                len(pending),
             )
     for keep, seeds, texts in pending:
         try:
             clusters = _greedy_cluster_indices([vec_map[t] for t in texts], threshold)
-        except Exception as e:  # missing vector for this group only
+        except KeyError as e:  # missing vector for this group only
             log.warning(
                 "Demand dedup: keeping %d exact-unique demands (%s)", len(seeds), e
             )
@@ -812,6 +906,8 @@ def deduplicate_demands(
     if total_out != total_in:
         log.info(
             "Demand dedup: %d -> %d demands before contract verification (%d merged).",
-            total_in, total_out, total_in - total_out,
+            total_in,
+            total_out,
+            total_in - total_out,
         )
     return grouped_demands

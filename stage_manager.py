@@ -55,7 +55,10 @@ def manager_agent_node(state: MasterState) -> dict[str, Any]:
         # Assign only the top-K best-scoring roles: distinct expert roles must
         # not re-scan the same nodes.
         for agent, score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True):
-            if assigned >= settings.max_experts_per_community or score < ASSIGNMENT_THRESHOLD:
+            if (
+                assigned >= settings.max_experts_per_community
+                or score < ASSIGNMENT_THRESHOLD
+            ):
                 break
             heuristic_tasks.append(_make_task(comm_id, agent))
             assigned += 1
