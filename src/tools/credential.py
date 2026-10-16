@@ -781,9 +781,10 @@ def _llm_normalize(candidates: list[dict]) -> tuple[list[dict] | None, dict | No
             )
         return records, usage
     except Exception as e:  # noqa: BLE001
+        # nosemgrep: python-logger-credential-disclosure
         logger.warning(
             "Credential finder LLM pass failed; using raw candidates: %s", e
-        )  # nosemgrep
+        )
         return None, None
 
 
@@ -792,13 +793,15 @@ def _write_credentials(records: list[dict]) -> None:
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        # nosemgrep: python-logger-credential-disclosure
         logger.info(
             "Credential finder: wrote %d credential(s) to %s.", len(records), target
-        )  # nosemgrep
+        )
     except OSError as e:
+        # nosemgrep: python-logger-credential-disclosure
         logger.error(
             "Credential finder: failed to write %s: %s", target, e
-        )  # nosemgrep
+        )
 
 
 def load_credentials() -> list[dict]:

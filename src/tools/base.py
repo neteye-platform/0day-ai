@@ -866,9 +866,8 @@ def send_http_request(
     session = requests.Session()
     if follow_redirects:
         redirect_adapter = _CappedRedirectAdapter(max_redirects)
-        # nosemgrep: python.lang.security.audit.insecure-transport.requests.request-session-with-http.request-session-with-http
         session.mount(
-            "http://", redirect_adapter
+            "http://", redirect_adapter  # nosemgrep: request-session-with-http
         )  # support direct communication with local container sandbox
         session.mount("https://", redirect_adapter)
     if start_jar:
