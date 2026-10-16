@@ -9,7 +9,7 @@ from langgraph.types import Send
 
 import settings
 from llms import get_llm, invoke_structured_capped
-from run_stats import (
+from utils.stats import (
     _log_agent_completion,
     _record_stat,
     _start_agent_progress,
@@ -19,7 +19,7 @@ from run_stats import (
     take_cached_usage,
 )
 from schemas import VERIFIER_AGENT, VerifierOutput, cwes
-from stage_cve import _normalize_cwe_ids
+from stages.cve import _normalize_cwe_ids
 from state import MasterState, VerifierState
 from utils import (
     cache,

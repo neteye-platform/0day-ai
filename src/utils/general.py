@@ -22,7 +22,7 @@ import tree_sitter
 from langchain_core.messages import AnyMessage
 
 import settings
-from languages import (
+from utils.languages import (
     AST_GRAMMAR_MAP,
     BEHAVIORAL_NODE_TYPES,
     DEFINITION_TYPES,
@@ -43,7 +43,7 @@ from languages import (
     TYPE_ALIAS_NODE_TYPES,
     guard_usages,
 )
-from run_stats import _record_stat
+from utils.stats import _record_stat
 from schemas import VulnerabilityRecord
 
 logger = logging.getLogger(__name__)
@@ -3121,7 +3121,7 @@ def _cache_stored_record(
     the run token ledger (earlier-run spend counted once, on the hit).
     Legacy entries (bare record dicts, written before token tracking) read
     back untouched and restore nothing."""
-    from run_stats import record_cached_token_usage
+    from utils.stats import record_cached_token_usage
 
     result = (
         None
@@ -3257,7 +3257,7 @@ def cache_reporter(
     record. A hit returns the stored ``ReporterFinding`` dict and books the
     entry's stored token usage into the ledger (legacy entries restore
     nothing)."""
-    from run_stats import record_cached_token_usage
+    from utils.stats import record_cached_token_usage
 
     vuln_id = (report or {}).get("vuln_id") or "Unknown"
     if finding is None:

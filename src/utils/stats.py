@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 
 import settings
-from dedup import Embeddings
+from utils.dedup import Embeddings
 
 logger = logging.getLogger(__name__)
 

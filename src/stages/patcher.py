@@ -17,11 +17,11 @@ import logging
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Command, Send
 
-import patch_tools
+import tools.patch as patch_tools
 import settings
 import tools
 from llms import get_llm
-from run_stats import (
+from utils.stats import (
     _record_stat,
     _start_agent_progress,
     affected_nodes_label,
@@ -30,7 +30,7 @@ from run_stats import (
     steps_block,
 )
 from schemas import PATCHER_AGENT
-from stage_reviewer import build_reviewer_payload
+from stages.reviewer import build_reviewer_payload
 from state import MasterState, PatcherState
 from tool_loop import CompactionConfig, ToolLoopAgent
 from utils import (

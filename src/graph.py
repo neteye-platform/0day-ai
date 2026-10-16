@@ -16,13 +16,13 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import RetryPolicy
 from openai import BadRequestError, LengthFinishReasonError
 
-import attacker_tools
-import browser_tools
-import patch_tools
+import tools.attacker as attacker_tools
+import tools.browser as browser_tools
+import tools.patch as patch_tools
 import settings
 import tools
-from credential_finder import credential_finder_node
-from run_stats import (
+from tools.credential import credential_finder_node
+from utils.stats import (
     RunStopped,
     gen_run_id,
     init_usage_ledger,
@@ -30,12 +30,12 @@ from run_stats import (
     langsmith_detached_node,
 )
 from schemas import PatcherOutput, ReviewerOutput, ValidatorOutput
-from stage_aggregate import aggregate_demands_node
-from stage_cve import cve_analyzer_node, dispatch_cve_analyzers
-from stage_dedup import dedup_agent_node
-from stage_edge_traversal import edge_traversal_node
-from stage_explorer import dispatch_explorers, expert_explorer_node
-from stage_integration_auditor import (
+from stages.aggregate import aggregate_demands_node
+from stages.cve import cve_analyzer_node, dispatch_cve_analyzers
+from stages.dedup import dedup_agent_node
+from stages.edge_traversal import edge_traversal_node
+from stages.explorer import dispatch_explorers, expert_explorer_node
+from stages.integration_auditor import (
     ask_integration_auditor_for_tool,
     dispatch_integration_audits,
     integration_auditor_fallback_node,
@@ -43,8 +43,8 @@ from stage_integration_auditor import (
     integration_auditor_router,
     route_integration_audit,
 )
-from stage_manager import manager_agent_node
-from stage_patcher import (
+from stages.manager import manager_agent_node
+from stages.patcher import (
     ask_patcher_for_tool,
     dispatch_patch_reviews,
     dispatch_patchers,
@@ -54,21 +54,21 @@ from stage_patcher import (
     route_patch_reviews,
     sandbox_resync_node,
 )
-from stage_preprocess import bootstrap_node, preprocessor_node
-from stage_reporter import dispatch_reporters, report_assembler_node, reporter_node
-from stage_reviewer import (
+from stages.preprocess import bootstrap_node, preprocessor_node
+from stages.reporter import dispatch_reporters, report_assembler_node, reporter_node
+from stages.reviewer import (
     ask_reviewer_for_tool,
     dispatch_reviewers,
     reviewer_agent_node,
     reviewer_fallback_node,
     reviewer_router,
 )
-from stage_threat_intel import (
+from stages.threat_intel import (
     dispatch_threat_intel,
     threat_intel_gate_node,
     threat_intel_node,
 )
-from stage_validator import (
+from stages.validator import (
     ask_validator_for_tool,
     dispatch_validators,
     route_validator_feedback,
@@ -76,7 +76,7 @@ from stage_validator import (
     validator_fallback_node,
     validator_router,
 )
-from stage_verifier import contract_verifier_node, dispatch_verifiers
+from stages.verifier import contract_verifier_node, dispatch_verifiers
 from state import (
     IntegrationAuditorState,
     MasterState,

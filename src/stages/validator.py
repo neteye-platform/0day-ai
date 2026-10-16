@@ -7,13 +7,13 @@ import uuid
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Command, Send
 
-import attacker_tools
-import browser_tools
-import credential_finder
+import tools.attacker as attacker_tools
+import tools.browser as browser_tools
+import tools.credential as credential_finder
 import settings
 import tools
 from llms import get_llm
-from run_stats import (
+from utils.stats import (
     _record_stat,
     _start_agent_progress,
     affected_nodes_label,
@@ -22,8 +22,8 @@ from run_stats import (
     steps_block,
 )
 from schemas import VALIDATOR_AGENT
-from stage_patcher import patchable_records
-from stage_reviewer import build_reviewer_payload
+from stages.patcher import patchable_records
+from stages.reviewer import build_reviewer_payload
 from state import MasterState, ValidatorState
 from tool_loop import CompactionConfig, ToolLoopAgent
 from utils import (

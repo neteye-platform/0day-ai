@@ -16,10 +16,10 @@ from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 from requests.adapters import HTTPAdapter
 
-import attacker_tools
-import browser_tools
+import tools.attacker as attacker_tools
+import tools.browser as browser_tools
 import settings
-from languages import MANIFEST_NAMES
+from utils.languages import MANIFEST_NAMES
 from schemas import (
     AskForContextInput,
     EvaluationToolInput,

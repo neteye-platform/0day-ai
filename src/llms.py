@@ -7,7 +7,7 @@ from langchain_openai import ChatOpenAI
 from openai import BadRequestError, LengthFinishReasonError
 
 import settings
-from run_stats import new_usage, record_usage
+from utils.stats import new_usage, record_usage
 
 logger = logging.getLogger(__name__)
 

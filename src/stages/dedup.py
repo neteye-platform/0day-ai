@@ -20,9 +20,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 import llms
 import settings
-from dedup import cluster_vulnerabilities
+from utils.dedup import cluster_vulnerabilities
 from llms import get_llm, invoke_structured_capped
-from run_stats import (
+from utils.stats import (
     _record_stat,
     as_dict,
     as_dicts,

@@ -4,9 +4,9 @@ from collections import defaultdict
 from pathlib import Path
 
 import settings
-from dedup import deduplicate_demands
-from run_stats import _record_stat, as_dict, get_embedder, raise_if_stopping
-from stage_cve import _normalize_cwe_ids
+from utils.dedup import deduplicate_demands
+from utils.stats import _record_stat, as_dict, get_embedder, raise_if_stopping
+from stages.cve import _normalize_cwe_ids
 from state import MasterState
 from utils import (
     build_container_members,

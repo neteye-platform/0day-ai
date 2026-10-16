@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from langchain_core.messages import HumanMessage, SystemMessage
 
 import settings
-from boundary_edges import (
+from utils.graph_edges import (
     boundary_batch_fingerprint,
     build_boundary_edges,
     cluster_boundary_edges,
@@ -14,7 +14,7 @@ from boundary_edges import (
     summarize_boundary_edges,
 )
 from llms import get_llm, invoke_structured_capped
-from run_stats import _record_stat, as_dict, raise_if_stopping, take_cached_usage
+from utils.stats import _record_stat, as_dict, raise_if_stopping, take_cached_usage
 from schemas import EDGE_TRAVERSAL_AGENT, EdgeTraversalOutput
 from state import MasterState
 from utils import cache, get_cached_graph_data, safe_cache_filename

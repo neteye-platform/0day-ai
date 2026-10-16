@@ -1,10 +1,11 @@
 import logging
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 
 _REQUIRED_KEYS = ("LLM_API_KEY", "TAVILY_API_KEY")
 _missing = [k for k in _REQUIRED_KEYS if not os.environ.get(k)]
@@ -17,7 +18,11 @@ if _missing:
 # ============================ Target settings ============================
 
 # Target repository to scan (lives OUTSIDE this repo). Edit this to switch targets.
-app_path = Path("../apps/target-app")
+app_path = Path("/home/simone/Downloads/tmp/grafana-jaeger-datasource/")
+
+if not app_path.exists():
+    logging.getLogger(__name__).error(f"Target app directory not found: {app_path.resolve()}")
+    sys.exit(1)
 
 graph = app_path / "graphify-out" / "graph.json"
 cache_dir = app_path / ".cache"

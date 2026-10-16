@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import settings
-from run_stats import _reset_pipeline_stats, gen_run_id, ledger_initialized
+from utils.stats import _reset_pipeline_stats, gen_run_id, ledger_initialized
 from state import MasterState
 from utils import (
     build_images,

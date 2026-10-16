@@ -49,8 +49,8 @@ import settings
 
 logger = logging.getLogger(__name__)
 
-_REPO_ROOT = Path(__file__).resolve().parent
-ATTACKER_DIR = _REPO_ROOT / "attacker"
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+ATTACKER_DIR = _REPO_ROOT / "docker" / "attacker"
 ATTACKER_DOCKERFILE = ATTACKER_DIR / "Dockerfile"
 # Caps on reading attacker files back into the LLM.
 ATTACKER_FILEREAD_MAX_LINES = 150

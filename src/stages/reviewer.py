@@ -8,7 +8,7 @@ from langgraph.types import Command, Send
 import settings
 import tools
 from llms import get_llm
-from run_stats import (
+from utils.stats import (
     _record_stat,
     _start_agent_progress,
     affected_nodes_label,
@@ -16,7 +16,7 @@ from run_stats import (
     record_llm_usage,
 )
 from schemas import REVIEWER_AGENT
-from stage_dedup import apply_agent_clusters, embedding_dedup
+from stages.dedup import apply_agent_clusters, embedding_dedup
 from state import MasterState, ReviewerState
 from tool_loop import CompactionConfig, ToolLoopAgent
 from utils import (

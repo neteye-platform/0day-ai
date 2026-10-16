@@ -865,7 +865,7 @@ def _llm_cache(candidates: list[dict]) -> tuple[list[dict] | None, bool]:
     )
     cached = utils.cache(cache_file, "read")
     if cached and isinstance(cached.get("credentials"), list):
-        from run_stats import take_cached_usage
+        from utils.stats import take_cached_usage
 
         take_cached_usage("credential_finder", cached)
         return cached["credentials"], True
@@ -880,7 +880,7 @@ def credential_finder_node(state) -> dict:
     """Graph node: discover pre-configured credentials and persist them to
     ``<target_app>/.cache/credentials.json``. Runs after container setup.
     Returns {} (no state change)."""
-    from run_stats import raise_if_stopping
+    from utils.stats import raise_if_stopping
 
     raise_if_stopping()
     if not getattr(settings, "credential_finder_enabled", True):
