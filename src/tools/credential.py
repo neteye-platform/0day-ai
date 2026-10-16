@@ -267,10 +267,17 @@ def _add(candidates: list[dict], **fields: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _iter_lines(path: Path) -> Iterator[str] | None:
+def _iter_lines(path: Path) -> list[str] | None:
     try:
-        return iter(path.open("r", encoding="utf-8"))
-    except (OSError, UnicodeDecodeError) as e:
+        resolved = path.resolve()
+        if path.is_relative_to(settings.app_path) and not resolved.is_relative_to(
+            settings.app_path.resolve()
+        ):
+            logger.warning("Skipping symlink pointing outside target: %s -> %s", path, resolved)
+            return None
+
+        return resolved.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    except OSError as e:
         logger.debug("Skipping unreadable file %s: %s", path, e)
         return None
 

@@ -292,7 +292,7 @@ class PatcherAgent(ToolLoopAgent):
                     "what they got wrong: aim at a deeper choke point or a missed "
                     "entry into the sink; the current on-disk source already "
                     "reflects the LATEST attempt only.\n"
-                    f"{'\n\n'.join(blocks)}"
+                    "\n\n".join(blocks)
                 )
         if report.get("poc_payload"):
             formatted += (

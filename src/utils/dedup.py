@@ -888,15 +888,28 @@ def deduplicate_demands(
                 len(pending),
             )
     for keep, seeds, texts in pending:
-        try:
-            clusters = _greedy_cluster_indices([vec_map[t] for t in texts], threshold)
-        except KeyError as e:  # missing vector for this group only
-            log.warning(
-                "Demand dedup: keeping %d exact-unique demands (%s)", len(seeds), e
-            )
-            keep.extend(seeds)
+        valid_indices = []
+        for i, t in enumerate(texts):
+            if vec_map.get(t) is not None:
+                valid_indices.append(i)
+            else:
+                keep.append(seeds[i])
+
+        if not valid_indices:
             continue
-        keep.extend(seeds[cl[0]] for cl in clusters)
+
+        try:
+            vectors_to_cluster = [vec_map[texts[i]] for i in valid_indices]
+            clusters = _greedy_cluster_indices(vectors_to_cluster, threshold)
+            for cl in clusters:
+                keep.append(seeds[valid_indices[cl[0]]])
+        except (KeyError, TypeError) as e:
+            log.warning(
+                "Demand dedup: clustering failed (%s); keeping %d exact-unique demands",
+                e,
+                len(valid_indices),
+            )
+            keep.extend(seeds[i] for i in valid_indices)
 
     for target, keep in targets_with_keeps:
         keep.sort()

@@ -18,7 +18,7 @@ if _missing:
 # ============================ Target settings ============================
 
 # Target repository to scan (lives OUTSIDE this repo). Edit this to switch targets.
-app_path = Path("/home/simone/Downloads/tmp/grafana-jaeger-datasource/")
+app_path = Path("../../apps/target-app")
 
 if not app_path.exists():
     logging.getLogger(__name__).error(f"Target app directory not found: {app_path.resolve()}")
