@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.codespell]
+ignore-words-list = "thirdparty"
