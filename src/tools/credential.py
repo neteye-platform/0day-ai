@@ -13,7 +13,6 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -273,10 +272,14 @@ def _iter_lines(path: Path) -> list[str] | None:
         if path.is_relative_to(settings.app_path) and not resolved.is_relative_to(
             settings.app_path.resolve()
         ):
-            logger.warning("Skipping symlink pointing outside target: %s -> %s", path, resolved)
+            logger.warning(
+                "Skipping symlink pointing outside target: %s -> %s", path, resolved
+            )
             return None
 
-        return resolved.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        return resolved.read_text(encoding="utf-8", errors="replace").splitlines(
+            keepends=True
+        )
     except OSError as e:
         logger.debug("Skipping unreadable file %s: %s", path, e)
         return None
@@ -789,9 +792,7 @@ def _llm_normalize(candidates: list[dict]) -> tuple[list[dict] | None, dict | No
         return records, usage
     except Exception as e:  # noqa: BLE001
         # nosemgrep: python-logger-credential-disclosure
-        logger.warning(
-            "Credential finder LLM pass failed; using raw candidates: %s", e
-        )
+        logger.warning("Credential finder LLM pass failed; using raw candidates: %s", e)
         return None, None
 
 
@@ -806,9 +807,7 @@ def _write_credentials(records: list[dict]) -> None:
         )
     except OSError as e:
         # nosemgrep: python-logger-credential-disclosure
-        logger.error(
-            "Credential finder: failed to write %s: %s", target, e
-        )
+        logger.error("Credential finder: failed to write %s: %s", target, e)
 
 
 def load_credentials() -> list[dict]:

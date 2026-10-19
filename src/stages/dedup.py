@@ -20,8 +20,11 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 import llms
 import settings
-from utils.dedup import cluster_vulnerabilities
 from llms import get_llm, invoke_structured_capped
+from schemas import DEDUP_AGENT, DedupAgentOutput, cwes
+from state import MasterState
+from utils import cache, get_cached_graph_data, safe_cache_filename
+from utils.dedup import cluster_vulnerabilities
 from utils.stats import (
     _record_stat,
     as_dict,
@@ -30,9 +33,6 @@ from utils.stats import (
     raise_if_stopping,
     take_cached_usage,
 )
-from schemas import DEDUP_AGENT, DedupAgentOutput, cwes
-from state import MasterState
-from utils import cache, get_cached_graph_data, safe_cache_filename
 
 logger = logging.getLogger(__name__)
 

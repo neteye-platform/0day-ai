@@ -6,7 +6,6 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import settings
-from utils.stats import _reset_pipeline_stats, gen_run_id, ledger_initialized
 from state import MasterState
 from utils import (
     build_images,
@@ -22,6 +21,7 @@ from utils import (
     run_osv_scanner_image,
     start_sandbox,
 )
+from utils.stats import _reset_pipeline_stats, gen_run_id, ledger_initialized
 
 logger = logging.getLogger(__name__)
 

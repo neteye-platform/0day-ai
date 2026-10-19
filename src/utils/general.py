@@ -22,6 +22,7 @@ import tree_sitter
 from langchain_core.messages import AnyMessage
 
 import settings
+from schemas import VulnerabilityRecord
 from utils.languages import (
     AST_GRAMMAR_MAP,
     BEHAVIORAL_NODE_TYPES,
@@ -44,7 +45,6 @@ from utils.languages import (
     guard_usages,
 )
 from utils.stats import _record_stat
-from schemas import VulnerabilityRecord
 
 logger = logging.getLogger(__name__)
 

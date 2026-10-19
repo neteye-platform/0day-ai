@@ -9,15 +9,6 @@ from langgraph.types import Send
 
 import settings
 from llms import get_llm, invoke_structured_capped
-from utils.stats import (
-    _log_agent_completion,
-    _record_stat,
-    _start_agent_progress,
-    add_usage,
-    new_usage,
-    raise_if_stopping,
-    take_cached_usage,
-)
 from schemas import VERIFIER_AGENT, VerifierOutput, cwes
 from stages.cve import _normalize_cwe_ids
 from state import MasterState, VerifierState
@@ -26,6 +17,15 @@ from utils import (
     get_cached_graph_data,
     get_node_code,
     is_path_excluded,
+)
+from utils.stats import (
+    _log_agent_completion,
+    _record_stat,
+    _start_agent_progress,
+    add_usage,
+    new_usage,
+    raise_if_stopping,
+    take_cached_usage,
 )
 
 logger = logging.getLogger(__name__)

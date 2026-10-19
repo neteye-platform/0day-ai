@@ -16,10 +16,9 @@ from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 from requests.adapters import HTTPAdapter
 
+import settings
 import tools.attacker as attacker_tools
 import tools.browser as browser_tools
-import settings
-from utils.languages import MANIFEST_NAMES
 from schemas import (
     AskForContextInput,
     EvaluationToolInput,
@@ -42,6 +41,7 @@ from utils import (
     is_path_excluded,
     reviewer_cache_key,
 )
+from utils.languages import MANIFEST_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -867,7 +867,8 @@ def send_http_request(
     if follow_redirects:
         redirect_adapter = _CappedRedirectAdapter(max_redirects)
         session.mount(
-            "http://", redirect_adapter  # nosemgrep: request-session-with-http
+            "http://",
+            redirect_adapter,  # nosemgrep: request-session-with-http
         )  # support direct communication with local container sandbox
         session.mount("https://", redirect_adapter)
     if start_jar:

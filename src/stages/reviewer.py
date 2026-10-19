@@ -8,13 +8,6 @@ from langgraph.types import Command, Send
 import settings
 import tools
 from llms import get_llm
-from utils.stats import (
-    _record_stat,
-    _start_agent_progress,
-    affected_nodes_label,
-    as_dicts,
-    record_llm_usage,
-)
 from schemas import REVIEWER_AGENT
 from stages.dedup import apply_agent_clusters, embedding_dedup
 from state import MasterState, ReviewerState
@@ -26,6 +19,13 @@ from utils import (
     get_node_code,
     is_feedback_review,
     reviewer_cache_key,
+)
+from utils.stats import (
+    _record_stat,
+    _start_agent_progress,
+    affected_nodes_label,
+    as_dicts,
+    record_llm_usage,
 )
 
 logger = logging.getLogger(__name__)

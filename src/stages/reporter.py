@@ -17,6 +17,14 @@ from weasyprint import HTML
 
 import settings
 from llms import get_llm, invoke_tracked
+from schemas import REPORTER_AGENT, ReporterFinding, cwes
+from state import MasterState, ReporterState
+from utils import (
+    cache_reporter,
+    cvss_gate_blocks,
+    cvss_severity_label,
+    cvss_v3_base_score,
+)
 from utils.stats import (
     _record_stat,
     _snapshot_pipeline_stats,
@@ -25,14 +33,6 @@ from utils.stats import (
     raise_if_stopping,
     snapshot_token_totals,
     strip_step_numbering,
-)
-from schemas import REPORTER_AGENT, ReporterFinding, cwes
-from state import MasterState, ReporterState
-from utils import (
-    cache_reporter,
-    cvss_gate_blocks,
-    cvss_severity_label,
-    cvss_v3_base_score,
 )
 
 logger = logging.getLogger(__name__)

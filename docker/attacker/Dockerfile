@@ -5,6 +5,9 @@ FROM kalilinux/kali-rolling:amd64
 # desktop/WiFi stack. First build pulls a large image and can take a while;
 # the build-hash stamp in attacker/.build.hash makes subsequent runs reuse it.
 
+# kali-rolling is a rolling distro: pinned package versions vanish from the
+# mirror within weeks and would break the build, so DL3008 is waived here.
+# hadolint ignore=DL3008
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends kali-linux-headless \
     && rm -rf /var/lib/apt/lists/*

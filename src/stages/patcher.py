@@ -17,18 +17,10 @@ import logging
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Command, Send
 
-import tools.patch as patch_tools
 import settings
 import tools
+import tools.patch as patch_tools
 from llms import get_llm
-from utils.stats import (
-    _record_stat,
-    _start_agent_progress,
-    affected_nodes_label,
-    as_dicts,
-    record_llm_usage,
-    steps_block,
-)
 from schemas import PATCHER_AGENT
 from stages.reviewer import build_reviewer_payload
 from state import MasterState, PatcherState
@@ -40,6 +32,14 @@ from utils import (
     get_node_code,
     resync_sandbox,
     take_dispatch_claim,
+)
+from utils.stats import (
+    _record_stat,
+    _start_agent_progress,
+    affected_nodes_label,
+    as_dicts,
+    record_llm_usage,
+    steps_block,
 )
 
 logger = logging.getLogger(__name__)

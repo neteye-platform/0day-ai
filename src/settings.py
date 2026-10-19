@@ -21,7 +21,9 @@ if _missing:
 app_path = Path("../../apps/target-app")
 
 if not app_path.exists():
-    logging.getLogger(__name__).error(f"Target app directory not found: {app_path.resolve()}")
+    logging.getLogger(__name__).error(
+        f"Target app directory not found: {app_path.resolve()}"
+    )
     sys.exit(1)
 
 graph = app_path / "graphify-out" / "graph.json"

@@ -8,13 +8,6 @@ from tavily import TavilyClient
 
 import settings
 from llms import get_llm, invoke_structured_capped
-from utils.stats import (
-    _log_agent_completion,
-    _record_stat,
-    _start_agent_progress,
-    raise_if_stopping,
-    take_cached_usage,
-)
 from schemas import THREAT_INTEL_AGENT, CVEAnalysis
 from stages.cve import (
     _backfill_osv_cwe_ids,
@@ -24,6 +17,13 @@ from stages.cve import (
 )
 from state import MasterState, ThreatIntelState
 from utils import cache, is_high_severity
+from utils.stats import (
+    _log_agent_completion,
+    _record_stat,
+    _start_agent_progress,
+    raise_if_stopping,
+    take_cached_usage,
+)
 
 logger = logging.getLogger(__name__)
 

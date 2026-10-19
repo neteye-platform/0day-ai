@@ -5,6 +5,9 @@ from langgraph.types import Send
 
 import settings
 from llms import get_llm, invoke_structured_capped
+from schemas import CVE_ANALYZER_AGENT, CVEAnalysis
+from state import CVEAnalyzerState, MasterState
+from utils import cache
 from utils.stats import (
     _log_agent_completion,
     _record_stat,
@@ -12,9 +15,6 @@ from utils.stats import (
     raise_if_stopping,
     take_cached_usage,
 )
-from schemas import CVE_ANALYZER_AGENT, CVEAnalysis
-from state import CVEAnalyzerState, MasterState
-from utils import cache
 
 logger = logging.getLogger(__name__)
 

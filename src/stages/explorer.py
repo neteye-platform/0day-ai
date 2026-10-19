@@ -6,13 +6,6 @@ from langgraph.types import Send
 
 import settings
 from llms import get_llm, invoke_structured_capped
-from utils.stats import (
-    _log_agent_completion,
-    _record_stat,
-    _start_agent_progress,
-    raise_if_stopping,
-    take_cached_usage,
-)
 from schemas import EXPERT_AGENTS, AnalysisNote, BatchedAnalysisResult
 from state import ExplorerState, MasterState
 from utils import (
@@ -26,6 +19,13 @@ from utils import (
     is_node_worth_scanning,
     is_path_excluded,
     safe_cache_filename,
+)
+from utils.stats import (
+    _log_agent_completion,
+    _record_stat,
+    _start_agent_progress,
+    raise_if_stopping,
+    take_cached_usage,
 )
 
 logger = logging.getLogger(__name__)

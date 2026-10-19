@@ -9,14 +9,6 @@ from langgraph.types import Command, Send
 import settings
 import tools
 from llms import get_llm
-from utils.stats import (
-    _record_stat,
-    _start_agent_progress,
-    affected_nodes_label,
-    as_dicts,
-    record_llm_usage,
-    steps_block,
-)
 from schemas import INTEGRATION_AUDITOR_AGENT
 from state import IntegrationAuditorState, MasterState, ValidatorState
 from tool_loop import CompactionConfig, ToolLoopAgent
@@ -28,6 +20,14 @@ from utils import (
     ensure_sandbox_reachable,
     info_once,
     take_dispatch_claim,
+)
+from utils.stats import (
+    _record_stat,
+    _start_agent_progress,
+    affected_nodes_label,
+    as_dicts,
+    record_llm_usage,
+    steps_block,
 )
 
 logger = logging.getLogger(__name__)

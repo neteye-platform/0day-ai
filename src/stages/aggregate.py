@@ -4,8 +4,6 @@ from collections import defaultdict
 from pathlib import Path
 
 import settings
-from utils.dedup import deduplicate_demands
-from utils.stats import _record_stat, as_dict, get_embedder, raise_if_stopping
 from stages.cve import _normalize_cwe_ids
 from state import MasterState
 from utils import (
@@ -22,6 +20,8 @@ from utils import (
     uses_namespace_in_ast,
     warning_once,
 )
+from utils.dedup import deduplicate_demands
+from utils.stats import _record_stat, as_dict, get_embedder, raise_if_stopping
 
 logger = logging.getLogger(__name__)
 

@@ -16,19 +16,11 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import RetryPolicy
 from openai import BadRequestError, LengthFinishReasonError
 
+import settings
+import tools
 import tools.attacker as attacker_tools
 import tools.browser as browser_tools
 import tools.patch as patch_tools
-import settings
-import tools
-from tools.credential import credential_finder_node
-from utils.stats import (
-    RunStopped,
-    gen_run_id,
-    init_usage_ledger,
-    install_signal_handlers,
-    langsmith_detached_node,
-)
 from schemas import PatcherOutput, ReviewerOutput, ValidatorOutput
 from stages.aggregate import aggregate_demands_node
 from stages.cve import cve_analyzer_node, dispatch_cve_analyzers
@@ -85,6 +77,14 @@ from state import (
     ValidatorState,
 )
 from tool_loop import SequentialToolNode, concise_tool_error
+from tools.credential import credential_finder_node
+from utils.stats import (
+    RunStopped,
+    gen_run_id,
+    init_usage_ledger,
+    install_signal_handlers,
+    langsmith_detached_node,
+)
 
 logger = logging.getLogger(__name__)
 

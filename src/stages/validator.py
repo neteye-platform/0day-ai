@@ -7,20 +7,12 @@ import uuid
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Command, Send
 
+import settings
+import tools
 import tools.attacker as attacker_tools
 import tools.browser as browser_tools
 import tools.credential as credential_finder
-import settings
-import tools
 from llms import get_llm
-from utils.stats import (
-    _record_stat,
-    _start_agent_progress,
-    affected_nodes_label,
-    as_dicts,
-    record_llm_usage,
-    steps_block,
-)
 from schemas import VALIDATOR_AGENT
 from stages.patcher import patchable_records
 from stages.reviewer import build_reviewer_payload
@@ -36,6 +28,14 @@ from utils import (
     info_once,
     take_dispatch_claim,
     take_feedback_dispatch,
+)
+from utils.stats import (
+    _record_stat,
+    _start_agent_progress,
+    affected_nodes_label,
+    as_dicts,
+    record_llm_usage,
+    steps_block,
 )
 
 logger = logging.getLogger(__name__)
