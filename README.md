@@ -114,6 +114,18 @@ uv run python src/graph.py    # Full scan
 uv run langgraph dev          # Serves graphs for LangGraph Studio debugging
 ```
 
+### Tests
+
+```bash
+uv sync --dev
+uv run pytest
+```
+
+The suite covers the pure decision logic (CVSS scoring and validation gate,
+verdict schemas, record merging, dispatch claims, dedup heuristics, path
+exclusion) and needs neither Docker, an LLM gateway, nor a target application.
+The same suite gates every pull request and every `vX.Y.Z` release tag.
+
 ### Outputs
 
 The scan generates a timestamped report directory (e.g.,

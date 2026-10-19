@@ -32,6 +32,12 @@ dependencies = [
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+testpaths = ["tests"]
 
 [tool.codespell]
 ignore-words-list = "thirdparty"
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+]
