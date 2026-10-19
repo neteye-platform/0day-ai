@@ -791,8 +791,14 @@ def _llm_normalize(candidates: list[dict]) -> tuple[list[dict] | None, dict | No
             )
         return records, usage
     except Exception as e:  # noqa: BLE001
+        # Log the exception TYPE only: a structured-output parse error can echo
+        # the model output (the normalized credential list) and API errors can
+        # echo the request (the raw candidates), both of which hold secrets.
         # nosemgrep: python-logger-credential-disclosure
-        logger.warning("Credential finder LLM pass failed; using raw candidates: %s", e)
+        logger.warning(
+            "Credential finder LLM pass failed (%s); using raw candidates.",
+            type(e).__name__,
+        )
         return None, None
 
 
