@@ -51,7 +51,7 @@ breakdown of the internal mechanics, see `architecture.md`.
 
 ## Prerequisites
 
-- Python >= 3.12
+- Python >= 3.12 and [uv](https://docs.astral.sh/uv/)
 - Docker (required for the target sandbox and Kali attacker containers). The
   target application is automatically built if the repository contains a
   `Dockerfile` or `docker-compose.yaml`.
@@ -64,16 +64,14 @@ breakdown of the internal mechanics, see `architecture.md`.
 1. **Clone and initialize the environment:**
 
 ```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+uv sync
 ```
 
 1. **Install browser dependencies:** The validator requires a patched Playwright
    Firefox build to drive DOM-based exploits.
 
 ```bash
-playwright install firefox
+uv run playwright install firefox
 ```
 
 1. **Configure the pipeline (`settings.py`):** Point `app_path` to your target
@@ -112,8 +110,8 @@ that lets in-flight agents finish their current tasks, ensuring the run can be
 resumed later without losing progress.
 
 ```bash
-python graph.py    # Full scan
-langgraph dev      # Serves graphs for LangGraph Studio debugging
+uv run python src/graph.py    # Full scan
+uv run langgraph dev          # Serves graphs for LangGraph Studio debugging
 ```
 
 ### Outputs
@@ -130,16 +128,18 @@ The scan generates a timestamped report directory (e.g.,
 
 ## Repository Layout
 
-| Module                                                                | Role                                                                                                              |
-| --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `graph.py`                                                            | Main entrypoint, graph wiring, fan-out barriers, and conditional routers.                                         |
-| `settings.py`, `agents.yaml`, `schemas.py`                            | Configuration, agent system prompts, and Pydantic schemas.                                                        |
-| `languages.py`                                                        | Supported target language definitions, file mappings, and AST parser configurations.                              |
-| `state.py`, `utils.py`, `run_stats.py`, `llms.py`                     | State channels, caching, progress ledgers, token accounting, and LLM instances.                                   |
-| `stage_*.py`                                                          | Modular implementations for each pipeline stage (e.g., manager, cve, threat intel, reviewer, validator, patcher). |
-| `tool_loop.py`                                                        | Shared bounded-memory tool-loop machinery for subgraphs.                                                          |
-| `tools.py`, `browser_tools.py`, `attacker_tools.py`, `patch_tools.py` | Agent toolsets spanning HTTP, headless browser manipulation, Kali shells, and source code patching.               |
-| `boundary_edges.py`, `dedup.py`, `credential_finder.py`               | Deterministic cross-boundary edge synthesis, embedding deduplication, and credential harvesting.                  |
+| Path | Role |
+| --- | --- |
+| `src/graph.py` | Main entrypoint, graph wiring, fan-out barriers, and conditional routers. |
+| `src/settings.py`, `agents.yaml`, `src/schemas.py` | Configuration, agent system prompts, and Pydantic schemas. |
+| `src/state.py`, `src/llms.py` | State channels and per-agent LLM instances. |
+| `src/utils/general.py`, `src/utils/stats.py` | Caching, shared helpers, progress ledgers, and token accounting. |
+| `src/utils/languages.py` | Supported target language definitions, file mappings, and AST parser configurations. |
+| `src/utils/graph_edges.py`, `src/utils/dedup.py` | Deterministic cross-boundary edge synthesis and embedding deduplication. |
+| `src/stages/*.py` | Modular implementations for each pipeline stage (e.g., manager, cve, threat intel, reviewer, validator, patcher). |
+| `src/tool_loop.py` | Shared bounded-memory tool-loop machinery for subgraphs. |
+| `src/tools/*.py` | Agent toolsets spanning HTTP (`base`), headless browser (`browser`), Kali shells (`attacker`), source patching (`patch`), and credential harvesting (`credential`). |
+| `docker/attacker/` | Dockerfile of the Kali attacker container used by the validator. |
 
 ## Documentation
 

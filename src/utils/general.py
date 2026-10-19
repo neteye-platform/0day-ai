@@ -1033,7 +1033,7 @@ def ensure_sandbox_reachable(sandbox_url: str | None, phase: str) -> None:
     raise RuntimeError(
         f"SANDBOX UNREACHABLE at {sandbox_url!r} — aborting the {phase} fan-out "
         f"(records stay pending). Repair the sandbox container, then rerun "
-        f"`python graph.py` to resume this scan."
+        f"`python src/graph.py` to resume this scan."
     )
 
 

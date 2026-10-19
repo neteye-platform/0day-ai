@@ -30,7 +30,7 @@ def bootstrap_node(state: MasterState) -> dict[str, Any]:
     """Ensure the knowledge graph exists before the parallel branches start."""
     # Fresh ledgers per invocation ONLY when no scan-scoped durable ledger was
     # pinned by the entrypoint (langgraph dev / in-process runs). Under
-    # `python graph.py` the resume path has already restored this scan's
+    # `python src/graph.py` the resume path has already restored this scan's
     # persisted token/stats totals into these ledgers; resetting here would
     # wipe the work of every process the scan was resumed from.
     if not ledger_initialized():

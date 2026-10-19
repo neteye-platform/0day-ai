@@ -320,4 +320,4 @@ configuration bugs.
   (`patches/`), a deterministic Pipeline Statistics section, and a per-agent
   Token Usage section.
 - **Token accounting:** every LLM turn in the pipeline is booked to a per-agent
-  ledger (run_stats.py) that feeds the report.
+  ledger (utils/stats.py) that feeds the report.

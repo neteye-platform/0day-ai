@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # commits its durable writes as it completes), and re-raises out of the run.
 # In-flight agents never read the flag, so a running reviewer/validator still
 # finishes its whole loop and submits normally. Everything checkpointed stays
-# in sqlite, so the next `python graph.py` resumes exactly where this stopped.
+# in sqlite, so the next `python src/graph.py` resumes exactly where this stopped.
 
 _stop_requested = threading.Event()
 
@@ -229,7 +229,7 @@ def snapshot_token_totals() -> dict[str, dict[str, int]]:
 # ---------------------------------------------------------------------------
 # Durable scan-scoped ledgers (token totals + pipeline stats).
 #
-# A `python graph.py` scan spans MANY process starts (restarts/resumes): with
+# A `python src/graph.py` scan spans MANY process starts (restarts/resumes): with
 # the ledgers kept purely in memory, every stopped process took its live LLM
 # spend (and the usage banked by the cache hits it read) down with it — the
 # report of a scan resumed N times could only ever show the LAST process's

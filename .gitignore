@@ -5,4 +5,8 @@ results.json
 graphify-out/
 .langgraph_api/
 logs.txt
-attacker/.build.hash
+docker/attacker/.build.hash
+.venv/
+venv/
+.ruff_cache/
+.pytest_cache/

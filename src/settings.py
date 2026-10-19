@@ -1,6 +1,5 @@
 import logging
 import os
-import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -21,10 +20,9 @@ if _missing:
 app_path = Path("../../apps/target-app")
 
 if not app_path.exists():
-    logging.getLogger(__name__).error(
+    logging.getLogger(__name__).warning(
         f"Target app directory not found: {app_path.resolve()}"
     )
-    sys.exit(1)
 
 graph = app_path / "graphify-out" / "graph.json"
 cache_dir = app_path / ".cache"

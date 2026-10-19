@@ -513,6 +513,10 @@ if __name__ == "__main__":
         datetime.now().astimezone().isoformat(timespec="seconds"),
     )
 
+    if not settings.app_path.exists():
+        logger.error("Target app directory not found: %s", settings.app_path.resolve())
+        sys.exit(1)
+
     run_id = gen_run_id()
     initial_state = MasterState(
         pipeline_run_id=run_id,
@@ -624,7 +628,7 @@ if __name__ == "__main__":
         except RunStopped:
             logger.info(
                 "Stopped after the in-flight agents finished. Progress is "
-                "checkpointed: rerun `python graph.py` to resume this scan."
+                "checkpointed: rerun `python src/graph.py` to resume this scan."
             )
             sys.exit(130)
         except KeyboardInterrupt:
@@ -632,6 +636,6 @@ if __name__ == "__main__":
             # the loop is live the signal handler itself acts.
             logger.info(
                 "Interrupted. Progress is checkpointed: "
-                "rerun `python graph.py` to resume this scan."
+                "rerun `python src/graph.py` to resume this scan."
             )
             sys.exit(130)
