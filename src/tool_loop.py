@@ -107,6 +107,18 @@ class CompactionConfig:
         return settings.hard_reserved
 
 
+def _group_turn_units(messages: list[AnyMessage]) -> list[list[AnyMessage]]:
+    """Group messages into atomic protocol units: an AI message plus the tool
+    results that immediately follow it; any other message is its own unit."""
+    units: list[list[AnyMessage]] = []
+    for m in messages:
+        if m.type == "tool" and units and units[-1][0].type == "ai":
+            units[-1].append(m)
+        else:
+            units.append([m])
+    return units
+
+
 def _split_agent_history(
     messages: list[AnyMessage], tail_turns: int, max_chars: int = 0
 ) -> tuple[list, list, list]:
@@ -157,17 +169,25 @@ def _split_agent_history(
     tail = rest[boundary:]
 
     if max_chars and tail:
-        oversized = [
-            m
-            for m in tail
-            if m.type in ("ai", "tool")
-            and isinstance(getattr(m, "content", ""), str)
-            and len(m.content) > max_chars
-        ]
-        if oversized:
-            oversized_ids = {id(o) for o in oversized}
-            tail = [m for m in tail if id(m) not in oversized_ids]
-            middle = middle + oversized
+        # An AI message and its tool results form ONE protocol unit (every
+        # tool_call needs its ToolMessage, AI first): demoting a lone message
+        # would orphan its partner. Demote the whole prefix of units up to the
+        # last oversized one so chronology survives even when the history is
+        # sent unsplit below the compaction threshold.
+        units = _group_turn_units(tail)
+        last_oversized = -1
+        for ui, unit in enumerate(units):
+            if any(
+                m.type in ("ai", "tool")
+                and isinstance(getattr(m, "content", ""), str)
+                and len(m.content) > max_chars
+                for m in unit
+            ):
+                last_oversized = ui
+        if last_oversized >= 0:
+            demoted = [m for unit in units[: last_oversized + 1] for m in unit]
+            middle = middle + demoted
+            tail = tail[len(demoted) :]
 
     return head, middle, tail
 
@@ -626,7 +646,12 @@ class ToolLoopAgent:
             if summary_msg is not None:
                 forced = head + [summary_msg] + tail
             else:
-                forced = head + tail[-2:]
+                # Keep the latest AI message with ALL its tool results (a
+                # fixed tail[-2:] cut orphans parallel tool calls).
+                last_ai = max(
+                    (i for i, m in enumerate(tail) if m.type == "ai"), default=None
+                )
+                forced = head + (tail[last_ai:] if last_ai is not None else tail[-2:])
             if estimate_message_tokens(forced) < estimate_message_tokens(
                 messages_for_llm
             ):
@@ -716,17 +741,33 @@ class ToolLoopAgent:
             self._log_progress_completion(state, "no LLM turn")
             return "__end__"
 
-        # Hard loop guard: if the model never submits a verdict, terminate
-        # gracefully instead of spinning until the recursion limit.
-        if state.get("iterations", 0) >= self._max_iterations:
-            logger.warning(
-                f"{self.name} on {self._subject(state)} exceeded "
-                f"{self._max_iterations} iterations without a verdict; falling back."
-            )
-            self._log_progress_completion(state, "iterations capped")
-            return self.fallback_node_name
-
         last_message = messages[-1]
+
+        # A successful terminal batch always wins, even on the final allowed
+        # turn: the verdict is already banked, no further LLM turn is needed.
+        if last_message.type == "tool" and self.tool_batch_done(state):
+            self._log_progress_completion(state)
+            return "__end__"
+
+        # Hard loop guard: if the model never submits a verdict, terminate
+        # gracefully instead of spinning until the recursion limit. A final-turn
+        # AI response that calls a terminal tool is still let through to the
+        # tools node (no extra LLM turn is needed to commit it); any other
+        # outcome at the limit would require another LLM turn, so fall back.
+        if state.get("iterations", 0) >= self._max_iterations:
+            final_terminal = last_message.type == "ai" and any(
+                (tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", ""))
+                in self._terminal_names()
+                for tc in (getattr(last_message, "tool_calls", None) or [])
+            )
+            if not final_terminal:
+                logger.warning(
+                    f"{self.name} on {self._subject(state)} exceeded "
+                    f"{self._max_iterations} iterations without a verdict; falling back."
+                )
+                self._log_progress_completion(state, "iterations capped")
+                return self.fallback_node_name
+            return self.tools_node_name
 
         if last_message.type == "ai":
             if last_message.tool_calls:

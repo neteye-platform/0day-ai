@@ -156,7 +156,7 @@ validator_min_cvss = 7.0
 # re-reviewed against the patched source; a re-confirmed record is validated
 # again in the resynced sandbox. When False the whole stage is inert and the
 # pipeline behaves exactly as before the feature existed.
-patcher_enabled = True
+patcher_enabled = False
 # Tool-loop cap for one patcher run (read + edit + submit_patch turns).
 patcher_max_iterations = 30
 patcher_countdown_start = max(1, patcher_max_iterations - COUNTDOWN_LEAD_TURNS)

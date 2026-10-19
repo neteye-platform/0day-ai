@@ -6,6 +6,7 @@ import threading
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urljoin, urlparse
 
 import networkx as nx
 import requests
@@ -661,6 +662,74 @@ def _extract_csrf_tokens(soup) -> dict:
     return tokens
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin_tuple(url) -> tuple[str, str, int] | None:
+    """Return ``(scheme, host, port)`` for an http(s) URL, or None when the URL
+    is not a plain, unambiguous http(s) origin.
+
+    User-info is rejected outright: ``http://127.0.0.1:8080@evil/`` shares a
+    string prefix with the sandbox URL but connects to ``evil``. Backslashes
+    and control characters are rejected too, since parsers disagree on them
+    and a mismatch between this check and the one Requests/Firefox apply is
+    exactly the bypass this guards against."""
+    if not isinstance(url, str) or any(c == "\\" or ord(c) < 33 for c in url):
+        return None
+    try:
+        parsed = urlparse(url)
+        scheme = (parsed.scheme or "").lower()
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError:
+        return None
+    if scheme not in _DEFAULT_PORTS or not host:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    return scheme, host, port or _DEFAULT_PORTS[scheme]
+
+
+def is_sandbox_origin(url, sandbox_url) -> bool:
+    """True only when ``url`` has the same scheme, host and port as the sandbox.
+
+    Shared by the HTTP and browser tools (browser.py imports it lazily: this
+    module imports browser at load time)."""
+    target = _origin_tuple(url)
+    return target is not None and target == _origin_tuple(sandbox_url)
+
+
+class _OffOriginRedirect(requests.RequestException):
+    """A redirect hop would leave the sandbox origin."""
+
+
+class _OriginPinnedSession(requests.Session):
+    """Session that refuses to follow a redirect leaving the sandbox origin.
+
+    ``Session.resolve_redirects`` asks ``get_redirect_target`` for each hop
+    BEFORE sending it, so raising there stops the request ahead of any
+    connection to the foreign host while keeping Requests' own method
+    rewriting, cookie handling and ``max_redirects`` cap. With
+    ``allow_redirects=False`` Requests also calls it to prefetch ``_next``, so
+    pinning is switched off then (``pin_redirects``)."""
+
+    def __init__(self, sandbox_url: str, pin_redirects: bool = True):
+        super().__init__()
+        self.sandbox_url = sandbox_url
+        self.pin_redirects = pin_redirects
+
+    def get_redirect_target(self, resp):
+        location = super().get_redirect_target(resp)
+        if location and self.pin_redirects:
+            hop = urljoin(resp.url, location)
+            if not is_sandbox_origin(hop, self.sandbox_url):
+                raise _OffOriginRedirect(
+                    f"redirect to {hop!r} leaves the sandbox origin "
+                    f"{self.sandbox_url}; not followed"
+                )
+        return location
+
+
 class _CappedRedirectAdapter(HTTPAdapter):
     """HTTPAdapter honouring a per-request redirect cap.
 
@@ -727,6 +796,8 @@ def _fetch_csrf_tokens(session, target_url, sandbox_url, allow_redirects: bool) 
     if target_url != root:
         candidates.append(root)
     for candidate in candidates:
+        if not is_sandbox_origin(candidate, sandbox_url):
+            continue
         try:
             resp = session.get(candidate, timeout=5, allow_redirects=allow_redirects)
         except Exception:  # noqa: BLE001, S112
@@ -842,7 +913,7 @@ def send_http_request(
             endpoint = f"/{endpoint}"
         url = f"{sandbox_url}{endpoint}"
 
-    if not url.startswith(sandbox_url):
+    if not is_sandbox_origin(url, sandbox_url):
         return (
             f"Error: You can only make requests to the sandbox application at {sandbox_url}",
             {},
@@ -863,8 +934,9 @@ def send_http_request(
     elif not reset_session and state and "cookies" in state:
         start_jar = dict(state.get("cookies", {}))
 
-    session = requests.Session()
+    session = _OriginPinnedSession(sandbox_url, pin_redirects=follow_redirects)
     if follow_redirects:
+        session.max_redirects = max_redirects
         redirect_adapter = _CappedRedirectAdapter(max_redirects)
         # Direct communication with the local container sandbox is plain HTTP.
         # nosemgrep: request-session-with-http
@@ -1003,6 +1075,8 @@ def send_http_request(
             http_sessions.save(state, session_id, cookies)
 
         return llm_output, cookies
+    except _OffOriginRedirect as e:
+        return f"Error: Request blocked: {e!s}", {}
     except Exception as e:  # noqa: BLE001
         return f"Error: Request failed: {e!s}", {}
 
@@ -1439,6 +1513,7 @@ def search_codebase(
         str: List of nodes with a match and the matched line of code.
     """
     app_dir = Path(settings.app_path)
+    app_root = app_dir.resolve()
 
     # Repeat-call memo (mirrors read_source_code): an identical search earlier
     # in this conversation already put its results in the history; re-injecting
@@ -1515,6 +1590,14 @@ def search_codebase(
         except ValueError:
             rel = str(file_path)
         if is_path_excluded(rel):
+            continue
+        # A repository symlink can point at host files outside the app; the
+        # open() below would follow it and leak the target into the results.
+        # Same confinement as read_file: the resolved path must stay inside.
+        try:
+            if not file_path.resolve().is_relative_to(app_root):
+                continue
+        except (OSError, RuntimeError):
             continue
         # Optional glob restriction (app-relative path or bare file name);
         # positive globs any-match, '!' globs exclude (agents reach for this

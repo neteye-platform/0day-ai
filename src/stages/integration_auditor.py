@@ -49,7 +49,12 @@ def dispatch_integration_audits(state: MasterState):
     for v in all_vulns:
         if v.get("status") != "confirmed":
             continue
-        if v.get("integration_audit_reasoning"):
+        if v.get("integration_audit_reasoning") and not v.get("patch_state"):
+            # patch_state set = a patched re-review that re-confirmed: the
+            # banked reasoning belongs to the PRE-patch audit, so the record
+            # must be re-audited (claim key embeds patch_round, so this stays
+            # bounded: once per patch round) or it would be deferred by
+            # dispatch_validators yet skipped here and never get its fix check.
             # Every audit outcome stamps reasoning on the record (submit, the
             # revoked boundary-unchainable note, the zero-peer resolution and
             # the timeout fallback). A CONFIRMED record carrying it was already

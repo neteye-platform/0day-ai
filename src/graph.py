@@ -624,6 +624,10 @@ if __name__ == "__main__":
             done_flag.touch()
 
         except FileNotFoundError:
+            # Only the graph preflight means "wait"; any other stage's missing
+            # file must fail visibly (and keep the scan resumable).
+            if settings.graph.exists():
+                raise
             print("Waiting for actual graph.json to execute.")
         except RunStopped:
             logger.info(

@@ -500,7 +500,9 @@ def _collect_sql(path: Path, allow_excluded: bool = False) -> list[dict]:
     source = str(path.relative_to(settings.app_path))
     for lineno, raw in enumerate(_iter_lines(path) or [], 1):
         line = raw.rstrip("\n")
-        buffer += line
+        # Newline-join: keeps `^` comment stripping line-anchored and keeps
+        # whitespace between tokens of a statement split across lines.
+        buffer += line + "\n"
         while ";" in buffer:
             head, _, rest = buffer.partition(";")
             stmt = re.sub(r"(?m)^\s*(?:--|#).*$", "", head)

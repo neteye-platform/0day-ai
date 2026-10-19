@@ -14,6 +14,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Send
 from markdown_it import MarkdownIt
 from weasyprint import HTML
+from weasyprint.urls import URLFetcher
 
 import settings
 from llms import get_llm, invoke_tracked
@@ -777,7 +778,13 @@ def _render_empty_report(statistics: str | None = None) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-_MD = MarkdownIt("commonmark").enable("table")
+# Finding text is LLM/target-derived, so raw HTML is escaped (html=False) rather
+# than rendered: a `<img src=file:///...>` must never reach weasyprint.
+_MD = MarkdownIt("commonmark", {"html": False}).enable("table")
+
+# Defense in depth for anything that still yields a resource URL: only inline
+# data: URIs may load, so no host file read or host-side request is possible.
+_PDF_URL_FETCHER = URLFetcher(allowed_protocols={"data"})
 
 _PDF_CSS = """
 @page { size: A4; margin: 18mm 16mm;
@@ -814,7 +821,7 @@ def _markdown_to_pdf(markdown_text: str) -> bytes:
         "<!doctype html><html><head><meta charset='utf-8'>"
         f"<style>{_PDF_CSS}</style></head><body>{html_body}</body></html>"
     )
-    return HTML(string=html).write_pdf()
+    return HTML(string=html, url_fetcher=_PDF_URL_FETCHER).write_pdf()
 
 
 def _write_report(path: Path, markdown_text: str) -> None:

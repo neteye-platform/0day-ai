@@ -246,7 +246,16 @@ def patch_source_file(
                 ),
             )
         )
-    entry: dict = {"file": rel, "diff": diff}
+    # Undo data for the iteration-cap fallback (rollback_patch_log).
+    entry: dict = {
+        "file": rel,
+        "diff": diff,
+        "undo": {
+            "start": start_line,
+            "new_len": len(new_lines),
+            "old_lines": old_lines,
+        },
+    }
     if advisories:
         entry["advisories"] = [key for key, _ in advisories]
     advisory_block = "".join(f"\n--- {text} ---" for _, text in advisories)
@@ -269,6 +278,39 @@ def patch_source_file(
             "patch_log": [entry],
         }
     )
+
+
+def rollback_patch_log(patch_log: list) -> list[str]:
+    """Undo every hunk of an UNSUBMITTED patch attempt, newest first (each undo
+    is valid exactly because the later hunks were already reverted), under the
+    same process-wide lock as the writes. Returns the restored file paths.
+    Fail-open per hunk: a file that no longer holds the expected replacement
+    (changed underneath) is skipped rather than clobbered."""
+    app_dir = Path(settings.app_path).resolve()
+    restored: list[str] = []
+    with _patch_lock:
+        for entry in reversed([e for e in patch_log if isinstance(e, dict)]):
+            undo = entry.get("undo")
+            if not undo:
+                continue  # no-op / already-applied entries changed no bytes
+            target = (app_dir / str(entry.get("file") or "")).resolve()
+            try:
+                if not target.is_relative_to(app_dir):
+                    continue
+                content = target.read_text(encoding="utf-8")
+                lines = content.splitlines()
+                start, n = int(undo["start"]), int(undo["new_len"])
+                if start - 1 + n > len(lines):
+                    continue
+                trailing = "\n" if content.endswith("\n") else ""
+                lines[start - 1 : start - 1 + n] = list(undo["old_lines"])
+                target.write_text("\n".join(lines) + trailing, encoding="utf-8")
+            except (OSError, UnicodeDecodeError, KeyError, ValueError, TypeError):
+                logger.warning(f"Patcher: rollback of {entry.get('file')} failed.")
+                continue
+            if entry["file"] not in restored:
+                restored.append(entry["file"])
+    return restored
 
 
 def _attempt_outcome(report: dict) -> str:

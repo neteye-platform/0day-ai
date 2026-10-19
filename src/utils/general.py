@@ -1555,6 +1555,26 @@ def find_container_builds(app_path: Path) -> list[tuple[str, Path]]:
     return [("dockerfile", d) for d in dockerfiles]
 
 
+def container_image_tag(build_file: Path, multiple: bool = False) -> str:
+    """Image tag for a build definition's image.
+
+    The common single-build case keeps the documented ``vulnscan-<dirname>:latest``
+    (existing stamps/caches stay valid). With several Dockerfiles each one needs
+    its own tag: a shared tag is retagged by every later build, so earlier
+    scans/snapshots would race and target the wrong (or duplicate) image."""
+    repo = f"vulnscan-{settings.app_path.name.lower()}"
+    if not multiple:
+        return f"{repo}:latest"
+    try:
+        rel = build_file.relative_to(settings.app_path)
+    except ValueError:
+        rel = Path(build_file.name)
+    # Docker tag charset is [a-z0-9_.-] (<=128); keep the path so same-named
+    # Dockerfiles in different directories stay distinct.
+    slug = re.sub(r"[^a-z0-9_.-]+", "-", str(rel).lower()).strip("-.")[:100]
+    return f"{repo}:{slug or 'build'}"
+
+
 def _docker(
     *args: str, timeout: int | None = None, stream: bool = False
 ) -> subprocess.CompletedProcess | None:
@@ -2154,7 +2174,6 @@ def resync_sandbox(patched_files: list[str], sandbox_container: str | None) -> d
     Returns ``{"note", "sandbox_url", "sandbox_container"}`` — None values in
     the last two fields mean the MasterState channel stays unchanged."""
     patched_files = [str(f).strip() for f in (patched_files or []) if str(f).strip()]
-    tag = f"vulnscan-{settings.app_path.name.lower()}:latest"
     rebuilt = False
     new_url = None
     container = sandbox_container
@@ -2162,11 +2181,14 @@ def resync_sandbox(patched_files: list[str], sandbox_container: str | None) -> d
     target = (
         None  # (kind, build_file) of the last buildable definition (sandbox target)
     )
-    for kind, build_file in find_container_builds(settings.app_path):
+    builds = find_container_builds(settings.app_path)
+    for kind, build_file in builds:
         if kind == "dockerfile" or _compose_built_refs(build_file):
             target = (kind, build_file)
     if target:
         kind, build_file = target
+        # Same per-build tag the preprocessor used (distinct when several builds).
+        tag = container_image_tag(build_file, len(builds) > 1)
         images = build_images(kind, build_file, tag, force=True)
         if images:
             sandbox_data = start_sandbox(kind, build_file, tag, settings.app_path.name)

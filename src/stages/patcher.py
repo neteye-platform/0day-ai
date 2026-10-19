@@ -27,6 +27,7 @@ from state import MasterState, PatcherState
 from tool_loop import CompactionConfig, ToolLoopAgent
 from utils import (
     cache_patcher,
+    dispatch_claim_taken,
     format_node_context,
     get_cached_graph_data,
     get_node_code,
@@ -101,9 +102,23 @@ def _patcher_payload(
 def dispatch_patchers(state: MasterState):
     """Fan exploitable records out to patcher threads (flag-gated upstream:
     route_validator_feedback only routes here when settings.patcher_enabled)."""
-    records = patchable_records(state)
+    # One claim per (record, patch round): a patching record stays
+    # `exploitable` (needs_patch) until submit_patch/fallback lands, and any
+    # sibling validator finishing re-fires this router; without the claim a
+    # second patcher would plan competing edits against the same source. A
+    # rejected round bumps patch_round and legitimately re-keys. Peeked while
+    # selecting, committed with the Sends below.
+    records, claims = [], []
+    for record in patchable_records(state):
+        key = (record.get("vuln_id") or "", "patch", record.get("patch_round") or 0)
+        if dispatch_claim_taken(*key):
+            continue
+        claims.append(key)
+        records.append(record)
     if not records:
         return "integration_audit_dispatch"
+    for key in claims:
+        take_dispatch_claim(*key)
 
     progress_id = _start_agent_progress(len(records))
     logger.info(
@@ -354,10 +369,29 @@ class PatcherAgent(ToolLoopAgent):
         updated["patch_state"] = "failed"
         updated["patch_round"] = (report.get("patch_round") or 0) + 1
 
+        # A half-edited tree would be adjudicated by nobody (failed attempts
+        # skip resync + re-review), so undo this attempt's hunks first.
+        rolled = patch_tools.rollback_patch_log(state.get("patch_log") or [])
+        if rolled:
+            note = (
+                f"Patcher hit its iteration cap before submit_patch; "
+                f"{len(rolled)} applied hunk(s) in {', '.join(rolled)} were rolled back."
+            )
+            history = list(report.get("patch_history") or [])
+            history.append(
+                {
+                    "round": updated["patch_round"],
+                    "summary": note,
+                    "files": rolled,
+                    "diff": "",
+                    "outcome": "ROLLED BACK — no patch was banked",
+                }
+            )
+            updated["patch_history"] = history
+            updated["patch_summary"] = note
+
         # Cache the failure so a resume/replay short-circuits instead of
-        # burning another doomed loop (files this run may have half-edited are
-        # NOT reverted — the reviewer re-read and the validator smoke test
-        # adjudicate them; the status stays exploitable either way).
+        # burning another doomed loop (the tree is already restored above).
         cache_patcher(dict(report), updated, state.get("token_spent"))
 
         logger.info(

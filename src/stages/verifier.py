@@ -154,8 +154,13 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
     demand_meta = {}
     formatted_demands = []
 
-    for d in demands:
-        d_id = d.get("parameter_name") or d.get("source") or "unknown"
+    # Positional prompt IDs: parameter_name/source collide (same `$id` from two
+    # callees, several downstream demands from one caller) and the last demand
+    # would shadow the rest. `demands` is canonically sorted upstream and hashed
+    # into the cache key, so the index is stable across runs.
+    labels = [d.get("parameter_name") or d.get("source") or "unknown" for d in demands]
+    for idx, d in enumerate(demands):
+        d_id = f"D{idx}"
         demand_meta[d_id] = d
 
         dtype = d.get("type")
@@ -165,7 +170,7 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
         if dtype == "explorer_upstream_assumption":
             param = d.get("parameter_name", "unknown")
             formatted_demands.append(
-                f"- [ID: {param}] [DEMAND FROM CALLEE] You call '{_node_display_name(source)}'. It demands: '{desc}'"
+                f"- [ID: {d_id}] [DEMAND FROM CALLEE] (parameter '{param}') You call '{_node_display_name(source)}'. It demands: '{desc}'"
             )
         elif dtype == "cve_assumption":
             suggested_cwes = _normalize_cwe_ids(d.get("cwe_ids"))
@@ -175,10 +180,10 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
                 else ""
             )
             formatted_demands.append(
-                f"- [ID: {source}] [LIBRARY CVE MITIGATION] Known constraint: '{desc}'{suffix}"
+                f"- [ID: {d_id}] [LIBRARY CVE MITIGATION] ({source}) Known constraint: '{desc}'{suffix}"
             )
         else:
-            formatted_demands.append(f"- [ID: {source}] {desc}")
+            formatted_demands.append(f"- [ID: {d_id}] ({source}) {desc}")
 
     # Chunk calls so a hub node's per-demand output never truncates at the
     # token cap; batches cache individually so retries pay only for unfinished ones.
@@ -202,7 +207,13 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
             / f"{target_node_id}_batch{b_idx}_{batch_hash}.json"
         )
         cached_batch = cache(batch_cache_file, "read")
-        if cached_batch and isinstance(cached_batch.get("evaluations"), list):
+        # Batches cached before positional IDs carry label-keyed demand_ids that
+        # demand_meta can no longer resolve: treat them as misses.
+        if (
+            cached_batch
+            and cached_batch.get("id_scheme") == "positional"
+            and isinstance(cached_batch.get("evaluations"), list)
+        ):
             # The node entry must reproduce the FULL original build cost, so
             # cached-batch spend joins node_usage too (booked live once by
             # take_cached_usage, which pops the key before it can leak on).
@@ -230,7 +241,11 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
         cache(
             batch_cache_file,
             "write",
-            {"evaluations": batch_evals, "token_usage": usage},
+            {
+                "evaluations": batch_evals,
+                "token_usage": usage,
+                "id_scheme": "positional",
+            },
         )
         evaluations.extend(batch_evals)
 
@@ -248,7 +263,8 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
     new_vulnerabilities = []
     for evaluation in evaluations:
         if evaluation.get("status") == "FAILED":
-            entry = demand_meta.get(evaluation.get("demand_id"))
+            prompt_id = evaluation.get("demand_id")
+            entry = demand_meta.get(prompt_id)
             original_desc = (
                 entry.get("description")
                 if entry is not None
@@ -268,13 +284,22 @@ def _contract_verifier_node(state: VerifierState) -> tuple[dict, str]:
                     None,
                 )
 
+            # Readable anchor for the record; a label shared within the node
+            # keeps its positional suffix so distinct failures keep distinct
+            # vuln_ids instead of collapsing in merge_vulnerabilities.
+            label = prompt_id
+            if entry is not None:
+                idx = int(prompt_id[1:])
+                label = labels[idx]
+                if labels.count(label) > 1:
+                    label = f"{label}#{idx}"
             new_vuln = {
                 "affected_nodes": [target_node_id],
                 "cwe_id": verifier_cwe,
                 "description": f"Fails to satisfy demand: '{original_desc}'. Evidence: {evaluation.get('evidence')}",
                 "status": "hypothesis",
-                "demand_id": evaluation.get("demand_id"),
-                "vulnerable_component": evaluation.get("demand_id"),
+                "demand_id": label,
+                "vulnerable_component": label,
             }
             # FAILED application_mitigation CVE demands become
             # dependency-mitigation reviews (routed by vulnerability_type).

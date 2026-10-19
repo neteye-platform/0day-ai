@@ -118,6 +118,7 @@ class BrowserSessionManager:
             max_workers=1, thread_name_prefix="pw-browser"
         )
         self._browser_tid = None
+        self._wedge_lock = threading.Lock()
 
     def _browser_thread_run(self, fn):
         """Run zero-arg callable ``fn`` on the dedicated browser thread.
@@ -130,15 +131,53 @@ class BrowserSessionManager:
         """
         if self._browser_tid == threading.get_ident():
             return fn()
-        future = self._executor.submit(fn)
+        executor = self._executor
+        future = executor.submit(fn)
         attempt_s = (
             int(getattr(settings, "browser_timeout_ms", 30000)) / 1000.0
         ) + 30.0
         try:
             return future.result(timeout=attempt_s)
         except concurrent.futures.TimeoutError:
+            # cancel() cannot stop a job already running on the sole worker
+            # (e.g. a never-settling evaluate Promise), and every later call
+            # would queue behind it. Abandon this worker and its browser.
             future.cancel()
+            self._recover_from_wedge(executor)
             raise
+
+    def _recover_from_wedge(self, stuck_executor):
+        """Replace a wedged worker+browser so later calls get a fresh one.
+
+        Never waits on the stuck worker. Killing the Playwright driver makes
+        the blocked call raise in the abandoned thread (so it can exit instead
+        of hanging interpreter shutdown); the sessions bound to that browser
+        are unusable and are dropped without touching their Playwright
+        objects. The next ``session_for`` lazily boots a new executor/browser.
+        """
+        with self._wedge_lock:
+            if self._executor is not stuck_executor:
+                return  # another caller already recovered from this worker
+            logger.warning(
+                "Browser operation exceeded its timeout; restarting the browser."
+            )
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="pw-browser"
+            )
+            self._browser_tid = None
+            playwright, self._playwright = self._playwright, None
+            self._browser = None
+            # The stuck job may be a boot still holding the old lock.
+            self._browser_lock = threading.Lock()
+        stuck_executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            # Private Playwright attribute: best effort, fail open if absent.
+            proc = playwright._impl_obj._connection._transport._proc
+            proc.kill()
+        except Exception:  # noqa: BLE001, S110
+            pass
+        with self._lock:
+            self._sessions.clear()
 
     # -- availability ------------------------------------------------------
 
@@ -207,7 +246,9 @@ class BrowserSessionManager:
             except Exception:  # noqa: BLE001, S110
                 pass
             self._playwright = None
-        self._executor.shutdown(wait=True)
+        # Teardown above already ran through the worker; never block on it, a
+        # wedged job would otherwise hang interpreter exit.
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     # -- console/dialog capture ----------------------------------------------
 
@@ -287,8 +328,11 @@ class BrowserSessionManager:
             if s is not None:
                 return s, None  # another thread created it while we launched
 
+            sandbox_url = (state or {}).get("sandbox_url") if state else None
+
             def _build():
                 context = browser.new_context()
+                self._pin_origin(context, sandbox_url)
                 self._seed_cookies(context, state)
                 page = context.new_page()
                 s = _Session(session_id, context, page)
@@ -304,6 +348,27 @@ class BrowserSessionManager:
             self._sessions[key] = s
             self._start_reaper()
             return s, None
+
+    @staticmethod
+    def _pin_origin(context, sandbox_url):
+        """Abort every request (navigation, subresource, redirect hop, XHR)
+        leaving the sandbox origin, so a page cannot pull the browser to
+        another host after the initial navigate check. Inline schemes stay
+        allowed so DOM tests that use data:/blob:/about: still work. Playwright
+        invokes the handler on the browser thread that owns the context."""
+        from tools.base import is_sandbox_origin
+
+        def _guard(route):
+            url = route.request.url
+            if url.startswith(("data:", "blob:", "about:")) or is_sandbox_origin(
+                url, sandbox_url
+            ):
+                route.continue_()
+            else:
+                logger.info("Blocked off-sandbox browser request: %.200s", url)
+                route.abort()
+
+        context.route("**/*", _guard)
 
     def _seed_cookies(self, context, state):
         cookies = (state or {}).get("cookies") if isinstance(state, dict) else None
@@ -463,6 +528,35 @@ def _describe(session) -> str:
     return "\n".join(parts)
 
 
+_EVAL_WRAPPER = """([expr, ms]) => {
+  const run = Promise.resolve().then(() => {
+    const v = (0, eval)(expr);
+    return typeof v === 'function' ? v() : v;
+  });
+  let timer;
+  const limit = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('evaluate timed out after ' + ms + 'ms')), ms);
+  });
+  return Promise.race([run, limit]).finally(() => clearTimeout(timer));
+}"""
+
+
+def _evaluate_bounded(page, expression):
+    """``page.evaluate`` with a JS-side deadline, so an expression returning a
+    never-settling Promise rejects instead of blocking the browser thread.
+
+    Falls back to the plain evaluate when the page's CSP forbids ``eval``
+    (the wrapper's only extra requirement); the manager-level wedge recovery
+    still bounds that path."""
+    ms = int(settings.browser_timeout_ms)
+    try:
+        return page.evaluate(_EVAL_WRAPPER, [expression, ms])
+    except Exception as e:
+        if "unsafe-eval" in str(e) or "Content Security Policy" in str(e):
+            return page.evaluate(expression)
+        raise
+
+
 def _url_from(state, url) -> tuple[str | None, str | None]:
     sandbox_url = (state or {}).get("sandbox_url") if isinstance(state, dict) else None
     if not sandbox_url:
@@ -475,7 +569,10 @@ def _url_from(state, url) -> tuple[str | None, str | None]:
         if not url.startswith("/"):
             url = f"/{url}"
         url = f"{sandbox_url}{url}"
-    if not url.startswith(sandbox_url):
+    # Lazy import: tools.base imports this module at load time.
+    from tools.base import is_sandbox_origin
+
+    if not is_sandbox_origin(url, sandbox_url):
         return (
             None,
             f"Error: You can only navigate the sandbox application at {sandbox_url}",
@@ -646,7 +743,7 @@ def browser_evaluate(
 
         def _evaluate():
             try:
-                result = session.page.evaluate(expression)
+                result = _evaluate_bounded(session.page, expression)
             except Exception as e:  # noqa: BLE001
                 return (
                     f"Error: evaluate failed: {str(e)[:500]}",

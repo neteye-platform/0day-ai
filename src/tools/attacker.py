@@ -36,7 +36,9 @@ Design / lifecycle
 import hashlib
 import logging
 import os
+import re
 import shlex
+import socket
 import subprocess
 import threading
 from pathlib import Path
@@ -55,6 +57,40 @@ ATTACKER_DOCKERFILE = ATTACKER_DIR / "Dockerfile"
 # Caps on reading attacker files back into the LLM.
 ATTACKER_FILEREAD_MAX_LINES = 150
 ATTACKER_FILEREAD_MAX_BYTES = 1_000_000
+
+
+OWNER_LABEL = "vulnscan.owner"
+
+
+def _owner_id() -> str:
+    """Owner stamp for containers this process starts: ``<pid>@<hostname>``."""
+    return f"{os.getpid()}@{socket.gethostname()}"
+
+
+def _owner_alive(owner: str) -> bool:
+    """False only when the stamp is a dead pid on this host; anything we cannot
+    prove dead (other host, unparsable) counts as alive so it is never swept."""
+    pid_s, _, host = owner.partition("@")
+    if not pid_s.isdigit() or host != socket.gethostname():
+        return True
+    try:
+        os.kill(int(pid_s), 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # PermissionError: exists, another user
+        return True
+    return True
+
+
+def abandoned_containers(ps_output: str) -> list[str]:
+    """Names from ``name<TAB>owner`` lines whose owner is gone (or unstamped)."""
+    out = []
+    for line in ps_output.splitlines():
+        name, _, owner = line.partition("\t")
+        name, owner = name.strip(), owner.strip()
+        if name and (not owner or not _owner_alive(owner)):
+            out.append(name)
+    return out
 
 
 class AttackerManager:
@@ -180,13 +216,16 @@ class AttackerManager:
             pass
 
     def sweep_stale_containers(self) -> None:
-        """Remove leftover per-agent attacker containers from a previous run.
+        """Remove abandoned per-agent attacker containers from earlier runs.
 
         A force-killed pipeline (2nd Ctrl+C / SIGTERM) exits before
         ``close_agent_sessions`` can run, leaving ``<prefix>-<agent_id>``
-        boxes up. Every container carrying the prefix is dead weight at
-        startup: this process owns the toolset, so none can belong to a
-        live validator yet. Fail open — docker absent means nothing to sweep.
+        boxes up. Another scan may share the prefix on this docker daemon, so
+        only containers whose owner stamp (``pid@hostname`` label) names a
+        dead process on THIS host are removed; foreign-host owners and live
+        pids are left alone. Containers with no stamp predate the label (no
+        live current-version scan creates one) and are treated as abandoned.
+        Fail open - docker absent means nothing to sweep.
         """
         base = getattr(settings, "attacker_container_name", "vulnscan-kali-attacker")
         try:
@@ -196,16 +235,17 @@ class AttackerManager:
                     "ps",
                     "-a",
                     "--filter",
-                    f"name={base}-",
+                    # docker's name filter is a partial regex match: anchor it.
+                    f"name=^/?{re.escape(base)}-",
                     "--format",
-                    "{{.Names}}",
+                    f'{{{{.Names}}}}\t{{{{.Label "{OWNER_LABEL}"}}}}',
                 ],
                 capture_output=True,
                 text=True,
                 check=False,
                 timeout=30,
             )
-            names = [n for n in found.stdout.split("\n") if n.strip()]
+            names = abandoned_containers(found.stdout)
             for name in names:
                 subprocess.run(
                     ["docker", "rm", "-f", name],
@@ -373,6 +413,10 @@ class AttackerManager:
                     # applies inside its own namespaces only.
                     "--cap-add",
                     "ALL",
+                    # Owner stamp so another scan's startup sweep can tell this
+                    # live box from an abandoned one.
+                    "--label",
+                    f"{OWNER_LABEL}={_owner_id()}",
                     "-v",
                     f"{host_dir.resolve()}:{mount_target}:z",
                     image,

@@ -12,6 +12,7 @@ from utils import (
     build_symbol_index,
     clear_feedback_dispatch_state,
     clear_warning_state,
+    container_image_tag,
     deduplicate_cves,
     extract_container_artifacts,
     find_container_builds,
@@ -82,10 +83,12 @@ def preprocessor_node(state: MasterState) -> dict[str, Any]:
         )
         scan_futures = []
         for kind, build_file in builds:
-            tag = f"vulnscan-{settings.app_path.name.lower()}:latest"
+            # One distinct tag per build definition: a shared tag is retagged
+            # by each later build, racing the SCA scans and artifact snapshots.
+            tag = container_image_tag(build_file, len(builds) > 1)
             images = build_images(kind, build_file, tag)
             if images:
-                built_images.extend(images)
+                built_images.extend(i for i in images if i not in built_images)
                 scan_futures.extend(
                     pool.submit(run_osv_scanner_image, img) for img in images
                 )
