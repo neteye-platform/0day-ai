@@ -51,7 +51,7 @@ breakdown of the internal mechanics, see `architecture.md`.
 
 ## Prerequisites
 
-- Python >= 3.11
+- Python >= 3.12
 - Docker (required for the target sandbox and Kali attacker containers). The
   target application is automatically built if the repository contains a
   `Dockerfile` or `docker-compose.yaml`.
