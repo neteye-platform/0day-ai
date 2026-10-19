@@ -547,7 +547,7 @@ if __name__ == "__main__":
     if done_flag.exists():
         done_flag.unlink()
         pointer_thread = None
-    thread_id = pointer_thread or f"scan-{datetime.now().strftime('%Y%m%d-%H%M%S')}"  # noqa: DTZ005
+    thread_id = pointer_thread or f"scan-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     thread_file.write_text(thread_id)
 
     # Stamp the entry config so this run's ROOT trace correlates with the
@@ -597,7 +597,7 @@ if __name__ == "__main__":
                     # The pointed thread already ran to END (e.g. killed just
                     # before the done flag was touched): reusing it would
                     # accumulate the old run's channel values into the new one.
-                    thread_id = f"scan-{datetime.now().strftime('%Y%m%d-%H%M%S')}"  # noqa: DTZ005
+                    thread_id = f"scan-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
                     thread_file.write_text(thread_id)
                     config["configurable"]["thread_id"] = thread_id
                     logger.info(

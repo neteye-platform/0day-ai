@@ -968,7 +968,7 @@ def report_assembler_node(state: MasterState) -> dict:
     {"report_dir": <name>}."""
     name = str(state.get("report_dir") or "").strip().strip("/")
     if not (name.startswith("report_") and Path(name).name == name):
-        name = f"report_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"  # noqa: DTZ005
+        name = f"report_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
     report_dir = settings.app_path / name
     if report_dir.exists():
         # Re-triggered arrival: wipe the previous render, because findings

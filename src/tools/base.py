@@ -866,10 +866,9 @@ def send_http_request(
     session = requests.Session()
     if follow_redirects:
         redirect_adapter = _CappedRedirectAdapter(max_redirects)
-        session.mount(
-            "http://",
-            redirect_adapter,  # nosemgrep: request-session-with-http
-        )  # support direct communication with local container sandbox
+        # Direct communication with the local container sandbox is plain HTTP.
+        # nosemgrep: request-session-with-http
+        session.mount("http://", redirect_adapter)
         session.mount("https://", redirect_adapter)
     if start_jar:
         session.cookies.update(start_jar)
