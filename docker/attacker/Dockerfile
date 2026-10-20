@@ -1,4 +1,4 @@
-FROM kalilinux/kali-rolling:amd64
+FROM kalilinux/kali-rolling:amd64@sha256:459f87b760ca9c2d8e953126db1847ae329d5b0660d113e4e3a9fb0806509fcd
 
 # Dedicated attacker box for the validator agent. kali-linux-headless is the
 # Kali meta-package with the full tool surface minus the heavyweight
