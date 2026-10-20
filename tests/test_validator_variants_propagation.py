@@ -14,7 +14,12 @@ def _state(*variants):
 
 
 def _verdict(status="exploitable"):
-    return {**SEED, "status": status, "poc_payload": "seedpoc", "execution_logs": "seedlog"}
+    return {
+        **SEED,
+        "status": status,
+        "poc_payload": "seedpoc",
+        "execution_logs": "seedlog",
+    }
 
 
 def _by_id(updates):
@@ -22,13 +27,20 @@ def _by_id(updates):
 
 
 def _res(vuln_id, ok, payload="p", logs="l"):
-    return {"vuln_id": vuln_id, "is_confirmed": ok, "poc_payload": payload, "execution_logs": logs}
+    return {
+        "vuln_id": vuln_id,
+        "is_confirmed": ok,
+        "poc_payload": payload,
+        "execution_logs": logs,
+    }
 
 
 def test_each_variant_gets_its_own_verdict_and_evidence():
     results = [
         _res("a", True, "pa", "la"),
-        VariantResult(vuln_id="b", is_confirmed=False, poc_payload=None, execution_logs="lb"),
+        VariantResult(
+            vuln_id="b", is_confirmed=False, poc_payload=None, execution_logs="lb"
+        ),
     ]
     out = _by_id(tools.propagate_validation_update(_state(A, B), _verdict(), results))
     assert out["s"]["status"] == "exploitable"
@@ -85,7 +97,28 @@ def test_legacy_replay_without_variant_results_does_not_blanket_copy():
 
 
 def test_replay_reads_results_from_cached_record_key():
-    cached = {**_verdict(), tools.VARIANT_RESULTS_CACHE_KEY: [_res("a", False, None, "la")]}
+    cached = {
+        **_verdict(),
+        tools.VARIANT_RESULTS_CACHE_KEY: [_res("a", False, None, "la")],
+    }
     out = _by_id(tools.propagate_validation_update(_state(A, B), cached))
     assert out["a"]["status"] == "false_positive"
     assert peek_solo_pending() == {"b"}
+
+
+def test_validator_cache_identity_includes_variant_reports(tmp_path, monkeypatch):
+    from utils import general
+
+    monkeypatch.setattr(general.settings, "app_path", str(tmp_path), raising=False)
+    seed = {"vuln_id": "s", "status": "confirmed"}
+    member = {"vuln_id": "m", "status": "confirmed", "reproduction_steps": ["a"]}
+    general.cache_validator(
+        seed, None, {**seed, "status": "exploitable"}, None, [member]
+    )
+
+    hit = general.cache_validator(seed, None, variants=[member])
+    changed = general.cache_validator(
+        seed, None, variants=[{**member, "reproduction_steps": ["b"]}]
+    )
+    assert hit is not None and hit["status"] == "exploitable"
+    assert changed is None

@@ -1251,6 +1251,7 @@ def mark_validation_complete(
         if variant_results
         else updated_vuln,
         state.get("token_spent"),
+        variants=state.get("validation_variants"),
     )
 
     # Close this validator's headless-browser sessions and remove its dedicated
@@ -1311,7 +1312,11 @@ def ask_for_context(
     # insufficient_context record keeps review_round bumped, so a repeat of the
     # same round-0 report re-triggers the reviewer feedback loop exactly).
     cache_validator(
-        report, state.get("peer_payloads"), updated_vuln, state.get("token_spent")
+        report,
+        state.get("peer_payloads"),
+        updated_vuln,
+        state.get("token_spent"),
+        variants=state.get("validation_variants"),
     )
 
     # Close this validator's headless-browser sessions and remove its dedicated

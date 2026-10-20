@@ -3231,12 +3231,17 @@ def cache_validator(
     peer_payloads: list | None = None,
     updated_vuln: dict | None = None,
     token_usage: dict | None = None,
+    variants: list | None = None,
 ) -> dict | None:
     """Read (``updated_vuln`` is None) or write a validator outcome cache entry.
 
     Keyed by (vuln_id, content hash of the report plus the injected
     ``peer_payloads`` — for a ``chained`` record the validator's verdict depends
-    on the proven peer payloads, which are NOT part of the report itself). The
+    on the proven peer payloads, which are NOT part of the report itself — and,
+    for a batched group, the full reports of every member in ``variants``: the
+    cached entry carries per-variant verdicts keyed by ``vuln_id``, so a member
+    whose text changed under the same id must miss instead of replaying a stale
+    verdict. Ungrouped records hash exactly as before). The
     live ``sandbox_url`` is deliberately excluded so results survive across runs
     despite docker reassigning the port. Shared by ``mark_validation_complete``,
     ``ask_for_context``, and the loop-fallback path so all three land in the
@@ -3248,10 +3253,17 @@ def cache_validator(
         (p for p in (peer_payloads or []) if isinstance(p, dict)),
         key=lambda p: p.get("vuln_id", ""),
     )
+    keyed: dict = {"report": report, "peer_payloads": peers}
+    members = sorted(
+        (v for v in (variants or []) if isinstance(v, dict)),
+        key=lambda v: v.get("vuln_id", ""),
+    )
+    if members:
+        keyed["variants"] = members
     return _cache_stored_record(
         "validator",
         vuln_id,
-        _strip_cvss_key({"report": report, "peer_payloads": peers}),
+        _strip_cvss_key(keyed),
         updated_vuln,
         token_usage,
     )

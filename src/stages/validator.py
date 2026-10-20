@@ -465,7 +465,9 @@ class ValidatorAgent(ToolLoopAgent):
 
     def cached_verdict(self, state):
         cached = cache_validator(
-            state.get("report_to_test", {}), state.get("peer_payloads")
+            state.get("report_to_test", {}),
+            state.get("peer_payloads"),
+            variants=state.get("validation_variants"),
         )
         # The ask verdict of a live ask_for_context IS validator-cached, but it
         # must NEVER short-circuit a pass on which the tool is no longer bound
@@ -750,6 +752,7 @@ class ValidatorAgent(ToolLoopAgent):
             state.get("peer_payloads"),
             updated_vuln,
             state.get("token_spent"),
+            variants=state.get("validation_variants"),
         )
 
         # Batched variants stay unproven too: give each its own timeout note
