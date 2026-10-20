@@ -22,10 +22,13 @@ from utils import (
     boundary_deferred,
     cache_validator,
     cvss_gate_blocks,
+    discard_solo_pending,
     dispatch_claim_taken,
     ensure_sandbox_reachable,
     get_node_code,
     info_once,
+    is_solo_validation,
+    peek_solo_pending,
     take_dispatch_claim,
     take_feedback_dispatch,
 )
@@ -88,6 +91,19 @@ def _is_first_pass(state) -> bool:
     return (
         state.get("report_to_test", {}).get("review_round") or 0
     ) < settings.validator_feedback_max_rounds
+
+
+def _direct_claim_key(record: dict) -> tuple:
+    """Dispatch-claim key of a record's direct validation run. A group member
+    left unresolved by a shared run uses a DISTINCT ``direct-solo`` key: its
+    original ``direct`` claim was consumed by the (finished) grouped run and
+    would otherwise suppress the standalone re-run forever."""
+    return (
+        record.get("vuln_id") or "",
+        "direct-solo" if is_solo_validation(record.get("vuln_id")) else "direct",
+        record.get("review_round") or 0,
+        record.get("patch_round") or 0,
+    )
 
 
 def dispatch_validators(state: MasterState):
@@ -160,12 +176,7 @@ def dispatch_validators(state: MasterState):
         # flight (status still 'confirmed') is a duplicate. Claims are only
         # peeked here and committed after the dead-sandbox abort point, so an
         # aborted dispatch never burns claims for records that never went out.
-        claim_key = (
-            evaluation.get("vuln_id") or "",
-            "direct",
-            evaluation.get("review_round") or 0,
-            evaluation.get("patch_round") or 0,
-        )
+        claim_key = _direct_claim_key(evaluation)
         if dispatch_claim_taken(*claim_key):
             info_once(
                 ("validator-direct-claim", *claim_key),
@@ -187,6 +198,10 @@ def dispatch_validators(state: MasterState):
         # (expired PoC + smoke test) bound to THEIR diff, so sharing one verdict
         # across a (cwe, component) group could mark an unverified fix proven.
         if evaluation.get("patch_state") or evaluation.get("patch_diff"):
+            continue
+        # A former group member left unresolved by a shared run validates
+        # alone from now on (its verdict must come from its own proof).
+        if is_solo_validation(evaluation.get("vuln_id")):
             continue
         if key := _validation_group_key(evaluation):
             groups.setdefault(key, []).append(evaluation)
@@ -269,6 +284,49 @@ def dispatch_validators(state: MasterState):
     return commands
 
 
+def _solo_validator_sends(state: MasterState, all_vulns: list[dict]) -> list:
+    """Standalone validator runs for grouped-run members that got no verdict.
+
+    propagate_validation_update queues a member here when the shared run's
+    ``variant_results`` did not cover it (it stays 'confirmed'). Each one is
+    Sent back as a batch of one (no ``validation_variants``), so its verdict is
+    applied to itself only. Termination: the member is permanently marked
+    solo (never batched again), its ``direct-solo`` claim is consumed here
+    exactly once per (review_round, patch_round), and a standalone run has no
+    variants to leave unresolved — it ends in a verdict, a feedback bump or the
+    timeout fallback, none of which re-queues. Records no longer 'confirmed'
+    (resolved meanwhile) just leave the queue."""
+    by_id = {v.get("vuln_id"): v for v in all_vulns}
+    ready = []
+    for vuln_id in sorted(peek_solo_pending()):
+        record = by_id.get(vuln_id)
+        if record is None or record.get("status") != "confirmed":
+            discard_solo_pending(vuln_id)
+            continue
+        ready.append(record)
+    if not ready:
+        return []
+    # Same dead-sandbox guard as the primary fan-out (raises, claims untouched).
+    ensure_sandbox_reachable(state.get("sandbox_url"), "validator")
+    picked = []
+    for record in ready:
+        discard_solo_pending(record["vuln_id"])
+        if take_dispatch_claim(*_direct_claim_key(record)):
+            picked.append(record)
+    if not picked:
+        return []
+    progress_id = _start_agent_progress(len(picked))
+    logger.info(
+        f"Re-queued {len(picked)} grouped-run member(s) without their own result "
+        f"for standalone validation: {[r['vuln_id'] for r in picked]}."
+    )
+    _record_stat("validator_records", len(picked))
+    return [
+        Send("validator_agent", _validator_payload(state, r, None, progress_id))
+        for r in picked
+    ]
+
+
 def route_validator_feedback(state: MasterState):
     """Conditional router from the validator back into the reviewer (or onward).
 
@@ -297,6 +355,13 @@ def route_validator_feedback(state: MasterState):
             continue
         flagged.append(v)
 
+    solo = _solo_validator_sends(state, all_vulns)
+
+    if not flagged and solo:
+        # Standalone re-runs of ungraded group members go first: the next
+        # validator superstep re-enters this router, which then advances.
+        return solo
+
     if not flagged:
         if settings.patcher_enabled and patchable_records(state):
             return "patch_dispatch"
@@ -321,7 +386,7 @@ def route_validator_feedback(state: MasterState):
         f"{len(flagged)} remaining."
     )
     _record_stat("reviewer_feedback_reviews", len(commands))
-    return commands
+    return commands + solo
 
 
 VALIDATOR_SUMMARY_LEDGER = (
@@ -423,7 +488,11 @@ class ValidatorAgent(ToolLoopAgent):
         cmd = super().pre_agent(state)
         if cmd is None or not (cmd.update or {}).get("vulnerabilities"):
             return cmd
-        cached = cmd.update["vulnerabilities"][0]
+        cached = dict(cmd.update["vulnerabilities"][0])
+        # Per-variant results ride the cached seed record under a private key
+        # (absent in legacy entries => no variant results => every member is
+        # re-queued standalone, never given the seed's verdict).
+        variant_results = cached.pop(tools.VARIANT_RESULTS_CACHE_KEY, None) or []
         if cached.get("status") == "insufficient_context":
             # The live ask_for_context bumps review_round BEFORE caching; the
             # replay must carry that bump onto the MERGED record too, or the
@@ -432,7 +501,7 @@ class ValidatorAgent(ToolLoopAgent):
             incoming_round = state.get("report_to_test", {}).get("review_round") or 0
             cached = {**cached, "review_round": incoming_round + 1}
         updates = (
-            tools.propagate_validation_update(state, cached)
+            tools.propagate_validation_update(state, cached, variant_results)
             if state.get("validation_variants")
             else [cached]
         )
@@ -454,6 +523,8 @@ class ValidatorAgent(ToolLoopAgent):
             sys_prompt += "\n\n" + VALIDATOR_AGENT.get("insufficient_context", "")
         if report.get("patch_diff"):
             sys_prompt += "\n\n" + VALIDATOR_AGENT.get("patched_target", "")
+        if state.get("validation_variants"):
+            sys_prompt += "\n\n" + VALIDATOR_AGENT.get("variant_results", "")
         sys_msg = SystemMessage(content=sys_prompt)
         affected = [n for n in (report.get("affected_nodes") or []) if n]
         affected_str = affected_nodes_label(report, report.get("node_id", "Unknown"))
@@ -570,9 +641,12 @@ class ValidatorAgent(ToolLoopAgent):
                 f"affected locations. Exercise the reproduction steps for EACH "
                 f"variant in addition to the core one; a generic proof of the "
                 f"shared pattern counts only if you demonstrate it applies to "
-                f"every variant's affected nodes. Record per-variant outcomes in "
-                f"execution_logs. Your single final verdict will be written to "
-                f"the core vulnerability AND to every variant.\n"
+                f"every variant's affected nodes. Your top-level verdict "
+                f"applies to the core vulnerability ONLY. For EACH variant you "
+                f"actually tested, add one `variant_results` entry (its exact "
+                f"vuln_id, its own is_confirmed, poc_payload and execution_logs "
+                f"excerpt); variants you leave out are validated in their own "
+                f"later run, never given your verdict.\n"
                 f"{'\n\n'.join(blocks)}"
             )
         # Source of every affected node so the validator can reason about the

@@ -889,6 +889,22 @@ class EvaluationToolInput(BaseModel):
         return v
 
 
+class VariantResult(BaseModel):
+    vuln_id: str = Field(
+        description="vuln_id of the EQUIVALENT VARIANT you actually tested (verbatim)."
+    )
+    is_confirmed: bool = Field(
+        description="True if the exploit triggered for THIS variant specifically."
+    )
+    poc_payload: str | None = Field(
+        default=None,
+        description="The payload/request that triggered (or failed against) this variant.",
+    )
+    execution_logs: str = Field(
+        description="This variant's own log/output excerpt supporting its verdict."
+    )
+
+
 class ValidationToolInput(BaseModel):
     is_confirmed: bool = Field(
         description="True if the exploit successfully triggered in the sandbox."
@@ -907,6 +923,15 @@ class ValidationToolInput(BaseModel):
     )
     execution_logs: str = Field(
         description="Relevant logs or output from the sandbox confirming the exploit."
+    )
+    variant_results: list[VariantResult] | None = Field(
+        default=None,
+        description=(
+            "Only when the report lists EQUIVALENT VARIANTS: one entry per variant "
+            "you actually tested, with that variant's OWN verdict, payload and log "
+            "excerpt. Omit variants you did not test (they get their own run); the "
+            "top-level fields describe the core vulnerability only."
+        ),
     )
 
 

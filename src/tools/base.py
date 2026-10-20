@@ -40,6 +40,7 @@ from utils import (
     get_node_code,
     is_feedback_review,
     is_path_excluded,
+    mark_solo_validation,
     reviewer_cache_key,
 )
 from utils.languages import MANIFEST_NAMES
@@ -938,10 +939,11 @@ def send_http_request(
     if follow_redirects:
         session.max_redirects = max_redirects
         redirect_adapter = _CappedRedirectAdapter(max_redirects)
-        # Direct communication with the local container sandbox is plain HTTP.
-        # nosemgrep: request-session-with-http
-        session.mount("http://", redirect_adapter)
-        session.mount("https://", redirect_adapter)
+        # The sandbox is a local container that may speak plain HTTP, so the
+        # capped adapter serves both schemes (off-origin hops are refused by
+        # the pinned session before any connection is made).
+        for scheme in ("http", "https"):
+            session.mount(f"{scheme}://", redirect_adapter)
     if start_jar:
         session.cookies.update(start_jar)
 
@@ -1081,25 +1083,80 @@ def send_http_request(
         return f"Error: Request failed: {e!s}", {}
 
 
-def propagate_validation_update(state: dict, updated_vuln: dict) -> list[dict]:
-    """Clone a validator's terminal update onto its grouped validation variants.
+# Private cache-only key: the sanitized per-variant results ride the cached
+# seed record (legacy entries simply lack it) and are popped on replay by
+# ValidatorAgent.pre_agent, so the record flowing into the channel stays pure.
+VARIANT_RESULTS_CACHE_KEY = "_variant_results"
 
-    dispatch_validators may batch confirmed records that share (cwe_id,
-    vulnerable_component) exactly into ONE validator run (``validation_variants``
-    in ValidatorState); the batched verdict must reach every member's own
-    vuln_id so each record still lands in the vulnerabilities channel — and the
-    report — as an individual finding. Records are cloned, never merged.
+
+def sanitize_variant_results(state: dict, raw) -> list[dict]:
+    """Keep only trustworthy per-variant results for this grouped run.
+
+    Accepted: entries whose vuln_id belongs to the dispatched group's
+    variants (never the seed, never unknown ids) and appears EXACTLY once —
+    two entries for one id are contradictory evidence, so that variant counts
+    as untested and is re-queued rather than guessed."""
+    members = {m.get("vuln_id") for m in (state.get("validation_variants") or [])} - {
+        None,
+        "",
+    }
+    entries: list[dict] = []
+    for item in raw or []:
+        if hasattr(item, "model_dump"):
+            item = item.model_dump()
+        if isinstance(item, dict) and item.get("vuln_id") in members:
+            entries.append(item)
+    counts: dict[str, int] = {}
+    for e in entries:
+        counts[e["vuln_id"]] = counts.get(e["vuln_id"], 0) + 1
+    return [e for e in entries if counts[e["vuln_id"]] == 1]
+
+
+def propagate_validation_update(
+    state: dict, updated_vuln: dict, variant_results: list | None = None
+) -> list[dict]:
+    """Return the seed's terminal update plus each grouped variant's OWN verdict.
+
+    dispatch_validators may batch confirmed records sharing (cwe_id,
+    vulnerable_component) into ONE validator run (``validation_variants`` in
+    ValidatorState). Equal component labels do not imply equal guards, so the
+    seed's verdict is NEVER copied onto a member: a member is resolved only by
+    its own entry in ``variant_results`` (own is_confirmed / poc_payload /
+    execution_logs). Every other member stays untouched (status 'confirmed')
+    and is queued for a STANDALONE run (utils.mark_solo_validation, drained by
+    route_validator_feedback) — that run has no variants, so its verdict lands
+    on itself only, which is also why the re-queue cannot loop. A group of one
+    (no variants) is unaffected. A seed that is still 'confirmed' (timeout
+    fallback replay) queues nothing: re-running a doomed group member alone
+    is not warranted by a group-level timeout.
     """
     updates = [updated_vuln]
-    for member in state.get("validation_variants") or []:
+    variants = state.get("validation_variants") or []
+    if not variants:
+        return updates
+    if variant_results is None:
+        variant_results = updated_vuln.get(VARIANT_RESULTS_CACHE_KEY)
+    if updated_vuln.get("status") not in (
+        "exploitable",
+        "false_positive",
+        "insufficient_context",
+    ):
+        return updates
+    # ask_for_context says nothing about any variant: all of them re-run alone.
+    own = (
+        {}
+        if updated_vuln.get("status") == "insufficient_context"
+        else {r["vuln_id"]: r for r in sanitize_variant_results(state, variant_results)}
+    )
+    for member in variants:
+        res = own.get(member.get("vuln_id"))
+        if res is None:
+            mark_solo_validation(member.get("vuln_id") or "")
+            continue
         clone = dict(member)
-        clone["status"] = updated_vuln.get("status")
-        clone["poc_payload"] = updated_vuln.get("poc_payload")
-        clone["poc_script"] = updated_vuln.get("poc_script")
-        clone["execution_logs"] = updated_vuln.get("execution_logs")
-        if updated_vuln.get("status") == "insufficient_context":
-            clone["review_round"] = (member.get("review_round") or 0) + 1
-            clone["open_questions"] = list(updated_vuln.get("open_questions") or [])
+        clone["status"] = "exploitable" if res.get("is_confirmed") else "false_positive"
+        clone["poc_payload"] = res.get("poc_payload")
+        clone["execution_logs"] = res.get("execution_logs")
         updates.append(clone)
     return updates
 
@@ -1181,9 +1238,19 @@ def mark_validation_complete(
         else None
     )
 
+    # Per-variant verdicts of a grouped run (sanitized once; the cached copy
+    # carries them so a replay resolves the same members instead of falling
+    # back to the seed's verdict).
+    variant_results = sanitize_variant_results(state, kwargs.get("variant_results"))
+
     # Save to cache so subsequent runs skip the tool-calling loop.
     cache_validator(
-        report, state.get("peer_payloads"), updated_vuln, state.get("token_spent")
+        report,
+        state.get("peer_payloads"),
+        {**updated_vuln, VARIANT_RESULTS_CACHE_KEY: variant_results}
+        if variant_results
+        else updated_vuln,
+        state.get("token_spent"),
     )
 
     # Close this validator's headless-browser sessions and remove its dedicated
@@ -1200,7 +1267,9 @@ def mark_validation_complete(
 
     return Command(
         update={
-            "vulnerabilities": propagate_validation_update(state, updated_vuln),
+            "vulnerabilities": propagate_validation_update(
+                state, updated_vuln, variant_results
+            ),
             "messages": [tool_msg],
         }
     )

@@ -999,11 +999,47 @@ def take_feedback_dispatch(vuln_id: str, review_round: int) -> bool:
     return take_dispatch_claim(vuln_id, "feedback", review_round)
 
 
+# Grouped-validation members the shared run left UNRESOLVED (no per-variant
+# result for their vuln_id). They stay 'confirmed' and must be validated
+# alone: _SOLO_VARIANTS is the permanent "never batch again" mark,
+# _SOLO_PENDING the queue route_validator_feedback drains into standalone runs.
+_SOLO_VARIANTS: set[str] = set()
+_SOLO_PENDING: set[str] = set()
+
+
+def mark_solo_validation(vuln_id: str) -> None:
+    """Queue ``vuln_id`` for a standalone (batch-of-one) validation run."""
+    if not vuln_id:
+        return
+    with _DISPATCH_CLAIM_LOCK:
+        _SOLO_VARIANTS.add(vuln_id)
+        _SOLO_PENDING.add(vuln_id)
+
+
+def is_solo_validation(vuln_id: str | None) -> bool:
+    """True once the record was marked to validate alone (never batched)."""
+    with _DISPATCH_CLAIM_LOCK:
+        return vuln_id in _SOLO_VARIANTS
+
+
+def peek_solo_pending() -> set[str]:
+    """Snapshot of the vuln_ids still queued for a standalone validation."""
+    with _DISPATCH_CLAIM_LOCK:
+        return set(_SOLO_PENDING)
+
+
+def discard_solo_pending(vuln_id: str) -> None:
+    with _DISPATCH_CLAIM_LOCK:
+        _SOLO_PENDING.discard(vuln_id)
+
+
 def clear_feedback_dispatch_state() -> None:
     """Reset the once-per-run dispatch claims (called from bootstrap, so a
     resumed scan re-dispatches everything still pending)."""
     with _DISPATCH_CLAIM_LOCK:
         _DISPATCH_CLAIMED.clear()
+        _SOLO_VARIANTS.clear()
+        _SOLO_PENDING.clear()
 
 
 def sandbox_url_alive(sandbox_url: str | None, timeout: float = 5.0) -> bool:

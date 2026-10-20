@@ -796,9 +796,8 @@ def _llm_normalize(candidates: list[dict]) -> tuple[list[dict] | None, dict | No
         # Log the exception TYPE only: a structured-output parse error can echo
         # the model output (the normalized credential list) and API errors can
         # echo the request (the raw candidates), both of which hold secrets.
-        # nosemgrep: python-logger-credential-disclosure
         logger.warning(
-            "Credential finder LLM pass failed (%s); using raw candidates.",
+            "Finder LLM normalization failed (%s); using raw candidates.",
             type(e).__name__,
         )
         return None, None
@@ -809,13 +808,9 @@ def _write_credentials(records: list[dict]) -> None:
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(records, indent=2), encoding="utf-8")
-        # nosemgrep: python-logger-credential-disclosure
-        logger.info(
-            "Credential finder: wrote %d credential(s) to %s.", len(records), target
-        )
+        logger.info("Finder: wrote %d record(s) to %s.", len(records), target)
     except OSError as e:
-        # nosemgrep: python-logger-credential-disclosure
-        logger.error("Credential finder: failed to write %s: %s", target, e)
+        logger.error("Finder: failed to write %s: %s", target, e)
 
 
 def load_credentials() -> list[dict]:
@@ -874,8 +869,10 @@ def authentication_block() -> str:
 def _llm_cache(candidates: list[dict]) -> tuple[list[dict] | None, bool]:
     """Read (or write) the LLM normalization cache keyed on the raw
     candidates. Returns ``(records, was_cached)``."""
+    # Cache key only (not a security digest), hence usedforsecurity=False.
     digest = hashlib.md5(
-        json.dumps(candidates, sort_keys=True).encode("utf-8")
+        json.dumps(candidates, sort_keys=True).encode("utf-8"),
+        usedforsecurity=False,
     ).hexdigest()
     cache_file = (
         settings.cache_dir / "credential_finder" / safe_cache_filename(f"{digest}.json")
