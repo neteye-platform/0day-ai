@@ -1,5 +1,3 @@
-import pytest
-
 import settings
 import tools.patch as patch_tools
 from stages import integration_auditor as ia
@@ -68,11 +66,15 @@ def test_patched_audited_record_is_reaudited(monkeypatch):
     clear_feedback_dispatch_state()
     monkeypatch.setattr(ia, "ensure_sandbox_reachable", lambda *a, **k: None)
     monkeypatch.setattr(settings, "validator_min_cvss", 0)
-    out = ia.dispatch_integration_audits(_audit_state(patch_state="reviewed", patch_round=1))
+    out = ia.dispatch_integration_audits(
+        _audit_state(patch_state="reviewed", patch_round=1)
+    )
     assert isinstance(out, list) and len(out) == 1
     # claim bounds it: same patch round does not re-audit
     assert (
-        ia.dispatch_integration_audits(_audit_state(patch_state="reviewed", patch_round=1))
+        ia.dispatch_integration_audits(
+            _audit_state(patch_state="reviewed", patch_round=1)
+        )
         == []
     )
     clear_feedback_dispatch_state()

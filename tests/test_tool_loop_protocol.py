@@ -70,7 +70,7 @@ def _agent(max_iter):
     a.tools_node_name = "n_tools"
     a.agent_node_name = "n_agent"
     a.ask_node_name = "ask"
-    a._setting = lambda name: max_iter  # noqa: ARG005
+    a._setting = lambda name: max_iter
     return a
 
 
@@ -108,7 +108,7 @@ def test_prepare_history_hard_cap_keeps_full_last_unit():
         threshold=lambda: 10**9,
         hard_cap=lambda: 0,
     )
-    a.summarize = lambda middle: (None, None)  # noqa: ARG005
+    a.summarize = lambda middle: (None, None)
     msgs = _history("ok")
     msgs = msgs[:7] + [_ai(["d", "e"]), _tool("d"), _tool("e")]
     out, *_ = a.prepare_history(msgs, "s", 1)

@@ -30,13 +30,29 @@ def run(monkeypatch, tmp_path):
 
 
 def _ev(i, **kw):
-    return {"demand_id": f"D{i}", "status": "FAILED", "evidence": "e", "cwe": "CWE-89", **kw}
+    return {
+        "demand_id": f"D{i}",
+        "status": "FAILED",
+        "evidence": "e",
+        "cwe": "CWE-89",
+        **kw,
+    }
 
 
 def test_colliding_labels_get_unique_ids_and_distinct_records(run):
     demands = [
-        {"type": "explorer_upstream_assumption", "parameter_name": "$id", "source": "a", "description": "first"},
-        {"type": "explorer_upstream_assumption", "parameter_name": "$id", "source": "b", "description": "second"},
+        {
+            "type": "explorer_upstream_assumption",
+            "parameter_name": "$id",
+            "source": "a",
+            "description": "first",
+        },
+        {
+            "type": "explorer_upstream_assumption",
+            "parameter_name": "$id",
+            "source": "b",
+            "description": "second",
+        },
     ]
     vulns, prompts, _ = run(demands, [_ev(0), _ev(1)])
     assert "[ID: D0]" in prompts[0] and "[ID: D1]" in prompts[0]
@@ -46,8 +62,18 @@ def test_colliding_labels_get_unique_ids_and_distinct_records(run):
 
 def test_unique_label_stays_readable_and_cve_type_kept(run):
     demands = [
-        {"type": "cve_assumption", "source": "CVE-1", "description": "d", "cwe_ids": ["CWE-89"]},
-        {"type": "explorer_upstream_assumption", "parameter_name": "$q", "source": "a", "description": "e"},
+        {
+            "type": "cve_assumption",
+            "source": "CVE-1",
+            "description": "d",
+            "cwe_ids": ["CWE-89"],
+        },
+        {
+            "type": "explorer_upstream_assumption",
+            "parameter_name": "$q",
+            "source": "a",
+            "description": "e",
+        },
     ]
     vulns, _, _ = run(demands, [_ev(0), _ev(1)])
     assert vulns[0]["vulnerable_component"] == "CVE-1"
